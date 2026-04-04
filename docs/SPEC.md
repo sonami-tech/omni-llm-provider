@@ -87,6 +87,8 @@ Primary endpoint. Accepts OpenAI Chat Completions format.
 | `reasoning_effort` | string | No | Thinking level: `none`, `low`, `medium`, `high`, `max` |
 | `stop` | string/array | No | Stop sequences (not forwarded to CLI — see Limitations) |
 
+Any other OpenAI parameters (`n`, `logprobs`, `top_logprobs`, `user`, `seed`, `response_format`, `frequency_penalty`, `presence_penalty`, `top_p`, `top_k`, `stream_options`, `tools`, `tool_choice`, etc.) are silently accepted and ignored. The `ChatCompletionRequest` struct uses serde's default behavior (no `deny_unknown_fields`), so unknown fields pass through without error. This is critical for compatibility — real-world clients send many parameters the proxy doesn't support, and rejecting them would break integration.
+
 **Streaming Response (SSE):**
 
 ```
@@ -189,7 +191,7 @@ The page auto-refreshes via a meta tag or lightweight JS polling. No frameworks 
 
 ### `GET /stats/json`
 
-Returns the same statistics as `/stats` in JSON format for programmatic consumption.
+Returns the same statistics as `/stats` in JSON format for programmatic consumption. The `recent_errors` array contains the last 10 errors (newest first), matching the HTML dashboard — the in-memory buffer stores up to 50 but only the 10 most recent are included in both views.
 
 **Response:**
 
@@ -304,7 +306,7 @@ The subprocess is spawned with `CLAUDE_CONFIG_DIR` set to the proxy's isolated c
 | `--verbose` | **Mandatory** when using `--output-format stream-json` with `-p`. The CLI exits with an error without it: "When using --print, --output-format=stream-json requires --verbose" |
 | `--output-format stream-json` | NDJSON output for streaming events |
 | `--include-partial-messages` | Emit streaming content deltas (without this, only the final result is emitted) |
-| `--tools ""` | **Disable all built-in tools.** The empty string removes Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch, and all other built-in tools from the CLI. Combined with process isolation, this results in zero tools available — the model generates text only and never attempts tool calls. This saves ~4,000–8,000 tokens per request (tool definitions are not included in the system prompt) and guarantees single-turn responses |
+| `--tools ""` | **Disable all built-in tools.** The empty string removes Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch, and all other built-in tools from the CLI. **Important:** `--tools ""` only removes *built-in* tools; plugin and MCP server tools remain active if installed. Combined with `CLAUDE_CONFIG_DIR` process isolation (which eliminates plugins and MCP servers), this results in zero tools available — the model generates text only and never attempts tool calls. This saves ~4,000–8,000 tokens per request (tool definitions are not included in the system prompt) and guarantees single-turn responses |
 | `--model` | Select the Claude model (accepts short names: `opus`, `sonnet`, `haiku`) |
 | `--append-system-prompt` | Append the client's system prompt to Claude Code's default system prompt. Uses `--append-system-prompt` (not `--system-prompt`) because the CLI has its own default system context that should be preserved |
 | `--effort` | Set thinking/reasoning level. Maps 1:1 from `reasoning_effort` request field |
@@ -329,13 +331,27 @@ The subprocess is spawned with `CLAUDE_CONFIG_DIR` set to the proxy's isolated c
 | `frequency_penalty` | No CLI equivalent |
 | `presence_penalty` | No CLI equivalent |
 
-**Note:** The CLI has a `--max-budget-usd` flag (for print mode) but NOT `--max-turns` (as of v2.1.81). Neither is exposed through the proxy API. The proxy always runs single-turn with `--tools ""`, so turn limits are irrelevant. `--max-budget-usd` could be added as a proxy-level safety limit in a future version.
+**Note:** The CLI has `--max-budget-usd` and `--fallback-model` flags (for print mode). `--max-turns` was introduced in a later version (v2.1.91+; not present in v2.1.81). None are exposed through the proxy API. The proxy always runs single-turn with `--tools ""`, so turn limits are irrelevant. `--max-budget-usd` could be added as a proxy-level safety limit in a future version (live testing confirms it produces `"subtype":"error_max_budget_usd"` in the result, which the proxy already handles). `--fallback-model <model>` provides automatic model fallback when the primary model is overloaded — could be exposed as a proxy config option.
+
+**Other CLI flags NOT used by the proxy** (present in CLI v2.1.81 but intentionally excluded):
+
+| CLI Flag | Why Not Used |
+|----------|-------------|
+| `--json-schema` | **Caution:** Live testing revealed that `--json-schema` **overrides `--tools ""`** by injecting a `StructuredOutput` tool, causing multi-turn behavior (2-3 turns, ~3x cost). The result text (`result.result`) becomes an empty string with output only in a `structured_output` field. This breaks the zero-tools single-turn guarantee. Do not use with this proxy. |
+| `--allowedTools` / `--disallowedTools` | Unnecessary — `--tools ""` already disables all built-in tools. These flags are for selective tool filtering, which is irrelevant when all tools are removed. |
+| `--permission-mode auto` | Live testing confirms this is silently ignored when `--tools ""` is active (init event shows `"permissionMode":"default"` regardless). No behavioral difference. |
+| `--agent` / `--agents` | Multi-agent routing — out of scope for a text-only proxy. |
+| `--strict-mcp-config` | Could supplement `CLAUDE_CONFIG_DIR` isolation, but the config directory approach is more thorough (eliminates all non-credential config, not just MCP). |
+| `--betas` | Beta API headers — only relevant for API key users, not OAuth/Claude Max. |
+| `--add-dir` | Adds directories to tool access scope — irrelevant with zero tools. |
+| `--brief` | Enables `SendUserMessage` tool for agent-to-user communication — irrelevant for API proxy. |
+| `--replay-user-messages` | Only useful with `--input-format stream-json` bidirectional streaming (a future consideration). |
 
 ### Prompt Construction
 
 The proxy separates the OpenAI message array into a system prompt and a conversation prompt:
 
-**System prompt** — Extracted from all `role: "system"` messages, concatenated with newlines, and passed via the `--append-system-prompt` CLI flag. This appends to (not replaces) Claude Code's default system prompt. If no system messages are present, the flag is omitted entirely.
+**System prompt** — Extracted from all `role: "system"` and `role: "developer"` messages, concatenated with newlines, and passed via the `--append-system-prompt` CLI flag. The `developer` role is OpenAI's newer equivalent of `system` (introduced for the o1/o3 model family) and should be treated identically. This appends to (not replaces) Claude Code's default system prompt. If no system messages are present, the flag is omitted entirely.
 
 **Why `--append-system-prompt` instead of `--system-prompt`?** The CLI has its own default system prompt. Using `--system-prompt` would replace it entirely. `--append-system-prompt` preserves the defaults and adds the client's context. The reference implementation uses an alternative approach (wrapping system messages in `<system>` XML tags inline in the prompt), but `--append-system-prompt` is preferred because it uses the CLI's native mechanism.
 
@@ -343,7 +359,8 @@ The proxy separates the OpenAI message array into a system prompt and a conversa
 
 1. **User messages** — Included as-is (bare text).
 2. **Assistant messages** — Wrapped in `<previous_response>` tags.
-3. **Other roles** (e.g., `tool`, `function`) — Treated as user messages (included as bare text). These are uncommon in practice since the proxy doesn't support tool use, but clients may send them.
+3. **Developer messages** (`role: "developer"`) — Treated as system messages (concatenated into the system prompt). This is OpenAI's newer name for system instructions.
+4. **Other roles** (e.g., `tool`, `function`) — Treated as user messages (included as bare text). These are uncommon in practice since the proxy doesn't support tool use, but clients may send them.
 4. **Content field handling** — The OpenAI format allows `content` to be either a plain string or an array of content blocks. When it is an array, extract all `text` type blocks and concatenate them. Non-text blocks (images, etc.) are ignored with a warning logged.
 
 Messages are joined with double newlines (`\n\n`) between them.
@@ -368,9 +385,11 @@ The proxy runs each `claude` subprocess with `CLAUDE_CONFIG_DIR` set to an isola
 
 **Why isolation is needed:** The `--tools ""` flag only disables built-in tools (Bash, Read, Edit, etc.). Without isolation, installed plugins (e.g., rust-analyzer-lsp, playwright) and MCP servers from the user's `~/.claude/` configuration still load and provide additional tools that the model can attempt to call. `CLAUDE_CONFIG_DIR` redirects all configuration reads to a clean directory, giving the CLI no plugins to discover.
 
+**Live-tested (CLI v2.1.81):** Running `claude -p --tools "" --model haiku` **without** `CLAUDE_CONFIG_DIR` on a system with installed plugins produced a `system/init` event with 22 MCP tools (playwright browser_*, LSP) and 3 loaded plugins (rust-analyzer-lsp, playwright, codex) — despite `--tools ""`. The model had access to tools the proxy never intended to provide. With `CLAUDE_CONFIG_DIR` isolation, the same command produces `"tools":[]` and `"plugins":[]` as expected.
+
 **Setup (performed once at startup):**
 
-1. Create an isolated config directory at `<data-dir>/claude-config/` (e.g., `~/.local/share/claude-code-provider/claude-config/`).
+1. Create an isolated config directory at `<data-dir>/claude-config/` (e.g., `~/.local/share/claude-code-provider/claude-config/` on Linux, `~/Library/Application Support/claude-code-provider/claude-config/` on macOS). The data directory is resolved via `dirs::data_dir()` which returns the platform-appropriate location.
 2. Symlink the credentials file: `<config-dir>/.credentials.json` → `~/.claude/.credentials.json`. This gives the CLI access to the user's OAuth tokens for Claude Max authentication without exposing any other configuration.
 3. Pass `CLAUDE_CONFIG_DIR=<config-dir>` as an environment variable to every subprocess via `.env("CLAUDE_CONFIG_DIR", ...)`.
 
@@ -391,9 +410,11 @@ The proxy runs each `claude` subprocess with `CLAUDE_CONFIG_DIR` set to an isola
 
 **Credential symlink note:** The symlink target (`~/.claude/.credentials.json`) must exist before the first subprocess is spawned. On startup, the proxy should verify this file exists and exit with a clear error message if it does not (e.g., "Claude Code credentials not found. Run `claude login` first.").
 
-**Config directory cleanup:** The CLI writes files into the config directory at runtime (`.claude.json` for cached feature flags, `mcp-needs-auth-cache.json`, `backups/`, `plugins/`, `projects/` subdirectories). **Important:** On startup, delete ALL files and subdirectories in the config directory (including the `.credentials.json` symlink if it exists), then recreate the `.credentials.json` symlink unconditionally. This is simpler and more robust than trying to preserve the symlink during cleanup. Cached feature flags in `.claude.json` from a previous run can enable tools like `RemoteTrigger` that break the zero-tools guarantee. A fresh config directory on each startup ensures clean isolation.
+**macOS credentials caveat:** On macOS, Claude Code may store credentials in the system Keychain rather than in `~/.claude/.credentials.json`. If the credentials file does not exist on macOS, the CLI may still authenticate via the Keychain. In this case, skip the symlink setup and rely on the CLI's own credential discovery. The startup `claude auth status` check will detect whether authentication is functional regardless of the credential storage mechanism. If `auth status` returns `loggedIn: true` but the credentials file doesn't exist, log a warning and proceed without the symlink — the CLI subprocess will inherit the parent environment's Keychain access.
 
-**CLAUDE.md in working directory (live-tested):** `CLAUDE_CONFIG_DIR` isolation does NOT prevent CLAUDE.md files in the subprocess's working directory (or its parent directories) from being loaded. The CLI discovers CLAUDE.md via filesystem traversal from the CWD, independently of the config directory. In live testing, a CLAUDE.md placed in the CWD was loaded and injected into the system prompt, adding ~1,000 tokens and altering model behavior. **The fix:** Set the subprocess working directory to the isolated config directory itself (via `Command::current_dir(&config.isolated_config_dir)`), which contains no CLAUDE.md. The `--working-dir` proxy config flag defaults to the isolated config dir, not the current directory. If users need a specific CWD (unlikely for a text-only proxy), they can override with `--working-dir`.
+**Config directory cleanup:** The CLI writes files into the config directory at runtime (`.claude.json` for cached feature flags, `mcp-needs-auth-cache.json`, `backups/`, `plugins/`, `projects/` subdirectories). Additionally, the CLI creates empty `memory/` subdirectories under `projects/<cwd-encoded>/memory/` even with `--no-session-persistence` — these are empty but accumulate over time. **Important:** On startup, delete ALL files and subdirectories in the config directory (including the `.credentials.json` symlink if it exists), then recreate the `.credentials.json` symlink unconditionally. This is simpler and more robust than trying to preserve the symlink during cleanup. Cached feature flags in `.claude.json` from a previous run can enable tools like `RemoteTrigger` that break the zero-tools guarantee. A fresh config directory on each startup ensures clean isolation.
+
+**CLAUDE.md in working directory (live-tested):** `CLAUDE_CONFIG_DIR` isolation does NOT prevent CLAUDE.md files in the subprocess's working directory (or its parent directories) from being loaded. The CLI discovers CLAUDE.md via filesystem traversal from the CWD, independently of the config directory. In live testing, a CLAUDE.md placed in the CWD was loaded and injected into the system prompt, adding ~1,000 tokens and altering model behavior. **The fix:** Set the subprocess working directory to the isolated config directory itself (via `Command::current_dir(config.isolated_config_dir())`), which contains no CLAUDE.md. The `--working-dir` proxy config flag defaults to the isolated config dir, not the current directory. If users need a specific CWD (unlikely for a text-only proxy), they can override with `--working-dir`.
 
 **Live-tested impact of stale `.claude.json`:** In testing (CLI v2.1.81), a second run using a stale `.claude.json` changed the CLI's behavior: different `slash_commands` appeared in the `system/init` message, and the cache tier shifted from `ephemeral_5m` to `ephemeral_1h` for `cache_creation_input_tokens`. While tools remained empty (the zero-tools guarantee held), the stale feature flags altered system prompt caching behavior. Cleaning on every startup is essential for deterministic behavior.
 
@@ -406,11 +427,23 @@ A `tokio::sync::Semaphore` bounds the number of concurrent `claude` subprocesses
 - When the limit is reached, new requests wait for a permit via `semaphore.acquire()`. Tokio's semaphore is approximately FIFO (waiters are woken in order) but does not strictly guarantee it.
 - If the wait exceeds the queue timeout (default: 60 seconds), the request is rejected with HTTP 503 and a `Retry-After: 30` header. Use `tokio::time::timeout(Duration::from_secs(queue_timeout), semaphore.acquire())` for this.
 - **Permit lifetime:** The `OwnedSemaphorePermit` must be moved into the subprocess reader task and held until the subprocess exits. This ensures the concurrency slot is occupied for the full duration of the request. Use `Arc<Semaphore>` and `semaphore.clone().acquire_owned()` to get an owned permit that can be moved across task boundaries. The permit is dropped automatically when the reader task completes (subprocess exits or is killed).
+- **Spawn-then-delegate pattern:** The handler acquires the semaphore permit and spawns the subprocess synchronously (via `spawn_managed()`) BEFORE returning the response. If spawn or semaphore acquisition fails, the handler returns an HTTP error. If it succeeds, the reader task runs in the background, and the handler either collects events (non-streaming) or returns an SSE stream (streaming). The `spawn_managed` function signature:
+```rust
+pub async fn spawn_managed(
+	config: Config,
+	semaphore: Arc<Semaphore>,
+	queue_timeout: Duration,
+	cli_args: Vec<String>,
+	tx: mpsc::Sender<SubprocessEvent>,
+) -> Result<(), AppError>
+```
+It acquires the semaphore permit with timeout, then `tokio::spawn`s the reader task (which holds the permit until the subprocess exits). Returns `Ok(())` on successful spawn, `Err(AppError::ServiceUnavailable)` on queue timeout, `Err(AppError::ServerError)` on semaphore closed. The spawned reader task calls `run_subprocess(&config, cli_args, tx)` and holds the permit via `let _permit = permit;`.
+- **Two distinct lifetimes:** The semaphore permit (concurrency slot) and the `ActiveRequestGuard` (active request counter) have different lifetimes. The permit lives in the reader task (dropped when subprocess exits). The `ActiveRequestGuard` lives in the handler (non-streaming) or the converter task (streaming) — it spans the time from request start to response completion. For streaming, the handler returns immediately after starting the SSE stream, so the guard must be in the converter task to track the full request-to-response-completion lifecycle.
 
 ### Process Lifecycle
 
-1. **Spawn** — `tokio::process::Command` with stdout/stderr piped, stdin set to `Stdio::null()`, `kill_on_drop(true)`, `.env("CLAUDE_CONFIG_DIR", &config.isolated_config_dir)`, `.current_dir(&config.working_dir)`. The working directory defaults to the isolated config dir to prevent CLAUDE.md discovery from the host filesystem (see Process Isolation). There is no `--working-dir` or `--cwd` CLI flag on the `claude` binary; the CWD is set via `Command::current_dir()`. **Important:** stdin must be explicitly `Stdio::null()`, not `Stdio::piped()`. When stdin is a pipe, the CLI waits 3 seconds for stdin data before proceeding, adding unnecessary latency and logging a stderr warning. With `Stdio::null()`, the CLI immediately knows there is no piped input. All arguments are passed as separate `arg()` calls (not shell-concatenated), preventing shell injection. **`kill_on_drop(true)` is critical** — it ensures the subprocess is killed if the owning task is dropped (e.g., due to panic or cancellation), preventing orphan processes. **Spawn failure:** If `Command::spawn()` returns `Err` (e.g., binary not found at runtime, permission denied, OS resource exhaustion), return HTTP 500 immediately with a descriptive error. Do not retry — spawn failures are not transient.
-2. **Read** — Stdout and stderr read line-by-line via `BufReader::lines()` in a `tokio::select!` loop. Stdout lines are parsed as NDJSON. Stderr lines are logged at DEBUG level and accumulated in a `Vec<String>` buffer (last 50 lines, capped to prevent unbounded growth). This buffer is used for error messages when the process exits abnormally without a `result` message. Both stdout and stderr lines reset the inactivity timer.
+1. **Spawn** — `tokio::process::Command` with stdout/stderr piped, stdin set to `Stdio::null()`, `kill_on_drop(true)`, `.env("CLAUDE_CONFIG_DIR", config.isolated_config_dir())`, `.current_dir(config.resolved_working_dir())`. The working directory defaults to the isolated config dir to prevent CLAUDE.md discovery from the host filesystem (see Process Isolation). There is no `--working-dir` or `--cwd` CLI flag on the `claude` binary; the CWD is set via `Command::current_dir()`. **Important:** stdin must be explicitly `Stdio::null()`, not `Stdio::piped()`. When stdin is a pipe, the CLI waits 3 seconds for stdin data before proceeding, adding unnecessary latency and logging a stderr warning. With `Stdio::null()`, the CLI immediately knows there is no piped input. All arguments are passed as separate `arg()` calls (not shell-concatenated), preventing shell injection. **`kill_on_drop(true)` is critical** — it ensures the subprocess is killed if the owning task is dropped (e.g., due to panic or cancellation), preventing orphan processes. **Spawn failure:** If `Command::spawn()` returns `Err` (e.g., binary not found at runtime, permission denied, OS resource exhaustion), return HTTP 500 immediately with a descriptive error. Do not retry — spawn failures are not transient. **Environment variable stripping:** The subprocess inherits the proxy's environment. To prevent loopback (where the CLI sends requests back to the proxy instead of using Claude Max OAuth), explicitly strip API-related environment variables: `.env_remove("ANTHROPIC_API_KEY").env_remove("ANTHROPIC_BASE_URL").env_remove("ANTHROPIC_AUTH_TOKEN")`. This is critical when users set `ANTHROPIC_BASE_URL` in their shell profile to route other tools through the proxy — without stripping, every subprocess would inherit that variable and loop requests back to itself, causing hangs. The meridian reference implementation does this unconditionally (not conditionally), and it is the correct approach. The cost is zero (removing absent vars is a no-op) and the protection against loopback is significant.
+2. **Read** — Stdout and stderr read line-by-line via `BufReader::lines()` in a `tokio::select!` loop. Stdout lines are parsed as NDJSON. Stderr lines are logged at DEBUG level and accumulated in a `VecDeque<String>` buffer (last 50 lines, capped to prevent unbounded growth). This buffer is used for error messages when the process exits abnormally without a `result` message. Both stdout and stderr lines reset the inactivity timer. **Line buffer sizing:** NDJSON lines from the CLI can be very large (multi-KB content deltas, tool use results with file contents, base64-encoded data). The line reader must not impose a fixed buffer size limit. Rust's `BufReader::lines()` allocates dynamically per line, so this is handled correctly. Implementations in other languages (e.g., Go's `bufio.Scanner` with its 64KB default) must explicitly increase the buffer limit — the cliproxyapi reference sets a 50MB scanner buffer for this reason.
 
 **Read loop skeleton:**
 ```rust
@@ -422,7 +455,7 @@ let inactivity = tokio::time::sleep(Duration::from_secs(config.timeout));
 tokio::pin!(inactivity);
 let progress = tokio::time::sleep(Duration::from_secs(30));
 tokio::pin!(progress);
-let mut stderr_buf: Vec<String> = Vec::new();
+let mut stderr_buf: VecDeque<String> = VecDeque::new();
 
 loop {
     tokio::select! {
@@ -441,8 +474,8 @@ loop {
                 Ok(Some(line)) => {
                     inactivity.as_mut().reset(Instant::now() + Duration::from_secs(config.timeout));
                     debug!(%line, "stderr");
-                    if stderr_buf.len() >= 50 { stderr_buf.remove(0); }
-                    stderr_buf.push(line);
+                    if stderr_buf.len() >= 50 { stderr_buf.pop_front(); }
+                    stderr_buf.push_back(line);
                 }
                 Ok(None) => {} // stderr closed — ignore, wait for stdout
                 Err(_) => {}
@@ -450,9 +483,9 @@ loop {
         }
         () = &mut inactivity => {
             warn!("Inactivity timeout");
-            let _ = child.kill().await;
             let _ = tx.send(SubprocessEvent::Error("Inactivity timeout".into())).await;
-            break;
+            let _ = child.kill().await;
+            return; // Error sent before kill so consumer receives it
         }
         () = &mut progress => {
             info!(elapsed = ?start.elapsed(), lines, chunks, "Still running");
@@ -466,7 +499,7 @@ loop {
 3. **Timeout** — Configurable inactivity timeout (default: 600 seconds / 10 minutes, set via `--timeout`). No stdout or stderr output for this duration. Subprocess is killed if exceeded.
 4. **Progress** — For long-running requests, log a progress line every 30 seconds showing elapsed time, line count, and chunk count.
 5. **Client disconnect** — Detected when the mpsc channel sender fails (receiver dropped). Subprocess is killed immediately via `child.kill()`.
-6. **Completion** — On subprocess exit, capture exit code via `child.wait()`. Non-zero exit without a result is an error. Exit code `-1` if the wait itself fails. Signal-killed processes (e.g., from inactivity timeout) produce non-zero exit codes (137 for SIGKILL); this is expected and should not be logged as an unexpected error if the kill was initiated by the proxy.
+6. **Completion** — On subprocess exit, capture exit code via `child.wait()`. Track a `got_result` boolean in the reader task — set to `true` when a `SubprocessEvent::Result` is sent. After the read loop, if `!got_result`, construct a `SubprocessEvent::Error` from the exit code and stderr buffer. If `got_result` is `true`, the exit code is redundant (even if non-zero, as in the invalid model case where `is_error: true` produces exit code 1). This suppression prevents duplicate error events from reaching the handler. Exit code `-1` if the wait itself fails. Signal-killed processes (e.g., from inactivity timeout) produce non-zero exit codes (137 for SIGKILL); this is expected and should not be logged as an unexpected error if the kill was initiated by the proxy.
 7. **Cleanup** — On server shutdown, Axum drops in-flight request futures, which drops subprocess tasks, which triggers `kill_on_drop(true)` on each child process (sends SIGKILL).
 
 ---
@@ -486,7 +519,7 @@ Every NDJSON line is a single tagged enum (`ClaudeCliMessage`) dispatched on `"t
 | `"stream_event"` | Streaming partial content (when `--include-partial-messages` is on) | Unwrap and forward text deltas |
 | `"result"` | Final result with usage, duration, exit status | Map to OpenAI response |
 | `"user"` | User-side message (e.g., tool_result in multi-turn scenarios) | **Ignored** — should not appear with `--tools ""` but handle gracefully |
-| `"rate_limit_event"` | Rate limit status from Anthropic | **Ignored** (log for visibility) |
+| `"rate_limit_event"` | Rate limit status from Anthropic | **Ignored** — falls through to `Unknown` catch-all via `#[serde(other)]` |
 
 Unknown `"type"` values must be silently ignored to ensure forward compatibility.
 
@@ -508,6 +541,8 @@ result                                  # final result with usage, duration, tex
 ```
 
 The `assistant` message (partial snapshot) appears mid-stream between content deltas and stop events. It contains accumulated text but is NOT the authoritative source for streaming — use `text_delta` events for that.
+
+**Note:** Without `CLAUDE_CONFIG_DIR` isolation, `system` messages with subtypes `hook_started` and `hook_response` may appear **before** `system/init`. The parser must not assume `init` is the first NDJSON line. With isolation (the production configuration), hooks are not configured, so `system/init` is the first event as shown above.
 
 ### Multi-Turn Behavior (Defensive Handling)
 
@@ -602,7 +637,7 @@ Contains model info and possibly inline content. Top-level keys: `type`, `messag
 
 The `message.model` field provides the actual model used (may differ from the requested model due to routing). The `message.content` array contains the accumulated text so far. The `message.stop_reason` may be `null` when emitted mid-stream (before the response is complete). Additional fields present on the message object: `stop_sequence` (always `null` in normal responses), `stop_details` (always `null` in normal responses), `context_management` (always `null` in observed testing). On synthetic error responses (e.g., invalid model), the message may also include `"container": null` and `"model": "<synthetic>"`. All of these are ignored by the proxy — only `model` and `content` are extracted.
 
-The assistant message can appear **mid-stream** (interleaved with `stream_event` lines), and may appear multiple times in multi-turn sequences (e.g., once per turn). For the proxy, extract the model name from the first assistant message but **do not re-emit content** from the assistant message — the `stream_event` deltas are the authoritative source for streaming text.
+The assistant message can appear **mid-stream** (interleaved with `stream_event` lines), and may appear multiple times in multi-turn sequences (e.g., once per turn). For the proxy, extract the model name from the `assistant` message (the implementation updates on every `Model` event; with `--tools ""` single-turn these all report the same model) but **do not re-emit content** from the assistant message — the `stream_event` deltas are the authoritative source for streaming text.
 
 ### Stream Events (Partial Messages)
 
@@ -639,7 +674,7 @@ The inner `event.delta.type` field determines what kind of content is being stre
 - `content_block_start` — New content block beginning. Contains `content_block.type` field (`"text"` or `"tool_use"`). For `tool_use`, also includes `name` and `id`.
 - `content_block_delta` — Content delta. Check `delta.type` (see table above).
 - `content_block_stop` — Content block finished.
-- `message_delta` — Message-level update. Contains `delta.stop_reason` (`"end_turn"` or `"tool_use"`), `delta.stop_sequence` (usually `null`), `delta.stop_details` (usually `null`), `usage` (with `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`).
+- `message_delta` — Message-level update. Contains `delta.stop_reason` (`"end_turn"` or `"tool_use"`), `delta.stop_sequence` (usually `null`), `delta.stop_details` (usually `null`), `usage` (with `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`), and `context_management` (with `applied_edits` array — always empty in observed testing; ignored by the proxy).
 - `message_stop` — Message streaming completed. No payload.
 
 ### Result Messages
@@ -696,6 +731,8 @@ Final output with usage and exit status.
 
 The result contains **two usage formats**: `modelUsage` (per-model, camelCase, includes cost and context window) and `usage` (flat aggregate, snake_case). Prefer `modelUsage` when present; fall back to `usage` if `modelUsage` is absent or empty.
 
+**`modelUsage` key format:** The dictionary keys are model name strings. When the CLI uses the short model name (e.g., `--model sonnet`), the key is `"claude-sonnet-4-6"`. When the `[1m]` context suffix is used (e.g., `--model opus[1m]`), the key includes the suffix: `"claude-opus-4-6[1m]"`. Since our proxy always passes short names without the `[1m]` suffix, the keys will be standard canonical names in practice. However, the substring-based model normalization used for statistics handles the `[1m]` suffix correctly if it ever appears (e.g., due to subscription-level routing).
+
 The `is_error` field is important: the `subtype` can be `"success"` while `is_error` is `true` (e.g., authentication failures, invalid model). Always check `is_error` in addition to `subtype`. When `is_error` is `true`, `modelUsage` is typically an empty object `{}` and `total_cost_usd` is `0`.
 
 The `stop_reason` field on the result indicates how the CLI's response ended: `"end_turn"` for normal completion, `"stop_sequence"` for synthetic/error responses (e.g., invalid model). This is a CLI-level field, distinct from the `message_delta.delta.stop_reason` in the stream events.
@@ -720,10 +757,10 @@ Each NDJSON line is deserialized with `serde` as a single tagged enum on `"type"
 4. Emit typed internal events via the mpsc channel:
 ```rust
 enum SubprocessEvent {
-	Model(String),          // Extracted from assistant or message_start
-	ContentDelta(String),   // text_delta content
-	Result(ResultMessage),  // Final result with usage
-	Error(String),          // Error message
+	Model(String),               // Extracted from assistant or message_start
+	ContentDelta(String),        // text_delta content
+	Result(Box<ResultMessage>),  // Final result with usage (boxed — ResultMessage is large)
+	Error(String),               // Error message
 }
 ```
 5. With `--tools ""` and process isolation, responses should always be single-turn. The parser should still handle multi-turn sequences defensively — forward `text_delta` from all turns and only treat the final `result` as the completion signal.
@@ -758,7 +795,7 @@ The NDJSON events map to OpenAI SSE chunks:
 | Subsequent `stream_event` with `text_delta` (any turn) | Emit chunk with `delta.content: "<text>"` only |
 | `stream_event` with `thinking_delta` | **Skip** — not forwarded to client |
 | `stream_event` with other inner event types | **Skip** — internal stream lifecycle events |
-| `result` with `is_error: true` | Emit error event with `result.result` as message, then `data: [DONE]` (checked first — takes priority over subtype) |
+| `result` with `is_error: true` | Emit error event with `result.result` as message, then `data: [DONE]` only if content was already streamed (checked first — takes priority over subtype). See Streaming Errors for details. |
 | `result` with `is_error: false` and `subtype: "success"` | Emit final chunk with `finish_reason: "stop"`, usage chunk, then `data: [DONE]` |
 | `result` with `is_error: false` and error subtype | Emit final chunk with `finish_reason: "stop"`, then `data: [DONE]` (log the error server-side) |
 | Process error or non-zero exit | Emit error event, then close stream |
@@ -774,9 +811,9 @@ Each chunk includes:
 - All responses (streaming and non-streaming) include an `x-request-id` header set to the request's 8-hex-char ID. This aids debugging and log correlation.
 - Streaming responses include `Cache-Control: no-cache` to prevent intermediary caching. Axum's `Sse` type handles `Content-Type: text/event-stream` automatically. Custom headers (like `x-request-id`) are added via tuple response: `(headers, sse).into_response()`.
 
-**Initial SSE comment:** Before any data events, emit an SSE comment line (`:ok\n\n`) to signal the stream is established. This helps clients and load balancers detect a live connection immediately rather than waiting for the first content delta (which may take seconds due to CLI startup time). Use `Event::default().comment("ok")` as the first event in the stream.
+**Initial SSE comment:** Before any data events, emit an SSE comment line (`: ok\n\n`) to signal the stream is established. This helps clients and load balancers detect a live connection immediately rather than waiting for the first content delta (which may take seconds due to CLI startup time). Use `Event::default().comment("ok")` as the first event in the stream. Note: Axum's `Event::comment()` produces `: ok` (with a space after the colon), matching the SSE spec's field format. The comment is emitted inside the converter task after `spawn_managed()` succeeds — if spawn fails, the client receives an HTTP error response, not an SSE stream.
 
-**Usage in final chunk:** After the last content chunk and before `data: [DONE]`, emit a chunk with `usage` populated from the `result` message's `modelUsage` field (summing all entries if multiple models are present). This follows the OpenAI `stream_options.include_usage` convention. The usage chunk has empty `choices: []` and the `usage` object:
+**Usage in final chunk:** After the last content chunk and before `data: [DONE]`, emit a chunk with `usage` populated from the `result` message's `modelUsage` field (summing all entries if multiple models are present). This follows the OpenAI `stream_options.include_usage` convention. The usage chunk has empty `choices: []` and the `usage` object. If `extract_usage` returns `None` (both `modelUsage` and flat `usage` are absent — rare, typically only on error paths), the usage chunk is omitted entirely and the stream proceeds directly to `[DONE]`:
 
 ```json
 data: {"id":"chatcmpl-a1b2c3d4","object":"chat.completion.chunk","created":1712345678,"model":"claude-sonnet-4-6","choices":[],"usage":{"prompt_tokens":25,"completion_tokens":8,"total_tokens":33}}
@@ -784,7 +821,7 @@ data: {"id":"chatcmpl-a1b2c3d4","object":"chat.completion.chunk","created":17123
 
 **`data: [DONE]` sentinel:** The stream terminator is literally `data: [DONE]\n\n` — it is NOT valid JSON. In Axum, emit it via `Event::default().data("[DONE]")`. This produces the correct SSE format. Do not attempt to serialize `[DONE]` as JSON.
 
-**Keepalive:** Use `Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))` to send SSE comments every 15 seconds, keeping the connection alive through proxies.
+**Keepalive:** Use `Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))` to send SSE comment lines (`: \n\n`) every 15 seconds. This is critical for keeping the connection alive through reverse proxies (nginx defaults to 60s proxy_read_timeout, Cloudflare to 100s) and HTTP clients with idle timeouts. Without keepalives, the connection may be terminated during the CLI's thinking phase (which can take 10+ seconds with `--effort max`) before any content is streamed.
 
 **Client disconnect:** When the client disconnects, Axum drops the response stream. This drops the `mpsc::Receiver`, causing the subprocess task's `tx.send()` to return `Err`. The subprocess task then kills the child process. Flow: client disconnect → stream drop → receiver drop → sender fails → kill subprocess.
 
@@ -810,7 +847,9 @@ For non-streaming requests (`stream: false`):
 | `error_during_execution` | `"stop"` (log error server-side) |
 | `error_max_budget_usd` | `"stop"` (log error server-side) |
 
-Note: The CLI does not report a distinct "max tokens reached" state, so `"length"` is not currently emitted. All completions use `"stop"`.
+**Important:** This table only applies when `is_error` is `false` (or absent). When `is_error` is `true`, the result is treated as an error regardless of subtype — the response is an HTTP 500 (non-streaming) or SSE error event (streaming), not a `ChatCompletionResponse` with a `finish_reason`. The `subtype` can be `"success"` while `is_error` is `true` (e.g., invalid model), so always check `is_error` first.
+
+Note: The CLI does not currently report a distinct "max tokens reached" state, so `"length"` is not emitted. All completions use `"stop"`. If the CLI ever reports `stop_reason: "max_tokens"` (as the Anthropic API does when output is truncated), it should map to `finish_reason: "length"` — OpenAI clients like Continue.dev and Cursor use `"length"` to detect truncation and may auto-request continuations.
 
 ### Token Usage Mapping
 
@@ -840,7 +879,7 @@ The proxy normalizes all model names to our canonical names using substring matc
 - Contains `haiku` → `claude-haiku-4-5`
 - Fallback → use the raw CLI model string as-is
 
-The model name from the `assistant` message or `message_start` inner event (actual model used) takes precedence over the `system/init` model (requested model). This handles cases where Claude Max routes to a different model than requested. In multi-turn sequences, use the model from the first `message_start` event.
+The model name from the `assistant` message or `message_start` inner event (actual model used) takes precedence over the `system/init` model (requested model). This handles cases where Claude Max routes to a different model than requested. The implementation updates the model variable on every `Model` event (from both `assistant` and `message_start`). With `--tools ""` (always single-turn), these events report the same model, so first-vs-last is equivalent. If multi-turn support is added later, consider tracking only the first `Model` event.
 
 **Fallback chain:** If no `Model` event is received (e.g., the CLI errors out before emitting an `assistant` or `message_start` event), fall back to the canonical model name resolved from the client's `model` field in the request. This ensures every response has a model name even on error paths.
 
@@ -869,6 +908,8 @@ enum AppError {
 	#[error("{0}")]
 	BadRequest(String),
 	#[error("{0}")]
+	NotFound(String),
+	#[error("{0}")]
 	ServerError(String),
 	#[error("{0}")]
 	Timeout(String),
@@ -880,6 +921,7 @@ impl IntoResponse for AppError {
 	fn into_response(self) -> Response {
 		let (status, error_type) = match &self {
 			AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
+			AppError::NotFound(_) => (StatusCode::NOT_FOUND, "invalid_request_error"),
 			AppError::ServerError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
 			AppError::Timeout(_) => (StatusCode::GATEWAY_TIMEOUT, "server_error"),
 			AppError::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "server_error"),
@@ -887,7 +929,11 @@ impl IntoResponse for AppError {
 		let body = serde_json::json!({
 			"error": { "message": self.to_string(), "type": error_type, "code": null }
 		});
-		(status, Json(body)).into_response()
+		let mut resp = (status, Json(body)).into_response();
+		if matches!(self, AppError::ServiceUnavailable(_)) {
+			resp.headers_mut().insert("retry-after", "30".parse().unwrap());
+		}
+		resp
 	}
 }
 ```
@@ -898,30 +944,34 @@ For `ServiceUnavailable`, also include a `Retry-After: 30` header in the respons
 
 | Condition | HTTP Status | `error.type` | Action |
 |-----------|-------------|--------------|--------|
-| Invalid JSON body | 400 | `invalid_request_error` | Return immediately |
+| Invalid JSON body | 400 | `invalid_request_error` | Return immediately. **Implementation note:** Use `body: Bytes` as the Axum extractor (not `Json<T>`) and call `serde_json::from_slice()` manually. Axum's `Json<T>` extractor returns its own 422 error format, not our OpenAI-compatible 400 format. Manual parsing gives us control over the error response. |
 | Missing or empty `model` field | 400 | `invalid_request_error` | Return immediately |
 | Empty `messages` array | 400 | `invalid_request_error` | Return immediately |
 | No user messages after filtering | 400 | `invalid_request_error` | Return immediately. All messages were system role or had empty content. |
 | Invalid `reasoning_effort` value | 400 | `invalid_request_error` | Return immediately. Valid values: `none`, `low`, `medium`, `high`, `max`, or absent. Any other string is invalid. |
-| Prompt too large (>1MB) | 400 | `invalid_request_error` | Return immediately with size information |
-| System prompt too large (>1MB) | 400 | `invalid_request_error` | Return immediately with size information |
+| Prompt too large (>128KB) | 400 | `invalid_request_error` | Return immediately with size information. Linux `MAX_ARG_STRLEN` is ~128KB per CLI argument. |
+| System prompt too large (>128KB) | 400 | `invalid_request_error` | Return immediately with size information |
 | Queue timeout (60s) | 503 | `server_error` | Include `Retry-After: 30` header |
 | CLI not found in PATH | 500 | `server_error` | Log critical error; return helpful message |
 | CLI subprocess spawn failure | 500 | `server_error` | Log error with spawn error details |
-| CLI exited with no output | 500 | `server_error` | Process exited immediately without producing any NDJSON. Collect and include stderr output. Common cause: auth failure or invalid arguments. |
-| CLI non-zero exit without result | 500 | `server_error` | Include stderr output in message |
-| `result` with `is_error: true` | 500 | `server_error` | Use `result.result` as error message |
-| Inactivity timeout (10 min) | 504 | `server_error` | Kill subprocess, log warning |
+| CLI exited with no output | 500 | `server_error` | Process exited immediately without producing any NDJSON. Collect and include stderr output. Common cause: auth failure or invalid arguments. **(Enhancement — not yet implemented:** If stderr contains "Not logged in" or "OAuth token has expired", append a hint: "Run `claude login` to re-authenticate."**)**  |
+| CLI non-zero exit without result | 500 | `server_error` | Include stderr output in message. Exit code 1 frequently indicates an auth failure. |
+| `result` with `is_error: true` | 500 | `server_error` | Use `result.result` as error message. **(Enhancement — not yet implemented:** If the message contains "Not logged in", append the `claude login` hint.**)** |
+| Inactivity timeout (10 min) | 504 | `server_error` | Kill subprocess, log warning. **Implementation note:** The reader task sends `SubprocessEvent::Error("Inactivity timeout".into())` — the error type information (504 vs 500) is lost through the string-typed channel. The handler recovers it by checking `if err.contains("Inactivity timeout")` and producing `AppError::Timeout` (504) instead of `AppError::ServerError` (500). This string-matching approach is intentional — adding a typed error variant to `SubprocessEvent` would complicate the enum for a single case. |
 | Internal panic / unexpected error | 500 | `server_error` | Log full backtrace |
 
 ### Streaming Errors
 
 If an error occurs after streaming has started (SSE headers already sent):
 
-1. **Before any content was sent** (e.g., subprocess spawn failure, immediate timeout): Emit an error event `data: {"error": {"message": "...", "type": "server_error"}}`, then close the stream (no `data: [DONE]`).
-2. **After content was already streamed** (e.g., `result` with `is_error: true`, late timeout): Emit an error event, then `data: [DONE]` to cleanly close the stream. The client already has partial content and needs a proper termination signal.
+1. **Before any content was sent** (e.g., subprocess spawn failure, immediate timeout, `result` with `is_error: true` when no content deltas were emitted): Emit an error event `data: {"error": {"message": "...", "type": "server_error"}}`, then close the stream (no `data: [DONE]`).
+2. **After content was already streamed** (e.g., `result` with `is_error: true` after content deltas were sent, late timeout): Emit an error event, then `data: [DONE]` to cleanly close the stream. The client already has partial content and needs a proper termination signal.
+
+The decision between case 1 and 2 is based on whether any `ContentDelta` events were forwarded to the client (tracked via a `content_sent` boolean), not on the event type that triggered the error.
 
 Clients should treat an abrupt stream close without `data: [DONE]` as an error.
+
+**Retry invariant (for future retry logic):** Once any content has been committed to the client (a `ContentDelta` forwarded as an SSE data event), the response is committed and must NOT be retried. Retrying after partial content delivery would duplicate or corrupt the response. This is a hard constraint — any future retry logic (e.g., for auth token refresh or rate limit recovery) must check the `content_sent` flag and suppress retries when true. The meridian reference implementation enforces this with `didYieldContent` / `didYieldClientEvent` booleans that unconditionally re-throw errors once content has been yielded.
 
 ---
 
@@ -940,7 +990,9 @@ Options:
 	-q, --queue-timeout <SECONDS>  Max time a request waits in queue [default: 60]
 	--claude-path <PATH>           Path to claude CLI binary [default: "claude"]
 	--data-dir <PATH>              Data directory for config isolation and stats DB
-	                               [default: ~/.local/share/claude-code-provider]
+	                               [default: platform data dir / claude-code-provider]
+	                               Linux: ~/.local/share/claude-code-provider
+	                               macOS: ~/Library/Application Support/claude-code-provider
 	--working-dir <PATH>           Working directory for subprocess [default: <data-dir>/claude-config]
 	                               (Note: This is OUR config flag, not a claude CLI flag. The working
 	                               directory is passed to the subprocess via Command::current_dir().
@@ -953,7 +1005,7 @@ Options:
 
 ### Environment Variables
 
-All CLI arguments can also be set via environment variables with `CCP_` prefix:
+All CLI arguments (except `--verbose`) can also be set via environment variables with `CCP_` prefix:
 
 | Variable | CLI Equivalent |
 |----------|----------------|
@@ -968,6 +1020,55 @@ All CLI arguments can also be set via environment variables with `CCP_` prefix:
 
 CLI arguments take precedence over environment variables.
 
+### Config Struct
+
+The `Config` struct is both the clap `Parser` target and the runtime configuration. Optional fields (`data_dir`, `working_dir`) use `Option<PathBuf>` with post-parse resolution methods:
+
+```rust
+#[derive(Parser, Clone, Debug)]
+#[command(name = "claude-code-provider", version, about = "OpenAI-compatible API proxy backed by Claude Code CLI")]
+pub struct Config {
+	#[arg(short = 'p', long, default_value = "3456", env = "CCP_PORT")]
+	pub port: u16,
+	#[arg(short = 'H', long, default_value = "127.0.0.1", env = "CCP_HOST")]
+	pub host: String,
+	#[arg(short = 'c', long, default_value = "5", env = "CCP_MAX_CONCURRENT")]
+	pub max_concurrent: usize,
+	#[arg(short = 't', long, default_value = "600", env = "CCP_TIMEOUT")]
+	pub timeout: u64,
+	#[arg(short = 'q', long, default_value = "60", env = "CCP_QUEUE_TIMEOUT")]
+	pub queue_timeout: u64,
+	#[arg(long, default_value = "claude", env = "CCP_CLAUDE_PATH")]
+	pub claude_path: String,
+	#[arg(long, env = "CCP_DATA_DIR")]
+	pub data_dir: Option<PathBuf>,
+	#[arg(long, env = "CCP_WORKING_DIR")]
+	pub working_dir: Option<PathBuf>,
+	#[arg(short = 'v', long)]
+	pub verbose: bool,
+}
+
+impl Config {
+	pub fn resolved_data_dir(&self) -> PathBuf {
+		self.data_dir.clone().unwrap_or_else(|| {
+			dirs::data_dir().expect("Could not determine data directory")
+				.join("claude-code-provider")
+		})
+	}
+	pub fn isolated_config_dir(&self) -> PathBuf {
+		self.resolved_data_dir().join("claude-config")
+	}
+	pub fn resolved_working_dir(&self) -> PathBuf {
+		self.working_dir.clone().unwrap_or_else(|| self.isolated_config_dir())
+	}
+	pub fn stats_db_path(&self) -> PathBuf {
+		self.resolved_data_dir().join("stats.redb")
+	}
+}
+```
+
+**Why `Option<PathBuf>` for `data_dir` and `working_dir`:** These have dynamic defaults that depend on the runtime platform (`dirs::data_dir()`) or on each other (`working_dir` defaults to `isolated_config_dir()`, which depends on `data_dir`). Clap's `default_value` only accepts static strings, so these are `None` at parse time and resolved via methods.
+
 ### Startup Validation
 
 On startup, the server:
@@ -978,8 +1079,8 @@ On startup, the server:
 4. **Sets up the isolated config directory:**
    - Creates `<data-dir>/claude-config/` if it does not exist (default: `~/.local/share/claude-code-provider/claude-config/`).
    - **Cleans the config directory:** Removes all files and subdirectories (including any existing `.credentials.json` symlink). This prevents stale cached feature flags (from `.claude.json`) from enabling unexpected tools on restart.
-   - Creates a fresh symlink `<config-dir>/.credentials.json` → `~/.claude/.credentials.json`.
-   - Verifies the symlink target resolves to an existing file. Check with `std::fs::metadata()` on the symlink target path (not the symlink itself), or equivalently `std::fs::read_link()` followed by `metadata()` on the result. A broken symlink (symlink exists but target is deleted) must be caught. If the target does not exist, exits with: `"Claude Code credentials not found at ~/.claude/.credentials.json. Run 'claude login' first."`.
+   - Verifies the credentials source file exists at `~/.claude/.credentials.json`. If it does not exist: on **macOS**, log a warning and skip the symlink (credentials may be in the system Keychain — the `claude auth status` check in step 3 already confirmed auth works). On **Linux**, exit with: `"Claude Code credentials not found at ~/.claude/.credentials.json. Run 'claude login' first."`. This check happens before symlink creation — if the source doesn't exist on Linux, there's nothing to symlink to.
+   - Creates a fresh symlink `<config-dir>/.credentials.json` → `~/.claude/.credentials.json` (skipped on macOS if the source file does not exist).
 5. **Opens the stats database** at `<data-dir>/stats.redb`. Creates it if it does not exist. Initializes tables on first access.
 6. **Constructs `AppState`** and wraps it in `Arc`:
 ```rust
@@ -1062,10 +1163,10 @@ impl Stats {
 
 **Recording points:**
 - **Request count** (persistent): Incremented when the request handler begins (before subprocess spawn). This ensures requests that fail to spawn are still counted.
-- **Active requests** (in-memory): Incremented at handler start, decremented when the handler returns (in a `Drop` guard or `defer`-style pattern). Use `AtomicU64::fetch_add` / `fetch_sub`.
-- **TTFT** (in-memory): Recorded when the first `ContentDelta` event is received in the subprocess reader. Measured as elapsed time since subprocess spawn.
-- **Duration** (in-memory): Recorded when the subprocess exits (after `child.wait()`). Measured as total elapsed time since subprocess spawn.
-- **Tokens** (persistent): Recorded from the `result` message's `modelUsage` field. Only recorded on successful completion (when `is_error` is false or absent).
+- **Active requests** (in-memory): Tracked via an `ActiveRequestGuard` RAII type that increments on creation and decrements on drop. **Non-streaming:** Created at the start of the handler, dropped when the handler returns. **Streaming:** Created inside the spawned converter task (not the handler), so it spans the full request-to-response-completion lifecycle — the handler itself returns immediately after starting the SSE stream. Use `AtomicU64::fetch_add` / `fetch_sub`.
+- **TTFT** (in-memory): Measured in the handler (non-streaming) or converter task (streaming) when the first `ContentDelta` event is received from the channel. Elapsed time is measured from a local `Instant::now()` captured after `spawn_managed()` returns. The reader task does NOT record TTFT — it only sends `SubprocessEvent::ContentDelta` through the channel. The receiving side measures wall-clock time to first delta. This approach avoids passing `Arc<Stats>` into the reader task.
+- **Duration** (in-memory): Measured in the handler (non-streaming) or converter task (streaming) as total elapsed time from the same local `Instant::now()` to when the `Result` event is received or the channel closes. Not measured in the reader task.
+- **Tokens** (persistent): Recorded from the `result` message's `modelUsage` field. Only recorded on successful completion (when `is_error` is false or absent). **Important:** The `modelUsage` keys are raw CLI model names (e.g., `"claude-haiku-4-5-20251001"` with date suffix). These must be normalized via `normalize_model_name()` before storing in the stats DB, so that token counts aggregate under canonical names (matching the request count keys). Without normalization, the stats page shows ghost entries with date-suffixed names that have tokens but zero requests.
 - **Errors** (persistent count + in-memory recent): Recorded when a request ends in error (subprocess failure, `is_error: true`, timeout, etc.).
 
 ### Stats Dashboard (`GET /stats`)
@@ -1128,8 +1229,8 @@ These are known limitations of the CLI subprocess approach:
 9. **No `frequency_penalty`, `presence_penalty`, `top_p`** — These sampling parameters have no CLI equivalent. Accepted but ignored.
 10. **Rate limits are Claude Max plan limits** — The proxy does not add its own rate limiting. Anthropic's server-side limits for Claude Max apply.
 11. **Model may reference tools in text** — With zero tools available, the model may occasionally produce text that looks like tool invocations (e.g., XML-like `<invoke>` blocks) when asked to do something that would normally require tools (like reading a file). This is harmless generated text, not actual tool execution.
-12. **Haiku model routing** — In live testing with Claude Max, requesting `haiku` resulted in the CLI's `system/init` reporting `claude-haiku-4-5-20251001` but `modelUsage` and `assistant` messages showing `claude-sonnet-4-6`. Claude Max may route haiku requests to sonnet. The proxy should still accept and forward haiku requests, but the actual model used (from `message_start` or `modelUsage`) may differ. The response model name reflects the actual model used, not the requested one.
-13. **Argument length limit** — The conversation prompt and system prompt are each passed as separate CLI arguments. Linux has a ~2MB per-argument limit (`MAX_ARG_STRLEN`). For extremely long inputs, this could be exceeded. The proxy should check both `prompt.len() > 1_048_576` and `system_prompt.len() > 1_048_576` (1MB each) before spawning and return a 400 error with `invalid_request_error` type and message "Prompt too large (exceeds 1MB argument limit)" or "System prompt too large (exceeds 1MB argument limit)". These checks apply to the fully constructed strings, not the raw request body.
+12. **Haiku model routing** — In earlier live testing with Claude Max, requesting `haiku` resulted in `modelUsage` showing `claude-sonnet-4-6` instead of haiku (server-side routing). In later testing, haiku requests were served by `claude-haiku-4-5-20251001` as expected. This routing behavior is **intermittent and server-side** — Claude Max may route haiku requests to sonnet under load. The proxy should accept and forward haiku requests regardless. The response model name reflects the actual model used (from `message_start` or `modelUsage`), not the requested one. The `modelUsage` key may include a date suffix (e.g., `"claude-haiku-4-5-20251001"`), which the proxy normalizes to `claude-haiku-4-5` via substring matching.
+13. **Argument length limit** — The conversation prompt and system prompt are each passed as separate CLI arguments. Linux has a ~128KB per-argument limit (`MAX_ARG_STRLEN` = 128 * 1024 = 131,072 bytes) and a total `ARG_MAX` of ~2-3MB for all arguments combined. If an individual argument exceeds `MAX_ARG_STRLEN`, `Command::spawn()` fails with `E2BIG` ("Argument list too long"). The proxy checks both `prompt.len() > 128_000` and `system_prompt.len() > 128_000` (~128KB each) before spawning and returns a 400 error, preventing spawn failures from the per-argument OS limit. The spawn error handler in process.rs provides additional safety in case any argument unexpectedly exceeds the OS limit. In practice, conversation prompts exceeding 128KB are unusual for text-only interactions (128KB is ~30,000 words). If this becomes an issue, the prompt can be piped via stdin (future enhancement using `--input-format stream-json`).
 
 ---
 
@@ -1172,7 +1273,7 @@ When `reasoning_effort` is set to a non-`none` value, Claude may produce thinkin
 3. **No request body modification** — The proxy does not inject, modify, or store any credentials.
 4. **Subprocess isolation** — `--tools ""` combined with `CLAUDE_CONFIG_DIR` isolation removes all tools. The CLI cannot execute tools, write files, or run commands because no tools exist in the session.
 5. **No secrets in logs** — Request/response content is only logged at TRACE level.
-6. **Request body size limit** — 10 MB maximum request body size. Prevents memory exhaustion from oversized requests. Use `.layer(DefaultBodyLimit::max(10 * 1024 * 1024))` on the router.
+6. **Request body size limit** — 10 MB maximum request body size. Prevents memory exhaustion from oversized requests. Use `.layer(DefaultBodyLimit::max(10 * 1024 * 1024))` on the router. Note: When this limit is exceeded, Axum returns a 413 Payload Too Large with its own plain-text error format (not our OpenAI JSON format), because the body limit middleware rejects the request before our handler runs. This is acceptable for this edge case.
 
 ---
 
@@ -1201,9 +1302,11 @@ claude-code-provider/
 │   │   ├── response.rs      # CLI events → OpenAI response (non-streaming)
 │   │   └── stream.rs        # CLI events → OpenAI SSE chunks (streaming)
 │   ├── models.rs            # Model name mapping and validation
-│   ├── stats.rs             # Stats collector (redb persistence) and dashboard HTML
+│   ├── stats.rs             # Stats collector (redb persistence)
 │   └── error.rs             # Error types and OpenAI error format
 ├── SPEC.md                  # This file
+├── README.md                # Project overview, setup instructions, API docs
+├── test_openai_client.py    # OpenAI Python SDK integration tests
 └── research/                # Reference implementations (not compiled)
 ```
 
@@ -1212,6 +1315,15 @@ claude-code-provider/
 ## Runtime Note
 
 The server uses Axum with tokio as its async runtime. All subprocess spawning uses `tokio::process::Command`. The reference implementation (`claude-max-api-proxy-rs`) uses this exact stack successfully.
+
+**Handler return type:** The completions handler returns `Result<Response, AppError>`. Both streaming (`Sse`) and non-streaming (`Json`) responses are converted to `Response` via `.into_response()`. The handler signature:
+```rust
+pub async fn completions_handler(
+	State(state): State<Arc<AppState>>,
+	body: Bytes,
+) -> Result<Response, AppError>
+```
+This works because `AppError` implements `IntoResponse` (Axum automatically converts `Err` variants), and both `(headers, Sse<...>).into_response()` and `(headers, Json<...>).into_response()` produce `Response`. The handler delegates to `handle_streaming()` or `handle_non_streaming()` which share the same return type.
 
 **SSE streaming:** Axum provides `axum::response::sse::Sse` with built-in keepalive support. The architecture uses two `mpsc::channel`s (same pattern as the reference implementation):
 
@@ -1226,11 +1338,10 @@ let (sub_tx, mut sub_rx) = mpsc::channel::<SubprocessEvent>(64);
 // Channel 2: event converter → SSE writer
 let (sse_tx, sse_rx) = mpsc::channel::<Result<Event, Infallible>>(64);
 
-// Task 1: Read NDJSON from subprocess, parse, send SubprocessEvents
-tokio::spawn(async move {
-	spawn_and_read_subprocess(prompt, args, sub_tx).await;
-	// Client disconnect detected when sub_tx.send() returns Err
-});
+// Spawn subprocess (acquires semaphore, spawns reader task internally).
+// Returns Err(AppError) on queue timeout or spawn failure — handler
+// returns HTTP error BEFORE the SSE stream starts.
+spawn_managed(config.clone(), semaphore.clone(), queue_timeout, cli_args, sub_tx).await?;
 
 // Task 2: Convert SubprocessEvents → SSE Events
 // State tracked across events:
@@ -1278,7 +1389,7 @@ let headers = [(header::HeaderName::from_static("x-request-id"), request_id)];
 (headers, Json(response)).into_response()
 ```
 
-**Initial SSE comment:** Before any data events, emit `:ok\n\n` via `Event::default().comment("ok")` as the first event.
+**Initial SSE comment:** Before any data events, emit `: ok\n\n` via `Event::default().comment("ok")` as the first event.
 
 **Server setup:**
 ```rust
@@ -1288,9 +1399,15 @@ let app = Router::new()
 	.route("/stats", get(stats_html_handler))
 	.route("/stats/json", get(stats_json_handler))
 	.route("/health", get(health_handler))
+	.fallback(fallback_handler)  // Returns 404 with OpenAI error format
 	.layer(CorsLayer::permissive())
 	.layer(DefaultBodyLimit::max(10 * 1024 * 1024))
 	.with_state(state);
+
+// Fallback returns NotFound for any unregistered path
+async fn fallback_handler() -> AppError {
+	AppError::NotFound("The requested endpoint does not exist".into())
+}
 ```
 
 **Graceful shutdown:**
@@ -1331,12 +1448,12 @@ Active subprocess cleanup is handled by `kill_on_drop(true)` on each subprocess 
 | `tower-http` 0.6+ (with `cors` feature) | CORS middleware |
 | `tokio` 1 (with `full` feature) | Async runtime |
 | `tokio-stream` | `ReceiverStream` adapter for SSE |
-| `serde` / `serde_json` | JSON serialization/deserialization |
+| `serde` 1 (with `derive` feature) / `serde_json` 1 | JSON serialization/deserialization |
 | `tracing` / `tracing-subscriber` (with `env-filter` feature) | Structured logging |
-| `clap` 4 (with `derive` feature) | CLI argument parsing |
+| `clap` 4 (with `derive`, `env` features) | CLI argument parsing |
 | `uuid` 1 (with `v4` feature) | Request ID generation |
 | `thiserror` 2 | Error type derivation |
-| `dirs` 4 | Home directory and data directory resolution |
+| `dirs` 6 | Home directory and data directory resolution |
 | `redb` 2.4+ | Persistent statistics database (embedded key-value store) |
 
 ---
@@ -1351,9 +1468,9 @@ Active subprocess cleanup is handled by `kill_on_drop(true)` on each subprocess 
 #[serde(tag = "type")]
 enum ClaudeCliMessage {
 	#[serde(rename = "system")]
-	System { subtype: Option<String>, model: Option<String> },
+	System { subtype: Option<String> },
 	#[serde(rename = "assistant")]
-	Assistant { message: Option<AssistantInner>, error: Option<String> },
+	Assistant { message: Option<AssistantInner> },
 	#[serde(rename = "stream_event")]
 	StreamEvent { event: StreamEventInner },
 	#[serde(rename = "result")]
@@ -1373,25 +1490,17 @@ enum StreamEventInner {
 	#[serde(rename = "message_start")]
 	MessageStart { message: Option<MessageStartInfo> },
 	#[serde(rename = "message_delta")]
-	MessageDelta { delta: Option<MessageDeltaInfo> },
+	MessageDelta {},  // Fields exist but are not used by the proxy
 	#[serde(other)]
 	Other,
 }
 ```
 
-**AssistantInner** — Nested inside the `assistant` variant's `message` field. Note: the `error` field (e.g., `"invalid_request"`) appears on the top-level `assistant` object alongside `message`, NOT inside `message` — this is already captured in the `ClaudeCliMessage` enum above:
+**AssistantInner** — Nested inside the `assistant` variant's `message` field. Only `model` is extracted; the CLI also sends `content`, `id`, `role`, `stop_reason`, `stop_sequence`, `stop_details`, `usage`, and `context_management` — all silently ignored by serde. Note: the `error` field (e.g., `"invalid_request"`) appears on the top-level `assistant` object alongside `message`, NOT inside `message` — also ignored (serde skips unknown fields).
 ```rust
 #[derive(Deserialize)]
 struct AssistantInner {
 	model: Option<String>,
-	content: Option<Vec<ContentBlock>>,
-}
-
-#[derive(Deserialize)]
-struct ContentBlock {
-	#[serde(rename = "type")]
-	block_type: Option<String>,
-	text: Option<String>,
 }
 ```
 
@@ -1413,7 +1522,7 @@ struct MessageStartInfo {
 }
 ```
 
-**MessageDeltaInfo** — The `delta` object inside `message_delta` events:
+**MessageDeltaInfo** — The `delta` object inside `message_delta` events. Not currently used by the proxy (the `MessageDelta` variant is an empty struct in the implementation), but documented for completeness:
 ```rust
 #[derive(Deserialize)]
 struct MessageDeltaInfo {
@@ -1423,15 +1532,13 @@ struct MessageDeltaInfo {
 }
 ```
 
-**ResultMessage** — Top-level result fields (mostly snake_case, with `modelUsage` as the camelCase exception):
+**ResultMessage** — Top-level result fields (mostly snake_case, with `modelUsage` as the camelCase exception). Only fields used by the proxy are included; the CLI emits additional fields (`stop_reason`, `session_id`, `permission_denials`, `fast_mode_state`, `uuid`) that are silently ignored by serde:
 ```rust
 #[derive(Deserialize)]
 struct ResultMessage {
 	subtype: Option<String>,
 	is_error: Option<bool>,
 	result: Option<String>,
-	stop_reason: Option<String>,
-	session_id: Option<String>,
 	duration_ms: Option<u64>,
 	duration_api_ms: Option<u64>,
 	num_turns: Option<u64>,
@@ -1453,7 +1560,7 @@ struct FlatUsage {
 }
 ```
 
-**ModelUsage** — camelCase fields:
+**ModelUsage** — camelCase fields. Only fields used by the proxy are included; the CLI also emits `webSearchRequests` (always 0 with tools disabled) which is silently ignored:
 ```rust
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1462,7 +1569,6 @@ struct ModelUsage {
 	output_tokens: Option<u64>,
 	cache_read_input_tokens: Option<u64>,
 	cache_creation_input_tokens: Option<u64>,
-	web_search_requests: Option<u64>,
 	#[serde(rename = "costUSD")]
 	cost_usd: Option<f64>,
 	context_window: Option<u64>,
@@ -1571,8 +1677,9 @@ struct ChatCompletionChunk {
 struct ChunkChoice {
 	index: u32,
 	delta: ChunkDelta,
-	#[serde(skip_serializing_if = "Option::is_none")]
 	finish_reason: Option<String>,         // null during streaming, "stop" on final
+	// Note: NO skip_serializing_if — None serializes as null (field present in JSON).
+	// OpenAI clients expect "finish_reason": null on content chunks.
 }
 
 #[derive(Serialize)]
@@ -1591,31 +1698,31 @@ Non-streaming requests use only one channel (subprocess → handler), not the tw
 ```rust
 let (sub_tx, mut sub_rx) = mpsc::channel::<SubprocessEvent>(64);
 
-// Task: Read NDJSON from subprocess, parse, send SubprocessEvents
-tokio::spawn(async move {
-	spawn_and_read_subprocess(prompt, args, sub_tx).await;
-});
+// Spawn subprocess (acquires semaphore, spawns reader task internally).
+spawn_managed(config.clone(), semaphore.clone(), queue_timeout, cli_args, sub_tx).await?;
 
 // Collect all events in the handler (no converter task needed)
 let mut content = String::new();
 let mut model = requested_model.clone();
 let mut result_msg = None;
+let mut error_msg = None;
 
 while let Some(event) = sub_rx.recv().await {
 	match event {
 		SubprocessEvent::Model(m) => { model = normalize_model(&m); }
 		SubprocessEvent::ContentDelta(text) => { content.push_str(&text); }
 		SubprocessEvent::Result(r) => { result_msg = Some(r); }
-		SubprocessEvent::Error(e) => { /* return error response */ }
+		SubprocessEvent::Error(e) => { error_msg = Some(e); }
 	}
 }
 
-// Build ChatCompletionResponse from collected data
+// After loop: check error_msg FIRST (takes priority over result_msg)
+// Then check result_msg.is_error. Then build ChatCompletionResponse.
 ```
 
 ### Error Behavior on Empty Prompt
 
-If the prompt argument is an empty string, the CLI exits with code 1 and emits an error to stderr: "Input must be provided either through stdin or as a prompt argument when using --print". No `result` line is emitted on stdout. The proxy should validate for non-empty prompts before spawning to avoid this failure mode entirely.
+If the prompt argument is an empty string, the CLI exits with code 1 and emits an error to stderr: "Input must be provided either through stdin or as a prompt argument when using --print". No `result` line is emitted on stdout. The proxy prevents this via the `has_user_message` flag in `build_prompt_and_system()` — if no user message has non-empty text content, the request is rejected with 400 before prompt construction completes. This means an empty prompt string cannot reach the subprocess spawn. Note: there is no explicit `prompt.is_empty()` check after construction; the prevention is structural via the input validation. If future changes to prompt construction could produce an empty prompt, an explicit check should be added.
 
 ### Error Behavior on Invalid Model
 
@@ -1637,7 +1744,11 @@ These are explicitly deferred but noted for future design awareness:
 - **TLS** — HTTPS support (or document reverse proxy setup).
 - **Session management** — The reference implementation provides file-based session persistence (`~/.claude-code-cli-sessions.json`) with 24-hour TTL and hourly cleanup. This enables multi-turn conversations via `--session-id`.
 - **Fallback model** — The CLI supports `--fallback-model <model>` for auto-fallback when the primary model is overloaded. Could be exposed as a proxy config option.
+- **Turn limits** — `--max-turns <N>` (available in CLI v2.1.91+) limits agentic turns. Not needed with `--tools ""` (always single-turn) but could be added as defense-in-depth.
 - **`--bare` mode migration** — The official documentation states `--bare` "will become the default for `-p` in a future release." When that happens, `--bare` would disable OAuth/keychain auth by default in print mode. If this change lands, the proxy would need an alternative approach (e.g., `--settings` with an `apiKeyHelper`, or the CLI may introduce a new flag for OAuth in bare mode). Monitor CLI release notes for this change.
+- **OAuth token refresh** — The meridian reference implementation transparently refreshes expired OAuth tokens mid-request (reads refresh token from Keychain/file, POSTs to Anthropic's token endpoint, retries the request). Currently our proxy relies on the CLI handling its own auth; a transparent retry on "OAuth token has expired" errors would improve reliability for long-running deployments.
+- **Extended context (1M) fallback** — Meridian implements a cooldown mechanism: if a `[1m]` model request fails due to Extra Usage not being enabled, it records the failure and falls back to base context (200K) for one hour before probing again. Our proxy always passes short model names (no `[1m]` suffix), so this is handled server-side by Anthropic, but explicit fallback could reduce failed-request latency.
+- **Agent adapter pattern** — Meridian uses a per-agent adapter interface to handle tool blocking, session management, and system prompts differently for each client (OpenCode, Droid, Crush, Cline). If we add support for multiple client types in the future, this pattern would prevent per-client logic from sprawling across the codebase.
 
 ---
 
@@ -1658,7 +1769,7 @@ The closest reference to our architecture. Key patterns to study:
 - Empty content filtering: `if !text.is_empty()` before emitting `ContentDelta` — prevents empty SSE chunks.
 - First-delta role emission: only the first streaming chunk includes `delta.role: "assistant"`, subsequent chunks omit it.
 - Token aggregation across models: sums `input_tokens` and `output_tokens` from all entries in the `modelUsage` HashMap.
-- `#[serde(skip_serializing_if = "Option::is_none")]` on optional response fields like `usage` and `finish_reason`.
+- `#[serde(skip_serializing_if = "Option::is_none")]` on `usage` (absent when `None`) and `delta.role`/`delta.content` (absent when `None`). **Not** on `finish_reason` — OpenAI clients expect `"finish_reason": null` (present in JSON), not absent.
 
 **Pitfalls in this reference (already documented in spec):**
 - Two-layer NDJSON parsing (unnecessary — all events are wrapped in `stream_event` envelope).
@@ -1667,6 +1778,7 @@ The closest reference to our architecture. Key patterns to study:
 - No `kill_on_drop(true)` on subprocess — risk of orphans.
 - Uses `--permission-mode bypassPermissions` — unnecessary and risky (we use `--tools ""` which makes permissions irrelevant).
 - Uses `Stdio::null()` for stdin (correct).
+- Sets `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` env var — unnecessary for this proxy (it enables multi-agent teams, which we don't use).
 
 ### meridian (TypeScript/Hono)
 
