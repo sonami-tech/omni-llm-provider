@@ -983,7 +983,7 @@ Clients should treat an abrupt stream close without `data: [DONE]` as an error.
 claude-code-provider [OPTIONS]
 
 Options:
-	-p, --port <PORT>              Listen port [default: 3456]
+	-p, --port <PORT>              Listen port [default: 18321]
 	-H, --host <HOST>              Listen address [default: 127.0.0.1]
 	-c, --max-concurrent <N>       Max concurrent subprocess [default: 5]
 	-t, --timeout <SECONDS>        Subprocess inactivity timeout [default: 600]
@@ -1028,7 +1028,7 @@ The `Config` struct is both the clap `Parser` target and the runtime configurati
 #[derive(Parser, Clone, Debug)]
 #[command(name = "claude-code-provider", version, about = "OpenAI-compatible API proxy backed by Claude Code CLI")]
 pub struct Config {
-	#[arg(short = 'p', long, default_value = "3456", env = "CCP_PORT")]
+	#[arg(short = 'p', long, default_value = "18321", env = "CCP_PORT")]
 	pub port: u16,
 	#[arg(short = 'H', long, default_value = "127.0.0.1", env = "CCP_HOST")]
 	pub host: String,

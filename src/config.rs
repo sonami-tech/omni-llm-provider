@@ -9,7 +9,7 @@ use std::path::PathBuf;
 )]
 pub struct Config {
 	/// Listen port.
-	#[arg(short = 'p', long, default_value = "3456", env = "CCP_PORT")]
+	#[arg(short = 'p', long, default_value = "18321", env = "CCP_PORT")]
 	pub port: u16,
 
 	/// Listen address.

@@ -1,10 +1,10 @@
 # Claude Code Provider
 
-An OpenAI-compatible API server that translates Chat Completions requests into [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) subprocess calls. Drop it in front of any OpenAI SDK client — no code changes required.
+An OpenAI-compatible API server that translates Chat Completions requests into Claude Code CLI subprocess calls. Drop it in front of any OpenAI SDK client, no code changes required.
 
 ## Why
 
-An Anthropic Max subscription gives you Claude access through the Claude Code CLI. This proxy lets tools like [aider](https://aider.chat), [Open WebUI](https://openwebui.com), [OpenClaw](https://openclaw.ai), [LiteLLM](https://litellm.ai), and any OpenAI SDK client use that same access — every request goes through the official `claude` binary, the same interface Anthropic provides and supports.
+An Anthropic Max subscription gives you Claude access through the Claude Code CLI. This proxy lets tools like aider, Open WebUI, OpenClaw, LiteLLM, and any OpenAI SDK client use that same access — every request goes through the official `claude` binary, the same interface Anthropic provides and supports.
 
 ## Features
 
@@ -33,7 +33,7 @@ An Anthropic Max subscription gives you Claude access through the Claude Code CL
 git clone <repo-url> claude-code-provider
 cd claude-code-provider
 cargo build --release
-./target/release/claude-code-provider          # port 3456, 5 concurrent
+./target/release/claude-code-provider          # port 18321, 5 concurrent
 ./target/release/claude-code-provider -p 8080 -c 10  # custom
 ```
 
@@ -42,7 +42,7 @@ cargo build --release
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:3456/v1", api_key="not-needed")
+client = OpenAI(base_url="http://127.0.0.1:18321/v1", api_key="not-needed")
 
 response = client.chat.completions.create(
     model="sonnet",
@@ -71,7 +71,7 @@ docker pull ghcr.io/sonami-tech/claude-code-provider:dev
 **Option A — Log in inside the container:**
 
 ```sh
-docker run -it -p 3456:3456 ghcr.io/sonami-tech/claude-code-provider bash
+docker run -it -p 18321:18321 ghcr.io/sonami-tech/claude-code-provider bash
 claude login            # authenticate once
 claude-code-provider    # start the proxy
 ```
@@ -79,7 +79,7 @@ claude-code-provider    # start the proxy
 **Option B — Mount credentials from host:**
 
 ```sh
-docker run -p 3456:3456 \
+docker run -p 18321:18321 \
   -v ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro \
   ghcr.io/sonami-tech/claude-code-provider
 ```
@@ -96,7 +96,7 @@ docker build -t claude-code-provider .
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `-p, --port` | `CCP_PORT` | `3456` | Listen port |
+| `-p, --port` | `CCP_PORT` | `18321` | Listen port |
 | `-H, --host` | `CCP_HOST` | `127.0.0.1` | Listen address |
 | `-c, --max-concurrent` | `CCP_MAX_CONCURRENT` | `5` | Max simultaneous subprocesses |
 | `-t, --timeout` | `CCP_TIMEOUT` | `600` | Inactivity timeout (seconds) |
