@@ -56,6 +56,10 @@ pub struct Config {
 	#[arg(long, env = "CCP_NO_AUTH")]
 	pub no_auth: bool,
 
+	/// Log full prompts and responses.
+	#[arg(long, env = "CCP_LOG_CONVERSATIONS")]
+	pub log_conversations: bool,
+
 	/// Enable debug logging.
 	#[arg(short = 'v', long)]
 	pub verbose: bool,
