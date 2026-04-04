@@ -12,6 +12,8 @@ RUN apt-get update \
 	&& curl -fsSL https://claude.ai/install.sh | bash \
 	&& apt-get clean && rm -rf /var/lib/apt/lists/*
 
+ENV PATH="/root/.local/bin:${PATH}"
+
 COPY --from=builder /build/target/release/claude-code-provider /usr/local/bin/
 
 ENV CCP_HOST=0.0.0.0
