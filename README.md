@@ -32,7 +32,7 @@ An Anthropic Max subscription gives you Claude access through the Claude Code CL
    curl -fsSL https://claude.ai/install.sh | bash
    claude login
    ```
-2. **Rust toolchain** (1.85+ for edition 2024).
+2. **[Rust toolchain](https://rustup.rs)** (1.85+ for edition 2024).
 
 ### Build and Run
 
