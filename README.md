@@ -19,7 +19,8 @@ An Anthropic Max subscription gives you Claude access through the Claude Code CL
 - **Streaming and non-streaming** - SSE and JSON responses compatible with the official Python/TypeScript SDKs.
 - **Concurrency control** - bounded subprocess pool with configurable queue timeout.
 - **Reasoning effort** - `low`, `medium`, `high`, `max` via the `reasoning_effort` parameter.
-- **Persistent stats** - `/stats` dashboard and `/stats/json` endpoint with per-model metrics, latency, and error history.
+- **Secure by default** - auto-generates an API key on startup; explicit keys and no-auth mode also supported.
+- **Persistent stats** - `/stats` dashboard and `/stats/json` endpoint with per-model and per-key metrics.
 - **Isolated configuration** - subprocesses use a separate config directory, so the proxy never touches your existing Claude Code settings.
 - **Single binary** - no runtime dependencies beyond the Claude CLI.
 
@@ -44,12 +45,12 @@ cargo build --release
 ./target/release/claude-code-provider -p 8080 -c 10  # custom
 ```
 
-### Try It
+An API key is auto-generated on startup and printed to the log. Use it with any OpenAI SDK client:
 
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:18321/v1", api_key="not-needed")
+client = OpenAI(base_url="http://127.0.0.1:18321/v1", api_key="<key from startup log>")
 
 response = client.chat.completions.create(
     model="sonnet",
@@ -91,7 +92,17 @@ docker run -p 18321:18321 \
   ghcr.io/sonami-tech/claude-code-provider
 ```
 
-The Docker image sets `CCP_NO_ISOLATE=true` by default since the container has no plugins or hooks to isolate from.
+The Docker image sets `CCP_NO_ISOLATE=true` by default since the container has no plugins or hooks to isolate from. The auto-generated API key is printed to the container log on startup.
+
+Note: API keys passed via `-e CCP_API_KEYS=...` are visible in `docker inspect`. For production, mount a keys file instead:
+
+```sh
+docker run -p 18321:18321 \
+  -v ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro \
+  -v /path/to/keys.txt:/etc/ccp-keys:ro \
+  -e CCP_API_KEYS_FILE=/etc/ccp-keys \
+  ghcr.io/sonami-tech/claude-code-provider
+```
 
 ### Build from Source
 
@@ -112,6 +123,9 @@ docker build -t claude-code-provider .
 | `--data-dir` | `CCP_DATA_DIR` | Platform default | Data directory for config and stats |
 | `--working-dir` | `CCP_WORKING_DIR` | Config dir | Subprocess working directory |
 | `--no-isolate` | `CCP_NO_ISOLATE` | Off | Use host Claude config directly |
+| `--api-keys` | `CCP_API_KEYS` | Auto-generated | Comma-separated API keys (min 8 chars each) |
+| `--api-keys-file` | `CCP_API_KEYS_FILE` | None | File with one API key per line (# comments allowed) |
+| `--no-auth` | `CCP_NO_AUTH` | Off | Disable authentication entirely |
 | `-v, --verbose` | | Off | Debug logging |
 
 ## API Endpoints
@@ -123,6 +137,8 @@ docker build -t claude-code-provider .
 | `GET /health` | Server health and active request count |
 | `GET /stats` | HTML stats dashboard |
 | `GET /stats/json` | Stats as JSON |
+
+All `/v1/*` endpoints also work without the prefix (`/chat/completions`, `/models`), so both `http://host:18321` and `http://host:18321/v1` work as a base URL.
 
 ## Models
 

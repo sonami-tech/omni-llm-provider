@@ -44,6 +44,18 @@ pub struct Config {
 	#[arg(long, env = "CCP_NO_ISOLATE")]
 	pub no_isolate: bool,
 
+	/// API keys (comma-separated). If set, requests must include a valid key.
+	#[arg(long, env = "CCP_API_KEYS", value_delimiter = ',')]
+	pub api_keys: Vec<String>,
+
+	/// File containing API keys (one per line, # comments allowed).
+	#[arg(long, env = "CCP_API_KEYS_FILE")]
+	pub api_keys_file: Option<PathBuf>,
+
+	/// Disable authentication entirely.
+	#[arg(long, env = "CCP_NO_AUTH")]
+	pub no_auth: bool,
+
 	/// Enable debug logging.
 	#[arg(short = 'v', long)]
 	pub verbose: bool,
@@ -74,5 +86,33 @@ impl Config {
 
 	pub fn stats_db_path(&self) -> PathBuf {
 		self.resolved_data_dir().join("stats.redb")
+	}
+
+	/// Load all API keys from --api-keys and --api-keys-file, deduplicated.
+	pub fn load_api_keys(&self) -> Vec<String> {
+		let mut keys: Vec<String> = self
+			.api_keys
+			.iter()
+			.map(|k| k.trim().to_string())
+			.filter(|k| !k.is_empty())
+			.collect();
+
+		if let Some(ref path) = self.api_keys_file {
+			if let Ok(contents) = std::fs::read_to_string(path) {
+				for line in contents.lines() {
+					let trimmed = line.trim();
+					if !trimmed.is_empty() && !trimmed.starts_with('#') {
+						keys.push(trimmed.to_string());
+					}
+				}
+			} else {
+				tracing::error!("Failed to read API keys file: {:?}", path);
+				std::process::exit(1);
+			}
+		}
+
+		keys.sort();
+		keys.dedup();
+		keys
 	}
 }

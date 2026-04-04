@@ -2,7 +2,6 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::header;
 use axum::response::IntoResponse;
@@ -13,6 +12,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info};
 
 use crate::AppState;
+use crate::auth::ApiKeyId;
 use crate::error::AppError;
 use crate::models::{normalize_model_name, resolve_model, validate_effort};
 use crate::subprocess::SubprocessEvent;
@@ -25,8 +25,12 @@ use crate::translate::stream;
 
 pub async fn completions_handler(
 	State(state): State<Arc<AppState>>,
-	body: Bytes,
+	request: axum::http::Request<axum::body::Body>,
 ) -> Result<Response, AppError> {
+	let api_key_id = request.extensions().get::<ApiKeyId>().map(|k| k.0.clone());
+	let body = axum::body::to_bytes(request.into_body(), crate::MAX_BODY_SIZE)
+		.await
+		.map_err(|e| AppError::BadRequest(format!("Failed to read body: {}", e)))?;
 	// Parse body manually for OpenAI-format error on bad JSON.
 	let request: ChatCompletionRequest = serde_json::from_slice(&body)
 		.map_err(|e| AppError::BadRequest(format!("Invalid JSON: {}", e)))?;
@@ -80,9 +84,9 @@ pub async fn completions_handler(
 		.as_secs();
 
 	// Record stats.
-	state.stats.record_request(model_def.canonical);
+	state.stats.record_request(model_def.canonical, api_key_id.as_deref());
 
-	info!("Chat completion request");
+	info!(key = api_key_id.as_deref().unwrap_or("-"), "Chat completion request");
 
 	let request_id = request_id.to_string();
 	if request.stream {

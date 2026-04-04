@@ -47,6 +47,19 @@ pub async fn stats_html_handler(State(state): State<Arc<AppState>>) -> impl Into
 		));
 	}
 
+	// Per-key rows.
+	let mut key_rows = String::new();
+	let mut key_names: Vec<&String> = snap.api_keys.keys().collect();
+	key_names.sort();
+	for name in &key_names {
+		let count = snap.api_keys[*name];
+		key_rows.push_str(&format!(
+			"<tr><td>{}</td><td>{}</td></tr>\n",
+			html_escape(name),
+			count,
+		));
+	}
+
 	// Cache efficiency.
 	let total_cache_input =
 		snap.total_cache_read_input_tokens + snap.total_cache_creation_input_tokens + snap.total_input_tokens;
@@ -94,6 +107,9 @@ tr:nth-child(even) {{ background: #16213e; }}
 <h2>Per-Model Statistics</h2>
 {model_table}
 
+<h2>API Key Usage</h2>
+{key_table}
+
 <h2>Recent Errors</h2>
 {error_table}
 
@@ -112,6 +128,14 @@ tr:nth-child(even) {{ background: #16213e; }}
 			format!(
 				"<table><tr><th>Model</th><th>Requests</th><th>Avg TTFT (ms)</th><th>Avg Duration (ms)</th><th>Input Tokens</th><th>Output Tokens</th><th>Cache Read</th><th>Cache Creation</th></tr>\n{}</table>",
 				model_rows
+			)
+		},
+		key_table = if key_rows.is_empty() {
+			"<p class=\"empty\">No API key usage recorded.</p>".to_string()
+		} else {
+			format!(
+				"<table><tr><th>Key</th><th>Requests</th></tr>\n{}</table>",
+				key_rows
 			)
 		},
 		error_table = if error_rows.is_empty() {

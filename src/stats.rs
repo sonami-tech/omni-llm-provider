@@ -16,6 +16,7 @@ const TOTAL_REQUESTS: TableDefinition<&str, u64> = TableDefinition::new("total_r
 const REQUESTS_BY_MODEL: TableDefinition<&str, u64> = TableDefinition::new("requests_by_model");
 const TOTAL_ERRORS: TableDefinition<&str, u64> = TableDefinition::new("total_errors");
 const TOKENS_BY_MODEL: TableDefinition<&str, &[u8]> = TableDefinition::new("tokens_by_model");
+const REQUESTS_BY_KEY: TableDefinition<&str, u64> = TableDefinition::new("requests_by_key");
 const TOTAL_KEY: &str = "total";
 
 const MAX_LATENCY_SAMPLES: usize = 100;
@@ -53,6 +54,7 @@ pub struct StatsSnapshot {
 	pub total_cache_read_input_tokens: u64,
 	pub total_cache_creation_input_tokens: u64,
 	pub models: HashMap<String, ModelStats>,
+	pub api_keys: HashMap<String, u64>,
 	pub recent_errors: Vec<ErrorRecord>,
 }
 
@@ -91,6 +93,7 @@ impl Stats {
 		let _ = write_txn.open_table(REQUESTS_BY_MODEL);
 		let _ = write_txn.open_table(TOTAL_ERRORS);
 		let _ = write_txn.open_table(TOKENS_BY_MODEL);
+		let _ = write_txn.open_table(REQUESTS_BY_KEY);
 		write_txn.commit()?;
 
 		Ok(Self {
@@ -103,8 +106,8 @@ impl Stats {
 		})
 	}
 
-	/// Increment persistent request count (total + per-model).
-	pub fn record_request(&self, model: &str) {
+	/// Increment persistent request count (total + per-model + per-key).
+	pub fn record_request(&self, model: &str, api_key_id: Option<&str>) {
 		if let Ok(write_txn) = self.db.begin_write() {
 			if let Ok(mut table) = write_txn.open_table(TOTAL_REQUESTS) {
 				let current = table.get(TOTAL_KEY).ok().flatten().map(|v| v.value()).unwrap_or(0);
@@ -113,6 +116,12 @@ impl Stats {
 			if let Ok(mut table) = write_txn.open_table(REQUESTS_BY_MODEL) {
 				let current = table.get(model).ok().flatten().map(|v| v.value()).unwrap_or(0);
 				let _ = table.insert(model, current + 1);
+			}
+			if let Some(key_id) = api_key_id {
+				if let Ok(mut table) = write_txn.open_table(REQUESTS_BY_KEY) {
+					let current = table.get(key_id).ok().flatten().map(|v| v.value()).unwrap_or(0);
+					let _ = table.insert(key_id, current + 1);
+				}
 			}
 			let _ = write_txn.commit();
 		}
@@ -209,11 +218,12 @@ impl Stats {
 		let uptime_seconds = self.started_at.elapsed().as_secs();
 		let active_requests = self.active_count();
 
-		// Read persistent data.
+		// Read persistent data in a single transaction.
 		let mut total_requests = 0u64;
 		let mut total_errors = 0u64;
 		let mut requests_by_model: HashMap<String, u64> = HashMap::new();
 		let mut tokens_by_model: HashMap<String, TokenStats> = HashMap::new();
+		let mut api_keys: HashMap<String, u64> = HashMap::new();
 
 		if let Ok(read_txn) = self.db.begin_read() {
 			if let Ok(table) = read_txn.open_table(TOTAL_REQUESTS)
@@ -242,6 +252,14 @@ impl Stats {
 					if let Ok(stats) = serde_json::from_slice::<TokenStats>(v.value()) {
 						tokens_by_model.insert(k.value().to_string(), stats);
 					}
+				}
+			}
+			if let Ok(table) = read_txn.open_table(REQUESTS_BY_KEY)
+				&& let Ok(iter) = table.iter()
+			{
+				for entry in iter.flatten() {
+					let (k, v) = entry;
+					api_keys.insert(k.value().to_string(), v.value());
 				}
 			}
 		}
@@ -305,6 +323,7 @@ impl Stats {
 			total_cache_read_input_tokens: total_cache_read,
 			total_cache_creation_input_tokens: total_cache_creation,
 			models,
+			api_keys,
 			recent_errors,
 		}
 	}

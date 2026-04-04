@@ -5,6 +5,8 @@ use axum::response::{IntoResponse, Response};
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
 	#[error("{0}")]
+	Unauthorized(String),
+	#[error("{0}")]
 	BadRequest(String),
 	#[error("{0}")]
 	NotFound(String),
@@ -19,6 +21,7 @@ pub enum AppError {
 impl IntoResponse for AppError {
 	fn into_response(self) -> Response {
 		let (status, error_type) = match &self {
+			AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "authentication_error"),
 			AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
 			AppError::NotFound(_) => (StatusCode::NOT_FOUND, "invalid_request_error"),
 			AppError::ServerError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),

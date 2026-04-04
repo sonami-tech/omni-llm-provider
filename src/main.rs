@@ -1,3 +1,4 @@
+mod auth;
 mod config;
 mod error;
 mod models;
@@ -6,11 +7,16 @@ mod stats;
 mod subprocess;
 mod translate;
 
+pub const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+const MIN_API_KEY_LENGTH: usize = 8;
+
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
+use axum::middleware;
 use axum::routing::{get, post};
 use clap::Parser;
 use tokio::net::TcpListener;
@@ -172,18 +178,57 @@ async fn main() {
 		stats: Arc::new(stats_db),
 	});
 
-	let app = Router::new()
-		.route("/health", get(routes::health::health_handler))
+	// Resolve API keys: no-auth, explicit, or auto-generated.
+	let api_keys: HashSet<String> = if config.no_auth {
+		warn!("Authentication disabled. All endpoints are open.");
+		HashSet::new()
+	} else {
+		let explicit = config.load_api_keys();
+		if explicit.is_empty() {
+			// Auto-generate a key.
+			let key = uuid::Uuid::new_v4().simple().to_string();
+			info!("Auto-generated API key: {}", key);
+			HashSet::from([key])
+		} else {
+			// Validate minimum length.
+			for key in &explicit {
+				if key.len() < MIN_API_KEY_LENGTH {
+					error!("API key too short (minimum {} characters): \"{}...\"", MIN_API_KEY_LENGTH, &key[..key.len().min(4)]);
+					std::process::exit(1);
+				}
+			}
+			let count = explicit.len();
+			info!("API key auth enabled ({} key{})", count, if count == 1 { "" } else { "s" });
+			explicit.into_iter().collect()
+		}
+	};
+	let api_keys = Arc::new(api_keys);
+
+	// API routes (auth-protected).
+	let api_keys_clone = api_keys.clone();
+	let api_routes = Router::new()
 		.route("/v1/models", get(routes::models::models_handler))
+		.route("/models", get(routes::models::models_handler))
 		.route(
 			"/v1/chat/completions",
 			post(routes::completions::completions_handler),
 		)
+		.route(
+			"/chat/completions",
+			post(routes::completions::completions_handler),
+		)
+		.layer(middleware::from_fn(move |req, next| {
+			auth::auth_layer(api_keys_clone.clone(), req, next)
+		}));
+
+	let app = Router::new()
+		.merge(api_routes)
+		.route("/health", get(routes::health::health_handler))
 		.route("/stats", get(routes::stats::stats_html_handler))
 		.route("/stats/json", get(routes::stats::stats_json_handler))
 		.fallback(fallback_handler)
 		.layer(tower_http::cors::CorsLayer::permissive())
-		.layer(DefaultBodyLimit::max(10 * 1024 * 1024))
+		.layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
 		.with_state(state);
 
 	let addr: SocketAddr = format!("{}:{}", config.host, config.port)
@@ -204,10 +249,16 @@ async fn main() {
 		}
 	};
 
+	let display_host = if config.host == "0.0.0.0" {
+		detect_lan_ip().unwrap_or_else(|| "127.0.0.1".to_string())
+	} else {
+		config.host.clone()
+	};
 	info!(
-		"Claude Code Provider v{} listening on http://{}",
+		"Claude Code Provider v{} listening on http://{}:{}",
 		env!("CARGO_PKG_VERSION"),
-		addr
+		display_host,
+		config.port,
 	);
 	info!(
 		"max_concurrent={} timeout={}s queue_timeout={}s",
@@ -246,4 +297,13 @@ async fn main() {
 
 async fn fallback_handler() -> AppError {
 	AppError::NotFound("The requested endpoint does not exist".into())
+}
+
+/// Detect LAN IP by asking the OS which interface routes to the internet.
+/// Does not send any traffic.
+fn detect_lan_ip() -> Option<String> {
+	let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+	socket.connect("8.8.8.8:80").ok()?;
+	let addr = socket.local_addr().ok()?;
+	Some(addr.ip().to_string())
 }
