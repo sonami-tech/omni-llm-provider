@@ -122,29 +122,30 @@ pub fn process_message(msg: ClaudeCliMessage) -> Vec<SubprocessEvent> {
 		}
 		ClaudeCliMessage::Assistant { message, .. } => {
 			// Extract model name only — do NOT extract content from assistant messages.
-			if let Some(inner) = message
-				&& let Some(model) = inner.model
-			{
-				return vec![SubprocessEvent::Model(model)];
+			if let Some(inner) = message {
+				if let Some(model) = inner.model {
+					return vec![SubprocessEvent::Model(model)];
+				}
 			}
 			vec![]
 		}
 		ClaudeCliMessage::StreamEvent { event } => match event {
 			StreamEventInner::ContentBlockDelta { delta } => {
-				if delta.delta_type.as_deref() == Some("text_delta")
-					&& let Some(text) = delta.text
-					&& !text.is_empty()
-				{
-					return vec![SubprocessEvent::ContentDelta(text)];
+				if delta.delta_type.as_deref() == Some("text_delta") {
+					if let Some(text) = delta.text {
+						if !text.is_empty() {
+							return vec![SubprocessEvent::ContentDelta(text)];
+						}
+					}
 				}
 				// Skip thinking_delta, input_json_delta, etc.
 				vec![]
 			}
 			StreamEventInner::MessageStart { message } => {
-				if let Some(info) = message
-					&& let Some(model) = info.model
-				{
-					return vec![SubprocessEvent::Model(model)];
+				if let Some(info) = message {
+					if let Some(model) = info.model {
+						return vec![SubprocessEvent::Model(model)];
+					}
 				}
 				vec![]
 			}
