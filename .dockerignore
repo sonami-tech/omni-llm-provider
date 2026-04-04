@@ -1,0 +1,7 @@
+target/
+research/
+.git/
+.claude/
+*.md
+!README.md
+test_openai_client.py
