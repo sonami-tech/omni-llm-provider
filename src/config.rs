@@ -40,6 +40,10 @@ pub struct Config {
 	#[arg(long, env = "CCP_WORKING_DIR")]
 	pub working_dir: Option<PathBuf>,
 
+	/// Disable config isolation (use host's ~/.claude directly).
+	#[arg(long, env = "CCP_NO_ISOLATE")]
+	pub no_isolate: bool,
+
 	/// Enable debug logging.
 	#[arg(short = 'v', long)]
 	pub verbose: bool,
@@ -59,9 +63,13 @@ impl Config {
 	}
 
 	pub fn resolved_working_dir(&self) -> PathBuf {
-		self.working_dir
-			.clone()
-			.unwrap_or_else(|| self.isolated_config_dir())
+		self.working_dir.clone().unwrap_or_else(|| {
+			if self.no_isolate {
+				self.resolved_data_dir()
+			} else {
+				self.isolated_config_dir()
+			}
+		})
 	}
 
 	pub fn stats_db_path(&self) -> PathBuf {

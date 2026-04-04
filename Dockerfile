@@ -15,6 +15,7 @@ RUN apt-get update \
 COPY --from=builder /build/target/release/claude-code-provider /usr/local/bin/
 
 ENV CCP_HOST=0.0.0.0
+ENV CCP_NO_ISOLATE=true
 EXPOSE 18321
 
 ENTRYPOINT ["claude-code-provider"]

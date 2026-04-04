@@ -34,19 +34,22 @@ pub async fn run_subprocess(
 
 	debug!(args = ?cli_args, "Spawning subprocess");
 
-	let mut child = match tokio::process::Command::new(&config.claude_path)
-		.args(&cli_args)
+	let mut cmd = tokio::process::Command::new(&config.claude_path);
+	cmd.args(&cli_args)
 		.stdin(Stdio::null())
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped())
 		.kill_on_drop(true)
-		.env("CLAUDE_CONFIG_DIR", config.isolated_config_dir().to_str().unwrap_or(""))
 		.env_remove("ANTHROPIC_API_KEY")
 		.env_remove("ANTHROPIC_BASE_URL")
 		.env_remove("ANTHROPIC_AUTH_TOKEN")
-		.current_dir(config.resolved_working_dir())
-		.spawn()
-	{
+		.current_dir(config.resolved_working_dir());
+
+	if !config.no_isolate {
+		cmd.env("CLAUDE_CONFIG_DIR", config.isolated_config_dir().to_str().unwrap_or(""));
+	}
+
+	let mut child = match cmd.spawn() {
 		Ok(child) => child,
 		Err(e) => {
 			let msg = if e.kind() == std::io::ErrorKind::NotFound {

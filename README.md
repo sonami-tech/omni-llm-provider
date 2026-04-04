@@ -91,7 +91,7 @@ docker run -p 18321:18321 \
   ghcr.io/sonami-tech/claude-code-provider
 ```
 
-The container is a clean environment with no plugins or hooks, so the proxy's config isolation is purely defense-in-depth. Your host Claude Code settings are never touched.
+The Docker image sets `CCP_NO_ISOLATE=true` by default since the container has no plugins or hooks to isolate from.
 
 ### Build from Source
 
@@ -111,6 +111,7 @@ docker build -t claude-code-provider .
 | `--claude-path` | `CCP_CLAUDE_PATH` | `claude` | Path to Claude CLI binary |
 | `--data-dir` | `CCP_DATA_DIR` | Platform default | Data directory for config and stats |
 | `--working-dir` | `CCP_WORKING_DIR` | Config dir | Subprocess working directory |
+| `--no-isolate` | `CCP_NO_ISOLATE` | Off | Use host Claude config directly |
 | `-v, --verbose` | | Off | Debug logging |
 
 ## API Endpoints

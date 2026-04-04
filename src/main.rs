@@ -98,47 +98,53 @@ async fn main() {
 		}
 	}
 
-	// 3. Setup isolated config directory.
-	let config_dir = config.isolated_config_dir();
-	std::fs::create_dir_all(&config_dir).unwrap_or_else(|e| {
-		error!("Failed to create config dir {:?}: {}", config_dir, e);
-		std::process::exit(1);
-	});
-
-	// Clean all contents (stale .claude.json can enable unexpected tools).
-	if let Ok(entries) = std::fs::read_dir(&config_dir) {
-		for entry in entries.flatten() {
-			let path = entry.path();
-			if path.is_dir() {
-				let _ = std::fs::remove_dir_all(&path);
-			} else {
-				let _ = std::fs::remove_file(&path);
-			}
-		}
-	}
-
-	// Create .credentials.json symlink.
-	let home_dir = dirs::home_dir().expect("Could not determine home directory");
-	let creds_source = home_dir.join(".claude").join(".credentials.json");
-	let creds_dest = config_dir.join(".credentials.json");
-
-	if !creds_source.exists() {
-		error!(
-			"Claude Code credentials not found at {:?}. Run 'claude login' first.",
-			creds_source
-		);
-		std::process::exit(1);
-	}
-
-	#[cfg(unix)]
-	{
-		std::os::unix::fs::symlink(&creds_source, &creds_dest).unwrap_or_else(|e| {
-			error!(
-				"Failed to symlink {:?} -> {:?}: {}",
-				creds_dest, creds_source, e
-			);
+	// 3. Setup config directory.
+	if config.no_isolate {
+		info!("Config isolation disabled, using host Claude configuration");
+	} else {
+		let config_dir = config.isolated_config_dir();
+		std::fs::create_dir_all(&config_dir).unwrap_or_else(|e| {
+			error!("Failed to create config dir {:?}: {}", config_dir, e);
 			std::process::exit(1);
 		});
+
+		// Clean all contents (stale .claude.json can enable unexpected tools).
+		if let Ok(entries) = std::fs::read_dir(&config_dir) {
+			for entry in entries.flatten() {
+				let path = entry.path();
+				if path.is_dir() {
+					let _ = std::fs::remove_dir_all(&path);
+				} else {
+					let _ = std::fs::remove_file(&path);
+				}
+			}
+		}
+
+		// Create .credentials.json symlink.
+		let home_dir = dirs::home_dir().expect("Could not determine home directory");
+		let creds_source = home_dir.join(".claude").join(".credentials.json");
+		let creds_dest = config_dir.join(".credentials.json");
+
+		if !creds_source.exists() {
+			error!(
+				"Claude Code credentials not found at {:?}. Run 'claude login' first.",
+				creds_source
+			);
+			std::process::exit(1);
+		}
+
+		#[cfg(unix)]
+		{
+			std::os::unix::fs::symlink(&creds_source, &creds_dest).unwrap_or_else(|e| {
+				error!(
+					"Failed to symlink {:?} -> {:?}: {}",
+					creds_dest, creds_source, e
+				);
+				std::process::exit(1);
+			});
+		}
+
+		info!("Isolated config dir: {:?}", config_dir);
 	}
 
 	// Ensure working directory exists.
@@ -148,18 +154,8 @@ async fn main() {
 		std::process::exit(1);
 	});
 
-	info!(
-		"Isolated config dir: {:?}",
-		config_dir
-	);
-	info!(
-		"Working dir: {:?}",
-		working_dir
-	);
-	info!(
-		"Stats DB: {:?}",
-		config.stats_db_path()
-	);
+	info!("Working dir: {:?}", working_dir);
+	info!("Stats DB: {:?}", config.stats_db_path());
 
 	// ── Server setup ──────────────────────────────────────────
 
