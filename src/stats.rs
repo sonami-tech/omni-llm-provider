@@ -127,42 +127,42 @@ impl Stats {
 		result: &ResultMessage,
 	) {
 		// In-memory TTFT and duration samples.
-		if let Some(ttft) = ttft_ms {
-			if let Ok(mut samples) = self.ttft_samples.lock() {
-				push_sample(samples.entry(model.to_string()).or_default(), ttft);
-			}
+		if let Some(ttft) = ttft_ms
+			&& let Ok(mut samples) = self.ttft_samples.lock()
+		{
+			push_sample(samples.entry(model.to_string()).or_default(), ttft);
 		}
 		if let Ok(mut samples) = self.duration_samples.lock() {
 			push_sample(samples.entry(model.to_string()).or_default(), duration_ms);
 		}
 
 		// Persistent token stats.
-		if let Some(mu) = &result.model_usage {
-			if let Ok(write_txn) = self.db.begin_write() {
-				if let Ok(mut table) = write_txn.open_table(TOKENS_BY_MODEL) {
-					for (raw_name, usage) in mu {
-						let normalized = normalize_model_name(raw_name);
-						let mut stats: TokenStats = table
-							.get(normalized.as_ref())
-							.ok()
-							.flatten()
-							.and_then(|v| serde_json::from_slice(v.value()).ok())
-							.unwrap_or_default();
+		if let Some(mu) = &result.model_usage
+			&& let Ok(write_txn) = self.db.begin_write()
+		{
+			if let Ok(mut table) = write_txn.open_table(TOKENS_BY_MODEL) {
+				for (raw_name, usage) in mu {
+					let normalized = normalize_model_name(raw_name);
+					let mut stats: TokenStats = table
+						.get(normalized.as_ref())
+						.ok()
+						.flatten()
+						.and_then(|v| serde_json::from_slice(v.value()).ok())
+						.unwrap_or_default();
 
-						stats.input_tokens += usage.input_tokens.unwrap_or(0);
-						stats.output_tokens += usage.output_tokens.unwrap_or(0);
-						stats.cache_read_input_tokens +=
-							usage.cache_read_input_tokens.unwrap_or(0);
-						stats.cache_creation_input_tokens +=
-							usage.cache_creation_input_tokens.unwrap_or(0);
+					stats.input_tokens += usage.input_tokens.unwrap_or(0);
+					stats.output_tokens += usage.output_tokens.unwrap_or(0);
+					stats.cache_read_input_tokens +=
+						usage.cache_read_input_tokens.unwrap_or(0);
+					stats.cache_creation_input_tokens +=
+						usage.cache_creation_input_tokens.unwrap_or(0);
 
-						if let Ok(bytes) = serde_json::to_vec(&stats) {
-							let _ = table.insert(normalized.as_ref(), bytes.as_slice());
-						}
+					if let Ok(bytes) = serde_json::to_vec(&stats) {
+						let _ = table.insert(normalized.as_ref(), bytes.as_slice());
 					}
 				}
-				let _ = write_txn.commit();
 			}
+			let _ = write_txn.commit();
 		}
 	}
 
@@ -216,31 +216,31 @@ impl Stats {
 		let mut tokens_by_model: HashMap<String, TokenStats> = HashMap::new();
 
 		if let Ok(read_txn) = self.db.begin_read() {
-			if let Ok(table) = read_txn.open_table(TOTAL_REQUESTS) {
-				if let Ok(Some(v)) = table.get(TOTAL_KEY) {
-					total_requests = v.value();
+			if let Ok(table) = read_txn.open_table(TOTAL_REQUESTS)
+				&& let Ok(Some(v)) = table.get(TOTAL_KEY)
+			{
+				total_requests = v.value();
+			}
+			if let Ok(table) = read_txn.open_table(TOTAL_ERRORS)
+				&& let Ok(Some(v)) = table.get(TOTAL_KEY)
+			{
+				total_errors = v.value();
+			}
+			if let Ok(table) = read_txn.open_table(REQUESTS_BY_MODEL)
+				&& let Ok(iter) = table.iter()
+			{
+				for entry in iter.flatten() {
+					let (k, v) = entry;
+					requests_by_model.insert(k.value().to_string(), v.value());
 				}
 			}
-			if let Ok(table) = read_txn.open_table(TOTAL_ERRORS) {
-				if let Ok(Some(v)) = table.get(TOTAL_KEY) {
-					total_errors = v.value();
-				}
-			}
-			if let Ok(table) = read_txn.open_table(REQUESTS_BY_MODEL) {
-				if let Ok(iter) = table.iter() {
-					for entry in iter.flatten() {
-						let (k, v) = entry;
-						requests_by_model.insert(k.value().to_string(), v.value());
-					}
-				}
-			}
-			if let Ok(table) = read_txn.open_table(TOKENS_BY_MODEL) {
-				if let Ok(iter) = table.iter() {
-					for entry in iter.flatten() {
-						let (k, v) = entry;
-						if let Ok(stats) = serde_json::from_slice::<TokenStats>(v.value()) {
-							tokens_by_model.insert(k.value().to_string(), stats);
-						}
+			if let Ok(table) = read_txn.open_table(TOKENS_BY_MODEL)
+				&& let Ok(iter) = table.iter()
+			{
+				for entry in iter.flatten() {
+					let (k, v) = entry;
+					if let Ok(stats) = serde_json::from_slice::<TokenStats>(v.value()) {
+						tokens_by_model.insert(k.value().to_string(), stats);
 					}
 				}
 			}
@@ -390,5 +390,5 @@ fn days_to_date(days: u64) -> (u64, u64, u64) {
 }
 
 fn is_leap(y: u64) -> bool {
-	(y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+	(y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }

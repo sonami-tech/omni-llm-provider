@@ -38,20 +38,20 @@ pub struct Usage {
 /// Extract usage from a ResultMessage. Prefers modelUsage (camelCase), falls back to flat usage.
 pub fn extract_usage(result: &ResultMessage) -> Option<Usage> {
 	// Try modelUsage first (sum all entries).
-	if let Some(mu) = &result.model_usage {
-		if !mu.is_empty() {
-			let mut input = 0u64;
-			let mut output = 0u64;
-			for u in mu.values() {
-				input += u.input_tokens.unwrap_or(0);
-				output += u.output_tokens.unwrap_or(0);
-			}
-			return Some(Usage {
-				prompt_tokens: input,
-				completion_tokens: output,
-				total_tokens: input + output,
-			});
+	if let Some(mu) = &result.model_usage
+		&& !mu.is_empty()
+	{
+		let mut input = 0u64;
+		let mut output = 0u64;
+		for u in mu.values() {
+			input += u.input_tokens.unwrap_or(0);
+			output += u.output_tokens.unwrap_or(0);
 		}
+		return Some(Usage {
+			prompt_tokens: input,
+			completion_tokens: output,
+			total_tokens: input + output,
+		});
 	}
 
 	// Fall back to flat usage.

@@ -61,14 +61,14 @@ pub async fn completions_handler(
 			MAX_ARG_LEN
 		)));
 	}
-	if let Some(ref sp) = system_prompt {
-		if sp.len() > MAX_ARG_LEN {
-			return Err(AppError::BadRequest(format!(
-				"System prompt too large ({} bytes, max {} bytes)",
-				sp.len(),
-				MAX_ARG_LEN
-			)));
-		}
+	if let Some(ref sp) = system_prompt
+		&& sp.len() > MAX_ARG_LEN
+	{
+		return Err(AppError::BadRequest(format!(
+			"System prompt too large ({} bytes, max {} bytes)",
+			sp.len(),
+			MAX_ARG_LEN
+		)));
 	}
 
 	// Build CLI args.
