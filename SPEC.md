@@ -410,8 +410,60 @@ A `tokio::sync::Semaphore` bounds the number of concurrent `claude` subprocesses
 ### Process Lifecycle
 
 1. **Spawn** — `tokio::process::Command` with stdout/stderr piped, stdin set to `Stdio::null()`, `kill_on_drop(true)`, `.env("CLAUDE_CONFIG_DIR", &config.isolated_config_dir)`, `.current_dir(&config.working_dir)`. The working directory defaults to the isolated config dir to prevent CLAUDE.md discovery from the host filesystem (see Process Isolation). There is no `--working-dir` or `--cwd` CLI flag on the `claude` binary; the CWD is set via `Command::current_dir()`. **Important:** stdin must be explicitly `Stdio::null()`, not `Stdio::piped()`. When stdin is a pipe, the CLI waits 3 seconds for stdin data before proceeding, adding unnecessary latency and logging a stderr warning. With `Stdio::null()`, the CLI immediately knows there is no piped input. All arguments are passed as separate `arg()` calls (not shell-concatenated), preventing shell injection. **`kill_on_drop(true)` is critical** — it ensures the subprocess is killed if the owning task is dropped (e.g., due to panic or cancellation), preventing orphan processes. **Spawn failure:** If `Command::spawn()` returns `Err` (e.g., binary not found at runtime, permission denied, OS resource exhaustion), return HTTP 500 immediately with a descriptive error. Do not retry — spawn failures are not transient.
-2. **Read** — Stdout and stderr read line-by-line via `BufReader::lines()` in a `tokio::select!` loop. Stdout lines are parsed as NDJSON. Stderr lines are logged at DEBUG level and accumulated in a `Vec<String>` buffer (last 50 lines, capped to prevent unbounded growth). This buffer is used for error messages when the process exits abnormally without a `result` message. Both stdout and stderr lines reset the inactivity timer. **Pinning:** The `tokio::select!` loop requires the `next_line()` futures to be re-created each iteration (they are not `Unpin`). Use `tokio::select!` with fresh `reader.next_line()` calls each loop iteration — do not try to pin and reuse them across iterations.
-3. **Timeout** — 10-minute inactivity timeout (no stdout or stderr output). Subprocess is killed if exceeded.
+2. **Read** — Stdout and stderr read line-by-line via `BufReader::lines()` in a `tokio::select!` loop. Stdout lines are parsed as NDJSON. Stderr lines are logged at DEBUG level and accumulated in a `Vec<String>` buffer (last 50 lines, capped to prevent unbounded growth). This buffer is used for error messages when the process exits abnormally without a `result` message. Both stdout and stderr lines reset the inactivity timer.
+
+**Read loop skeleton:**
+```rust
+let stdout = BufReader::new(child.stdout.take().unwrap());
+let stderr = BufReader::new(child.stderr.take().unwrap());
+let mut stdout_lines = stdout.lines();
+let mut stderr_lines = stderr.lines();
+let inactivity = tokio::time::sleep(Duration::from_secs(config.timeout));
+tokio::pin!(inactivity);
+let progress = tokio::time::sleep(Duration::from_secs(30));
+tokio::pin!(progress);
+let mut stderr_buf: Vec<String> = Vec::new();
+
+loop {
+    tokio::select! {
+        line = stdout_lines.next_line() => {
+            match line {
+                Ok(Some(line)) => {
+                    inactivity.as_mut().reset(Instant::now() + Duration::from_secs(config.timeout));
+                    // Parse NDJSON, emit SubprocessEvents via tx
+                }
+                Ok(None) => break, // stdout closed — process exiting
+                Err(e) => { /* log error, break */ }
+            }
+        }
+        line = stderr_lines.next_line() => {
+            match line {
+                Ok(Some(line)) => {
+                    inactivity.as_mut().reset(Instant::now() + Duration::from_secs(config.timeout));
+                    debug!(%line, "stderr");
+                    if stderr_buf.len() >= 50 { stderr_buf.remove(0); }
+                    stderr_buf.push(line);
+                }
+                Ok(None) => {} // stderr closed — ignore, wait for stdout
+                Err(_) => {}
+            }
+        }
+        () = &mut inactivity => {
+            warn!("Inactivity timeout");
+            let _ = child.kill().await;
+            let _ = tx.send(SubprocessEvent::Error("Inactivity timeout".into())).await;
+            break;
+        }
+        () = &mut progress => {
+            info!(elapsed = ?start.elapsed(), lines, chunks, "Still running");
+            progress.as_mut().reset(Instant::now() + Duration::from_secs(30));
+        }
+    }
+}
+// After loop: child.wait(), handle exit code, emit Error if no Result was sent
+```
+
+3. **Timeout** — Configurable inactivity timeout (default: 600 seconds / 10 minutes, set via `--timeout`). No stdout or stderr output for this duration. Subprocess is killed if exceeded.
 4. **Progress** — For long-running requests, log a progress line every 30 seconds showing elapsed time, line count, and chunk count.
 5. **Client disconnect** — Detected when the mpsc channel sender fails (receiver dropped). Subprocess is killed immediately via `child.kill()`.
 6. **Completion** — On subprocess exit, capture exit code via `child.wait()`. Non-zero exit without a result is an error. Exit code `-1` if the wait itself fails. Signal-killed processes (e.g., from inactivity timeout) produce non-zero exit codes (137 for SIGKILL); this is expected and should not be logged as an unexpected error if the kill was initiated by the proxy.
@@ -810,12 +862,44 @@ All errors use OpenAI-compatible error format:
 }
 ```
 
+**Error type with IntoResponse:**
+```rust
+#[derive(Debug, thiserror::Error)]
+enum AppError {
+	#[error("{0}")]
+	BadRequest(String),
+	#[error("{0}")]
+	ServerError(String),
+	#[error("{0}")]
+	Timeout(String),
+	#[error("{0}")]
+	ServiceUnavailable(String),
+}
+
+impl IntoResponse for AppError {
+	fn into_response(self) -> Response {
+		let (status, error_type) = match &self {
+			AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
+			AppError::ServerError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+			AppError::Timeout(_) => (StatusCode::GATEWAY_TIMEOUT, "server_error"),
+			AppError::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "server_error"),
+		};
+		let body = serde_json::json!({
+			"error": { "message": self.to_string(), "type": error_type, "code": null }
+		});
+		(status, Json(body)).into_response()
+	}
+}
+```
+
+For `ServiceUnavailable`, also include a `Retry-After: 30` header in the response.
+
 ### Error Conditions
 
 | Condition | HTTP Status | `error.type` | Action |
 |-----------|-------------|--------------|--------|
 | Invalid JSON body | 400 | `invalid_request_error` | Return immediately |
-| Missing `model` field | 400 | `invalid_request_error` | Return immediately |
+| Missing or empty `model` field | 400 | `invalid_request_error` | Return immediately |
 | Empty `messages` array | 400 | `invalid_request_error` | Return immediately |
 | No user messages after filtering | 400 | `invalid_request_error` | Return immediately. All messages were system role or had empty content. |
 | Invalid `reasoning_effort` value | 400 | `invalid_request_error` | Return immediately. Valid values: `none`, `low`, `medium`, `high`, `max`, or absent. Any other string is invalid. |
@@ -890,15 +974,24 @@ On startup, the server:
 
 1. Verifies `claude` binary exists and is executable.
 2. Runs `claude --version` to confirm CLI is functional and logs the version.
-3. **Checks authentication status** by running `claude auth status`. Parses the output for login status. If not logged in, exits with: `"Claude Code is not logged in. Run 'claude login' first."`. This catches auth issues early rather than failing on the first request. The check is best-effort — if parsing fails, log a warning and continue (the first request will surface any auth problems).
+3. **Checks authentication status** by running `claude auth status`. The output is JSON: `{"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "max", ...}`. Parse the `loggedIn` field. If `false`, exits with: `"Claude Code is not logged in. Run 'claude login' first."`. Log the `subscriptionType` at INFO level for visibility (e.g., "Authenticated as max subscriber"). This catches auth issues early rather than failing on the first request. The check is best-effort — if parsing fails, log a warning and continue (the first request will surface any auth problems).
 4. **Sets up the isolated config directory:**
    - Creates `<data-dir>/claude-config/` if it does not exist (default: `~/.local/share/claude-code-provider/claude-config/`).
    - **Cleans the config directory:** Removes all files and subdirectories (including any existing `.credentials.json` symlink). This prevents stale cached feature flags (from `.claude.json`) from enabling unexpected tools on restart.
    - Creates a fresh symlink `<config-dir>/.credentials.json` → `~/.claude/.credentials.json`.
    - Verifies the symlink target resolves to an existing file. Check with `std::fs::metadata()` on the symlink target path (not the symlink itself), or equivalently `std::fs::read_link()` followed by `metadata()` on the result. A broken symlink (symlink exists but target is deleted) must be caught. If the target does not exist, exits with: `"Claude Code credentials not found at ~/.claude/.credentials.json. Run 'claude login' first."`.
 5. **Opens the stats database** at `<data-dir>/stats.redb`. Creates it if it does not exist. Initializes tables on first access.
-6. Binds to the configured host:port (exits with error if port is in use).
-7. Logs the full configuration (port, host, concurrency, timeouts, isolated config dir path, stats DB path).
+6. **Constructs `AppState`** and wraps it in `Arc`:
+```rust
+struct AppState {
+	config: Config,                        // Resolved configuration
+	semaphore: Arc<Semaphore>,             // Concurrency limiter
+	stats: Arc<Stats>,                     // Statistics (redb + in-memory)
+}
+```
+Pass `AppState` to Axum via `.with_state(Arc::new(state))`. All route handlers receive `State(state): State<Arc<AppState>>`.
+7. Binds to the configured host:port (exits with error if port is in use).
+8. Logs the full configuration (port, host, concurrency, timeouts, isolated config dir path, stats DB path).
 
 ---
 
@@ -1140,16 +1233,32 @@ tokio::spawn(async move {
 });
 
 // Task 2: Convert SubprocessEvents → SSE Events
-// (Needed because one SubprocessEvent::Result produces multiple SSE events:
-//  finish chunk + usage chunk + [DONE])
+// State tracked across events:
+let request_id = request_id.clone();        // stable for all chunks
+let created = created;                       // unix timestamp
+let mut model = requested_model.clone();     // updated from Model events
+let mut is_first = true;                     // role emitted on first delta only
+let mut content_sent = false;                // tracks whether any content was streamed
+
 tokio::spawn(async move {
-	// Emit initial :ok comment
 	let _ = sse_tx.send(Ok(Event::default().comment("ok"))).await;
 	while let Some(event) = sub_rx.recv().await {
 		match event {
-			SubprocessEvent::ContentDelta(text) => { /* one SSE data event */ }
-			SubprocessEvent::Result(result) => { /* finish + usage + [DONE] */ }
-			// ...
+			SubprocessEvent::Model(m) => { model = m; }
+			SubprocessEvent::ContentDelta(text) => {
+				content_sent = true;
+				// Build ChunkDelta with role only if is_first
+				// Serialize to JSON, wrap in Event::default().data(json)
+				is_first = false;
+			}
+			SubprocessEvent::Result(result) => {
+				// 1. Emit finish chunk (finish_reason: "stop")
+				// 2. Emit usage chunk (choices: [], usage: {...})
+				// 3. Emit Event::default().data("[DONE]")
+			}
+			SubprocessEvent::Error(msg) => {
+				// Emit error event, optionally [DONE] if content_sent
+			}
 		}
 	}
 });
