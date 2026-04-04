@@ -11,17 +11,17 @@ An OpenAI-compatible API server that translates Chat Completions requests into C
 
 ## Why
 
-An Anthropic Max subscription gives you Claude access through the Claude Code CLI. This proxy lets tools like aider, Open WebUI, OpenClaw, LiteLLM, and any OpenAI SDK client use that same access — every request goes through the official `claude` binary, the same interface Anthropic provides and supports.
+An Anthropic Max subscription gives you Claude access through the Claude Code CLI. This proxy lets tools like aider, Open WebUI, OpenClaw, LiteLLM, and any OpenAI SDK client use that same access. Every request goes through the official `claude` binary, the same interface Anthropic provides and supports.
 
 ## Features
 
-- **Model aliases** — `sonnet`, `opus`, `haiku` resolve automatically; unrecognized names fall back to Sonnet.
-- **Streaming and non-streaming** — SSE and JSON responses compatible with the official Python/TypeScript SDKs.
-- **Concurrency control** — bounded subprocess pool with configurable queue timeout.
-- **Reasoning effort** — `low`, `medium`, `high`, `max` via the `reasoning_effort` parameter.
-- **Persistent stats** — `/stats` dashboard and `/stats/json` endpoint with per-model metrics, latency, and error history.
-- **Isolated configuration** — subprocesses use a separate config directory, so the proxy never touches your existing Claude Code settings.
-- **Single binary** — no runtime dependencies beyond the Claude CLI.
+- **Model aliases** - `sonnet`, `opus`, `haiku` resolve automatically; unrecognized names fall back to Sonnet.
+- **Streaming and non-streaming** - SSE and JSON responses compatible with the official Python/TypeScript SDKs.
+- **Concurrency control** - bounded subprocess pool with configurable queue timeout.
+- **Reasoning effort** - `low`, `medium`, `high`, `max` via the `reasoning_effort` parameter.
+- **Persistent stats** - `/stats` dashboard and `/stats/json` endpoint with per-model metrics, latency, and error history.
+- **Isolated configuration** - subprocesses use a separate config directory, so the proxy never touches your existing Claude Code settings.
+- **Single binary** - no runtime dependencies beyond the Claude CLI.
 
 ## Quick Start
 
@@ -63,19 +63,19 @@ print(response.choices[0].message.content)
 Prebuilt images are published to GHCR on every push and tag.
 
 ```sh
-# Stable (recommended) — latest tagged release.
+# Stable (recommended). Latest tagged release.
 docker pull ghcr.io/sonami-tech/claude-code-provider:latest
 
 # Specific version.
 docker pull ghcr.io/sonami-tech/claude-code-provider:v0.1.0
 
-# Development — built from every push to main.
+# Development. Built from every push to main.
 docker pull ghcr.io/sonami-tech/claude-code-provider:dev
 ```
 
 ### Authentication
 
-**Option A — Log in inside the container:**
+**Option A - Log in inside the container:**
 
 ```sh
 docker run -it -p 18321:18321 ghcr.io/sonami-tech/claude-code-provider bash
@@ -83,7 +83,7 @@ claude login            # authenticate once
 claude-code-provider    # start the proxy
 ```
 
-**Option B — Mount credentials from host:**
+**Option B - Mount credentials from host:**
 
 ```sh
 docker run -p 18321:18321 \
@@ -111,7 +111,7 @@ docker build -t claude-code-provider .
 | `--claude-path` | `CCP_CLAUDE_PATH` | `claude` | Path to Claude CLI binary |
 | `--data-dir` | `CCP_DATA_DIR` | Platform default | Data directory for config and stats |
 | `--working-dir` | `CCP_WORKING_DIR` | Config dir | Subprocess working directory |
-| `-v, --verbose` | — | Off | Debug logging |
+| `-v, --verbose` | | Off | Debug logging |
 
 ## API Endpoints
 
@@ -133,10 +133,10 @@ docker build -t claude-code-provider .
 
 ## Limitations
 
-- **Latency** — each request spawns a `claude -p` subprocess (~100-500ms overhead).
-- **Text only** — image and audio content parts are silently ignored.
-- **No tool use** — subprocesses run with `--tools ""`.
-- **Ignored parameters** — `max_tokens`, `temperature`, `top_p`, `stop` are accepted but not passed through.
+- **Latency** - each request spawns a `claude -p` subprocess (~100-500ms overhead).
+- **Text only** - image and audio content parts are silently ignored.
+- **No tool use** - subprocesses run with `--tools ""`.
+- **Ignored parameters** - `max_tokens`, `temperature`, `top_p`, `stop` are accepted but not passed through.
 
 ## License
 
