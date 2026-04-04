@@ -1,0 +1,325 @@
+use std::convert::Infallible;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::header;
+use axum::response::IntoResponse;
+use axum::response::Response;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tracing::{error, info};
+
+use crate::AppState;
+use crate::error::AppError;
+use crate::models::{normalize_model_name, resolve_model, validate_effort};
+use crate::subprocess::SubprocessEvent;
+use crate::subprocess::manager::spawn_managed;
+use crate::translate::request::{
+	ChatCompletionRequest, build_cli_args, build_prompt_and_system, validate_request,
+};
+use crate::translate::response::{build_response, extract_usage};
+use crate::translate::stream;
+
+pub async fn completions_handler(
+	State(state): State<Arc<AppState>>,
+	body: Bytes,
+) -> Result<Response, AppError> {
+	// Parse body manually for OpenAI-format error on bad JSON.
+	let request: ChatCompletionRequest = serde_json::from_slice(&body)
+		.map_err(|e| AppError::BadRequest(format!("Invalid JSON: {}", e)))?;
+
+	// Generate request ID: first 8 hex chars of UUID v4.
+	let uuid_str = uuid::Uuid::new_v4().to_string();
+	let request_id = &uuid_str[..8];
+	let chat_id = format!("chatcmpl-{request_id}");
+
+	let span = tracing::info_span!(
+		"request",
+		request_id = %request_id,
+		model = %request.model,
+		stream = %request.stream,
+	);
+	let _guard = span.enter();
+
+	// Validate.
+	validate_request(&request)?;
+	let model_def = resolve_model(&request.model);
+	let effort = validate_effort(request.reasoning_effort.as_deref())?;
+
+	// Build prompt and system prompt.
+	let (prompt, system_prompt) = build_prompt_and_system(&request.messages)?;
+
+	// Size checks (Linux MAX_ARG_STRLEN is ~128KB per argument).
+	const MAX_ARG_LEN: usize = 128_000;
+	if prompt.len() > MAX_ARG_LEN {
+		return Err(AppError::BadRequest(format!(
+			"Prompt too large ({} bytes, max {} bytes)",
+			prompt.len(),
+			MAX_ARG_LEN
+		)));
+	}
+	if let Some(ref sp) = system_prompt
+		&& sp.len() > MAX_ARG_LEN
+	{
+		return Err(AppError::BadRequest(format!(
+			"System prompt too large ({} bytes, max {} bytes)",
+			sp.len(),
+			MAX_ARG_LEN
+		)));
+	}
+
+	// Build CLI args.
+	let cli_args = build_cli_args(model_def, &prompt, system_prompt.as_deref(), effort);
+
+	let created = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_secs();
+
+	// Record stats.
+	state.stats.record_request(model_def.canonical);
+
+	info!("Chat completion request");
+
+	let request_id = request_id.to_string();
+	if request.stream {
+		handle_streaming(state, request_id, chat_id, created, model_def.canonical, cli_args).await
+	} else {
+		handle_non_streaming(state, request_id, chat_id, created, model_def.canonical, cli_args)
+			.await
+	}
+}
+
+async fn handle_non_streaming(
+	state: Arc<AppState>,
+	request_id: String,
+	chat_id: String,
+	created: u64,
+	requested_model: &'static str,
+	cli_args: Vec<String>,
+) -> Result<Response, AppError> {
+	let _active = crate::stats::ActiveRequestGuard::new(&state.stats);
+	let start = std::time::Instant::now();
+	let (tx, mut rx) = mpsc::channel::<SubprocessEvent>(64);
+
+	spawn_managed(
+		state.config.clone(),
+		state.semaphore.clone(),
+		Duration::from_secs(state.config.queue_timeout),
+		cli_args,
+		tx,
+	)
+	.await?;
+
+	// Collect all events.
+	let mut content = String::new();
+	let mut model = requested_model.to_string();
+	let mut result_msg = None;
+	let mut error_msg = None;
+	let mut ttft_ms: Option<f64> = None;
+
+	while let Some(event) = rx.recv().await {
+		match event {
+			SubprocessEvent::Model(m) => {
+				model = normalize_model_name(&m).into_owned();
+			}
+			SubprocessEvent::ContentDelta(text) => {
+				if ttft_ms.is_none() {
+					ttft_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+				}
+				content.push_str(&text);
+			}
+			SubprocessEvent::Result(r) => {
+				result_msg = Some(r);
+			}
+			SubprocessEvent::Error(e) => {
+				error_msg = Some(e);
+			}
+		}
+	}
+
+	let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+	// Check for subprocess errors.
+	if let Some(err) = error_msg {
+		state.stats.record_error(&model, &err);
+		if err.contains("Inactivity timeout") {
+			return Err(AppError::Timeout(err));
+		}
+		return Err(AppError::ServerError(err));
+	}
+
+	let result = result_msg.ok_or_else(|| {
+		let msg = "Process exited without producing a result".to_string();
+		state.stats.record_error(&model, &msg);
+		AppError::ServerError(msg)
+	})?;
+
+	// Check is_error FIRST (can be true even with subtype "success").
+	if result.is_error.unwrap_or(false) {
+		let msg = result
+			.result
+			.clone()
+			.unwrap_or_else(|| "CLI returned an error with no message".to_string());
+		state.stats.record_error(&model, &msg);
+		return Err(AppError::ServerError(msg));
+	}
+
+	// Record successful completion.
+	state.stats.record_completion(&model, ttft_ms, duration_ms, &result);
+
+	// Fall back to result.result if no deltas were collected.
+	if content.is_empty() {
+		content = result.result.clone().unwrap_or_default();
+	}
+
+	let response = build_response(&chat_id, created, &model, &content, &result);
+
+	let headers = [(
+		header::HeaderName::from_static("x-request-id"),
+		header::HeaderValue::from_str(&request_id).unwrap(),
+	)];
+
+	Ok((headers, axum::Json(response)).into_response())
+}
+
+async fn handle_streaming(
+	state: Arc<AppState>,
+	request_id: String,
+	chat_id: String,
+	created: u64,
+	requested_model: &'static str,
+	cli_args: Vec<String>,
+) -> Result<Response, AppError> {
+	let (sub_tx, mut sub_rx) = mpsc::channel::<SubprocessEvent>(64);
+	let (sse_tx, sse_rx) = mpsc::channel::<Result<Event, Infallible>>(64);
+
+	spawn_managed(
+		state.config.clone(),
+		state.semaphore.clone(),
+		Duration::from_secs(state.config.queue_timeout),
+		cli_args,
+		sub_tx,
+	)
+	.await?;
+
+	// Converter task: SubprocessEvent → SSE Event.
+	let conv_chat_id = chat_id.clone();
+	let conv_model = requested_model.to_string();
+	let stats = state.stats.clone();
+	tokio::spawn(async move {
+		let _active = crate::stats::ActiveRequestGuard::new(&stats);
+		let start = std::time::Instant::now();
+		let mut model = conv_model;
+		let mut is_first = true;
+		let mut content_sent = false;
+		let mut ttft_ms: Option<f64> = None;
+
+		// Initial :ok comment.
+		let _ = sse_tx.send(Ok(Event::default().comment("ok"))).await;
+
+		while let Some(event) = sub_rx.recv().await {
+			match event {
+				SubprocessEvent::Model(m) => {
+					model = normalize_model_name(&m).into_owned();
+				}
+				SubprocessEvent::ContentDelta(text) => {
+					if ttft_ms.is_none() {
+						ttft_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+					}
+					content_sent = true;
+					let chunk = stream::content_chunk(
+						&conv_chat_id,
+						created,
+						&model,
+						&text,
+						is_first,
+					);
+					is_first = false;
+
+					match serde_json::to_string(&chunk) {
+						Ok(json) => {
+							if sse_tx.send(Ok(Event::default().data(json))).await.is_err() {
+								return; // Client disconnected.
+							}
+						}
+						Err(e) => {
+							error!("Failed to serialize chunk: {}", e);
+						}
+					}
+				}
+				SubprocessEvent::Result(result) => {
+					let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+					// Check is_error first.
+					if result.is_error.unwrap_or(false) {
+						let msg = result
+							.result
+							.clone()
+							.unwrap_or_else(|| "CLI returned an error with no message".into());
+						stats.record_error(&model, &msg);
+						let error_data = stream::error_event_data(&msg);
+						let _ = sse_tx.send(Ok(Event::default().data(error_data))).await;
+						if content_sent {
+							let _ = sse_tx
+								.send(Ok(Event::default().data("[DONE]")))
+								.await;
+						}
+						return;
+					}
+
+					// Record successful completion.
+					stats.record_completion(&model, ttft_ms, duration_ms, &result);
+
+					// Emit finish chunk.
+					let finish = stream::finish_chunk(&conv_chat_id, created, &model);
+					if let Ok(json) = serde_json::to_string(&finish) {
+						let _ = sse_tx.send(Ok(Event::default().data(json))).await;
+					}
+
+					// Emit usage chunk.
+					if let Some(usage) = extract_usage(&result) {
+						let usage_c =
+							stream::usage_chunk(&conv_chat_id, created, &model, usage);
+						if let Ok(json) = serde_json::to_string(&usage_c) {
+							let _ = sse_tx.send(Ok(Event::default().data(json))).await;
+						}
+					}
+
+					// Emit [DONE] sentinel.
+					let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
+				}
+				SubprocessEvent::Error(msg) => {
+					stats.record_error(&model, &msg);
+					let error_data = stream::error_event_data(&msg);
+					let _ = sse_tx.send(Ok(Event::default().data(error_data))).await;
+					if content_sent {
+						let _ = sse_tx
+							.send(Ok(Event::default().data("[DONE]")))
+							.await;
+					}
+					return;
+				}
+			}
+		}
+	});
+
+	let sse_stream = ReceiverStream::new(sse_rx);
+	let sse = Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
+
+	let headers = [
+		(
+			header::HeaderName::from_static("x-request-id"),
+			header::HeaderValue::from_str(&request_id).unwrap(),
+		),
+		(
+			header::CACHE_CONTROL,
+			header::HeaderValue::from_static("no-cache"),
+		),
+	];
+
+	Ok((headers, sse).into_response())
+}
