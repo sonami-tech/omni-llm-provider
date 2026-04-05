@@ -17,25 +17,48 @@ docker pull ghcr.io/sonami-tech/claude-code-provider:dev
 
 Multi-platform images are built for `linux/amd64` and `linux/arm64`.
 
+## Setup
+
+Create a directory to hold your configuration, then place your files in it:
+
+```
+~/claude-code-provider/
+├── docker-compose.yml
+├── keys.txt
+├── rules.toml
+└── logs/              (created automatically when logging is enabled)
+```
+
+Download `docker-compose.yml` from the repository:
+
+```sh
+mkdir -p ~/claude-code-provider && cd ~/claude-code-provider
+curl -fsSL https://raw.githubusercontent.com/sonami-tech/claude-code-provider/master/docker-compose.yml -o docker-compose.yml
+```
+
+Edit it to adjust settings (enable logging, change concurrency, pin a version tag, etc.), then start:
+
+```sh
+docker compose up -d
+```
+
 ## Authentication
 
-**Option A - Mount credentials from host (recommended):**
+The `docker-compose.yml` mounts `~/.claude/.credentials.json` from the host by default. If you haven't logged in yet:
 
 ```sh
-docker run -p 18321:18321 \
-  -v ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro \
-  ghcr.io/sonami-tech/claude-code-provider:latest
+curl -fsSL https://claude.ai/install.sh | bash
+claude login
 ```
 
-**Option B - Log in inside the container:**
+To log in inside the container instead:
 
 ```sh
-docker run -it --entrypoint /bin/bash -p 18321:18321 ghcr.io/sonami-tech/claude-code-provider:latest
-claude login            # authenticate once
-claude-code-provider    # start the proxy
+docker compose run --rm claude-code-provider /bin/bash
+claude login
 ```
 
-Credentials created inside the container are lost when it stops. To persist them, add `-v claude-creds:/root/.claude` to the `docker run` command.
+Credentials created inside the container are lost when it stops unless you add a volume for `~/.claude`.
 
 ## Default Settings
 
@@ -45,21 +68,11 @@ The Docker image sets:
 - `CCP_NO_ISOLATE=true` (no host config to isolate from in a container).
 - `ENTRYPOINT ["claude-code-provider"]` (starts the proxy automatically).
 
-The auto-generated API key is printed to the container log on startup.
+The auto-generated API key is printed to the container log on startup (unless you provide your own via `keys.txt`).
 
 ## API Keys
 
-API keys passed via `-e CCP_API_KEYS=...` are visible in `docker inspect`. For production, mount a keys file instead:
-
-```sh
-docker run -p 18321:18321 \
-  -v ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro \
-  -v /path/to/keys.txt:/etc/ccp-keys:ro \
-  -e CCP_API_KEYS_FILE=/etc/ccp-keys \
-  ghcr.io/sonami-tech/claude-code-provider:latest
-```
-
-Keys file format (one key per line, `#` comments allowed):
+The `docker-compose.yml` mounts `./keys.txt` into the container. Create it with one key per line (`#` comments allowed):
 
 ```
 # Production keys
@@ -67,54 +80,68 @@ sk-prod-key-one
 sk-prod-key-two
 ```
 
+Avoid passing keys via `CCP_API_KEYS` in the environment — they are visible in `docker inspect`.
+
 ## Text Replacement and Logging
 
-Mount a TOML rules file and a log directory:
+The `docker-compose.yml` mounts `./rules.toml` by default. To enable conversation logging, uncomment the log volume and environment variable:
 
-```sh
-docker run -p 18321:18321 \
-  -v ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro \
-  -v /path/to/rules.toml:/etc/ccp-rules.toml:ro \
-  -v ~/ccp-logs:/var/log/ccp \
-  -e CCP_REPLACE_RULES=/etc/ccp-rules.toml \
-  -e CCP_LOG_FILE=/var/log/ccp/conversations.log \
-  ghcr.io/sonami-tech/claude-code-provider:latest
+```yaml
+volumes:
+  - ./logs:/var/log/ccp
+environment:
+  CCP_LOG_FILE: /var/log/ccp/conversations.log
 ```
 
-## Full Example
+## All Environment Variables
 
-A production-ready example with all features:
+Uncomment or add any of these in the `environment:` section of your `docker-compose.yml`. See [configuration reference](configuration.md) for details.
 
-```sh
-docker run -d \
-  -p 18321:18321 \
-  --name ccp \
-  --restart unless-stopped \
-  -v ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro \
-  -v /path/to/keys.txt:/etc/ccp-keys:ro \
-  -v /path/to/rules.toml:/etc/ccp-rules.toml:ro \
-  -v ~/ccp-logs:/var/log/ccp \
-  -e CCP_API_KEYS_FILE=/etc/ccp-keys \
-  -e CCP_REPLACE_RULES=/etc/ccp-rules.toml \
-  -e CCP_LOG_FILE=/var/log/ccp/conversations.log \
-  -e CCP_MAX_CONCURRENT=10 \
-  ghcr.io/sonami-tech/claude-code-provider:latest
-```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CCP_API_KEYS_FILE` | None | Path to API keys file inside the container |
+| `CCP_REPLACE_RULES` | None | Path to replacement rules TOML inside the container |
+| `CCP_LOG_FILE` | None | Path to conversation log file inside the container |
+| `CCP_MAX_CONCURRENT` | `5` | Max simultaneous subprocesses |
+| `CCP_TIMEOUT` | `600` | Subprocess inactivity timeout (seconds) |
+| `CCP_QUEUE_TIMEOUT` | `60` | Max queue wait time (seconds) |
+| `CCP_PORT` | `18321` | Listen port |
+| `CCP_NO_AUTH` | Off | Set to `true` to disable authentication |
+| `CCP_NO_TOOL_PASSTHROUGH` | Off | Set to `true` to disable tool calling |
 
 ## Verify
 
 ```sh
 # Check the container is running.
-docker logs ccp
+docker compose logs
 
 # Test the health endpoint.
 curl http://localhost:18321/health
 
-# Test a completion (use the API key from the logs).
+# Test a completion (use the API key from your keys.txt).
 curl http://localhost:18321/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <key>" \
   -d '{"model": "haiku", "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+## Common Operations
+
+```sh
+# Start in the background.
+docker compose up -d
+
+# View logs.
+docker compose logs -f
+
+# Restart after changing docker-compose.yml.
+docker compose up -d
+
+# Stop.
+docker compose down
+
+# Pull a newer image.
+docker compose pull && docker compose up -d
 ```
 
 ## Build from Source

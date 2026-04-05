@@ -38,18 +38,24 @@ curl -fsSL https://claude.ai/install.sh | bash
 claude login
 ```
 
-### 2. Create an API key file
+### 2. Create your project directory
 
 ```sh
-echo "sk-my-secret-key-here" > ~/ccp-keys.txt
+mkdir ~/claude-code-provider && cd ~/claude-code-provider
 ```
 
-### 3. Create a text replacement rules file
+### 3. Create an API key file
+
+```sh
+echo "sk-my-secret-key-here" > keys.txt
+```
+
+### 4. Create a text replacement rules file
 
 Text replacement prevents sensitive data from reaching the model by masking terms in prompts and restoring them in responses:
 
 ```sh
-cat > ~/ccp-rules.toml << 'EOF'
+cat > rules.toml << 'EOF'
 # Replace sensitive terms in prompts before they reach Claude.
 [[rule]]
 scope = "prompt"
@@ -76,42 +82,25 @@ EOF
 
 See [configuration reference](docs/configuration.md#text-replacement) for rule scopes and streaming behavior.
 
-### 4. Start the server
-
-**Docker:**
+### 5. Create `docker-compose.yml`
 
 ```sh
-docker run -p 18321:18321 \
-  -v ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro \
-  -v ~/ccp-rules.toml:/root/ccp-rules.toml:ro \
-  -v ~/ccp-keys.txt:/root/ccp-keys.txt:ro \
-  -e CCP_API_KEYS_FILE=/root/ccp-keys.txt \
-  -e CCP_REPLACE_RULES=/root/ccp-rules.toml \
-  ghcr.io/sonami-tech/claude-code-provider:latest
+curl -fsSL https://raw.githubusercontent.com/sonami-tech/claude-code-provider/master/docker-compose.yml -o docker-compose.yml
 ```
 
-See [Docker documentation](docs/docker.md) for image tags, alternative auth methods, and production setup.
+Or copy the `docker-compose.yml` from the [repository root](docker-compose.yml). See the [Docker guide](docs/docker.md) for image tags, auth options, and all available settings.
 
-**Build from source** (requires [Rust](https://rustup.rs) 1.85+):
+### 6. Start the server
 
 ```sh
-git clone https://github.com/sonami-tech/claude-code-provider.git
-cd claude-code-provider
-cargo build --release
-./target/release/claude-code-provider \
-  --api-keys-file ~/ccp-keys.txt \
-  --replace-rules ~/ccp-rules.toml
+docker compose up -d
 ```
 
-### 5. Test it
-
-Verify the server is running:
+### 7. Test it
 
 ```sh
 curl http://localhost:18321/health
 ```
-
-Send a request:
 
 ```sh
 curl http://localhost:18321/v1/chat/completions \
@@ -121,6 +110,19 @@ curl http://localhost:18321/v1/chat/completions \
 ```
 
 Point any OpenAI SDK client at `http://your-host:18321/v1` with the API key from your keys file.
+
+### Building from source
+
+If you prefer to run without Docker (requires [Rust](https://rustup.rs) 1.85+):
+
+```sh
+git clone https://github.com/sonami-tech/claude-code-provider.git
+cd claude-code-provider
+cargo build --release
+./target/release/claude-code-provider \
+  --api-keys-file keys.txt \
+  --replace-rules rules.toml
+```
 
 ## Models
 

@@ -1,0 +1,18 @@
+services:
+  claude-code-provider:
+    image: ghcr.io/sonami-tech/claude-code-provider:latest
+    container_name: ccp
+    restart: unless-stopped
+    ports:
+      - "18321:18321"
+    volumes:
+      - ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro
+      - ./keys.txt:/etc/ccp-keys:ro
+      - ./rules.toml:/etc/ccp-rules.toml:ro
+      # Uncomment to persist conversation logs:
+      # - ./logs:/var/log/ccp
+    environment:
+      CCP_API_KEYS_FILE: /etc/ccp-keys
+      CCP_REPLACE_RULES: /etc/ccp-rules.toml
+      # CCP_LOG_FILE: /var/log/ccp/conversations.log
+      # CCP_MAX_CONCURRENT: 10
