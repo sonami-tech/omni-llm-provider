@@ -168,7 +168,10 @@ pub async fn run_subprocess(
 
 	if !got_result {
 		let stderr_text = if stderr_buf.is_empty() {
-			format!("Process exited with code {} (no output)", exit_code)
+			format!(
+				"Process exited with code {} (no result; {} lines, {} chunks)",
+				exit_code, line_count, chunk_count
+			)
 		} else {
 			format!(
 				"Process exited with code {}: {}",
