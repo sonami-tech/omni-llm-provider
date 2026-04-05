@@ -60,6 +60,10 @@ pub struct Config {
 	#[arg(long, env = "CCP_LOG_CONVERSATIONS")]
 	pub log_conversations: bool,
 
+	/// File to write conversation logs to (implies --log-conversations).
+	#[arg(long, env = "CCP_LOG_FILE")]
+	pub log_file: Option<PathBuf>,
+
 	/// Enable debug logging.
 	#[arg(short = 'v', long)]
 	pub verbose: bool,

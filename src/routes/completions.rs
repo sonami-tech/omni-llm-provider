@@ -88,19 +88,19 @@ pub async fn completions_handler(
 
 	info!(key = api_key_id.as_deref().unwrap_or("-"), "Chat completion request");
 
-	if state.config.log_conversations {
-		info!(">>> Prompt:\n{}", prompt);
+	if let Some(ref log) = state.conversation_log {
+		log.log(request_id, ">>>", "Prompt", &prompt);
 		if let Some(ref sp) = system_prompt {
-			info!(">>> System prompt:\n{}", sp);
+			log.log(request_id, ">>>", "System", sp);
 		}
 	}
 
-	let log_response = state.config.log_conversations;
+	let conv_log = state.conversation_log.clone();
 	let request_id = request_id.to_string();
 	if request.stream {
-		handle_streaming(state, request_id, chat_id, created, model_def.canonical, cli_args, log_response).await
+		handle_streaming(state, request_id, chat_id, created, model_def.canonical, cli_args, conv_log).await
 	} else {
-		handle_non_streaming(state, request_id, chat_id, created, model_def.canonical, cli_args, log_response)
+		handle_non_streaming(state, request_id, chat_id, created, model_def.canonical, cli_args, conv_log)
 			.await
 	}
 }
@@ -112,7 +112,7 @@ async fn handle_non_streaming(
 	created: u64,
 	requested_model: &'static str,
 	cli_args: Vec<String>,
-	log_response: bool,
+	conv_log: Option<Arc<crate::conversation_log::ConversationLog>>,
 ) -> Result<Response, AppError> {
 	let _active = crate::stats::ActiveRequestGuard::new(&state.stats);
 	let start = std::time::Instant::now();
@@ -189,8 +189,8 @@ async fn handle_non_streaming(
 		content = result.result.clone().unwrap_or_default();
 	}
 
-	if log_response {
-		info!("<<< Response:\n{}", content);
+	if let Some(ref log) = conv_log {
+		log.log(&request_id, "<<<", "Response", &content);
 	}
 
 	let response = build_response(&chat_id, created, &model, &content, &result);
@@ -210,7 +210,7 @@ async fn handle_streaming(
 	created: u64,
 	requested_model: &'static str,
 	cli_args: Vec<String>,
-	log_response: bool,
+	conv_log: Option<Arc<crate::conversation_log::ConversationLog>>,
 ) -> Result<Response, AppError> {
 	let (sub_tx, mut sub_rx) = mpsc::channel::<SubprocessEvent>(64);
 	let (sse_tx, sse_rx) = mpsc::channel::<Result<Event, Infallible>>(64);
@@ -226,6 +226,7 @@ async fn handle_streaming(
 
 	// Converter task: SubprocessEvent → SSE Event.
 	let conv_chat_id = chat_id.clone();
+	let conv_request_id = request_id.clone();
 	let conv_model = requested_model.to_string();
 	let stats = state.stats.clone();
 	tokio::spawn(async move {
@@ -235,7 +236,7 @@ async fn handle_streaming(
 		let mut is_first = true;
 		let mut content_sent = false;
 		let mut ttft_ms: Option<f64> = None;
-		let mut full_content = if log_response { Some(String::new()) } else { None };
+		let mut full_content = if conv_log.is_some() { Some(String::new()) } else { None };
 
 		// Initial :ok comment.
 		let _ = sse_tx.send(Ok(Event::default().comment("ok"))).await;
@@ -296,8 +297,8 @@ async fn handle_streaming(
 					// Record successful completion.
 					stats.record_completion(&model, ttft_ms, duration_ms, &result);
 
-					if let Some(ref buf) = full_content {
-						info!("<<< Response:\n{}", buf);
+					if let (Some(log), Some(buf)) = (&conv_log, &full_content) {
+						log.log(&conv_request_id, "<<<", "Response", buf);
 					}
 
 					// Emit finish chunk.

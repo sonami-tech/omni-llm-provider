@@ -1,5 +1,6 @@
 mod auth;
 mod config;
+mod conversation_log;
 mod error;
 mod models;
 mod routes;
@@ -30,6 +31,7 @@ pub struct AppState {
 	pub config: Config,
 	pub semaphore: Arc<Semaphore>,
 	pub stats: Arc<stats::Stats>,
+	pub conversation_log: Option<Arc<conversation_log::ConversationLog>>,
 }
 
 #[tokio::main]
@@ -172,10 +174,32 @@ async fn main() {
 		std::process::exit(1);
 	});
 
+	// Setup conversation logging.
+	let log_conversations = config.log_conversations || config.log_file.is_some();
+	let conversation_log = if log_conversations {
+		let log = if let Some(ref path) = config.log_file {
+			conversation_log::ConversationLog::to_file(path).unwrap_or_else(|e| {
+				error!("Failed to open log file {:?}: {}", path, e);
+				std::process::exit(1);
+			})
+		} else {
+			conversation_log::ConversationLog::to_stderr()
+		};
+		if let Some(ref path) = config.log_file {
+			info!("Conversation logging to file: {:?}", path);
+		} else {
+			info!("Conversation logging to stderr");
+		}
+		Some(Arc::new(log))
+	} else {
+		None
+	};
+
 	let state = Arc::new(AppState {
 		config: config.clone(),
 		semaphore,
 		stats: Arc::new(stats_db),
+		conversation_log,
 	});
 
 	// Resolve API keys: no-auth, explicit, or auto-generated.

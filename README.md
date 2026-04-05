@@ -126,7 +126,8 @@ docker build -t claude-code-provider .
 | `--api-keys` | `CCP_API_KEYS` | Auto-generated | Comma-separated API keys (min 8 chars each) |
 | `--api-keys-file` | `CCP_API_KEYS_FILE` | None | File with one API key per line (# comments allowed) |
 | `--no-auth` | `CCP_NO_AUTH` | Off | Disable authentication entirely |
-| `--log-conversations` | `CCP_LOG_CONVERSATIONS` | Off | Log full prompts and responses to stderr |
+| `--log-conversations` | `CCP_LOG_CONVERSATIONS` | Off | Log full prompts and responses |
+| `--log-file` | `CCP_LOG_FILE` | None | Write conversation logs to file (implies --log-conversations) |
 | `-v, --verbose` | | Off | Debug logging |
 
 ## API Endpoints
