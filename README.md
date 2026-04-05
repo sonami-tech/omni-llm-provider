@@ -22,6 +22,7 @@ An Anthropic Max subscription gives you Claude access through the Claude Code CL
 - **Secure by default** - auto-generates an API key on startup; explicit keys and no-auth mode also supported.
 - **Persistent stats** - `/stats` dashboard and `/stats/json` endpoint with per-model and per-key metrics.
 - **Text replacement** - TOML-based find-and-replace rules for prompts, responses, or both.
+- **Conversation logging** - full prompt and response logging to stderr or a dedicated file.
 - **Isolated configuration** - subprocesses use a separate config directory, so the proxy never touches your existing Claude Code settings.
 - **Single binary** - no runtime dependencies beyond the Claude CLI.
 
@@ -77,21 +78,23 @@ docker pull ghcr.io/sonami-tech/claude-code-provider:dev
 
 ### Authentication
 
-**Option A - Log in inside the container:**
-
-```sh
-docker run -it --entrypoint bash -p 18321:18321 ghcr.io/sonami-tech/claude-code-provider
-claude login            # authenticate once
-claude-code-provider    # start the proxy
-```
-
-**Option B - Mount credentials from host:**
+**Option A - Mount credentials from host (recommended):**
 
 ```sh
 docker run -p 18321:18321 \
   -v ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro \
   ghcr.io/sonami-tech/claude-code-provider
 ```
+
+**Option B - Log in inside the container:**
+
+```sh
+docker run -it --entrypoint /bin/bash -p 18321:18321 ghcr.io/sonami-tech/claude-code-provider
+claude login            # authenticate once
+claude-code-provider    # start the proxy
+```
+
+Note: credentials created inside the container are lost when it stops. To persist them, add `-v claude-creds:/root/.claude` to the `docker run` command.
 
 The Docker image sets `CCP_NO_ISOLATE=true` by default since the container has no plugins or hooks to isolate from. The auto-generated API key is printed to the container log on startup.
 
