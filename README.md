@@ -18,7 +18,7 @@ An Anthropic Max subscription gives you Claude access through the Claude Code CL
 - **Model aliases** - `sonnet`, `opus`, `haiku` resolve automatically; unrecognized names fall back to Sonnet.
 - **Streaming and non-streaming** - SSE and JSON responses compatible with the official Python/TypeScript SDKs.
 - **Concurrency control** - bounded subprocess pool with configurable queue timeout.
-- **Reasoning effort** - `low`, `medium`, `high`, `max` via the `reasoning_effort` parameter.
+- **Reasoning effort** - `none`, `low`, `medium`, `high`, `max` via the `reasoning_effort` parameter.
 - **Secure by default** - auto-generates an API key on startup; explicit keys and no-auth mode also supported.
 - **Persistent stats** - `/stats` dashboard and `/stats/json` endpoint with per-model and per-key metrics.
 - **Text replacement** - TOML-based find-and-replace rules for prompts, responses, or both.
@@ -43,8 +43,7 @@ An Anthropic Max subscription gives you Claude access through the Claude Code CL
 git clone <repo-url> claude-code-provider
 cd claude-code-provider
 cargo build --release
-./target/release/claude-code-provider          # port 18321, 5 concurrent
-./target/release/claude-code-provider -p 8080 -c 10  # custom
+./target/release/claude-code-provider
 ```
 
 An API key is auto-generated on startup and printed to the log. Use it with any OpenAI SDK client:
@@ -63,89 +62,67 @@ print(response.choices[0].message.content)
 
 ## Docker
 
-Prebuilt images are published to GHCR on every push and tag.
-
-```sh
-# Stable (recommended). Latest tagged release.
-docker pull ghcr.io/sonami-tech/claude-code-provider:latest
-
-# Specific version.
-docker pull ghcr.io/sonami-tech/claude-code-provider:v0.1.0
-
-# Development. Built from every push to main.
-docker pull ghcr.io/sonami-tech/claude-code-provider:dev
-```
-
-### Authentication
-
-**Option A - Mount credentials from host (recommended):**
-
 ```sh
 docker run -p 18321:18321 \
   -v ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro \
-  ghcr.io/sonami-tech/claude-code-provider
+  ghcr.io/sonami-tech/claude-code-provider:dev
 ```
 
-**Option B - Log in inside the container:**
+The auto-generated API key is printed to the container log. See [Docker documentation](docs/docker.md) for image tags, alternative auth methods, and production setup.
+
+## API Keys
+
+An API key is auto-generated on startup by default. To use your own:
 
 ```sh
-docker run -it --entrypoint /bin/bash -p 18321:18321 ghcr.io/sonami-tech/claude-code-provider
-claude login            # authenticate once
-claude-code-provider    # start the proxy
+# Single key via environment variable.
+claude-code-provider --api-keys my-secret-key
+
+# Multiple keys from a file.
+claude-code-provider --api-keys-file keys.txt
+
+# Disable auth entirely.
+claude-code-provider --no-auth
 ```
 
-Note: credentials created inside the container are lost when it stops. To persist them, add `-v claude-creds:/root/.claude` to the `docker run` command.
+Keys must be at least 8 characters. In Docker, avoid `-e CCP_API_KEYS=...` (visible in `docker inspect`) and mount a keys file instead. See [configuration reference](docs/configuration.md) for details.
 
-The Docker image sets `CCP_NO_ISOLATE=true` by default since the container has no plugins or hooks to isolate from. The auto-generated API key is printed to the container log on startup.
+## Text Replacement
 
-Note: API keys passed via `-e CCP_API_KEYS=...` are visible in `docker inspect`. For production, mount a keys file instead:
+Automatic find-and-replace on prompts and/or responses. Create a TOML rules file:
+
+```toml
+[[rule]]
+scope = "prompt"
+search = "COMPANY_NAME"
+replace = "Acme Corp"
+
+[[rule]]
+scope = "response"
+search = "As an AI language model, "
+replace = ""
+
+[[rule]]
+scope = "both"
+search = "http://old.internal:8080"
+replace = "https://api.example.com"
+```
 
 ```sh
-docker run -p 18321:18321 \
-  -v ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro \
-  -v /path/to/keys.txt:/etc/ccp-keys:ro \
-  -e CCP_API_KEYS_FILE=/etc/ccp-keys \
-  ghcr.io/sonami-tech/claude-code-provider
+claude-code-provider --replace-rules rules.toml
 ```
 
-To use text replacement rules and conversation logging in Docker:
+Rules are applied in file order. Literal string matching only. Scopes: `prompt` (before sending to Claude), `response` (before returning to client), or `both`. For streaming responses, replacement is per-chunk.
 
-```sh
-docker run -p 18321:18321 \
-  -v ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro \
-  -v /path/to/rules.toml:/etc/ccp-rules.toml:ro \
-  -v ~/ccp-logs:/var/log/ccp \
-  -e CCP_REPLACE_RULES=/etc/ccp-rules.toml \
-  -e CCP_LOG_FILE=/var/log/ccp/conversations.log \
-  ghcr.io/sonami-tech/claude-code-provider
-```
+## Models
 
-### Build from Source
+| Model | Aliases |
+|-------|---------|
+| `claude-opus-4-6` | `opus`, `claude-opus` |
+| `claude-sonnet-4-6` | `sonnet`, `claude-sonnet` |
+| `claude-haiku-4-5` | `haiku`, `claude-haiku` |
 
-```sh
-docker build -t claude-code-provider .
-```
-
-## Configuration
-
-| Flag | Env Var | Default | Description |
-|------|---------|---------|-------------|
-| `-p, --port` | `CCP_PORT` | `18321` | Listen port |
-| `-H, --host` | `CCP_HOST` | `127.0.0.1` | Listen address |
-| `-c, --max-concurrent` | `CCP_MAX_CONCURRENT` | `5` | Max simultaneous subprocesses |
-| `-t, --timeout` | `CCP_TIMEOUT` | `600` | Inactivity timeout (seconds) |
-| `-q, --queue-timeout` | `CCP_QUEUE_TIMEOUT` | `60` | Queue wait timeout (seconds) |
-| `--claude-path` | `CCP_CLAUDE_PATH` | `claude` | Path to Claude CLI binary |
-| `--data-dir` | `CCP_DATA_DIR` | Platform default | Data directory for config and stats |
-| `--working-dir` | `CCP_WORKING_DIR` | Config dir | Subprocess working directory |
-| `--no-isolate` | `CCP_NO_ISOLATE` | Off | Use host Claude config directly |
-| `--api-keys` | `CCP_API_KEYS` | Auto-generated | Comma-separated API keys (min 8 chars each) |
-| `--api-keys-file` | `CCP_API_KEYS_FILE` | None | File with one API key per line (# comments allowed) |
-| `--no-auth` | `CCP_NO_AUTH` | Off | Disable authentication entirely |
-| `--replace-rules` | `CCP_REPLACE_RULES` | None | TOML file with text replacement rules (see below) |
-| `--log-conversations` | `CCP_LOG_CONVERSATIONS` | Off | Log full prompts and responses |
-| `--log-file` | `CCP_LOG_FILE` | None | Write conversation logs to file (implies --log-conversations) |
-| `-v, --verbose` | | Off | Debug logging |
+Date-suffixed model names (e.g., `claude-sonnet-4-6-20260101`) are also resolved via substring matching. Unrecognized names fall back to Sonnet.
 
 ## API Endpoints
 
@@ -159,49 +136,17 @@ docker build -t claude-code-provider .
 
 All `/v1/*` endpoints also work without the prefix (`/chat/completions`, `/models`), so both `http://host:18321` and `http://host:18321/v1` work as a base URL.
 
-## Models
+## Documentation
 
-| Model | Aliases |
-|-------|---------|
-| `claude-opus-4-6` | `opus`, `claude-opus` |
-| `claude-sonnet-4-6` | `sonnet`, `claude-sonnet` |
-| `claude-haiku-4-5` | `haiku`, `claude-haiku` |
-
-## Text Replacement
-
-Automatic find-and-replace on prompts and/or responses. Create a TOML rules file:
-
-```toml
-# Inject context into prompts.
-[[rule]]
-scope = "prompt"
-search = "COMPANY_NAME"
-replace = "Acme Corp"
-
-# Remove boilerplate from responses.
-[[rule]]
-scope = "response"
-search = "As an AI language model, "
-replace = ""
-
-# Apply to both directions.
-[[rule]]
-scope = "both"
-search = "http://old.internal:8080"
-replace = "https://api.example.com"
-```
-
-```sh
-claude-code-provider --replace-rules rules.toml
-```
-
-Rules are applied in file order. Literal string matching only. For streaming responses, replacement is per-chunk (cross-chunk matches are rare but possible).
+- [Configuration reference](docs/configuration.md) - all flags, env vars, and defaults.
+- [Docker guide](docs/docker.md) - image tags, auth options, production setup.
+- [Architecture](docs/architecture.md) - request flow, subprocess lifecycle, design decisions.
 
 ## Limitations
 
-- **Latency** - each request spawns a `claude -p` subprocess (~100-500ms overhead).
+- **Latency** - each request spawns a `claude` subprocess.
 - **Text only** - image and audio content parts are silently ignored.
-- **No tool use** - subprocesses run with `--tools ""`.
+- **No tool use** - subprocesses run with tools disabled.
 - **Ignored parameters** - `max_tokens`, `temperature`, `top_p`, `stop` are accepted but not passed through.
 
 ## License
