@@ -36,6 +36,18 @@ The `RUST_LOG` environment variable overrides `-v` when set, allowing fine-grain
 
 Date-suffixed model names (e.g., `claude-sonnet-4-6-20260101`) are also resolved via substring matching. Unrecognized names fall back to Sonnet.
 
+## Reasoning Effort
+
+| Value | Behavior |
+|-------|----------|
+| `none` (or absent) | Default behavior, no extended thinking |
+| `low` | Light reasoning |
+| `medium` | Moderate reasoning |
+| `high` | Deep reasoning |
+| `max` | Maximum reasoning |
+
+Pass `reasoning_effort` in the request body. Maps directly to the CLI `--effort` flag. When absent or `none`, the flag is omitted and Claude uses its default behavior.
+
 ## API Endpoints
 
 | Endpoint | Description |

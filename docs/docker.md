@@ -5,11 +5,14 @@
 Images are published to GHCR on every push to `master` and on version tags.
 
 ```sh
-# Development. Built from every push to master.
-docker pull ghcr.io/sonami-tech/claude-code-provider:dev
+# Latest stable release.
+docker pull ghcr.io/sonami-tech/claude-code-provider:latest
 
 # Specific version.
-docker pull ghcr.io/sonami-tech/claude-code-provider:v0.1.0
+docker pull ghcr.io/sonami-tech/claude-code-provider:v1.1.1
+
+# Development. Built from every push to master.
+docker pull ghcr.io/sonami-tech/claude-code-provider:dev
 ```
 
 Multi-platform images are built for `linux/amd64` and `linux/arm64`.
@@ -21,13 +24,13 @@ Multi-platform images are built for `linux/amd64` and `linux/arm64`.
 ```sh
 docker run -p 18321:18321 \
   -v ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro \
-  ghcr.io/sonami-tech/claude-code-provider:dev
+  ghcr.io/sonami-tech/claude-code-provider:latest
 ```
 
 **Option B - Log in inside the container:**
 
 ```sh
-docker run -it --entrypoint /bin/bash -p 18321:18321 ghcr.io/sonami-tech/claude-code-provider:dev
+docker run -it --entrypoint /bin/bash -p 18321:18321 ghcr.io/sonami-tech/claude-code-provider:latest
 claude login            # authenticate once
 claude-code-provider    # start the proxy
 ```
@@ -53,7 +56,7 @@ docker run -p 18321:18321 \
   -v ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro \
   -v /path/to/keys.txt:/etc/ccp-keys:ro \
   -e CCP_API_KEYS_FILE=/etc/ccp-keys \
-  ghcr.io/sonami-tech/claude-code-provider:dev
+  ghcr.io/sonami-tech/claude-code-provider:latest
 ```
 
 Keys file format (one key per line, `#` comments allowed):
@@ -75,7 +78,7 @@ docker run -p 18321:18321 \
   -v ~/ccp-logs:/var/log/ccp \
   -e CCP_REPLACE_RULES=/etc/ccp-rules.toml \
   -e CCP_LOG_FILE=/var/log/ccp/conversations.log \
-  ghcr.io/sonami-tech/claude-code-provider:dev
+  ghcr.io/sonami-tech/claude-code-provider:latest
 ```
 
 ## Full Example
@@ -95,7 +98,7 @@ docker run -d \
   -e CCP_REPLACE_RULES=/etc/ccp-rules.toml \
   -e CCP_LOG_FILE=/var/log/ccp/conversations.log \
   -e CCP_MAX_CONCURRENT=10 \
-  ghcr.io/sonami-tech/claude-code-provider:dev
+  ghcr.io/sonami-tech/claude-code-provider:latest
 ```
 
 ## Verify
