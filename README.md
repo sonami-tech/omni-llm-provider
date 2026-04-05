@@ -15,17 +15,11 @@ An Anthropic Max subscription gives you Claude access through the Claude Code CL
 
 ## Features
 
-- **Model aliases** - `sonnet`, `opus`, `haiku` resolve automatically; unrecognized names fall back to Sonnet.
-- **Streaming and non-streaming** - SSE and JSON responses compatible with the official Python/TypeScript SDKs.
-- **Concurrency control** - bounded subprocess pool with configurable queue timeout.
-- **Reasoning effort** - `none`, `low`, `medium`, `high`, `max` via the `reasoning_effort` parameter.
-- **Tool/function calling** - OpenAI-compatible `tools` and `tool_calls` passthrough, enabled by default.
-- **Secure by default** - auto-generates an API key on startup; explicit keys and no-auth mode also supported.
-- **Persistent stats** - `/stats` dashboard and `/stats/json` endpoint with per-model and per-key metrics.
-- **Text replacement** - TOML-based find-and-replace rules for prompts, responses, or both.
-- **Conversation logging** - full prompt and response logging to stderr or a dedicated file.
-- **Isolated configuration** - subprocesses use a separate config directory, so the proxy never touches your existing Claude Code settings.
-- **Single binary** - no runtime dependencies beyond the Claude CLI.
+- **Drop-in OpenAI compatibility** — streaming and non-streaming responses work with any OpenAI SDK client, no code changes required.
+- **Tool/function calling** — OpenAI-compatible `tools` and `tool_calls` passthrough for agent frameworks like aider and LiteLLM.
+- **Text replacement** — TOML-based find-and-replace rules applied to prompts, responses, or both. Rewrite content on the fly without changing client code.
+- **Concurrency control** — bounded subprocess pool with configurable queue timeout. Supports multiple concurrent clients safely.
+- **Isolated and secure** — auto-generated API keys, separate config directory per subprocess, and no interference with your existing Claude Code settings.
 
 ## Quick Start
 
@@ -171,10 +165,7 @@ All `/v1/*` endpoints also work without the prefix (`/chat/completions`, `/model
 
 ## Limitations
 
-- **Latency** - each request spawns a `claude` subprocess.
-- **Text only** - image and audio content parts are silently ignored.
-- **Tool calling is prompt-based** - tool calls are simulated via prompt injection, not native API tool_use. Works reliably but streaming is buffered when tools are present.
-- **Ignored parameters** - `max_tokens`, `temperature`, `top_p`, `stop` are accepted but not passed through.
+- **Text only** — image and audio content parts are silently ignored.
 
 ## License
 

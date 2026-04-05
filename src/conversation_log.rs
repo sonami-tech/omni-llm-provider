@@ -30,7 +30,7 @@ impl ConversationLog {
 	}
 
 	pub fn log(&self, request_id: &str, direction: &str, label: &str, content: &str) {
-		let timestamp = timestamp_now();
+		let timestamp = crate::time_util::time_of_day_now();
 		let header = format!("[{}] {} {} {}", timestamp, request_id, direction, label);
 		let separator = "-".repeat(header.len().min(72));
 
@@ -47,14 +47,3 @@ impl ConversationLog {
 	}
 }
 
-fn timestamp_now() -> String {
-	use std::time::{SystemTime, UNIX_EPOCH};
-	let secs = SystemTime::now()
-		.duration_since(UNIX_EPOCH)
-		.unwrap_or_default()
-		.as_secs();
-	let hours = (secs % 86400) / 3600;
-	let minutes = (secs % 3600) / 60;
-	let seconds = secs % 60;
-	format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
-}

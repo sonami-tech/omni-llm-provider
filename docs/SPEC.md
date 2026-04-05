@@ -18,10 +18,12 @@ The proxy accepts standard OpenAI Chat Completions requests, translates them int
 
 - Anthropic Messages API format (`/v1/messages`).
 - OAuth token extraction or management (Claude Code handles its own auth).
-- MCP tool use or function calling passthrough.
+- MCP tool use (the proxy disables all built-in tools via `--tools ""`).
 - Multi-account load balancing.
 - Session persistence or multi-turn conversation state (clients manage their own history).
 - Web UI for chat (this is an API proxy, not a frontend).
+
+**Note:** OpenAI-compatible function/tool calling passthrough was added via prompt injection after the initial spec. See the Tool Call Passthrough section below.
 
 ---
 

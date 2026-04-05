@@ -14,7 +14,7 @@ pub enum ResolvedToolChoice {
 
 pub fn resolve_tool_choice(choice: &Option<ToolChoice>) -> ResolvedToolChoice {
 	match choice {
-		Option::None => ResolvedToolChoice::Auto,
+		None => ResolvedToolChoice::Auto,
 		Some(ToolChoice::Mode(s)) => match s.as_str() {
 			"none" => ResolvedToolChoice::None,
 			"required" => ResolvedToolChoice::Required,
@@ -177,7 +177,7 @@ fn extract_json_array(text: &str) -> Option<&str> {
 	if end > start {
 		Some(&text[start..=end])
 	} else {
-		Option::None
+		None
 	}
 }
 

@@ -130,6 +130,13 @@ Subprocesses have the following environment variables removed to prevent interfe
 - `ANTHROPIC_BASE_URL`
 - `ANTHROPIC_AUTH_TOKEN`
 
+## Known Limitations
+
+- **Text only** — image and audio content parts in messages are silently ignored; only text is extracted.
+- **Ignored parameters** — `max_tokens`, `temperature`, `top_p`, `stop`, and other sampling parameters are accepted for client compatibility but not forwarded to the CLI (no corresponding flags exist).
+- **Subprocess per request** — each request spawns a new `claude` subprocess, adding startup latency compared to a direct API connection.
+- **Buffered streaming with tools** — when `tools` are present, the response is buffered before streaming to detect whether it contains tool calls or plain text.
+
 ## Request Limits
 
 - **Request body**: 10 MB maximum.
