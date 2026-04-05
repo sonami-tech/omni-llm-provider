@@ -15,6 +15,7 @@ pub async fn stats_html_handler(State(state): State<Arc<AppState>>) -> impl Into
 	let snap = state.stats.snapshot();
 
 	let uptime = format_duration(snap.uptime_seconds);
+	let last_request = snap.last_request_at.as_deref().unwrap_or("–");
 
 	let error_rate = if snap.total_requests > 0 {
 		(snap.errors as f64 / snap.total_requests as f64) * 100.0
@@ -102,6 +103,7 @@ tr:nth-child(even) {{ background: #16213e; }}
 <div class="card"><div class="value">{errors}</div><div class="label">Errors</div></div>
 <div class="card"><div class="value">{error_rate:.1}%</div><div class="label">Error Rate</div></div>
 <div class="card"><div class="value">{cache_ratio:.1}%</div><div class="label">Cache Read Ratio</div></div>
+<div class="card"><div class="value" style="font-size:1em">{last_request}</div><div class="label">Last Request</div></div>
 </div>
 
 <h2>Per-Model Statistics</h2>
@@ -122,6 +124,7 @@ tr:nth-child(even) {{ background: #16213e; }}
 		errors = snap.errors,
 		error_rate = error_rate,
 		cache_ratio = cache_ratio,
+		last_request = last_request,
 		model_table = if model_rows.is_empty() {
 			"<p class=\"empty\">No requests yet.</p>".to_string()
 		} else {

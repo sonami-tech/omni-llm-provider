@@ -17,6 +17,7 @@ const REQUESTS_BY_MODEL: TableDefinition<&str, u64> = TableDefinition::new("requ
 const TOTAL_ERRORS: TableDefinition<&str, u64> = TableDefinition::new("total_errors");
 const TOKENS_BY_MODEL: TableDefinition<&str, &[u8]> = TableDefinition::new("tokens_by_model");
 const REQUESTS_BY_KEY: TableDefinition<&str, u64> = TableDefinition::new("requests_by_key");
+const LAST_REQUEST_AT: TableDefinition<&str, &str> = TableDefinition::new("last_request_at");
 const TOTAL_KEY: &str = "total";
 
 const MAX_LATENCY_SAMPLES: usize = 100;
@@ -53,6 +54,7 @@ pub struct StatsSnapshot {
 	pub total_output_tokens: u64,
 	pub total_cache_read_input_tokens: u64,
 	pub total_cache_creation_input_tokens: u64,
+	pub last_request_at: Option<String>,
 	pub models: HashMap<String, ModelStats>,
 	pub api_keys: HashMap<String, u64>,
 	pub recent_errors: Vec<ErrorRecord>,
@@ -94,6 +96,7 @@ impl Stats {
 		let _ = write_txn.open_table(TOTAL_ERRORS);
 		let _ = write_txn.open_table(TOKENS_BY_MODEL);
 		let _ = write_txn.open_table(REQUESTS_BY_KEY);
+		let _ = write_txn.open_table(LAST_REQUEST_AT);
 		write_txn.commit()?;
 
 		Ok(Self {
@@ -122,6 +125,10 @@ impl Stats {
 					let current = table.get(key_id).ok().flatten().map(|v| v.value()).unwrap_or(0);
 					let _ = table.insert(key_id, current + 1);
 				}
+			}
+			if let Ok(mut table) = write_txn.open_table(LAST_REQUEST_AT) {
+				let now = crate::time_util::iso_now();
+				let _ = table.insert(TOTAL_KEY, now.as_str());
 			}
 			let _ = write_txn.commit();
 		}
@@ -221,6 +228,7 @@ impl Stats {
 		// Read persistent data in a single transaction.
 		let mut total_requests = 0u64;
 		let mut total_errors = 0u64;
+		let mut last_request_at: Option<String> = None;
 		let mut requests_by_model: HashMap<String, u64> = HashMap::new();
 		let mut tokens_by_model: HashMap<String, TokenStats> = HashMap::new();
 		let mut api_keys: HashMap<String, u64> = HashMap::new();
@@ -235,6 +243,11 @@ impl Stats {
 				&& let Ok(Some(v)) = table.get(TOTAL_KEY)
 			{
 				total_errors = v.value();
+			}
+			if let Ok(table) = read_txn.open_table(LAST_REQUEST_AT)
+				&& let Ok(Some(v)) = table.get(TOTAL_KEY)
+			{
+				last_request_at = Some(v.value().to_string());
 			}
 			if let Ok(table) = read_txn.open_table(REQUESTS_BY_MODEL)
 				&& let Ok(iter) = table.iter()
@@ -318,6 +331,7 @@ impl Stats {
 			total_requests,
 			active_requests,
 			errors: total_errors,
+			last_request_at,
 			total_input_tokens: total_input,
 			total_output_tokens: total_output,
 			total_cache_read_input_tokens: total_cache_read,
