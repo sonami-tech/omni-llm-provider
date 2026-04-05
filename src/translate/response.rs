@@ -25,7 +25,23 @@ pub struct Choice {
 #[derive(Serialize)]
 pub struct ResponseMessage {
 	pub role: String,
-	pub content: String,
+	pub content: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub tool_calls: Option<Vec<ResponseToolCall>>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ResponseToolCall {
+	pub id: String,
+	#[serde(rename = "type")]
+	pub call_type: String,
+	pub function: ResponseFunctionCall,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ResponseFunctionCall {
+	pub name: String,
+	pub arguments: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -86,9 +102,37 @@ pub fn build_response(
 			index: 0,
 			message: ResponseMessage {
 				role: "assistant".to_string(),
-				content: content.to_string(),
+				content: Some(content.to_string()),
+				tool_calls: None,
 			},
 			finish_reason: "stop".to_string(),
+		}],
+		usage: extract_usage(result),
+	}
+}
+
+/// Build a non-streaming response containing tool calls.
+pub fn build_tool_call_response(
+	chat_id: &str,
+	created: u64,
+	model: &str,
+	tool_calls: Vec<ResponseToolCall>,
+	result: &ResultMessage,
+) -> ChatCompletionResponse {
+	ChatCompletionResponse {
+		id: chat_id.to_string(),
+		object: "chat.completion".to_string(),
+		created,
+		model: model.to_string(),
+		system_fingerprint: None,
+		choices: vec![Choice {
+			index: 0,
+			message: ResponseMessage {
+				role: "assistant".to_string(),
+				content: None,
+				tool_calls: Some(tool_calls),
+			},
+			finish_reason: "tool_calls".to_string(),
 		}],
 		usage: extract_usage(result),
 	}
@@ -235,7 +279,7 @@ mod tests {
 		assert!(resp.system_fingerprint.is_none());
 		assert_eq!(resp.choices.len(), 1);
 		assert_eq!(resp.choices[0].message.role, "assistant");
-		assert_eq!(resp.choices[0].message.content, "Hello");
+		assert_eq!(resp.choices[0].message.content, Some("Hello".into()));
 		assert_eq!(resp.choices[0].finish_reason, "stop");
 	}
 

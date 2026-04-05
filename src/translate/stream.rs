@@ -29,6 +29,28 @@ pub struct ChunkDelta {
 	pub role: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub content: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub tool_calls: Option<Vec<ChunkToolCall>>,
+}
+
+#[derive(Serialize)]
+pub struct ChunkToolCall {
+	pub index: u32,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub id: Option<String>,
+	#[serde(rename = "type")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub call_type: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub function: Option<ChunkFunctionCall>,
+}
+
+#[derive(Serialize)]
+pub struct ChunkFunctionCall {
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub name: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub arguments: Option<String>,
 }
 
 fn base_chunk(
@@ -70,6 +92,7 @@ pub fn content_chunk(
 					None
 				},
 				content: Some(text.to_string()),
+				tool_calls: None,
 			},
 			finish_reason: None,
 		}],
@@ -77,8 +100,8 @@ pub fn content_chunk(
 	)
 }
 
-/// Create the finish chunk with finish_reason: "stop".
-pub fn finish_chunk(id: &str, created: u64, model: &str) -> ChatCompletionChunk {
+/// Create the finish chunk with the given finish_reason.
+pub fn finish_chunk(id: &str, created: u64, model: &str, reason: &str) -> ChatCompletionChunk {
 	base_chunk(
 		id,
 		created,
@@ -88,11 +111,54 @@ pub fn finish_chunk(id: &str, created: u64, model: &str) -> ChatCompletionChunk 
 			delta: ChunkDelta {
 				role: None,
 				content: None,
+				tool_calls: None,
 			},
-			finish_reason: Some("stop".to_string()),
+			finish_reason: Some(reason.to_string()),
 		}],
 		None,
 	)
+}
+
+/// Create streaming chunks for tool calls. Returns one chunk per tool call.
+pub fn tool_call_chunks(
+	id: &str,
+	created: u64,
+	model: &str,
+	tool_calls: &[crate::translate::response::ResponseToolCall],
+) -> Vec<ChatCompletionChunk> {
+	tool_calls
+		.iter()
+		.enumerate()
+		.map(|(i, tc)| {
+			base_chunk(
+				id,
+				created,
+				model,
+				vec![ChunkChoice {
+					index: 0,
+					delta: ChunkDelta {
+						role: if i == 0 {
+							Some("assistant".to_string())
+						} else {
+							None
+						},
+						content: None,
+						tool_calls: Some(vec![ChunkToolCall {
+							index: i as u32,
+							id: Some(tc.id.clone()),
+							call_type: Some("function".to_string()),
+							function: Some(ChunkFunctionCall {
+								name: Some(tc.function.name.clone()),
+								arguments: Some(tc.function.arguments.clone()),
+							}),
+						}]),
+					},
+					finish_reason: None,
+				}],
+				None,
+			)
+		})
+		.collect()
 }
 
 /// Create the usage chunk (empty choices, usage populated).
@@ -134,7 +200,7 @@ mod tests {
 
 	#[test]
 	fn finish_chunk_has_stop() {
-		let chunk = finish_chunk("chatcmpl-abc", 1000, "claude-sonnet-4-6");
+		let chunk = finish_chunk("chatcmpl-abc", 1000, "claude-sonnet-4-6", "stop");
 		assert_eq!(
 			chunk.choices[0].finish_reason,
 			Some("stop".into())
@@ -182,7 +248,7 @@ mod tests {
 		assert!(json["choices"][0]["finish_reason"].is_null());
 		assert!(json["choices"][0].as_object().unwrap().contains_key("finish_reason"));
 		// Role and content should be absent (not null) when None on delta.
-		let chunk = finish_chunk("id", 0, "model");
+		let chunk = finish_chunk("id", 0, "model", "stop");
 		let json = serde_json::to_value(&chunk).unwrap();
 		let delta = &json["choices"][0]["delta"];
 		assert!(!delta.as_object().unwrap().contains_key("role"));

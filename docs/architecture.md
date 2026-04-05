@@ -61,7 +61,8 @@ src/
 └── translate/
     ├── request.rs       # OpenAI messages → CLI args + prompt
     ├── response.rs      # CLI result → OpenAI response JSON
-    └── stream.rs        # SSE chunk builders for streaming
+    ├── stream.rs        # SSE chunk builders for streaming
+    └── tools.rs         # Tool call prompt injection and response parsing
 ```
 
 ## Design Decisions
@@ -85,6 +86,21 @@ A `tokio::sync::Semaphore` limits concurrent subprocesses. This prevents resourc
 ### Text Replacement
 
 Replacement rules are loaded once at startup and stored in an `Arc<Replacements>`. Prompt replacements happen before the prompt is passed to the CLI. Response replacements happen after content is received (per-chunk for streaming, on full content for non-streaming).
+
+### Tool Call Passthrough
+
+The Claude Code CLI executes tools internally in its agent loop — there is no way to make it forward `tool_use` blocks to the caller. The proxy works around this with prompt injection:
+
+1. When a request includes `tools`, tool definitions are converted to text and prepended to the user message.
+2. `--tools ""` remains set so Claude Code never executes tools internally.
+3. The model responds with JSON tool call arrays as plain text.
+4. The proxy parses the text response, detects tool call JSON (stripping markdown code fences if present), and converts it to OpenAI `tool_calls` format.
+5. For multi-turn, the client's `tool` role messages are formatted as `<tool_result>` XML tags in the prompt.
+
+Key design constraints discovered through testing:
+- Tool dispatch instructions must go in the **user message**, not `--append-system-prompt`. The CLI's built-in system prompt overrides appended instructions.
+- Haiku wraps output in markdown code fences; Sonnet outputs clean JSON. The parser handles both.
+- When tools are present in streaming mode, the response is buffered to determine if it contains tool calls before emitting SSE chunks.
 
 ### Error Format
 

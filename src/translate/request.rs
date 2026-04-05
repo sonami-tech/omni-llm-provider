@@ -12,6 +12,10 @@ pub struct ChatCompletionRequest {
 	#[serde(default)]
 	pub stream: bool,
 	pub reasoning_effort: Option<String>,
+	#[serde(default)]
+	pub tools: Option<Vec<ToolDefinition>>,
+	#[serde(default)]
+	pub tool_choice: Option<ToolChoice>,
 	// All other OpenAI fields (max_tokens, temperature, top_p, stop, etc.)
 	// are accepted and silently ignored — no #[serde(deny_unknown_fields)].
 }
@@ -21,6 +25,60 @@ pub struct ChatMessage {
 	pub role: String,
 	#[serde(default)]
 	pub content: Option<MessageContent>,
+	#[serde(default)]
+	pub tool_calls: Option<Vec<RequestToolCall>>,
+	#[serde(default)]
+	pub tool_call_id: Option<String>,
+}
+
+// ── Tool types ───────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ToolDefinition {
+	#[serde(rename = "type")]
+	#[allow(dead_code)]
+	pub tool_type: Option<String>,
+	pub function: FunctionDefinition,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FunctionDefinition {
+	pub name: String,
+	pub description: Option<String>,
+	pub parameters: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+	Mode(String),
+	Specific {
+		#[serde(rename = "type")]
+		#[allow(dead_code)]
+		choice_type: String,
+		function: ToolChoiceFunction,
+	},
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ToolChoiceFunction {
+	pub name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RequestToolCall {
+	#[allow(dead_code)]
+	pub id: String,
+	#[serde(rename = "type")]
+	#[allow(dead_code)]
+	pub call_type: Option<String>,
+	pub function: RequestFunctionCall,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RequestFunctionCall {
+	pub name: String,
+	pub arguments: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,13 +143,30 @@ pub fn build_prompt_and_system(
 				}
 			}
 			"assistant" => {
-				prompt_parts.push(format!(
-					"<previous_response>\n{}\n</previous_response>",
-					text
-				));
+				if let Some(tool_calls) = &msg.tool_calls {
+					let tc_text = crate::translate::tools::format_assistant_tool_calls(tool_calls);
+					let combined = if text.is_empty() {
+						tc_text
+					} else {
+						format!("{}\n{}", tc_text, text)
+					};
+					prompt_parts.push(format!(
+						"<previous_response>\n{}\n</previous_response>",
+						combined
+					));
+				} else {
+					prompt_parts.push(format!(
+						"<previous_response>\n{}\n</previous_response>",
+						text
+					));
+				}
+			}
+			"tool" => {
+				prompt_parts.push(crate::translate::tools::format_tool_result(msg));
+				has_user_message = true;
 			}
 			_ => {
-				// user, tool, function, and other roles treated as user messages.
+				// user, function, and other roles treated as user messages.
 				if !text.is_empty() {
 					has_user_message = true;
 				}
@@ -173,6 +248,8 @@ mod tests {
 		ChatMessage {
 			role: role.into(),
 			content: Some(MessageContent::Text(content.into())),
+			tool_calls: None,
+			tool_call_id: None,
 		}
 	}
 
@@ -323,6 +400,8 @@ mod tests {
 			messages: vec![msg("user", "hi")],
 			stream: false,
 			reasoning_effort: None,
+			tools: None,
+			tool_choice: None,
 		};
 		assert!(validate_request(&req).is_err());
 	}
@@ -334,6 +413,8 @@ mod tests {
 			messages: vec![],
 			stream: false,
 			reasoning_effort: None,
+			tools: None,
+			tool_choice: None,
 		};
 		assert!(validate_request(&req).is_err());
 	}
@@ -345,6 +426,8 @@ mod tests {
 			messages: vec![msg("user", "hi")],
 			stream: false,
 			reasoning_effort: None,
+			tools: None,
+			tool_choice: None,
 		};
 		assert!(validate_request(&req).is_ok());
 	}

@@ -18,6 +18,7 @@ All options can be set via CLI flags or environment variables. CLI flags take pr
 | `--api-keys` | `CCP_API_KEYS` | Auto-generated | Comma-separated API keys (min 8 chars each) |
 | `--api-keys-file` | `CCP_API_KEYS_FILE` | None | File with one API key per line (`#` comments allowed) |
 | `--no-auth` | `CCP_NO_AUTH` | Off | Disable authentication entirely |
+| `--no-tool-passthrough` | `CCP_NO_TOOL_PASSTHROUGH` | Off | Disable tool/function call passthrough |
 | `--replace-rules` | `CCP_REPLACE_RULES` | None | TOML file with text replacement rules |
 | `--log-conversations` | `CCP_LOG_CONVERSATIONS` | Off | Log full prompts and responses to stderr |
 | `--log-file` | `CCP_LOG_FILE` | None | Write conversation logs to file (implies `--log-conversations`) |
@@ -97,6 +98,30 @@ Log format:
 
 System prompts are logged separately with the label `System`.
 
+## Tool/Function Calling
+
+Tool passthrough is enabled by default. When a request includes `tools`, the proxy:
+
+1. Converts tool definitions into prompt instructions prepended to the user message.
+2. Keeps `--tools ""` so Claude Code never executes tools internally.
+3. Parses the model's text response for structured JSON tool calls.
+4. Returns OpenAI-compatible `tool_calls` in the response.
+
+Supported `tool_choice` values:
+
+| Value | Behavior |
+|-------|----------|
+| `"auto"` (default) | Model decides whether to call tools or respond with text |
+| `"none"` | Tool injection skipped entirely, normal text response |
+| `"required"` | Soft nudge for the model to use a tool |
+| `{"type":"function","function":{"name":"X"}}` | Directs the model to call function X |
+
+Use `--no-tool-passthrough` to disable globally. When disabled, `tools` in requests are silently ignored.
+
+**Streaming with tools:** When tools are present, the response is buffered before streaming to detect whether it contains tool calls or plain text. The SSE keepalive (15s interval) maintains the connection during buffering.
+
+**Multi-turn:** Assistant messages with `tool_calls` and `tool` role messages with `tool_call_id` are formatted into the prompt so the model can read tool results and continue the conversation.
+
 ## Environment Variable Sanitization
 
 Subprocesses have the following environment variables removed to prevent interference:
@@ -128,7 +153,7 @@ Each request spawns a `claude` subprocess with these flags:
 
 - `-p` (print mode, non-interactive)
 - `--verbose --output-format stream-json --include-partial-messages` (NDJSON streaming output)
-- `--tools ""` (tools disabled)
+- `--tools ""` (Claude Code's built-in tools disabled; tool calling is handled via prompt injection)
 - `--model <model>` (resolved from the request)
 - `--no-session-persistence` (no conversation memory between requests)
 - `--append-system-prompt <text>` (if a system/developer message is present)

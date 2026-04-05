@@ -20,8 +20,12 @@ use crate::subprocess::manager::spawn_managed;
 use crate::translate::request::{
 	ChatCompletionRequest, build_cli_args, build_prompt_and_system, validate_request,
 };
-use crate::translate::response::{build_response, extract_usage};
+use crate::translate::response::{build_response, build_tool_call_response, extract_usage};
 use crate::translate::stream;
+use crate::translate::tools::{
+	ParsedResponse, ResolvedToolChoice, build_tool_prompt_prefix, parse_tool_response,
+	resolve_tool_choice, to_response_tool_calls,
+};
 
 pub async fn completions_handler(
 	State(state): State<Arc<AppState>>,
@@ -53,8 +57,20 @@ pub async fn completions_handler(
 	let model_def = resolve_model(&request.model);
 	let effort = validate_effort(request.reasoning_effort.as_deref())?;
 
+	// Resolve tool passthrough.
+	let resolved_choice = resolve_tool_choice(&request.tool_choice);
+	let tools_active = !state.config.no_tool_passthrough
+		&& request.tools.as_ref().is_some_and(|t| !t.is_empty())
+		&& !matches!(resolved_choice, ResolvedToolChoice::None);
+
 	// Build prompt and system prompt.
 	let (mut prompt, mut system_prompt) = build_prompt_and_system(&request.messages)?;
+
+	if tools_active {
+		let tools = request.tools.as_ref().unwrap();
+		let prefix = build_tool_prompt_prefix(tools, &resolved_choice);
+		prompt = format!("{}{}", prefix, prompt);
+	}
 
 	if !state.replacements.is_empty() {
 		prompt = state.replacements.apply_prompt(&prompt);
@@ -103,9 +119,9 @@ pub async fn completions_handler(
 	let conv_log = state.conversation_log.clone();
 	let request_id = request_id.to_string();
 	if request.stream {
-		handle_streaming(state, request_id, chat_id, created, model_def.canonical, cli_args, conv_log).await
+		handle_streaming(state, request_id, chat_id, created, model_def.canonical, cli_args, conv_log, tools_active).await
 	} else {
-		handle_non_streaming(state, request_id, chat_id, created, model_def.canonical, cli_args, conv_log)
+		handle_non_streaming(state, request_id, chat_id, created, model_def.canonical, cli_args, conv_log, tools_active)
 			.await
 	}
 }
@@ -118,6 +134,7 @@ async fn handle_non_streaming(
 	requested_model: &'static str,
 	cli_args: Vec<String>,
 	conv_log: Option<Arc<crate::conversation_log::ConversationLog>>,
+	tools_active: bool,
 ) -> Result<Response, AppError> {
 	let _active = crate::stats::ActiveRequestGuard::new(&state.stats);
 	let start = std::time::Instant::now();
@@ -198,6 +215,27 @@ async fn handle_non_streaming(
 		content = state.replacements.apply_response(&content);
 	}
 
+	// Parse for tool calls if tools are active.
+	if tools_active {
+		if let ParsedResponse::ToolCalls(calls) = parse_tool_response(&content) {
+			let tool_calls = to_response_tool_calls(calls);
+			info!("Detected {} tool call(s)", tool_calls.len());
+
+			if let Some(ref log) = conv_log {
+				log.log(&request_id, "<<<", "Tool calls", &content);
+			}
+
+			let response = build_tool_call_response(&chat_id, created, &model, tool_calls, &result);
+
+			let headers = [(
+				header::HeaderName::from_static("x-request-id"),
+				header::HeaderValue::from_str(&request_id).unwrap(),
+			)];
+
+			return Ok((headers, axum::Json(response)).into_response());
+		}
+	}
+
 	if let Some(ref log) = conv_log {
 		log.log(&request_id, "<<<", "Response", &content);
 	}
@@ -220,6 +258,7 @@ async fn handle_streaming(
 	requested_model: &'static str,
 	cli_args: Vec<String>,
 	conv_log: Option<Arc<crate::conversation_log::ConversationLog>>,
+	tools_active: bool,
 ) -> Result<Response, AppError> {
 	let (sub_tx, mut sub_rx) = mpsc::channel::<SubprocessEvent>(64);
 	let (sse_tx, sse_rx) = mpsc::channel::<Result<Event, Infallible>>(64);
@@ -246,7 +285,11 @@ async fn handle_streaming(
 		let mut is_first = true;
 		let mut content_sent = false;
 		let mut ttft_ms: Option<f64> = None;
-		let mut full_content = if conv_log.is_some() { Some(String::new()) } else { None };
+		let mut full_content = if conv_log.is_some() || tools_active {
+			Some(String::new())
+		} else {
+			None
+		};
 
 		// Initial :ok comment.
 		let _ = sse_tx.send(Ok(Event::default().comment("ok"))).await;
@@ -261,38 +304,46 @@ async fn handle_streaming(
 						ttft_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
 					}
 					content_sent = true;
-					let text = if !replacements.is_empty() {
-						replacements.apply_response(&text)
-					} else {
-						text
-					};
-					if let Some(ref mut buf) = full_content {
-						buf.push_str(&text);
-					}
-					let chunk = stream::content_chunk(
-						&conv_chat_id,
-						created,
-						&model,
-						&text,
-						is_first,
-					);
-					is_first = false;
 
-					match serde_json::to_string(&chunk) {
-						Ok(json) => {
-							if sse_tx.send(Ok(Event::default().data(json))).await.is_err() {
-								return; // Client disconnected.
-							}
+					if tools_active {
+						// Buffer mode: collect all content, parse for tool calls later.
+						if let Some(ref mut buf) = full_content {
+							buf.push_str(&text);
 						}
-						Err(e) => {
-							error!("Failed to serialize chunk: {}", e);
+					} else {
+						// Stream mode: emit chunks immediately.
+						let text = if !replacements.is_empty() {
+							replacements.apply_response(&text)
+						} else {
+							text
+						};
+						if let Some(ref mut buf) = full_content {
+							buf.push_str(&text);
+						}
+						let chunk = stream::content_chunk(
+							&conv_chat_id,
+							created,
+							&model,
+							&text,
+							is_first,
+						);
+						is_first = false;
+
+						match serde_json::to_string(&chunk) {
+							Ok(json) => {
+								if sse_tx.send(Ok(Event::default().data(json))).await.is_err() {
+									return;
+								}
+							}
+							Err(e) => {
+								error!("Failed to serialize chunk: {}", e);
+							}
 						}
 					}
 				}
 				SubprocessEvent::Result(result) => {
 					let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-					// Check is_error first.
 					if result.is_error.unwrap_or(false) {
 						let msg = result
 							.result
@@ -302,24 +353,94 @@ async fn handle_streaming(
 						let error_data = stream::error_event_data(&msg);
 						let _ = sse_tx.send(Ok(Event::default().data(error_data))).await;
 						if content_sent {
-							let _ = sse_tx
-								.send(Ok(Event::default().data("[DONE]")))
-								.await;
+							let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
 						}
 						return;
 					}
 
-					// Record successful completion.
 					stats.record_completion(&model, ttft_ms, duration_ms, &result);
 
-					if let (Some(log), Some(buf)) = (&conv_log, &full_content) {
-						log.log(&conv_request_id, "<<<", "Response", buf);
-					}
+					// Emit buffered tool calls or text if in tool mode.
+					if tools_active {
+						if let Some(ref mut buf) = full_content {
+							if !replacements.is_empty() {
+								*buf = replacements.apply_response(buf);
+							}
 
-					// Emit finish chunk.
-					let finish = stream::finish_chunk(&conv_chat_id, created, &model);
-					if let Ok(json) = serde_json::to_string(&finish) {
-						let _ = sse_tx.send(Ok(Event::default().data(json))).await;
+							match parse_tool_response(buf) {
+								ParsedResponse::ToolCalls(calls) => {
+									let tool_calls = to_response_tool_calls(calls);
+
+									if let Some(log) = &conv_log {
+										log.log(&conv_request_id, "<<<", "Tool calls", buf);
+									}
+
+									for chunk in stream::tool_call_chunks(
+										&conv_chat_id,
+										created,
+										&model,
+										&tool_calls,
+									) {
+										if let Ok(json) = serde_json::to_string(&chunk) {
+											let _ = sse_tx
+												.send(Ok(Event::default().data(json)))
+												.await;
+										}
+									}
+
+									let finish = stream::finish_chunk(
+										&conv_chat_id,
+										created,
+										&model,
+										"tool_calls",
+									);
+									if let Ok(json) = serde_json::to_string(&finish) {
+										let _ = sse_tx
+											.send(Ok(Event::default().data(json)))
+											.await;
+									}
+								}
+								ParsedResponse::Text => {
+									if let Some(log) = &conv_log {
+										log.log(&conv_request_id, "<<<", "Response", buf);
+									}
+
+									let chunk = stream::content_chunk(
+										&conv_chat_id,
+										created,
+										&model,
+										buf,
+										true,
+									);
+									if let Ok(json) = serde_json::to_string(&chunk) {
+										let _ = sse_tx
+											.send(Ok(Event::default().data(json)))
+											.await;
+									}
+
+									let finish = stream::finish_chunk(
+										&conv_chat_id,
+										created,
+										&model,
+										"stop",
+									);
+									if let Ok(json) = serde_json::to_string(&finish) {
+										let _ = sse_tx
+											.send(Ok(Event::default().data(json)))
+											.await;
+									}
+								}
+							}
+						}
+					} else {
+						if let (Some(log), Some(buf)) = (&conv_log, &full_content) {
+							log.log(&conv_request_id, "<<<", "Response", buf);
+						}
+
+						let finish = stream::finish_chunk(&conv_chat_id, created, &model, "stop");
+						if let Ok(json) = serde_json::to_string(&finish) {
+							let _ = sse_tx.send(Ok(Event::default().data(json))).await;
+						}
 					}
 
 					// Emit usage chunk.
@@ -331,7 +452,6 @@ async fn handle_streaming(
 						}
 					}
 
-					// Emit [DONE] sentinel.
 					let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
 				}
 				SubprocessEvent::Error(msg) => {
@@ -339,9 +459,7 @@ async fn handle_streaming(
 					let error_data = stream::error_event_data(&msg);
 					let _ = sse_tx.send(Ok(Event::default().data(error_data))).await;
 					if content_sent {
-						let _ = sse_tx
-							.send(Ok(Event::default().data("[DONE]")))
-							.await;
+						let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
 					}
 					return;
 				}

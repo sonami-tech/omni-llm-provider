@@ -56,6 +56,10 @@ pub struct Config {
 	#[arg(long, env = "CCP_NO_AUTH")]
 	pub no_auth: bool,
 
+	/// Disable tool/function call passthrough.
+	#[arg(long, env = "CCP_NO_TOOL_PASSTHROUGH")]
+	pub no_tool_passthrough: bool,
+
 	/// TOML file with text replacement rules.
 	#[arg(long, env = "CCP_REPLACE_RULES")]
 	pub replace_rules: Option<PathBuf>,

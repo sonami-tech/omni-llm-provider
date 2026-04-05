@@ -19,6 +19,7 @@ An Anthropic Max subscription gives you Claude access through the Claude Code CL
 - **Streaming and non-streaming** - SSE and JSON responses compatible with the official Python/TypeScript SDKs.
 - **Concurrency control** - bounded subprocess pool with configurable queue timeout.
 - **Reasoning effort** - `none`, `low`, `medium`, `high`, `max` via the `reasoning_effort` parameter.
+- **Tool/function calling** - OpenAI-compatible `tools` and `tool_calls` passthrough, enabled by default.
 - **Secure by default** - auto-generates an API key on startup; explicit keys and no-auth mode also supported.
 - **Persistent stats** - `/stats` dashboard and `/stats/json` endpoint with per-model and per-key metrics.
 - **Text replacement** - TOML-based find-and-replace rules for prompts, responses, or both.
@@ -114,6 +115,32 @@ claude-code-provider --replace-rules rules.toml
 
 Rules are applied in file order. Literal string matching only. Scopes: `prompt` (before sending to Claude), `response` (before returning to client), or `both`. For streaming responses, replacement is per-chunk.
 
+## Tool Calling
+
+Clients that send `tools` in their requests get OpenAI-compatible `tool_calls` back. The proxy translates tool definitions into prompt instructions, parses the model's response for structured JSON, and converts it to the standard `tool_calls` format. Multi-turn conversations with `tool` role messages are supported.
+
+```python
+response = client.chat.completions.create(
+    model="sonnet",
+    messages=[{"role": "user", "content": "What's the weather in London?"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get current weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+                "required": ["location"]
+            }
+        }
+    }]
+)
+# response.choices[0].message.tool_calls contains the function call
+```
+
+Tool passthrough is enabled by default. Use `--no-tool-passthrough` to disable. Supports `tool_choice` values: `auto`, `none`, `required`, and specific function selection. See [configuration reference](docs/configuration.md) for details.
+
 ## Models
 
 | Model | Aliases |
@@ -146,7 +173,7 @@ All `/v1/*` endpoints also work without the prefix (`/chat/completions`, `/model
 
 - **Latency** - each request spawns a `claude` subprocess.
 - **Text only** - image and audio content parts are silently ignored.
-- **No tool use** - subprocesses run with tools disabled.
+- **Tool calling is prompt-based** - tool calls are simulated via prompt injection, not native API tool_use. Works reliably but streaming is buffered when tools are present.
 - **Ignored parameters** - `max_tokens`, `temperature`, `top_p`, `stop` are accepted but not passed through.
 
 ## License
