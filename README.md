@@ -80,7 +80,7 @@ docker pull ghcr.io/sonami-tech/claude-code-provider:dev
 **Option A - Log in inside the container:**
 
 ```sh
-docker run -it -p 18321:18321 ghcr.io/sonami-tech/claude-code-provider bash
+docker run -it --entrypoint bash -p 18321:18321 ghcr.io/sonami-tech/claude-code-provider
 claude login            # authenticate once
 claude-code-provider    # start the proxy
 ```
