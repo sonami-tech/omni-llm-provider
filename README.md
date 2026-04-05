@@ -21,6 +21,7 @@ An Anthropic Max subscription gives you Claude access through the Claude Code CL
 - **Reasoning effort** - `low`, `medium`, `high`, `max` via the `reasoning_effort` parameter.
 - **Secure by default** - auto-generates an API key on startup; explicit keys and no-auth mode also supported.
 - **Persistent stats** - `/stats` dashboard and `/stats/json` endpoint with per-model and per-key metrics.
+- **Text replacement** - TOML-based find-and-replace rules for prompts, responses, or both.
 - **Isolated configuration** - subprocesses use a separate config directory, so the proxy never touches your existing Claude Code settings.
 - **Single binary** - no runtime dependencies beyond the Claude CLI.
 
@@ -101,6 +102,18 @@ docker run -p 18321:18321 \
   -v ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro \
   -v /path/to/keys.txt:/etc/ccp-keys:ro \
   -e CCP_API_KEYS_FILE=/etc/ccp-keys \
+  ghcr.io/sonami-tech/claude-code-provider
+```
+
+To use text replacement rules and conversation logging in Docker:
+
+```sh
+docker run -p 18321:18321 \
+  -v ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro \
+  -v /path/to/rules.toml:/etc/ccp-rules.toml:ro \
+  -v ~/ccp-logs:/var/log/ccp \
+  -e CCP_REPLACE_RULES=/etc/ccp-rules.toml \
+  -e CCP_LOG_FILE=/var/log/ccp/conversations.log \
   ghcr.io/sonami-tech/claude-code-provider
 ```
 
