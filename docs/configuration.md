@@ -26,6 +26,28 @@ All options can be set via CLI flags or environment variables. CLI flags take pr
 
 The `RUST_LOG` environment variable overrides `-v` when set, allowing fine-grained log filtering (e.g., `RUST_LOG=claude_code_provider=debug`).
 
+## Models
+
+| Model | Aliases |
+|-------|---------|
+| `claude-opus-4-6` | `opus`, `claude-opus` |
+| `claude-sonnet-4-6` | `sonnet`, `claude-sonnet` |
+| `claude-haiku-4-5` | `haiku`, `claude-haiku` |
+
+Date-suffixed model names (e.g., `claude-sonnet-4-6-20260101`) are also resolved via substring matching. Unrecognized names fall back to Sonnet.
+
+## API Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /v1/chat/completions` | Chat completions (streaming and non-streaming) |
+| `GET /v1/models` | List available models |
+| `GET /health` | Server health and active request count |
+| `GET /stats` | HTML stats dashboard |
+| `GET /stats/json` | Stats as JSON |
+
+All `/v1/*` endpoints also work without the prefix (`/chat/completions`, `/models`), so both `http://host:18321` and `http://host:18321/v1` work as a base URL.
+
 ## Authentication
 
 Three modes, in priority order:
@@ -71,7 +93,21 @@ Request statistics are stored in a `redb` database at `<data-dir>/stats.redb`. S
 
 ## Text Replacement
 
-See the [README](../README.md#text-replacement) for the TOML rule format. Additional details:
+Rules are defined in a TOML file passed via `--replace-rules` or `CCP_REPLACE_RULES`. Each rule has a `scope` (`prompt`, `response`, or `both`), a `search` string, and a `replace` string. Example:
+
+```toml
+[[rule]]
+scope = "prompt"
+search = "Acme"
+replace = "SomeStringNobodyElseWouldChoose"
+
+[[rule]]
+scope = "response"
+search = "SomeStringNobodyElseWouldChoose"
+replace = "Acme"
+```
+
+Additional details:
 
 - Rules are loaded once at startup. Restart the server to pick up changes.
 - `Both`-scoped rules are expanded into separate prompt and response rules internally.

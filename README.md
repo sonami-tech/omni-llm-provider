@@ -11,17 +11,71 @@ An OpenAI-compatible API server that translates Chat Completions requests into C
 
 ## Why
 
-An Anthropic Max subscription gives you Claude access through the Claude Code CLI. This proxy lets tools like aider, Open WebUI, OpenClaw, LiteLLM, and any OpenAI SDK client use that same access. Every request goes through the official `claude` binary, the same interface Anthropic provides and supports.
+An Anthropic Max subscription gives you Claude access through the Claude Code CLI. This proxy lets any OpenAI SDK client use that same access. Every request goes through the official `claude` binary, the same interface Anthropic provides and supports.
 
 ## Features
 
-- **Drop-in OpenAI compatibility** — streaming and non-streaming responses work with any OpenAI SDK client, no code changes required.
-- **Tool/function calling** — OpenAI-compatible `tools` and `tool_calls` passthrough for agent frameworks like aider and LiteLLM.
-- **Text replacement** — TOML-based find-and-replace rules applied to prompts, responses, or both. Rewrite content on the fly without changing client code.
-- **Concurrency control** — bounded subprocess pool with configurable queue timeout. Supports multiple concurrent clients safely.
-- **Isolated and secure** — auto-generated API keys, separate config directory per subprocess, and no interference with your existing Claude Code settings.
+- **Drop-in OpenAI compatibility** - streaming and non-streaming responses work with any OpenAI SDK client, no code changes required.
+- **Tool/function calling** - OpenAI-compatible `tools` and `tool_calls` passthrough, enabled by default.
+- **Text replacement** - TOML-based find-and-replace rules applied to prompts, responses, or both. Rewrite content on the fly without changing client code.
+- **Concurrency control** - bounded subprocess pool with configurable queue timeout. Supports multiple concurrent clients safely.
+- **Isolated and secure** - auto-generated API keys, separate config directory per subprocess, and no interference with your existing Claude Code settings.
 
-## Quick Start
+## Quick Start: Docker
+
+### 1. Create an API key file
+
+```sh
+echo "sk-my-secret-key-here" > ~/ccp-keys.txt
+```
+
+### 2. Create a text replacement rules file
+
+Text replacement lets you rewrite prompts before they reach Claude and responses before they return to the client. A common use case is masking a product name so Claude does not develop biases about it:
+
+```sh
+cat > ~/ccp-rules.toml << 'EOF'
+# Mask brand name in prompts sent to Claude.
+[[rule]]
+scope = "prompt"
+search = "Acme"
+replace = "SomeStringNobodyElseWouldChoose"
+
+[[rule]]
+scope = "prompt"
+search = "acme"
+replace = "somestringnobodyelsewould"
+
+# Restore brand name in responses back to the client.
+[[rule]]
+scope = "response"
+search = "SomeStringNobodyElseWouldChoose"
+replace = "Acme"
+
+[[rule]]
+scope = "response"
+search = "somestringnobodyelsewould"
+replace = "acme"
+EOF
+```
+
+### 3. Run the container
+
+```sh
+docker run -p 18321:18321 \
+  -v ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro \
+  -v ~/ccp-rules.toml:/root/ccp-rules.toml:ro \
+  -v ~/ccp-keys.txt:/root/ccp-keys.txt:ro \
+  -e CCP_API_KEYS_FILE=/root/ccp-keys.txt \
+  -e CCP_REPLACE_RULES=/root/ccp-rules.toml \
+  ghcr.io/sonami-tech/claude-code-provider:dev
+```
+
+The server starts on port 18321. Point any OpenAI SDK client at `http://your-host:18321/v1` with the API key from your keys file.
+
+See [Docker documentation](docs/docker.md) for image tags, alternative auth methods, and production setup.
+
+## Quick Start: Build from Source
 
 ### Prerequisites
 
@@ -32,21 +86,27 @@ An Anthropic Max subscription gives you Claude access through the Claude Code CL
    ```
 2. **[Rust toolchain](https://rustup.rs)** (1.85+ for edition 2024).
 
-### Build and Run
+### 1. Create an API key file and rules file
+
+Follow steps 1 and 2 from the Docker section above.
+
+### 2. Build and run
 
 ```sh
 git clone <repo-url> claude-code-provider
 cd claude-code-provider
 cargo build --release
-./target/release/claude-code-provider
+./target/release/claude-code-provider \
+  --api-keys-file ~/ccp-keys.txt \
+  --replace-rules ~/ccp-rules.toml
 ```
 
-An API key is auto-generated on startup and printed to the log. Use it with any OpenAI SDK client:
+### 3. Test it
 
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:18321/v1", api_key="<key from startup log>")
+client = OpenAI(base_url="http://127.0.0.1:18321/v1", api_key="sk-my-secret-key-here")
 
 response = client.chat.completions.create(
     model="sonnet",
@@ -55,117 +115,25 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-## Docker
-
-```sh
-docker run -p 18321:18321 \
-  -v ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro \
-  ghcr.io/sonami-tech/claude-code-provider:dev
-```
-
-The auto-generated API key is printed to the container log. See [Docker documentation](docs/docker.md) for image tags, alternative auth methods, and production setup.
-
-## API Keys
-
-An API key is auto-generated on startup by default. To use your own:
-
-```sh
-# Single key via environment variable.
-claude-code-provider --api-keys my-secret-key
-
-# Multiple keys from a file.
-claude-code-provider --api-keys-file keys.txt
-
-# Disable auth entirely.
-claude-code-provider --no-auth
-```
-
-Keys must be at least 8 characters. In Docker, avoid `-e CCP_API_KEYS=...` (visible in `docker inspect`) and mount a keys file instead. See [configuration reference](docs/configuration.md) for details.
-
 ## Text Replacement
 
-Automatic find-and-replace on prompts and/or responses. Create a TOML rules file:
+Rules are defined in a TOML file with three scopes:
 
-```toml
-[[rule]]
-scope = "prompt"
-search = "COMPANY_NAME"
-replace = "Acme Corp"
+- `prompt` - applied before sending to Claude.
+- `response` - applied before returning to the client.
+- `both` - applied in both directions.
 
-[[rule]]
-scope = "response"
-search = "As an AI language model, "
-replace = ""
-
-[[rule]]
-scope = "both"
-search = "http://old.internal:8080"
-replace = "https://api.example.com"
-```
-
-```sh
-claude-code-provider --replace-rules rules.toml
-```
-
-Rules are applied in file order. Literal string matching only. Scopes: `prompt` (before sending to Claude), `response` (before returning to client), or `both`. For streaming responses, replacement is per-chunk.
-
-## Tool Calling
-
-Clients that send `tools` in their requests get OpenAI-compatible `tool_calls` back. The proxy translates tool definitions into prompt instructions, parses the model's response for structured JSON, and converts it to the standard `tool_calls` format. Multi-turn conversations with `tool` role messages are supported.
-
-```python
-response = client.chat.completions.create(
-    model="sonnet",
-    messages=[{"role": "user", "content": "What's the weather in London?"}],
-    tools=[{
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get current weather",
-            "parameters": {
-                "type": "object",
-                "properties": {"location": {"type": "string"}},
-                "required": ["location"]
-            }
-        }
-    }]
-)
-# response.choices[0].message.tool_calls contains the function call
-```
-
-Tool passthrough is enabled by default. Use `--no-tool-passthrough` to disable. Supports `tool_choice` values: `auto`, `none`, `required`, and specific function selection. See [configuration reference](docs/configuration.md) for details.
-
-## Models
-
-| Model | Aliases |
-|-------|---------|
-| `claude-opus-4-6` | `opus`, `claude-opus` |
-| `claude-sonnet-4-6` | `sonnet`, `claude-sonnet` |
-| `claude-haiku-4-5` | `haiku`, `claude-haiku` |
-
-Date-suffixed model names (e.g., `claude-sonnet-4-6-20260101`) are also resolved via substring matching. Unrecognized names fall back to Sonnet.
-
-## API Endpoints
-
-| Endpoint | Description |
-|----------|-------------|
-| `POST /v1/chat/completions` | Chat completions (streaming and non-streaming) |
-| `GET /v1/models` | List available models |
-| `GET /health` | Server health and active request count |
-| `GET /stats` | HTML stats dashboard |
-| `GET /stats/json` | Stats as JSON |
-
-All `/v1/*` endpoints also work without the prefix (`/chat/completions`, `/models`), so both `http://host:18321` and `http://host:18321/v1` work as a base URL.
-
-## Documentation
-
-- [Configuration reference](docs/configuration.md) - all flags, env vars, and defaults.
-- [Docker guide](docs/docker.md) - image tags, auth options, production setup.
-- [Architecture](docs/architecture.md) - request flow, subprocess lifecycle, design decisions.
+Rules are applied in file order using literal string matching. See [configuration reference](docs/configuration.md#text-replacement) for details on streaming behavior and rule loading.
 
 ## Limitations
 
-- **Text only** — image and audio content parts are silently ignored.
+- **Text only** - image and audio content parts are silently ignored.
+
+## Documentation
+
+- [Configuration reference](docs/configuration.md) - all flags, env vars, models, endpoints, and defaults.
+- [Docker guide](docs/docker.md) - image tags, auth options, production setup.
+- [Architecture](docs/architecture.md) - request flow, subprocess lifecycle, design decisions.
 
 ## License
 
