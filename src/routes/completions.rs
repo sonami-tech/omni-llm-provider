@@ -54,7 +54,12 @@ pub async fn completions_handler(
 	let effort = validate_effort(request.reasoning_effort.as_deref())?;
 
 	// Build prompt and system prompt.
-	let (prompt, system_prompt) = build_prompt_and_system(&request.messages)?;
+	let (mut prompt, mut system_prompt) = build_prompt_and_system(&request.messages)?;
+
+	if !state.replacements.is_empty() {
+		prompt = state.replacements.apply_prompt(&prompt);
+		system_prompt = system_prompt.map(|sp| state.replacements.apply_prompt(&sp));
+	}
 
 	// Size checks (Linux MAX_ARG_STRLEN is ~128KB per argument).
 	const MAX_ARG_LEN: usize = 128_000;
@@ -189,6 +194,10 @@ async fn handle_non_streaming(
 		content = result.result.clone().unwrap_or_default();
 	}
 
+	if !state.replacements.is_empty() {
+		content = state.replacements.apply_response(&content);
+	}
+
 	if let Some(ref log) = conv_log {
 		log.log(&request_id, "<<<", "Response", &content);
 	}
@@ -228,6 +237,7 @@ async fn handle_streaming(
 	let conv_chat_id = chat_id.clone();
 	let conv_request_id = request_id.clone();
 	let conv_model = requested_model.to_string();
+	let replacements = state.replacements.clone();
 	let stats = state.stats.clone();
 	tokio::spawn(async move {
 		let _active = crate::stats::ActiveRequestGuard::new(&stats);
@@ -251,6 +261,11 @@ async fn handle_streaming(
 						ttft_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
 					}
 					content_sent = true;
+					let text = if !replacements.is_empty() {
+						replacements.apply_response(&text)
+					} else {
+						text
+					};
 					if let Some(ref mut buf) = full_content {
 						buf.push_str(&text);
 					}

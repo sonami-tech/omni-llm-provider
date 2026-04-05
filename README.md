@@ -126,6 +126,7 @@ docker build -t claude-code-provider .
 | `--api-keys` | `CCP_API_KEYS` | Auto-generated | Comma-separated API keys (min 8 chars each) |
 | `--api-keys-file` | `CCP_API_KEYS_FILE` | None | File with one API key per line (# comments allowed) |
 | `--no-auth` | `CCP_NO_AUTH` | Off | Disable authentication entirely |
+| `--replace-rules` | `CCP_REPLACE_RULES` | None | TOML file with text replacement rules (see below) |
 | `--log-conversations` | `CCP_LOG_CONVERSATIONS` | Off | Log full prompts and responses |
 | `--log-file` | `CCP_LOG_FILE` | None | Write conversation logs to file (implies --log-conversations) |
 | `-v, --verbose` | | Off | Debug logging |
@@ -149,6 +150,36 @@ All `/v1/*` endpoints also work without the prefix (`/chat/completions`, `/model
 | `claude-opus-4-6` | `opus`, `claude-opus` |
 | `claude-sonnet-4-6` | `sonnet`, `claude-sonnet` |
 | `claude-haiku-4-5` | `haiku`, `claude-haiku` |
+
+## Text Replacement
+
+Automatic find-and-replace on prompts and/or responses. Create a TOML rules file:
+
+```toml
+# Inject context into prompts.
+[[rule]]
+scope = "prompt"
+search = "COMPANY_NAME"
+replace = "Acme Corp"
+
+# Remove boilerplate from responses.
+[[rule]]
+scope = "response"
+search = "As an AI language model, "
+replace = ""
+
+# Apply to both directions.
+[[rule]]
+scope = "both"
+search = "http://old.internal:8080"
+replace = "https://api.example.com"
+```
+
+```sh
+claude-code-provider --replace-rules rules.toml
+```
+
+Rules are applied in file order. Literal string matching only. For streaming responses, replacement is per-chunk (cross-chunk matches are rare but possible).
 
 ## Limitations
 

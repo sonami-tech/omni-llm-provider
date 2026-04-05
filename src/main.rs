@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod conversation_log;
 mod error;
+mod replacements;
 mod models;
 mod routes;
 mod stats;
@@ -32,6 +33,7 @@ pub struct AppState {
 	pub semaphore: Arc<Semaphore>,
 	pub stats: Arc<stats::Stats>,
 	pub conversation_log: Option<Arc<conversation_log::ConversationLog>>,
+	pub replacements: Arc<replacements::Replacements>,
 }
 
 #[tokio::main]
@@ -195,11 +197,24 @@ async fn main() {
 		None
 	};
 
+	// Load replacement rules.
+	let replacements = if let Some(ref path) = config.replace_rules {
+		let r = replacements::Replacements::load(path).unwrap_or_else(|e| {
+			error!("{}", e);
+			std::process::exit(1);
+		});
+		info!("Loaded {} replacement rules from {:?}", r.count(), path);
+		Arc::new(r)
+	} else {
+		Arc::new(replacements::Replacements::empty())
+	};
+
 	let state = Arc::new(AppState {
 		config: config.clone(),
 		semaphore,
 		stats: Arc::new(stats_db),
 		conversation_log,
+		replacements,
 	});
 
 	// Resolve API keys: no-auth, explicit, or auto-generated.
