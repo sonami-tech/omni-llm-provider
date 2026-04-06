@@ -35,10 +35,13 @@ pub fn build_tool_prompt_prefix(
 ) -> String {
 	let mut prefix = String::from(
 		"<tool_definitions>\n\
-		 You have access to the following tools. To call a tool, respond with a JSON array \
+		 You have access to the following tools. To call a tool, respond with ONLY a JSON array \
 		 of tool call objects. Each object must have \"name\" (string) and \"arguments\" (object) \
-		 fields. Respond ONLY with the JSON array if you need to call tools. If you do not need \
-		 to call any tool, respond normally with text.\n\n",
+		 fields.\n\n\
+		 CRITICAL: You must choose ONE response type per message:\n\
+		 - EITHER a JSON tool call array with NO surrounding text\n\
+		 - OR normal text with NO embedded JSON tool calls\n\
+		 NEVER mix text and tool calls in the same response.\n\n",
 	);
 
 	for tool in tools {
@@ -110,23 +113,25 @@ struct ToolCallCandidate {
 }
 
 /// Parse a model response to detect tool call JSON or plain text.
+/// The prompt instructs the model to respond with ONLY a JSON array (no surrounding text),
+/// but models sometimes mix prose and tool calls anyway. The parser handles both clean
+/// and mixed responses as a defensive fallback.
 pub fn parse_tool_response(raw: &str) -> ParsedResponse {
 	let stripped = strip_code_fences(raw.trim());
 
-	// Try to extract a JSON array from the text.
-	if let Some(json_str) = extract_json_array(stripped) {
+	let mut all_calls = Vec::new();
+	for json_str in extract_json_arrays(stripped) {
 		if let Ok(candidates) = serde_json::from_str::<Vec<ToolCallCandidate>>(json_str) {
 			if !candidates.is_empty() && candidates.iter().all(|c| validate_candidate(c)) {
-				let calls = candidates
-					.into_iter()
-					.map(|c| ParsedToolCall {
-						name: c.name,
-						arguments: c.arguments,
-					})
-					.collect();
-				return ParsedResponse::ToolCalls(calls);
+				all_calls.extend(candidates.into_iter().map(|c| ParsedToolCall {
+					name: c.name,
+					arguments: c.arguments,
+				}));
 			}
 		}
+	}
+	if !all_calls.is_empty() {
+		return ParsedResponse::ToolCalls(all_calls);
 	}
 
 	// Try single object: {"name": "...", "arguments": {...}}
@@ -170,15 +175,69 @@ fn strip_code_fences(text: &str) -> &str {
 	}
 }
 
-/// Extract a JSON array substring from text. Finds the first `[` and last `]`.
-fn extract_json_array(text: &str) -> Option<&str> {
-	let start = text.find('[')?;
-	let end = text.rfind(']')?;
-	if end > start {
-		Some(&text[start..=end])
-	} else {
-		None
+/// Extract all balanced JSON array substrings from text.
+/// Tracks bracket nesting and string literals to find each top-level `[...]`.
+fn extract_json_arrays(text: &str) -> Vec<&str> {
+	let mut results = Vec::new();
+	let bytes = text.as_bytes();
+	let mut i = 0;
+
+	while i < bytes.len() {
+		if bytes[i] == b'[' {
+			if let Some(end) = find_balanced_close(bytes, i) {
+				let candidate = &text[i..=end];
+				if candidate.contains("\"name\"") {
+					results.push(candidate);
+				}
+				i = end + 1;
+				continue;
+			} else {
+				// Unbalanced bracket — skip to end to avoid O(n^2) rescanning.
+				break;
+			}
+		}
+		i += 1;
 	}
+
+	results
+}
+
+/// Find the matching `]` for a `[` at `start`, respecting nesting and JSON strings.
+fn find_balanced_close(bytes: &[u8], start: usize) -> Option<usize> {
+	let mut depth = 0i32;
+	let mut in_string = false;
+	let mut i = start;
+
+	while i < bytes.len() {
+		let b = bytes[i];
+
+		if in_string {
+			if b == b'\\' {
+				// Skip escaped character. Safe for UTF-8: all JSON escape sequences
+				// after `\` are ASCII, and continuation bytes (0x80-0xBF) cannot
+				// collide with the delimiters we track (`"`, `[`, `]`).
+				i += 1;
+			} else if b == b'"' {
+				in_string = false;
+			}
+		} else {
+			match b {
+				b'"' => in_string = true,
+				b'[' => depth += 1,
+				b']' => {
+					depth -= 1;
+					if depth == 0 {
+						return Some(i);
+					}
+				}
+				_ => {}
+			}
+		}
+
+		i += 1;
+	}
+
+	None
 }
 
 /// Generate a unique tool call ID.
@@ -355,6 +414,63 @@ mod tests {
 		match parse_tool_response(raw) {
 			ParsedResponse::ToolCalls(calls) => {
 				assert_eq!(calls.len(), 1);
+			}
+			ParsedResponse::Text => panic!("Expected ToolCalls"),
+		}
+	}
+
+	#[test]
+	fn parse_tool_calls_embedded_in_prose() {
+		let raw = r#"Let me find those.[{"name": "exec", "arguments": {"command": "ls", "timeout": 10}}]  The latest error is a 403."#;
+		match parse_tool_response(raw) {
+			ParsedResponse::ToolCalls(calls) => {
+				assert_eq!(calls.len(), 1);
+				assert_eq!(calls[0].name, "exec");
+				assert_eq!(calls[0].arguments["command"], "ls");
+			}
+			ParsedResponse::Text => panic!("Expected ToolCalls"),
+		}
+	}
+
+	#[test]
+	fn parse_multiple_tool_call_arrays_in_prose() {
+		let raw = r#"Some text [{"name": "a", "arguments": {"x": 1}}] middle text [{"name": "b", "arguments": {"y": 2}}] end"#;
+		match parse_tool_response(raw) {
+			ParsedResponse::ToolCalls(calls) => {
+				assert_eq!(calls.len(), 2);
+				assert_eq!(calls[0].name, "a");
+				assert_eq!(calls[1].name, "b");
+			}
+			ParsedResponse::Text => panic!("Expected ToolCalls"),
+		}
+	}
+
+	#[test]
+	fn parse_tool_calls_with_nested_arrays_in_args() {
+		let raw = r#"Here: [{"name": "f", "arguments": {"items": ["a", "b"]}}] done"#;
+		match parse_tool_response(raw) {
+			ParsedResponse::ToolCalls(calls) => {
+				assert_eq!(calls.len(), 1);
+				assert_eq!(calls[0].name, "f");
+				assert!(calls[0].arguments["items"].is_array());
+			}
+			ParsedResponse::Text => panic!("Expected ToolCalls"),
+		}
+	}
+
+	#[test]
+	fn plain_text_with_brackets_not_tool_calls() {
+		let raw = "The array [1, 2, 3] contains numbers.";
+		assert!(matches!(parse_tool_response(raw), ParsedResponse::Text));
+	}
+
+	#[test]
+	fn escaped_quotes_in_arguments() {
+		let raw = r#"[{"name": "exec", "arguments": {"command": "echo \"hello\""}}]"#;
+		match parse_tool_response(raw) {
+			ParsedResponse::ToolCalls(calls) => {
+				assert_eq!(calls.len(), 1);
+				assert_eq!(calls[0].name, "exec");
 			}
 			ParsedResponse::Text => panic!("Expected ToolCalls"),
 		}
