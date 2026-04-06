@@ -103,7 +103,7 @@ tr:nth-child(even) {{ background: #16213e; }}
 <div class="card"><div class="value">{errors}</div><div class="label">Errors</div></div>
 <div class="card"><div class="value">{error_rate:.1}%</div><div class="label">Error Rate</div></div>
 <div class="card"><div class="value">{cache_ratio:.1}%</div><div class="label">Cache Read Ratio</div></div>
-<div class="card"><div class="value" style="font-size:1em">{last_request}</div><div class="label">Last Request</div></div>
+<div class="card"><div class="value">{last_request}</div><div class="label">Last Request</div></div>
 </div>
 
 <h2>Per-Model Statistics</h2>

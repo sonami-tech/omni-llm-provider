@@ -9,7 +9,7 @@ Images are published to GHCR on every push to `master` and on version tags.
 docker pull ghcr.io/sonami-tech/claude-code-provider:latest
 
 # Specific version.
-docker pull ghcr.io/sonami-tech/claude-code-provider:v1.1.1
+docker pull ghcr.io/sonami-tech/claude-code-provider:v1.1.2
 
 # Development. Built from every push to master.
 docker pull ghcr.io/sonami-tech/claude-code-provider:dev
