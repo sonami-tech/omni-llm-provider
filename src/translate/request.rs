@@ -197,6 +197,7 @@ pub fn build_cli_args(
 	prompt: &str,
 	system_prompt: Option<&str>,
 	effort: Option<&str>,
+	max_turns: u32,
 ) -> Vec<String> {
 	let mut args = vec![
 		"-p".to_string(),
@@ -209,6 +210,8 @@ pub fn build_cli_args(
 		"--model".to_string(),
 		model_def.cli_name.to_string(),
 		"--no-session-persistence".to_string(),
+		"--max-turns".to_string(),
+		max_turns.to_string(),
 	];
 
 	if let Some(sp) = system_prompt {
@@ -356,7 +359,7 @@ mod tests {
 	#[test]
 	fn cli_args_basic() {
 		let model_def = &crate::models::MODELS[1]; // sonnet
-		let args = build_cli_args(model_def, "Hello", None, None);
+		let args = build_cli_args(model_def, "Hello", None, None, 3);
 		assert!(args.contains(&"-p".to_string()));
 		assert!(args.contains(&"--verbose".to_string()));
 		assert!(args.contains(&"--output-format".to_string()));
@@ -367,6 +370,8 @@ mod tests {
 		assert!(args.contains(&"--model".to_string()));
 		assert!(args.contains(&"sonnet".to_string()));
 		assert!(args.contains(&"--no-session-persistence".to_string()));
+		assert!(args.contains(&"--max-turns".to_string()));
+		assert!(args.contains(&"3".to_string()));
 		assert!(!args.contains(&"--append-system-prompt".to_string()));
 		assert!(!args.contains(&"--effort".to_string()));
 		assert_eq!(args.last().unwrap(), "Hello");
@@ -375,7 +380,7 @@ mod tests {
 	#[test]
 	fn cli_args_with_system_and_effort() {
 		let model_def = &crate::models::MODELS[0]; // opus
-		let args = build_cli_args(model_def, "Hello", Some("Be concise"), Some("high"));
+		let args = build_cli_args(model_def, "Hello", Some("Be concise"), Some("high"), 3);
 		assert!(args.contains(&"--append-system-prompt".to_string()));
 		assert!(args.contains(&"Be concise".to_string()));
 		assert!(args.contains(&"--effort".to_string()));
@@ -386,7 +391,7 @@ mod tests {
 	#[test]
 	fn tools_empty_string_is_separate_arg() {
 		let model_def = &crate::models::MODELS[1];
-		let args = build_cli_args(model_def, "test", None, None);
+		let args = build_cli_args(model_def, "test", None, None, 3);
 		let tools_idx = args.iter().position(|a| a == "--tools").unwrap();
 		assert_eq!(args[tools_idx + 1], "");
 	}

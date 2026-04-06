@@ -28,6 +28,10 @@ pub struct Config {
 	#[arg(short = 'q', long, default_value = "60", env = "CCP_QUEUE_TIMEOUT")]
 	pub queue_timeout: u64,
 
+	/// Max agentic turns per request (passed to CLI as --max-turns).
+	#[arg(long, default_value = "3", env = "CCP_MAX_TURNS")]
+	pub max_turns: u32,
+
 	/// Path to claude CLI binary.
 	#[arg(long, default_value = "claude", env = "CCP_CLAUDE_PATH")]
 	pub claude_path: String,
