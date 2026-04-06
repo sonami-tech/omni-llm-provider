@@ -14,6 +14,7 @@ pub async fn spawn_managed(
 	config: Config,
 	semaphore: Arc<Semaphore>,
 	queue_timeout: Duration,
+	request_id: String,
 	cli_args: Vec<String>,
 	tx: mpsc::Sender<SubprocessEvent>,
 ) -> Result<(), AppError> {
@@ -34,7 +35,7 @@ pub async fn spawn_managed(
 
 	tokio::spawn(async move {
 		let _permit = permit; // Held until task completes.
-		run_subprocess(&config, cli_args, tx).await;
+		run_subprocess(&config, &request_id, cli_args, tx).await;
 	});
 
 	Ok(())

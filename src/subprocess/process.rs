@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -8,6 +9,19 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::subprocess::ndjson::{self, ResultMessage};
+
+/// Removes a directory when dropped.
+struct DirGuard(Option<PathBuf>);
+
+impl Drop for DirGuard {
+	fn drop(&mut self) {
+		if let Some(ref dir) = self.0 {
+			if let Err(e) = std::fs::remove_dir_all(dir) {
+				warn!(path = ?dir, error = %e, "Failed to clean up request config dir");
+			}
+		}
+	}
+}
 
 /// Events emitted by the subprocess to the route handler.
 #[derive(Debug)]
@@ -26,6 +40,7 @@ pub enum SubprocessEvent {
 /// Reads NDJSON from stdout, sends SubprocessEvents via tx.
 pub async fn run_subprocess(
 	config: &Config,
+	request_id: &str,
 	cli_args: Vec<String>,
 	tx: mpsc::Sender<SubprocessEvent>,
 ) {
@@ -33,6 +48,11 @@ pub async fn run_subprocess(
 	let mut ttft_logged = false;
 
 	debug!(args = ?cli_args, "Spawning subprocess");
+
+	// Each request gets its own config dir so concurrent subprocesses don't
+	// interfere, and stale OAuth caches don't survive across requests.
+	let request_config_dir = config.create_request_config_dir(request_id);
+	let _dir_guard = DirGuard(request_config_dir.clone());
 
 	let mut cmd = tokio::process::Command::new(&config.claude_path);
 	cmd.args(&cli_args)
@@ -45,8 +65,8 @@ pub async fn run_subprocess(
 		.env_remove("ANTHROPIC_AUTH_TOKEN")
 		.current_dir(config.resolved_working_dir());
 
-	if !config.no_isolate {
-		cmd.env("CLAUDE_CONFIG_DIR", config.isolated_config_dir().to_str().unwrap_or(""));
+	if let Some(ref dir) = request_config_dir {
+		cmd.env("CLAUDE_CONFIG_DIR", dir.to_str().unwrap_or(""));
 	}
 
 	let mut child = match cmd.spawn() {

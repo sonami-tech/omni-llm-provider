@@ -150,6 +150,7 @@ async fn handle_non_streaming(
 		state.config.clone(),
 		state.semaphore.clone(),
 		Duration::from_secs(state.config.queue_timeout),
+		request_id.to_string(),
 		cli_args,
 		tx,
 	)
@@ -273,6 +274,7 @@ async fn handle_streaming(
 		state.config.clone(),
 		state.semaphore.clone(),
 		Duration::from_secs(state.config.queue_timeout),
+		request_id.to_string(),
 		cli_args,
 		sub_tx,
 	)

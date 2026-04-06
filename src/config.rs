@@ -1,5 +1,8 @@
-use clap::Parser;
 use std::path::PathBuf;
+
+use clap::Parser;
+
+const CREDENTIALS_FILENAME: &str = ".credentials.json";
 
 #[derive(Parser, Clone, Debug)]
 #[command(
@@ -106,6 +109,37 @@ impl Config {
 
 	pub fn stats_db_path(&self) -> PathBuf {
 		self.resolved_data_dir().join("stats.redb")
+	}
+
+	/// Create a per-request config dir with a fresh credentials symlink.
+	/// Returns the path on success, or `None` if isolation is disabled or
+	/// setup fails. The caller must remove the directory when done.
+	pub fn create_request_config_dir(&self, request_id: &str) -> Option<PathBuf> {
+		if self.no_isolate {
+			return None;
+		}
+		let dir = self.isolated_config_dir().join(request_id);
+		if let Err(e) = std::fs::create_dir_all(&dir) {
+			tracing::warn!(path = ?dir, error = %e, "Failed to create request config dir");
+			return None;
+		}
+		let creds_source = self.credentials_source();
+		let creds_dest = dir.join(CREDENTIALS_FILENAME);
+		#[cfg(unix)]
+		if let Err(e) = std::os::unix::fs::symlink(&creds_source, &creds_dest) {
+			tracing::warn!(error = %e, "Failed to symlink credentials for request");
+			let _ = std::fs::remove_dir_all(&dir);
+			return None;
+		}
+		Some(dir)
+	}
+
+	/// Path to the host credentials file.
+	pub fn credentials_source(&self) -> PathBuf {
+		dirs::home_dir()
+			.expect("Could not determine home directory")
+			.join(".claude")
+			.join(CREDENTIALS_FILENAME)
 	}
 
 	/// Load all API keys from --api-keys and --api-keys-file, deduplicated.
