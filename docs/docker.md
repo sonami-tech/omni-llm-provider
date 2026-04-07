@@ -9,7 +9,7 @@ Images are published to GHCR on every push to `master` and on version tags.
 docker pull ghcr.io/sonami-tech/claude-code-provider:latest
 
 # Specific version.
-docker pull ghcr.io/sonami-tech/claude-code-provider:v1.1.7
+docker pull ghcr.io/sonami-tech/claude-code-provider:v1.1.8
 
 # Development. Built from every push to master.
 docker pull ghcr.io/sonami-tech/claude-code-provider:dev
@@ -44,29 +44,23 @@ docker compose up -d
 
 ## Authentication
 
-The `docker-compose.yml` mounts `~/.claude/.credentials.json` from the host by default. If you haven't logged in yet:
+The `docker-compose.yml` mounts the host's `~/.claude` directory into the container. This allows the CLI to read credentials and write back refreshed OAuth tokens when they expire. If you haven't logged in yet:
 
 ```sh
 curl -fsSL https://claude.ai/install.sh | bash
 claude login
 ```
 
-To log in inside the container instead:
-
-```sh
-docker compose run --rm claude-code-provider /bin/bash
-claude login
-```
-
-Credentials created inside the container are lost when it stops unless you add a volume for `~/.claude`.
+After re-authenticating (`claude login`), the container picks up the new credentials automatically on the next request — no restart needed.
 
 ## Default Settings
 
 The Docker image sets:
 
 - `CCP_HOST=0.0.0.0` (listen on all interfaces, required for port mapping).
-- `CCP_NO_ISOLATE=true` (no host config to isolate from in a container).
 - `ENTRYPOINT ["claude-code-provider"]` (starts the proxy automatically).
+
+Each request gets its own isolated config directory inside the container, preventing stale OAuth caches from blocking requests after token refresh.
 
 The auto-generated API key is printed to the container log on startup (unless you provide your own via `keys.txt`).
 

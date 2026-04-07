@@ -6,7 +6,7 @@ services:
     ports:
       - "18321:18321"
     volumes:
-      - ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro
+      - ~/.claude:/root/.claude
       - ./keys.txt:/etc/ccp-keys:ro
       - ./rules.toml:/etc/ccp-rules.toml:ro
       # Uncomment to persist conversation logs:
