@@ -77,15 +77,10 @@ pub async fn completions_handler(
 		system_prompt = system_prompt.map(|sp| state.replacements.apply_prompt(&sp));
 	}
 
-	// Size checks (Linux MAX_ARG_STRLEN is ~128KB per argument).
+	// System prompt is still passed as a CLI argument; check against the
+	// Linux MAX_ARG_STRLEN limit (~128KB per argument). The main prompt is
+	// piped via stdin, so it has no kernel size limit.
 	const MAX_ARG_LEN: usize = 128_000;
-	if prompt.len() > MAX_ARG_LEN {
-		return Err(AppError::BadRequest(format!(
-			"Prompt too large ({} bytes, max {} bytes)",
-			prompt.len(),
-			MAX_ARG_LEN
-		)));
-	}
 	if let Some(ref sp) = system_prompt
 		&& sp.len() > MAX_ARG_LEN
 	{
@@ -96,10 +91,8 @@ pub async fn completions_handler(
 		)));
 	}
 
-	// Build CLI args.
 	let cli_args = build_cli_args(
 		model_def,
-		&prompt,
 		system_prompt.as_deref(),
 		effort,
 		state.config.max_turns,
@@ -125,9 +118,9 @@ pub async fn completions_handler(
 	let conv_log = state.conversation_log.clone();
 	let request_id = request_id.to_string();
 	if request.stream {
-		handle_streaming(state, request_id, chat_id, created, model_def.canonical, cli_args, conv_log, tools_active).await
+		handle_streaming(state, request_id, chat_id, created, model_def.canonical, cli_args, prompt, conv_log, tools_active).await
 	} else {
-		handle_non_streaming(state, request_id, chat_id, created, model_def.canonical, cli_args, conv_log, tools_active)
+		handle_non_streaming(state, request_id, chat_id, created, model_def.canonical, cli_args, prompt, conv_log, tools_active)
 			.await
 	}
 }
@@ -139,6 +132,7 @@ async fn handle_non_streaming(
 	created: u64,
 	requested_model: &'static str,
 	cli_args: Vec<String>,
+	prompt: String,
 	conv_log: Option<Arc<crate::conversation_log::ConversationLog>>,
 	tools_active: bool,
 ) -> Result<Response, AppError> {
@@ -152,6 +146,7 @@ async fn handle_non_streaming(
 		Duration::from_secs(state.config.queue_timeout),
 		request_id.to_string(),
 		cli_args,
+		prompt,
 		tx,
 	)
 	.await?;
@@ -264,6 +259,7 @@ async fn handle_streaming(
 	created: u64,
 	requested_model: &'static str,
 	cli_args: Vec<String>,
+	prompt: String,
 	conv_log: Option<Arc<crate::conversation_log::ConversationLog>>,
 	tools_active: bool,
 ) -> Result<Response, AppError> {
@@ -276,6 +272,7 @@ async fn handle_streaming(
 		Duration::from_secs(state.config.queue_timeout),
 		request_id.to_string(),
 		cli_args,
+		prompt,
 		sub_tx,
 	)
 	.await?;

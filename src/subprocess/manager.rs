@@ -16,6 +16,7 @@ pub async fn spawn_managed(
 	queue_timeout: Duration,
 	request_id: String,
 	cli_args: Vec<String>,
+	prompt: String,
 	tx: mpsc::Sender<SubprocessEvent>,
 ) -> Result<(), AppError> {
 	let permit = match tokio::time::timeout(queue_timeout, semaphore.clone().acquire_owned()).await
@@ -35,7 +36,7 @@ pub async fn spawn_managed(
 
 	tokio::spawn(async move {
 		let _permit = permit; // Held until task completes.
-		run_subprocess(&config, &request_id, cli_args, tx).await;
+		run_subprocess(&config, &request_id, cli_args, prompt, tx).await;
 	});
 
 	Ok(())

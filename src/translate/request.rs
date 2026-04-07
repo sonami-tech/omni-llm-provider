@@ -192,9 +192,10 @@ pub fn build_prompt_and_system(
 }
 
 /// Build CLI arguments for the claude subprocess.
+/// The prompt is NOT included — it is piped via stdin to avoid kernel
+/// argument size limits.
 pub fn build_cli_args(
 	model_def: &ModelDef,
-	prompt: &str,
 	system_prompt: Option<&str>,
 	effort: Option<&str>,
 	max_turns: u32,
@@ -223,9 +224,6 @@ pub fn build_cli_args(
 		args.push("--effort".to_string());
 		args.push(e.to_string());
 	}
-
-	// Prompt as the final positional argument.
-	args.push(prompt.to_string());
 
 	args
 }
@@ -359,7 +357,7 @@ mod tests {
 	#[test]
 	fn cli_args_basic() {
 		let model_def = &crate::models::MODELS[1]; // sonnet
-		let args = build_cli_args(model_def, "Hello", None, None, 3);
+		let args = build_cli_args(model_def, None, None, 3);
 		assert!(args.contains(&"-p".to_string()));
 		assert!(args.contains(&"--verbose".to_string()));
 		assert!(args.contains(&"--output-format".to_string()));
@@ -374,13 +372,14 @@ mod tests {
 		assert!(args.contains(&"3".to_string()));
 		assert!(!args.contains(&"--append-system-prompt".to_string()));
 		assert!(!args.contains(&"--effort".to_string()));
-		assert_eq!(args.last().unwrap(), "Hello");
+		// Prompt is piped via stdin, not in CLI args.
+		assert!(!args.iter().any(|a| a == "Hello"));
 	}
 
 	#[test]
 	fn cli_args_with_system_and_effort() {
 		let model_def = &crate::models::MODELS[0]; // opus
-		let args = build_cli_args(model_def, "Hello", Some("Be concise"), Some("high"), 3);
+		let args = build_cli_args(model_def, Some("Be concise"), Some("high"), 3);
 		assert!(args.contains(&"--append-system-prompt".to_string()));
 		assert!(args.contains(&"Be concise".to_string()));
 		assert!(args.contains(&"--effort".to_string()));
@@ -391,7 +390,7 @@ mod tests {
 	#[test]
 	fn tools_empty_string_is_separate_arg() {
 		let model_def = &crate::models::MODELS[1];
-		let args = build_cli_args(model_def, "test", None, None, 3);
+		let args = build_cli_args(model_def, None, None, 3);
 		let tools_idx = args.iter().position(|a| a == "--tools").unwrap();
 		assert_eq!(args[tools_idx + 1], "");
 	}

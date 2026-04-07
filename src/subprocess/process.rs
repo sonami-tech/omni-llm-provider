@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -37,17 +37,18 @@ pub enum SubprocessEvent {
 }
 
 /// Spawn and manage a single claude subprocess.
-/// Reads NDJSON from stdout, sends SubprocessEvents via tx.
+/// The prompt is piped via stdin; NDJSON is read from stdout.
 pub async fn run_subprocess(
 	config: &Config,
 	request_id: &str,
 	cli_args: Vec<String>,
+	prompt: String,
 	tx: mpsc::Sender<SubprocessEvent>,
 ) {
 	let start = Instant::now();
 	let mut ttft_logged = false;
 
-	debug!(args = ?cli_args, "Spawning subprocess");
+	debug!(args = ?cli_args, prompt_bytes = prompt.len(), "Spawning subprocess");
 
 	// Each request gets its own config dir so concurrent subprocesses don't
 	// interfere, and stale OAuth caches don't survive across requests.
@@ -56,7 +57,7 @@ pub async fn run_subprocess(
 
 	let mut cmd = tokio::process::Command::new(&config.claude_path);
 	cmd.args(&cli_args)
-		.stdin(Stdio::null())
+		.stdin(Stdio::piped())
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped())
 		.kill_on_drop(true)
@@ -88,6 +89,25 @@ pub async fn run_subprocess(
 
 	let pid = child.id().unwrap_or(0);
 	info!(pid, "Subprocess started");
+
+	// Write the prompt to stdin concurrently with reading stdout/stderr.
+	// This avoids deadlock when the prompt exceeds the OS pipe buffer (~64KB):
+	// the child may write to stdout/stderr before consuming all of stdin.
+	let stdin = child.stdin.take().expect("stdin not captured");
+	let stdin_tx = tx.clone();
+	let stdin_task = tokio::spawn(async move {
+		let mut stdin = stdin;
+		if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+			error!(error = %e, "Failed to write prompt to stdin");
+			let _ = stdin_tx
+				.send(SubprocessEvent::Error(format!(
+					"Failed to write prompt to subprocess stdin: {}",
+					e
+				)))
+				.await;
+		}
+		// stdin is dropped here, closing the pipe and signaling EOF.
+	});
 
 	let stdout = child.stdout.take().expect("stdout not captured");
 	let stderr = child.stderr.take().expect("stderr not captured");
@@ -123,9 +143,16 @@ pub async fn run_subprocess(
 									}
 									chunk_count += 1;
 								}
-								if matches!(&event, SubprocessEvent::Result(_)) {
+								// Enrich error results that have no message with stderr.
+								let event = if let SubprocessEvent::Result(mut result) = event {
 									got_result = true;
-								}
+									if result.is_error.unwrap_or(false) && result.result.is_none() && !stderr_buf.is_empty() {
+										result.result = Some(stderr_buf.make_contiguous().join("\n"));
+									}
+									SubprocessEvent::Result(result)
+								} else {
+									event
+								};
 								if tx.send(event).await.is_err() {
 									warn!(pid, "Client disconnected, killing subprocess");
 									let _ = child.kill().await;
@@ -173,6 +200,9 @@ pub async fn run_subprocess(
 			}
 		}
 	}
+
+	// Ensure the stdin writer has finished (it may already be done).
+	stdin_task.abort();
 
 	// Wait for process exit.
 	let exit_code = match child.wait().await {
