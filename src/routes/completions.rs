@@ -78,8 +78,9 @@ pub async fn completions_handler(
 		system_prompt = system_prompt.map(|sp| state.replacements.apply_prompt(&sp));
 	}
 
-	// Wrap any client-supplied system prompt with the CCP preamble that
-	// replaces the CLI's built-in agentic system prompt. Always present.
+	// Always set --system-prompt so the CLI's built-in agentic prompt is
+	// replaced (not appended to). Otherwise it dominates and triggers
+	// tool-call retry loops in single-shot proxy mode.
 	let final_system_prompt = compose_system_prompt(system_prompt.as_deref());
 
 	// System prompt is passed as a CLI argument; check against the Linux

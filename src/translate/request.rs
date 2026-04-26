@@ -198,7 +198,10 @@ const SYSTEM_PROMPT_PREAMBLE: &str = "You are a helpful assistant accessed throu
 
 /// Compose the final system prompt passed to the CLI.
 /// Always returns the CCP preamble; appends the client-supplied system prompt
-/// when present so client instructions still take effect.
+/// when present so client instructions still take effect. The empty-string
+/// guard treats `Some("")` like `None` to keep the preamble clean of trailing
+/// blank sections — `build_prompt_and_system` already filters empty system
+/// messages, so this protects only direct callers (notably unit tests).
 pub fn compose_system_prompt(client_system_prompt: Option<&str>) -> String {
 	match client_system_prompt {
 		Some(client) if !client.is_empty() => {
