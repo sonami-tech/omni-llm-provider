@@ -98,7 +98,8 @@ The Claude Code CLI executes tools internally in its agent loop — there is no 
 5. For multi-turn, the client's `tool` role messages are formatted as `<tool_result>` XML tags in the prompt.
 
 Key design constraints discovered through testing:
-- Tool dispatch instructions must go in the **user message**, not `--append-system-prompt`. The CLI's built-in system prompt overrides appended instructions.
+- The CLI's built-in agentic system prompt is replaced wholesale via `--system-prompt` (not `--append-system-prompt`), with a minimal CCP-owned preamble that yields formatting authority to the user message. Appending was insufficient: the CLI default still dominated and triggered tool-call retry loops and `error_max_turns` failures in single-shot mode. Client-supplied system prompts are appended after the preamble so they still take effect.
+- Tool dispatch instructions live in the **user message** (prepended via `build_tool_prompt_prefix`). The system prompt deliberately stays out of formatting rules so the model treats the user-message instructions as authoritative.
 - Haiku wraps output in markdown code fences; Sonnet outputs clean JSON. The parser handles both.
 - When tools are present in streaming mode, the response is buffered to determine if it contains tool calls before emitting SSE chunks.
 

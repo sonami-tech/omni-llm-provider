@@ -125,7 +125,8 @@ pub fn extract_text(content: &Option<MessageContent>) -> String {
 // ── Prompt construction ───────────────────────────────────────────
 
 /// Separate messages into a conversation prompt and optional system prompt.
-/// System messages are concatenated for --append-system-prompt.
+/// System messages are concatenated and later wrapped by `compose_system_prompt`
+/// before being passed via the CLI's --system-prompt flag.
 /// Non-system messages are formatted for the positional prompt argument.
 pub fn build_prompt_and_system(
 	messages: &[ChatMessage],
@@ -191,6 +192,22 @@ pub fn build_prompt_and_system(
 	Ok((prompt, system_prompt))
 }
 
+/// Preamble that replaces the Claude CLI's built-in agentic system prompt.
+/// Kept minimal so the user-message tool prefix retains formatting authority.
+const SYSTEM_PROMPT_PREAMBLE: &str = "You are a helpful assistant accessed through an OpenAI-compatible API. Respond directly to user requests in a single turn. Tool definitions, formatting rules, and conversation context all come from the user message — follow whatever instructions the user provides for response formatting.";
+
+/// Compose the final system prompt passed to the CLI.
+/// Always returns the CCP preamble; appends the client-supplied system prompt
+/// when present so client instructions still take effect.
+pub fn compose_system_prompt(client_system_prompt: Option<&str>) -> String {
+	match client_system_prompt {
+		Some(client) if !client.is_empty() => {
+			format!("{}\n\n{}", SYSTEM_PROMPT_PREAMBLE, client)
+		}
+		_ => SYSTEM_PROMPT_PREAMBLE.to_string(),
+	}
+}
+
 /// Build CLI arguments for the claude subprocess.
 /// The prompt is NOT included — it is piped via stdin to avoid kernel
 /// argument size limits.
@@ -216,7 +233,7 @@ pub fn build_cli_args(
 	];
 
 	if let Some(sp) = system_prompt {
-		args.push("--append-system-prompt".to_string());
+		args.push("--system-prompt".to_string());
 		args.push(sp.to_string());
 	}
 
@@ -370,7 +387,7 @@ mod tests {
 		assert!(args.contains(&"--no-session-persistence".to_string()));
 		assert!(args.contains(&"--max-turns".to_string()));
 		assert!(args.contains(&"3".to_string()));
-		assert!(!args.contains(&"--append-system-prompt".to_string()));
+		assert!(!args.contains(&"--system-prompt".to_string()));
 		assert!(!args.contains(&"--effort".to_string()));
 		// Prompt is piped via stdin, not in CLI args.
 		assert!(!args.iter().any(|a| a == "Hello"));
@@ -380,7 +397,7 @@ mod tests {
 	fn cli_args_with_system_and_effort() {
 		let model_def = &crate::models::MODELS[0]; // opus
 		let args = build_cli_args(model_def, Some("Be concise"), Some("high"), 3);
-		assert!(args.contains(&"--append-system-prompt".to_string()));
+		assert!(args.contains(&"--system-prompt".to_string()));
 		assert!(args.contains(&"Be concise".to_string()));
 		assert!(args.contains(&"--effort".to_string()));
 		assert!(args.contains(&"high".to_string()));
@@ -393,6 +410,28 @@ mod tests {
 		let args = build_cli_args(model_def, None, None, 3);
 		let tools_idx = args.iter().position(|a| a == "--tools").unwrap();
 		assert_eq!(args[tools_idx + 1], "");
+	}
+
+	// ── compose_system_prompt ────────────────────────────────
+
+	#[test]
+	fn compose_no_client_prompt_returns_preamble_only() {
+		let composed = compose_system_prompt(None);
+		assert_eq!(composed, SYSTEM_PROMPT_PREAMBLE);
+	}
+
+	#[test]
+	fn compose_empty_client_prompt_returns_preamble_only() {
+		let composed = compose_system_prompt(Some(""));
+		assert_eq!(composed, SYSTEM_PROMPT_PREAMBLE);
+	}
+
+	#[test]
+	fn compose_with_client_prompt_appends_after_preamble() {
+		let composed = compose_system_prompt(Some("Be terse."));
+		assert!(composed.starts_with(SYSTEM_PROMPT_PREAMBLE));
+		assert!(composed.ends_with("Be terse."));
+		assert!(composed.contains("\n\n"));
 	}
 
 	// ── validate_request ──────────────────────────────────────

@@ -213,7 +213,7 @@ Each request spawns a `claude` subprocess with these flags:
 - `--model <model>` (resolved from the request)
 - `--no-session-persistence` (no conversation memory between requests)
 - `--max-turns <n>` (limits agentic turns; defaults to 3)
-- `--append-system-prompt <text>` (if a system/developer message is present)
+- `--system-prompt <text>` (always set — replaces the CLI's built-in agentic system prompt with a minimal CCP-owned preamble; any client-supplied system/developer message is appended after the preamble)
 - `--effort <level>` (if reasoning_effort is specified)
 
 The `developer` message role (used by newer OpenAI SDKs) is treated identically to `system`.

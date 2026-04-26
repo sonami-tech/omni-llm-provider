@@ -675,6 +675,104 @@ class TestEdgeCases:
 
 
 # ════════════════════════════════════════════════════════════════
+# Tool Calling
+# ════════════════════════════════════════════════════════════════
+
+
+class TestToolCalling:
+	"""Tool/function call passthrough end-to-end."""
+
+	@staticmethod
+	def _tools():
+		return [
+			{
+				"type": "function",
+				"function": {
+					"name": "search",
+					"description": "Search files matching a glob pattern.",
+					"parameters": {
+						"type": "object",
+						"properties": {"pattern": {"type": "string"}},
+						"required": ["pattern"],
+					},
+				},
+			},
+			{
+				"type": "function",
+				"function": {
+					"name": "read",
+					"description": "Read the contents of a file.",
+					"parameters": {
+						"type": "object",
+						"properties": {"path": {"type": "string"}},
+						"required": ["path"],
+					},
+				},
+			},
+		]
+
+	def test_first_turn_emits_tool_call(self, api_base_url):
+		"""Initial tool request should produce a tool_calls response."""
+		r = httpx.post(
+			f"{api_base_url}/chat/completions",
+			json={
+				"model": "claude-haiku-4-5",
+				"messages": [{"role": "user", "content": "Search for *.rs files."}],
+				"tools": self._tools(),
+			},
+			timeout=120,
+		)
+		assert r.status_code == 200, r.text
+		choice = r.json()["choices"][0]
+		assert choice["message"].get("tool_calls"), choice
+		assert choice["message"]["tool_calls"][0]["function"]["name"] == "search"
+
+	def test_multi_turn_after_tool_result(self, api_base_url):
+		"""Regression: multi-turn conversations with prior tool_calls + tool result.
+		Previously caused 'tool call could not be parsed (retry also failed)' or hung
+		due to the CLI's agentic retry loop. After replacing the CLI's default system
+		prompt with the CCP preamble, this completes without error."""
+		r = httpx.post(
+			f"{api_base_url}/chat/completions",
+			json={
+				"model": "claude-haiku-4-5",
+				"messages": [
+					{"role": "user", "content": "Search for *.rs files."},
+					{
+						"role": "assistant",
+						"tool_calls": [
+							{
+								"id": "call_1",
+								"type": "function",
+								"function": {
+									"name": "search",
+									"arguments": '{"pattern":"*.rs"}',
+								},
+							}
+						],
+					},
+					{
+						"role": "tool",
+						"tool_call_id": "call_1",
+						"content": "Found: main.rs, lib.rs, config.rs",
+					},
+					{"role": "user", "content": "Now read main.rs."},
+				],
+				"tools": self._tools(),
+			},
+			timeout=120,
+		)
+		assert r.status_code == 200, r.text
+		body = r.json()
+		# Response must succeed (no error). The model may either emit a tool_call
+		# for `read` or fall back to a text response — both are acceptable. The
+		# regression we are guarding against is an empty error or 5xx.
+		choice = body["choices"][0]
+		message = choice["message"]
+		assert message.get("tool_calls") or message.get("content"), body
+
+
+# ════════════════════════════════════════════════════════════════
 # Async Client
 # ════════════════════════════════════════════════════════════════
 

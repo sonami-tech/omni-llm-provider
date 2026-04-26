@@ -18,7 +18,8 @@ use crate::models::{normalize_model_name, resolve_model, validate_effort};
 use crate::subprocess::SubprocessEvent;
 use crate::subprocess::manager::spawn_managed;
 use crate::translate::request::{
-	ChatCompletionRequest, build_cli_args, build_prompt_and_system, validate_request,
+	ChatCompletionRequest, build_cli_args, build_prompt_and_system, compose_system_prompt,
+	validate_request,
 };
 use crate::translate::response::{build_response, build_tool_call_response, extract_usage};
 use crate::translate::stream;
@@ -77,23 +78,25 @@ pub async fn completions_handler(
 		system_prompt = system_prompt.map(|sp| state.replacements.apply_prompt(&sp));
 	}
 
-	// System prompt is still passed as a CLI argument; check against the
-	// Linux MAX_ARG_STRLEN limit (~128KB per argument). The main prompt is
-	// piped via stdin, so it has no kernel size limit.
+	// Wrap any client-supplied system prompt with the CCP preamble that
+	// replaces the CLI's built-in agentic system prompt. Always present.
+	let final_system_prompt = compose_system_prompt(system_prompt.as_deref());
+
+	// System prompt is passed as a CLI argument; check against the Linux
+	// MAX_ARG_STRLEN limit (~128KB per argument). The main prompt is piped
+	// via stdin, so it has no kernel size limit.
 	const MAX_ARG_LEN: usize = 128_000;
-	if let Some(ref sp) = system_prompt
-		&& sp.len() > MAX_ARG_LEN
-	{
+	if final_system_prompt.len() > MAX_ARG_LEN {
 		return Err(AppError::BadRequest(format!(
 			"System prompt too large ({} bytes, max {} bytes)",
-			sp.len(),
+			final_system_prompt.len(),
 			MAX_ARG_LEN
 		)));
 	}
 
 	let cli_args = build_cli_args(
 		model_def,
-		system_prompt.as_deref(),
+		Some(&final_system_prompt),
 		effort,
 		state.config.max_turns,
 	);
