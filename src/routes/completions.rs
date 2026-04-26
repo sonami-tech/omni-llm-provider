@@ -197,10 +197,12 @@ async fn handle_non_streaming(
 
 	// Check is_error FIRST (can be true even with subtype "success").
 	if result.is_error.unwrap_or(false) {
-		let msg = result
-			.result
-			.clone()
-			.unwrap_or_else(|| "CLI returned an error with no message".to_string());
+		let msg = result.result.clone().unwrap_or_else(|| {
+			format!(
+				"CLI returned an error with no message (subtype: {})",
+				result.subtype.as_deref().unwrap_or("none")
+			)
+		});
 		state.stats.record_error(&model, &msg);
 		return Err(AppError::ServerError(msg));
 	}
@@ -350,10 +352,12 @@ async fn handle_streaming(
 					let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
 					if result.is_error.unwrap_or(false) {
-						let msg = result
-							.result
-							.clone()
-							.unwrap_or_else(|| "CLI returned an error with no message".into());
+						let msg = result.result.clone().unwrap_or_else(|| {
+							format!(
+								"CLI returned an error with no message (subtype: {})",
+								result.subtype.as_deref().unwrap_or("none")
+							)
+						});
 						stats.record_error(&model, &msg);
 						let error_data = stream::error_event_data(&msg);
 						let _ = sse_tx.send(Ok(Event::default().data(error_data))).await;

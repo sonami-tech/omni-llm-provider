@@ -146,8 +146,21 @@ pub async fn run_subprocess(
 								// Enrich error results that have no message with stderr.
 								let event = if let SubprocessEvent::Result(mut result) = event {
 									got_result = true;
-									if result.is_error.unwrap_or(false) && result.result.is_none() && !stderr_buf.is_empty() {
-										result.result = Some(stderr_buf.make_contiguous().join("\n"));
+									if result.is_error.unwrap_or(false) {
+										// Log the raw NDJSON line so subtype and any other
+										// CLI-side fields are recoverable for forensics on
+										// intermittent empty-message failures.
+										warn!(
+											pid,
+											subtype = ?result.subtype,
+											has_result = result.result.is_some(),
+											stderr_lines = stderr_buf.len(),
+											raw = %line,
+											"CLI emitted is_error=true"
+										);
+										if result.result.is_none() && !stderr_buf.is_empty() {
+											result.result = Some(stderr_buf.make_contiguous().join("\n"));
+										}
 									}
 									SubprocessEvent::Result(result)
 								} else {
