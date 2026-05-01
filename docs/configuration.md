@@ -11,7 +11,6 @@ All options can be set via CLI flags or environment variables. CLI flags take pr
 | `-c, --max-concurrent` | `CCP_MAX_CONCURRENT` | `5` | Max simultaneous subprocesses |
 | `-t, --timeout` | `CCP_TIMEOUT` | `600` | Subprocess inactivity timeout (seconds) |
 | `-q, --queue-timeout` | `CCP_QUEUE_TIMEOUT` | `60` | Max time a request waits for an available slot (seconds) |
-| `--max-turns` | `CCP_MAX_TURNS` | `3` | Max agentic turns per request (passed to CLI as `--max-turns`) |
 | `--claude-path` | `CCP_CLAUDE_PATH` | `claude` | Path to Claude CLI binary |
 | `--data-dir` | `CCP_DATA_DIR` | Platform default | Data directory for config isolation and stats DB |
 | `--working-dir` | `CCP_WORKING_DIR` | See below | Subprocess working directory |
@@ -212,7 +211,6 @@ Each request spawns a `claude` subprocess with these flags:
 - `--tools ""` (Claude Code's built-in tools disabled; tool calling is handled via prompt injection)
 - `--model <model>` (resolved from the request)
 - `--no-session-persistence` (no conversation memory between requests)
-- `--max-turns <n>` (limits agentic turns; defaults to 3)
 - `--system-prompt <text>` (always set — replaces the CLI's built-in agentic system prompt with a minimal CCP-owned preamble; any client-supplied system/developer message is appended after the preamble)
 - `--effort <level>` (if reasoning_effort is specified)
 

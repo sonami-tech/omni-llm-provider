@@ -95,12 +95,7 @@ pub async fn completions_handler(
 		)));
 	}
 
-	let cli_args = build_cli_args(
-		model_def,
-		Some(&final_system_prompt),
-		effort,
-		state.config.max_turns,
-	);
+	let cli_args = build_cli_args(model_def, Some(&final_system_prompt), effort);
 
 	let created = SystemTime::now()
 		.duration_since(UNIX_EPOCH)

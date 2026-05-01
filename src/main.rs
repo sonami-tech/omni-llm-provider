@@ -285,8 +285,8 @@ async fn main() {
 		config.port,
 	);
 	info!(
-		"max_concurrent={} timeout={}s queue_timeout={}s max_turns={}",
-		config.max_concurrent, config.timeout, config.queue_timeout, config.max_turns
+		"max_concurrent={} timeout={}s queue_timeout={}s",
+		config.max_concurrent, config.timeout, config.queue_timeout
 	);
 
 	let shutdown = async {

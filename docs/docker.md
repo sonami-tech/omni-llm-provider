@@ -99,7 +99,6 @@ Uncomment or add any of these in the `environment:` section of your `docker-comp
 | `CCP_MAX_CONCURRENT` | `5` | Max simultaneous subprocesses |
 | `CCP_TIMEOUT` | `600` | Subprocess inactivity timeout (seconds) |
 | `CCP_QUEUE_TIMEOUT` | `60` | Max queue wait time (seconds) |
-| `CCP_MAX_TURNS` | `3` | Max agentic turns per request |
 | `CCP_PORT` | `18321` | Listen port |
 | `CCP_NO_AUTH` | Off | Set to `true` to disable authentication |
 | `CCP_NO_TOOL_PASSTHROUGH` | Off | Set to `true` to disable tool calling |

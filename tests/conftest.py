@@ -81,7 +81,6 @@ def ccp_server(ccp_binary):
 			"--max-concurrent", "3",
 			"--timeout", "60",
 			"--queue-timeout", "10",
-			"--max-turns", "2",
 			"--log-file", log_file,
 			"--data-dir", data_dir,
 			"--verbose",
