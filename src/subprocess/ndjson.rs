@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use serde::Deserialize;
 
@@ -72,6 +72,33 @@ pub struct ResultMessage {
 	pub usage: Option<FlatUsage>,
 	#[serde(rename = "modelUsage")]
 	pub model_usage: Option<HashMap<String, ModelUsage>>,
+}
+
+impl ResultMessage {
+	/// If this result is an error with no message, fill it from the buffered
+	/// stderr so the client gets actionable diagnostics. Logs the raw NDJSON
+	/// line for forensics on intermittent empty-message failures.
+	pub fn enrich_with_stderr(
+		&mut self,
+		stderr_buf: &mut VecDeque<String>,
+		pid: u32,
+		raw_line: &str,
+	) {
+		if !self.is_error.unwrap_or(false) {
+			return;
+		}
+		tracing::warn!(
+			pid,
+			subtype = ?self.subtype,
+			has_result = self.result.is_some(),
+			stderr_lines = stderr_buf.len(),
+			raw = %raw_line,
+			"CLI emitted is_error=true"
+		);
+		if self.result.is_none() && !stderr_buf.is_empty() {
+			self.result = Some(stderr_buf.make_contiguous().join("\n"));
+		}
+	}
 }
 
 #[derive(Debug, Deserialize)]

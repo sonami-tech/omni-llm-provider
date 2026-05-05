@@ -170,9 +170,17 @@ async fn handle_non_streaming(
 			}
 			SubprocessEvent::Result(r) => {
 				result_msg = Some(r);
+				// Result is terminal: stop reading so the request returns
+				// promptly even if the subprocess task is still finishing
+				// teardown. Closing the receiver also signals the sender
+				// side to wind down cleanly.
+				rx.close();
+				break;
 			}
 			SubprocessEvent::Error(e) => {
 				error_msg = Some(e);
+				rx.close();
+				break;
 			}
 		}
 	}

@@ -3,12 +3,39 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{ChildStderr, ChildStdout};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::subprocess::ndjson::{self, ResultMessage};
+
+const STDERR_BUF_CAP: usize = 50;
+const POST_EXIT_DRAIN: Duration = Duration::from_millis(200);
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+
+type StdoutLines = Lines<BufReader<ChildStdout>>;
+type StderrLines = Lines<BufReader<ChildStderr>>;
+
+/// Yield the next line from `lines` if open, or park forever if `None`.
+/// Used so a closed stream's `select!` arm becomes inert without spinning.
+async fn next_line_or_pending<R>(lines: &mut Option<Lines<R>>) -> std::io::Result<Option<String>>
+where
+	R: tokio::io::AsyncBufRead + Unpin,
+{
+	match lines.as_mut() {
+		Some(l) => l.next_line().await,
+		None => std::future::pending().await,
+	}
+}
+
+fn push_stderr(buf: &mut VecDeque<String>, line: String) {
+	if buf.len() >= STDERR_BUF_CAP {
+		buf.pop_front();
+	}
+	buf.push_back(line);
+}
 
 /// Removes a directory when dropped.
 struct DirGuard(Option<PathBuf>);
@@ -112,8 +139,8 @@ pub async fn run_subprocess(
 	let stdout = child.stdout.take().expect("stdout not captured");
 	let stderr = child.stderr.take().expect("stderr not captured");
 
-	let mut stdout_lines = BufReader::new(stdout).lines();
-	let mut stderr_lines = BufReader::new(stderr).lines();
+	let mut stdout_lines: Option<StdoutLines> = Some(BufReader::new(stdout).lines());
+	let mut stderr_lines: Option<StderrLines> = Some(BufReader::new(stderr).lines());
 	let mut stderr_buf: VecDeque<String> = VecDeque::new();
 	let mut got_result = false;
 	let mut line_count: u64 = 0;
@@ -122,83 +149,82 @@ pub async fn run_subprocess(
 	let timeout_dur = Duration::from_secs(config.timeout);
 	let inactivity = tokio::time::sleep(timeout_dur);
 	tokio::pin!(inactivity);
-	let progress = tokio::time::sleep(Duration::from_secs(30));
+	let progress = tokio::time::sleep(PROGRESS_INTERVAL);
 	tokio::pin!(progress);
 
-	loop {
+	let exit_code: i32 = 'outer: loop {
 		tokio::select! {
-			line = stdout_lines.next_line() => {
+			status = child.wait() => {
+				let code = match status {
+					Ok(s) => s.code().unwrap_or(-1),
+					Err(e) => {
+						error!(pid, error = %e, "Error waiting for subprocess");
+						-1
+					}
+				};
+				// Drain any buffered stdout/stderr that arrived just before
+				// exit — bounded so descendants holding the pipe can't stall
+				// the drain.
+				let drain = tokio::time::sleep(POST_EXIT_DRAIN);
+				tokio::pin!(drain);
+				loop {
+					tokio::select! {
+						() = &mut drain => break,
+						line = next_line_or_pending(&mut stdout_lines) => match line {
+							Ok(Some(line)) => {
+								line_count += 1;
+								if !dispatch_stdout_line(
+									&line, &tx, &mut stderr_buf, &mut got_result, pid,
+								).await {
+									break 'outer code;
+								}
+							}
+							_ => { stdout_lines = None; }
+						},
+						line = next_line_or_pending(&mut stderr_lines) => match line {
+							Ok(Some(line)) => push_stderr(&mut stderr_buf, line),
+							_ => { stderr_lines = None; }
+						},
+					}
+					if stdout_lines.is_none() && stderr_lines.is_none() { break; }
+				}
+				break 'outer code;
+			}
+			line = next_line_or_pending(&mut stdout_lines) => {
 				match line {
 					Ok(Some(line)) => {
 						inactivity.as_mut().reset(tokio::time::Instant::now() + timeout_dur);
 						line_count += 1;
-
-						if let Some(msg) = ndjson::parse_line(&line) {
-							for event in ndjson::process_message(msg) {
-								if matches!(&event, SubprocessEvent::ContentDelta(_)) {
-									if !ttft_logged {
-										let ttft = start.elapsed().as_secs_f64() * 1000.0;
-										info!(pid, ttft_ms = format!("{:.0}", ttft), "First token");
-										ttft_logged = true;
-									}
-									chunk_count += 1;
-								}
-								// Enrich error results that have no message with stderr.
-								let event = if let SubprocessEvent::Result(mut result) = event {
-									got_result = true;
-									if result.is_error.unwrap_or(false) {
-										// Log the raw NDJSON line so subtype and any other
-										// CLI-side fields are recoverable for forensics on
-										// intermittent empty-message failures.
-										warn!(
-											pid,
-											subtype = ?result.subtype,
-											has_result = result.result.is_some(),
-											stderr_lines = stderr_buf.len(),
-											raw = %line,
-											"CLI emitted is_error=true"
-										);
-										if result.result.is_none() && !stderr_buf.is_empty() {
-											result.result = Some(stderr_buf.make_contiguous().join("\n"));
-										}
-									}
-									SubprocessEvent::Result(result)
-								} else {
-									event
-								};
-								if tx.send(event).await.is_err() {
-									warn!(pid, "Client disconnected, killing subprocess");
-									let _ = child.kill().await;
-									return;
-								}
-							}
+						if !dispatch_stdout_line_with_ttft(
+							&line, &tx, &mut stderr_buf, &mut got_result,
+							&mut ttft_logged, &mut chunk_count, pid, start,
+						).await {
+							warn!(pid, "Client disconnected, killing subprocess");
+							teardown(stdin_task, &mut child).await;
+							return;
 						}
 					}
-					Ok(None) => break, // stdout closed
+					Ok(None) => { stdout_lines = None; }
 					Err(e) => {
 						error!(pid, error = %e, "Error reading stdout");
-						break;
+						stdout_lines = None;
 					}
 				}
 			}
-			line = stderr_lines.next_line() => {
+			line = next_line_or_pending(&mut stderr_lines) => {
 				match line {
 					Ok(Some(line)) => {
 						inactivity.as_mut().reset(tokio::time::Instant::now() + timeout_dur);
 						debug!(pid, line = %line, "stderr");
-						if stderr_buf.len() >= 50 {
-							stderr_buf.pop_front();
-						}
-						stderr_buf.push_back(line);
+						push_stderr(&mut stderr_buf, line);
 					}
-					Ok(None) => {} // stderr closed, wait for stdout
-					Err(_) => {}
+					Ok(None) | Err(_) => { stderr_lines = None; }
 				}
 			}
 			() = &mut inactivity => {
 				warn!(pid, elapsed_s = start.elapsed().as_secs(), "Inactivity timeout");
 				let _ = tx.send(SubprocessEvent::Error("Inactivity timeout".into())).await;
-				let _ = child.kill().await;
+				teardown(stdin_task, &mut child).await;
 				return;
 			}
 			() = &mut progress => {
@@ -209,22 +235,13 @@ pub async fn run_subprocess(
 					chunks = chunk_count,
 					"Still running"
 				);
-				progress.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(30));
+				progress.as_mut().reset(tokio::time::Instant::now() + PROGRESS_INTERVAL);
 			}
 		}
-	}
-
-	// Ensure the stdin writer has finished (it may already be done).
-	stdin_task.abort();
-
-	// Wait for process exit.
-	let exit_code = match child.wait().await {
-		Ok(status) => status.code().unwrap_or(-1),
-		Err(e) => {
-			error!(pid, error = %e, "Error waiting for subprocess");
-			-1
-		}
 	};
+
+	stdin_task.abort();
+	let _ = stdin_task.await;
 
 	let elapsed = start.elapsed().as_secs_f64();
 	info!(pid, exit_code, elapsed_s = format!("{:.2}", elapsed), "Subprocess exited");
@@ -244,4 +261,79 @@ pub async fn run_subprocess(
 		};
 		let _ = tx.send(SubprocessEvent::Error(stderr_text)).await;
 	}
+}
+
+/// Parse one stdout NDJSON line, enrich any error result with stderr, and
+/// forward each derived event. Returns `false` if the receiver has dropped.
+async fn dispatch_stdout_line(
+	line: &str,
+	tx: &mpsc::Sender<SubprocessEvent>,
+	stderr_buf: &mut VecDeque<String>,
+	got_result: &mut bool,
+	pid: u32,
+) -> bool {
+	let Some(msg) = ndjson::parse_line(line) else {
+		return true;
+	};
+	for event in ndjson::process_message(msg) {
+		let event = if let SubprocessEvent::Result(mut result) = event {
+			*got_result = true;
+			result.enrich_with_stderr(stderr_buf, pid, line);
+			SubprocessEvent::Result(result)
+		} else {
+			event
+		};
+		if tx.send(event).await.is_err() {
+			return false;
+		}
+	}
+	true
+}
+
+/// Same as [`dispatch_stdout_line`] but also tracks TTFT logging and content
+/// chunk counts for the main I/O loop. Returns `false` on receiver drop.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_stdout_line_with_ttft(
+	line: &str,
+	tx: &mpsc::Sender<SubprocessEvent>,
+	stderr_buf: &mut VecDeque<String>,
+	got_result: &mut bool,
+	ttft_logged: &mut bool,
+	chunk_count: &mut u64,
+	pid: u32,
+	start: Instant,
+) -> bool {
+	let Some(msg) = ndjson::parse_line(line) else {
+		return true;
+	};
+	for event in ndjson::process_message(msg) {
+		if matches!(&event, SubprocessEvent::ContentDelta(_)) {
+			if !*ttft_logged {
+				let ttft = start.elapsed().as_secs_f64() * 1000.0;
+				info!(pid, ttft_ms = format!("{:.0}", ttft), "First token");
+				*ttft_logged = true;
+			}
+			*chunk_count += 1;
+		}
+		let event = if let SubprocessEvent::Result(mut result) = event {
+			*got_result = true;
+			result.enrich_with_stderr(stderr_buf, pid, line);
+			SubprocessEvent::Result(result)
+		} else {
+			event
+		};
+		if tx.send(event).await.is_err() {
+			return false;
+		}
+	}
+	true
+}
+
+/// Drop stdin writer and reap the child. Used on every early-return path so
+/// the kernel doesn't accumulate zombie subprocesses.
+async fn teardown(stdin_task: tokio::task::JoinHandle<()>, child: &mut tokio::process::Child) {
+	stdin_task.abort();
+	let _ = stdin_task.await;
+	let _ = child.kill().await;
+	let _ = child.wait().await;
 }

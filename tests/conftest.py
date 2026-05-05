@@ -40,6 +40,57 @@ def _wait_for_health(base_url: str, timeout: float = 120) -> None:
 	raise RuntimeError(f"Server at {base_url} did not become healthy within {timeout}s")
 
 
+def _start_ccp_server(binary: str, name: str, extra_args: list[str], data_dir: str) -> dict:
+	"""Spawn a CCP server and wait until it's healthy.
+
+	Redirects stdout/stderr to a file rather than `subprocess.PIPE`. With
+	`--verbose` and many sequential requests, the unread pipe buffer fills
+	(~64KB) and CCP blocks on its next stderr write — deadlocking all tokio
+	tasks and producing zombie subprocesses with stuck handlers.
+
+	Returns a dict with base_url, api_base_url, port, data_dir, process.
+	On startup failure, calls `pytest.fail` with the tail of the stderr log.
+	"""
+	port = _free_port()
+	stderr_file = os.path.join(data_dir, "ccp.stderr")
+	stderr_fp = open(stderr_file, "wb")
+
+	args = [binary, "--port", str(port), "--host", "127.0.0.1", "--data-dir", data_dir]
+	args.extend(extra_args)
+	proc = subprocess.Popen(args, stdout=stderr_fp, stderr=stderr_fp)
+
+	base_url = f"http://127.0.0.1:{port}"
+	try:
+		_wait_for_health(base_url)
+	except RuntimeError:
+		proc.kill()
+		proc.wait(timeout=5)
+		stderr_fp.close()
+		with open(stderr_file, "rb") as f:
+			tail = f.read()[-2000:].decode(errors="replace")
+		pytest.fail(f"CCP {name} server failed to start on port {port}.\nlast stderr:\n{tail}")
+
+	return {
+		"base_url": base_url,
+		"api_base_url": f"{base_url}/v1",
+		"port": port,
+		"data_dir": data_dir,
+		"process": proc,
+	}
+
+
+def _stop_ccp_server(info: dict) -> None:
+	"""Terminate the server process and remove its data directory."""
+	proc = info["process"]
+	proc.terminate()
+	try:
+		proc.wait(timeout=10)
+	except subprocess.TimeoutExpired:
+		proc.kill()
+		proc.wait(timeout=5)
+	shutil.rmtree(info["data_dir"], ignore_errors=True)
+
+
 # ── Session-scoped server ─────────────────────────────────────
 
 
@@ -63,132 +114,52 @@ def ccp_binary():
 
 @pytest.fixture(scope="session")
 def ccp_server(ccp_binary):
-	"""
-	Start a CCP server with no-auth on a random port.
-	Yields a dict with connection info. Tears down on session end.
-	"""
-	port = _free_port()
+	"""Start a CCP server with no-auth on a random port."""
 	data_dir = tempfile.mkdtemp(prefix="ccp-test-")
 	log_file = os.path.join(data_dir, "conversations.log")
-
-	proc = subprocess.Popen(
-		[
-			ccp_binary,
-			"--port", str(port),
-			"--host", "127.0.0.1",
+	info = _start_ccp_server(
+		ccp_binary,
+		name="default",
+		extra_args=[
 			"--no-auth",
-			"--no-isolate",
 			"--max-concurrent", "3",
 			"--timeout", "60",
 			"--queue-timeout", "10",
 			"--log-file", log_file,
-			"--data-dir", data_dir,
 			"--verbose",
 		],
-		stdout=subprocess.PIPE,
-		stderr=subprocess.PIPE,
+		data_dir=data_dir,
 	)
-
-	base_url = f"http://127.0.0.1:{port}"
-	try:
-		_wait_for_health(base_url)
-	except RuntimeError:
-		proc.kill()
-		stdout, stderr = proc.communicate(timeout=5)
-		pytest.fail(
-			f"CCP server failed to start on port {port}.\n"
-			f"stdout: {stdout.decode()}\n"
-			f"stderr: {stderr.decode()}"
-		)
-
-	info = {
-		"base_url": base_url,
-		"api_base_url": f"{base_url}/v1",
-		"port": port,
-		"data_dir": data_dir,
-		"log_file": log_file,
-		"process": proc,
-	}
-
+	info["log_file"] = log_file
 	yield info
-
-	# Teardown.
-	proc.terminate()
-	try:
-		proc.wait(timeout=10)
-	except subprocess.TimeoutExpired:
-		proc.kill()
-		proc.wait(timeout=5)
-	shutil.rmtree(data_dir, ignore_errors=True)
+	_stop_ccp_server(info)
 
 
 @pytest.fixture(scope="session")
 def ccp_auth_server(ccp_binary):
-	"""
-	Start a second CCP server WITH auth enabled for auth-specific tests.
-	Yields a dict with connection info including the API key.
-	"""
-	port = _free_port()
+	"""Start a second CCP server WITH auth enabled for auth-specific tests."""
 	data_dir = tempfile.mkdtemp(prefix="ccp-test-auth-")
 	api_key = "sk-test-integration-key-1234"
-
-	proc = subprocess.Popen(
-		[
-			ccp_binary,
-			"--port", str(port),
-			"--host", "127.0.0.1",
+	info = _start_ccp_server(
+		ccp_binary,
+		name="auth",
+		extra_args=[
 			"--api-keys", api_key,
-			"--no-isolate",
 			"--max-concurrent", "2",
 			"--timeout", "60",
 			"--queue-timeout", "10",
-			"--data-dir", data_dir,
 		],
-		stdout=subprocess.PIPE,
-		stderr=subprocess.PIPE,
+		data_dir=data_dir,
 	)
-
-	base_url = f"http://127.0.0.1:{port}"
-	try:
-		_wait_for_health(base_url)
-	except RuntimeError:
-		proc.kill()
-		stdout, stderr = proc.communicate(timeout=5)
-		pytest.fail(
-			f"CCP auth server failed to start on port {port}.\n"
-			f"stdout: {stdout.decode()}\n"
-			f"stderr: {stderr.decode()}"
-		)
-
-	info = {
-		"base_url": base_url,
-		"api_base_url": f"{base_url}/v1",
-		"port": port,
-		"data_dir": data_dir,
-		"api_key": api_key,
-		"process": proc,
-	}
-
+	info["api_key"] = api_key
 	yield info
-
-	proc.terminate()
-	try:
-		proc.wait(timeout=10)
-	except subprocess.TimeoutExpired:
-		proc.kill()
-		proc.wait(timeout=5)
-	shutil.rmtree(data_dir, ignore_errors=True)
+	_stop_ccp_server(info)
 
 
 @pytest.fixture(scope="session")
 def ccp_replace_server(ccp_binary):
-	"""
-	Start a CCP server with text replacement rules enabled.
-	"""
-	port = _free_port()
+	"""Start a CCP server with text replacement rules enabled."""
 	data_dir = tempfile.mkdtemp(prefix="ccp-test-replace-")
-
-	# Write a replacement rules TOML file.
 	rules_file = os.path.join(data_dir, "rules.toml")
 	with open(rules_file, "w") as f:
 		f.write(
@@ -202,53 +173,20 @@ def ccp_replace_server(ccp_binary):
 			'search = "PONG"\n'
 			'replace = "REPLACED_OUTPUT"\n'
 		)
-
-	proc = subprocess.Popen(
-		[
-			ccp_binary,
-			"--port", str(port),
-			"--host", "127.0.0.1",
+	info = _start_ccp_server(
+		ccp_binary,
+		name="replace",
+		extra_args=[
 			"--no-auth",
-			"--no-isolate",
 			"--max-concurrent", "2",
 			"--timeout", "60",
 			"--queue-timeout", "10",
-			"--data-dir", data_dir,
 			"--replace-rules", rules_file,
 		],
-		stdout=subprocess.PIPE,
-		stderr=subprocess.PIPE,
+		data_dir=data_dir,
 	)
-
-	base_url = f"http://127.0.0.1:{port}"
-	try:
-		_wait_for_health(base_url)
-	except RuntimeError:
-		proc.kill()
-		stdout, stderr = proc.communicate(timeout=5)
-		pytest.fail(
-			f"CCP replace server failed to start on port {port}.\n"
-			f"stdout: {stdout.decode()}\n"
-			f"stderr: {stderr.decode()}"
-		)
-
-	info = {
-		"base_url": base_url,
-		"api_base_url": f"{base_url}/v1",
-		"port": port,
-		"data_dir": data_dir,
-		"process": proc,
-	}
-
 	yield info
-
-	proc.terminate()
-	try:
-		proc.wait(timeout=10)
-	except subprocess.TimeoutExpired:
-		proc.kill()
-		proc.wait(timeout=5)
-	shutil.rmtree(data_dir, ignore_errors=True)
+	_stop_ccp_server(info)
 
 
 # ── Client fixtures ───────────────────────────────────────────
