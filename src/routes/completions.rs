@@ -24,8 +24,8 @@ use crate::translate::request::{
 use crate::translate::response::{build_response, build_tool_call_response, extract_usage};
 use crate::translate::stream;
 use crate::translate::tools::{
-	ParsedResponse, ResolvedToolChoice, build_tool_prompt_prefix, parse_tool_response,
-	resolve_tool_choice, to_response_tool_calls,
+	ParsedResponse, ResolvedToolChoice, build_tool_prompt_prefix, malformed_tool_call_message,
+	parse_tool_response, resolve_tool_choice, to_response_tool_calls,
 };
 
 pub async fn completions_handler(
@@ -220,22 +220,33 @@ async fn handle_non_streaming(
 
 	// Parse for tool calls if tools are active.
 	if tools_active {
-		if let ParsedResponse::ToolCalls(calls) = parse_tool_response(&content) {
-			let tool_calls = to_response_tool_calls(calls);
-			info!("Detected {} tool call(s)", tool_calls.len());
+		match parse_tool_response(&content) {
+			ParsedResponse::ToolCalls(calls) => {
+				let tool_calls = to_response_tool_calls(calls);
+				info!("Detected {} tool call(s)", tool_calls.len());
 
-			if let Some(ref log) = conv_log {
-				log.log(&request_id, "<<<", "Tool calls", &content);
+				if let Some(ref log) = conv_log {
+					log.log(&request_id, "<<<", "Tool calls", &content);
+				}
+
+				let response =
+					build_tool_call_response(&chat_id, created, &model, tool_calls, &result);
+
+				let headers = [(
+					header::HeaderName::from_static("x-request-id"),
+					header::HeaderValue::from_str(&request_id).unwrap(),
+				)];
+
+				return Ok((headers, axum::Json(response)).into_response());
 			}
-
-			let response = build_tool_call_response(&chat_id, created, &model, tool_calls, &result);
-
-			let headers = [(
-				header::HeaderName::from_static("x-request-id"),
-				header::HeaderValue::from_str(&request_id).unwrap(),
-			)];
-
-			return Ok((headers, axum::Json(response)).into_response());
+			ParsedResponse::MalformedToolCall(err) => {
+				info!("Detected malformed tool call attempt: {}", err);
+				if let Some(ref log) = conv_log {
+					log.log(&request_id, "<<<", "Malformed tool call", &content);
+				}
+				content = malformed_tool_call_message(&err);
+			}
+			ParsedResponse::Text => {}
 		}
 	}
 
@@ -401,6 +412,42 @@ async fn handle_streaming(
 										created,
 										&model,
 										"tool_calls",
+									);
+									if let Ok(json) = serde_json::to_string(&finish) {
+										let _ = sse_tx
+											.send(Ok(Event::default().data(json)))
+											.await;
+									}
+								}
+								ParsedResponse::MalformedToolCall(err) => {
+									if let Some(log) = &conv_log {
+										log.log(
+											&conv_request_id,
+											"<<<",
+											"Malformed tool call",
+											buf,
+										);
+									}
+
+									let message = malformed_tool_call_message(&err);
+									let chunk = stream::content_chunk(
+										&conv_chat_id,
+										created,
+										&model,
+										&message,
+										true,
+									);
+									if let Ok(json) = serde_json::to_string(&chunk) {
+										let _ = sse_tx
+											.send(Ok(Event::default().data(json)))
+											.await;
+									}
+
+									let finish = stream::finish_chunk(
+										&conv_chat_id,
+										created,
+										&model,
+										"stop",
 									);
 									if let Ok(json) = serde_json::to_string(&finish) {
 										let _ = sse_tx

@@ -99,6 +99,10 @@ fn format_tool_definition(buf: &mut String, func: &FunctionDefinition) {
 pub enum ParsedResponse {
 	Text,
 	ToolCalls(Vec<ParsedToolCall>),
+	/// The response looks like a tool-call attempt (shape matches `[{"name":...}]`
+	/// or `{"name":...}`) but failed to parse as valid JSON. Carries the parser
+	/// error so the caller can surface a self-correcting message back to the model.
+	MalformedToolCall(String),
 }
 
 pub struct ParsedToolCall {
@@ -112,10 +116,43 @@ struct ToolCallCandidate {
 	arguments: serde_json::Value,
 }
 
+/// Detect whether a response *looks* like a tool-call attempt, even if the JSON
+/// is malformed. Conservative: only matches when the entire trimmed/fence-stripped
+/// response begins like a tool-call array or object and ends with the matching
+/// close bracket. Avoids false positives on legitimate prose containing JSON snippets.
+fn looks_like_tool_call_attempt(stripped: &str) -> bool {
+	let s = stripped.trim();
+	if s.is_empty() {
+		return false;
+	}
+
+	// Array form: starts with `[`, optional ws, `{`, optional ws, `"name"`; ends with `}]`.
+	if s.starts_with('[') && s.ends_with("}]") {
+		let after_brace = s[1..].trim_start().strip_prefix('{').unwrap_or("").trim_start();
+		if after_brace.starts_with("\"name\"") {
+			return true;
+		}
+	}
+
+	// Object form: starts with `{`, optional ws, `"name"`; ends with `}`.
+	if s.starts_with('{') && s.ends_with('}') {
+		let after = s[1..].trim_start();
+		if after.starts_with("\"name\"") {
+			return true;
+		}
+	}
+
+	false
+}
+
 /// Parse a model response to detect tool call JSON or plain text.
 /// The prompt instructs the model to respond with ONLY a JSON array (no surrounding text),
 /// but models sometimes mix prose and tool calls anyway. The parser handles both clean
 /// and mixed responses as a defensive fallback.
+///
+/// If the response *shape* matches a tool-call attempt but the JSON is malformed
+/// (e.g., unescaped quotes inside string values), returns `MalformedToolCall` with
+/// the parser error so the caller can surface a self-correcting message to the model.
 pub fn parse_tool_response(raw: &str) -> ParsedResponse {
 	let stripped = strip_code_fences(raw.trim());
 
@@ -144,7 +181,36 @@ pub fn parse_tool_response(raw: &str) -> ParsedResponse {
 		}
 	}
 
+	// Nothing parsed cleanly. If the shape looks like a tool-call attempt,
+	// surface the parser error so the model can self-correct.
+	if looks_like_tool_call_attempt(stripped) {
+		let err = serde_json::from_str::<serde_json::Value>(stripped)
+			.err()
+			.map(|e| e.to_string())
+			.unwrap_or_else(|| "JSON did not satisfy tool-call schema".to_string());
+		return ParsedResponse::MalformedToolCall(err);
+	}
+
 	ParsedResponse::Text
+}
+
+/// Build a self-correcting assistant message returned when a tool-call attempt
+/// failed to parse. Wrapped in sentinel tags so harnesses can catch it
+/// programmatically; the body is plain English so the model itself recognizes
+/// the problem and retries with corrected JSON on the next turn.
+pub fn malformed_tool_call_message(parser_error: &str) -> String {
+	format!(
+		"[CCP_TOOL_CALL_PARSE_ERROR]\n\
+		 Your previous response was detected as a tool call attempt, but the JSON could not be parsed.\n\
+		 Parser error: {}\n\
+		 Common cause: unescaped double-quote characters (\") inside string values. \
+		 Inside a JSON string, every \" must be written as \\\". Backslashes must be \\\\.\n\
+		 Example — INVALID:  [{{\"name\": \"exec\", \"arguments\": {{\"command\": \"echo \"hi\"\"}}}}]\n\
+		 Example — VALID:    [{{\"name\": \"exec\", \"arguments\": {{\"command\": \"echo \\\"hi\\\"\"}}}}]\n\
+		 Please retry with valid JSON.\n\
+		 [/CCP_TOOL_CALL_PARSE_ERROR]",
+		parser_error
+	)
 }
 
 fn validate_candidate(c: &ToolCallCandidate) -> bool {
@@ -288,6 +354,14 @@ pub fn format_tool_result(msg: &ChatMessage) -> String {
 mod tests {
 	use super::*;
 
+	fn parsed_variant_name(p: &ParsedResponse) -> &'static str {
+		match p {
+			ParsedResponse::Text => "Text",
+			ParsedResponse::ToolCalls(_) => "ToolCalls",
+			ParsedResponse::MalformedToolCall(_) => "MalformedToolCall",
+		}
+	}
+
 	// ── parse_tool_response ──────────────────────────────────
 
 	#[test]
@@ -299,7 +373,7 @@ mod tests {
 				assert_eq!(calls[0].name, "get_weather");
 				assert_eq!(calls[0].arguments["location"], "London");
 			}
-			ParsedResponse::Text => panic!("Expected ToolCalls"),
+			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
 		}
 	}
 
@@ -311,7 +385,7 @@ mod tests {
 				assert_eq!(calls.len(), 1);
 				assert_eq!(calls[0].name, "search");
 			}
-			ParsedResponse::Text => panic!("Expected ToolCalls"),
+			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
 		}
 	}
 
@@ -323,7 +397,7 @@ mod tests {
 				assert_eq!(calls.len(), 1);
 				assert_eq!(calls[0].name, "f");
 			}
-			ParsedResponse::Text => panic!("Expected ToolCalls"),
+			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
 		}
 	}
 
@@ -335,7 +409,7 @@ mod tests {
 				assert_eq!(calls.len(), 1);
 				assert_eq!(calls[0].name, "get_time");
 			}
-			ParsedResponse::Text => panic!("Expected ToolCalls"),
+			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
 		}
 	}
 
@@ -348,7 +422,7 @@ mod tests {
 				assert_eq!(calls[0].name, "a");
 				assert_eq!(calls[1].name, "b");
 			}
-			ParsedResponse::Text => panic!("Expected ToolCalls"),
+			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
 		}
 	}
 
@@ -361,7 +435,7 @@ mod tests {
 				assert!(calls[0].arguments["attendees"].is_array());
 				assert!(calls[0].arguments["location"].is_object());
 			}
-			ParsedResponse::Text => panic!("Expected ToolCalls"),
+			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
 		}
 	}
 
@@ -372,27 +446,71 @@ mod tests {
 	}
 
 	#[test]
-	fn parse_malformed_json() {
-		let raw = "[{\"name\": \"f\", \"arguments\": {broken}]";
+	fn parse_malformed_json_garbage_inside_returns_malformed() {
+		// Shape matches a tool-call attempt but the JSON body is broken.
+		let raw = "[{\"name\": \"f\", \"arguments\": {broken}}]";
+		assert!(matches!(
+			parse_tool_response(raw),
+			ParsedResponse::MalformedToolCall(_)
+		));
+	}
+
+	#[test]
+	fn parse_malformed_unescaped_quotes_returns_malformed() {
+		// The real-world OpenClaw failure case: unescaped " inside string value.
+		let raw = r#"[{"name":"exec","arguments":{"command":"echo "hi""}}]"#;
+		match parse_tool_response(raw) {
+			ParsedResponse::MalformedToolCall(err) => {
+				assert!(!err.is_empty());
+			}
+			_ => panic!("Expected MalformedToolCall for unescaped quotes"),
+		}
+	}
+
+	#[test]
+	fn parse_malformed_object_form_returns_malformed() {
+		let raw = r#"{"name":"exec","arguments":{"command":"echo "hi""}}"#;
+		assert!(matches!(
+			parse_tool_response(raw),
+			ParsedResponse::MalformedToolCall(_)
+		));
+	}
+
+	#[test]
+	fn parse_prose_with_broken_brackets_returns_text() {
+		// Doesn't match the tool-call shape — should be Text, not Malformed.
+		let raw = "Here is some text [not a tool call] and more text.";
 		assert!(matches!(parse_tool_response(raw), ParsedResponse::Text));
 	}
 
 	#[test]
-	fn parse_empty_name_rejected() {
-		let raw = r#"[{"name": "", "arguments": {}}]"#;
-		match parse_tool_response(raw) {
-			ParsedResponse::Text => {}
-			ParsedResponse::ToolCalls(_) => panic!("Expected Text for empty name"),
-		}
+	fn malformed_message_contains_sentinels_and_guidance() {
+		let msg = malformed_tool_call_message("test parser error");
+		assert!(msg.contains("[CCP_TOOL_CALL_PARSE_ERROR]"));
+		assert!(msg.contains("[/CCP_TOOL_CALL_PARSE_ERROR]"));
+		assert!(msg.contains("test parser error"));
+		assert!(msg.contains("\\\""));
 	}
 
 	#[test]
-	fn parse_arguments_not_object_rejected() {
+	fn parse_empty_name_rejected_as_malformed() {
+		// Shape matches a tool-call attempt but the schema fails validation
+		// (empty name). Surface as MalformedToolCall so the model self-corrects.
+		let raw = r#"[{"name": "", "arguments": {}}]"#;
+		assert!(matches!(
+			parse_tool_response(raw),
+			ParsedResponse::MalformedToolCall(_)
+		));
+	}
+
+	#[test]
+	fn parse_arguments_not_object_rejected_as_malformed() {
+		// Same as above: shape matches, schema fails (arguments is a string).
 		let raw = r#"[{"name": "f", "arguments": "not an object"}]"#;
-		match parse_tool_response(raw) {
-			ParsedResponse::Text => {}
-			ParsedResponse::ToolCalls(_) => panic!("Expected Text for non-object arguments"),
-		}
+		assert!(matches!(
+			parse_tool_response(raw),
+			ParsedResponse::MalformedToolCall(_)
+		));
 	}
 
 	#[test]
@@ -403,7 +521,7 @@ mod tests {
 				assert_eq!(calls.len(), 1);
 				assert_eq!(calls[0].name, "f");
 			}
-			ParsedResponse::Text => panic!("Expected ToolCalls"),
+			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
 		}
 	}
 
@@ -415,7 +533,7 @@ mod tests {
 			ParsedResponse::ToolCalls(calls) => {
 				assert_eq!(calls.len(), 1);
 			}
-			ParsedResponse::Text => panic!("Expected ToolCalls"),
+			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
 		}
 	}
 
@@ -428,7 +546,7 @@ mod tests {
 				assert_eq!(calls[0].name, "exec");
 				assert_eq!(calls[0].arguments["command"], "ls");
 			}
-			ParsedResponse::Text => panic!("Expected ToolCalls"),
+			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
 		}
 	}
 
@@ -441,7 +559,7 @@ mod tests {
 				assert_eq!(calls[0].name, "a");
 				assert_eq!(calls[1].name, "b");
 			}
-			ParsedResponse::Text => panic!("Expected ToolCalls"),
+			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
 		}
 	}
 
@@ -454,7 +572,7 @@ mod tests {
 				assert_eq!(calls[0].name, "f");
 				assert!(calls[0].arguments["items"].is_array());
 			}
-			ParsedResponse::Text => panic!("Expected ToolCalls"),
+			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
 		}
 	}
 
@@ -472,7 +590,7 @@ mod tests {
 				assert_eq!(calls.len(), 1);
 				assert_eq!(calls[0].name, "exec");
 			}
-			ParsedResponse::Text => panic!("Expected ToolCalls"),
+			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
 		}
 	}
 
