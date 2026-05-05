@@ -420,70 +420,31 @@ async fn handle_streaming(
 									}
 								}
 								ParsedResponse::MalformedToolCall(err) => {
-									if let Some(log) = &conv_log {
-										log.log(
-											&conv_request_id,
-											"<<<",
-											"Malformed tool call",
-											buf,
-										);
-									}
-
 									let message = malformed_tool_call_message(&err);
-									let chunk = stream::content_chunk(
+									emit_text_finish(
+										&sse_tx,
 										&conv_chat_id,
 										created,
 										&model,
 										&message,
-										true,
-									);
-									if let Ok(json) = serde_json::to_string(&chunk) {
-										let _ = sse_tx
-											.send(Ok(Event::default().data(json)))
-											.await;
-									}
-
-									let finish = stream::finish_chunk(
-										&conv_chat_id,
-										created,
-										&model,
-										"stop",
-									);
-									if let Ok(json) = serde_json::to_string(&finish) {
-										let _ = sse_tx
-											.send(Ok(Event::default().data(json)))
-											.await;
-									}
+										&conv_log,
+										&conv_request_id,
+										"Malformed tool call",
+									)
+									.await;
 								}
 								ParsedResponse::Text => {
-									if let Some(log) = &conv_log {
-										log.log(&conv_request_id, "<<<", "Response", buf);
-									}
-
-									let chunk = stream::content_chunk(
+									emit_text_finish(
+										&sse_tx,
 										&conv_chat_id,
 										created,
 										&model,
 										buf,
-										true,
-									);
-									if let Ok(json) = serde_json::to_string(&chunk) {
-										let _ = sse_tx
-											.send(Ok(Event::default().data(json)))
-											.await;
-									}
-
-									let finish = stream::finish_chunk(
-										&conv_chat_id,
-										created,
-										&model,
-										"stop",
-									);
-									if let Ok(json) = serde_json::to_string(&finish) {
-										let _ = sse_tx
-											.send(Ok(Event::default().data(json)))
-											.await;
-									}
+										&conv_log,
+										&conv_request_id,
+										"Response",
+									)
+									.await;
 								}
 							}
 						}
@@ -537,4 +498,30 @@ async fn handle_streaming(
 	];
 
 	Ok((headers, sse).into_response())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_text_finish(
+	sse_tx: &mpsc::Sender<Result<Event, Infallible>>,
+	chat_id: &str,
+	created: u64,
+	model: &str,
+	text: &str,
+	conv_log: &Option<Arc<crate::conversation_log::ConversationLog>>,
+	request_id: &str,
+	log_label: &str,
+) {
+	if let Some(log) = conv_log {
+		log.log(request_id, "<<<", log_label, text);
+	}
+
+	let chunk = stream::content_chunk(chat_id, created, model, text, true);
+	if let Ok(json) = serde_json::to_string(&chunk) {
+		let _ = sse_tx.send(Ok(Event::default().data(json))).await;
+	}
+
+	let finish = stream::finish_chunk(chat_id, created, model, "stop");
+	if let Ok(json) = serde_json::to_string(&finish) {
+		let _ = sse_tx.send(Ok(Event::default().data(json))).await;
+	}
 }

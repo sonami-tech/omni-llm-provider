@@ -96,6 +96,7 @@ fn format_tool_definition(buf: &mut String, func: &FunctionDefinition) {
 
 // ── Response parsing ─────────────────────────────────────────────
 
+#[derive(Debug)]
 pub enum ParsedResponse {
 	Text,
 	ToolCalls(Vec<ParsedToolCall>),
@@ -105,6 +106,7 @@ pub enum ParsedResponse {
 	MalformedToolCall(String),
 }
 
+#[derive(Debug)]
 pub struct ParsedToolCall {
 	pub name: String,
 	pub arguments: serde_json::Value,
@@ -157,13 +159,25 @@ pub fn parse_tool_response(raw: &str) -> ParsedResponse {
 	let stripped = strip_code_fences(raw.trim());
 
 	let mut all_calls = Vec::new();
+	let mut first_parse_error: Option<String> = None;
 	for json_str in extract_json_arrays(stripped) {
-		if let Ok(candidates) = serde_json::from_str::<Vec<ToolCallCandidate>>(json_str) {
-			if !candidates.is_empty() && candidates.iter().all(|c| validate_candidate(c)) {
+		match serde_json::from_str::<Vec<ToolCallCandidate>>(json_str) {
+			Ok(candidates) if !candidates.is_empty() && candidates.iter().all(validate_candidate) => {
 				all_calls.extend(candidates.into_iter().map(|c| ParsedToolCall {
 					name: c.name,
 					arguments: c.arguments,
 				}));
+			}
+			Ok(_) => {
+				if first_parse_error.is_none() {
+					first_parse_error =
+						Some("JSON did not satisfy tool-call schema (empty name or non-object arguments)".to_string());
+				}
+			}
+			Err(e) => {
+				if first_parse_error.is_none() {
+					first_parse_error = Some(e.to_string());
+				}
 			}
 		}
 	}
@@ -172,23 +186,33 @@ pub fn parse_tool_response(raw: &str) -> ParsedResponse {
 	}
 
 	// Try single object: {"name": "...", "arguments": {...}}
-	if let Ok(candidate) = serde_json::from_str::<ToolCallCandidate>(stripped) {
-		if validate_candidate(&candidate) {
+	match serde_json::from_str::<ToolCallCandidate>(stripped) {
+		Ok(candidate) if validate_candidate(&candidate) => {
 			return ParsedResponse::ToolCalls(vec![ParsedToolCall {
 				name: candidate.name,
 				arguments: candidate.arguments,
 			}]);
 		}
+		Ok(_) => {
+			if first_parse_error.is_none() {
+				first_parse_error = Some(
+					"JSON did not satisfy tool-call schema (empty name or non-object arguments)"
+						.to_string(),
+				);
+			}
+		}
+		Err(e) => {
+			if first_parse_error.is_none() {
+				first_parse_error = Some(e.to_string());
+			}
+		}
 	}
 
-	// Nothing parsed cleanly. If the shape looks like a tool-call attempt,
-	// surface the parser error so the model can self-correct.
 	if looks_like_tool_call_attempt(stripped) {
-		let err = serde_json::from_str::<serde_json::Value>(stripped)
-			.err()
-			.map(|e| e.to_string())
-			.unwrap_or_else(|| "JSON did not satisfy tool-call schema".to_string());
-		return ParsedResponse::MalformedToolCall(err);
+		return ParsedResponse::MalformedToolCall(
+			first_parse_error
+				.unwrap_or_else(|| "JSON did not satisfy tool-call schema".to_string()),
+		);
 	}
 
 	ParsedResponse::Text
@@ -354,14 +378,6 @@ pub fn format_tool_result(msg: &ChatMessage) -> String {
 mod tests {
 	use super::*;
 
-	fn parsed_variant_name(p: &ParsedResponse) -> &'static str {
-		match p {
-			ParsedResponse::Text => "Text",
-			ParsedResponse::ToolCalls(_) => "ToolCalls",
-			ParsedResponse::MalformedToolCall(_) => "MalformedToolCall",
-		}
-	}
-
 	// ── parse_tool_response ──────────────────────────────────
 
 	#[test]
@@ -373,7 +389,7 @@ mod tests {
 				assert_eq!(calls[0].name, "get_weather");
 				assert_eq!(calls[0].arguments["location"], "London");
 			}
-			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
+			other => panic!("Expected ToolCalls, got {:?}", other),
 		}
 	}
 
@@ -385,7 +401,7 @@ mod tests {
 				assert_eq!(calls.len(), 1);
 				assert_eq!(calls[0].name, "search");
 			}
-			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
+			other => panic!("Expected ToolCalls, got {:?}", other),
 		}
 	}
 
@@ -397,7 +413,7 @@ mod tests {
 				assert_eq!(calls.len(), 1);
 				assert_eq!(calls[0].name, "f");
 			}
-			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
+			other => panic!("Expected ToolCalls, got {:?}", other),
 		}
 	}
 
@@ -409,7 +425,7 @@ mod tests {
 				assert_eq!(calls.len(), 1);
 				assert_eq!(calls[0].name, "get_time");
 			}
-			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
+			other => panic!("Expected ToolCalls, got {:?}", other),
 		}
 	}
 
@@ -422,7 +438,7 @@ mod tests {
 				assert_eq!(calls[0].name, "a");
 				assert_eq!(calls[1].name, "b");
 			}
-			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
+			other => panic!("Expected ToolCalls, got {:?}", other),
 		}
 	}
 
@@ -435,7 +451,7 @@ mod tests {
 				assert!(calls[0].arguments["attendees"].is_array());
 				assert!(calls[0].arguments["location"].is_object());
 			}
-			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
+			other => panic!("Expected ToolCalls, got {:?}", other),
 		}
 	}
 
@@ -521,7 +537,7 @@ mod tests {
 				assert_eq!(calls.len(), 1);
 				assert_eq!(calls[0].name, "f");
 			}
-			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
+			other => panic!("Expected ToolCalls, got {:?}", other),
 		}
 	}
 
@@ -533,7 +549,7 @@ mod tests {
 			ParsedResponse::ToolCalls(calls) => {
 				assert_eq!(calls.len(), 1);
 			}
-			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
+			other => panic!("Expected ToolCalls, got {:?}", other),
 		}
 	}
 
@@ -546,7 +562,7 @@ mod tests {
 				assert_eq!(calls[0].name, "exec");
 				assert_eq!(calls[0].arguments["command"], "ls");
 			}
-			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
+			other => panic!("Expected ToolCalls, got {:?}", other),
 		}
 	}
 
@@ -559,7 +575,7 @@ mod tests {
 				assert_eq!(calls[0].name, "a");
 				assert_eq!(calls[1].name, "b");
 			}
-			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
+			other => panic!("Expected ToolCalls, got {:?}", other),
 		}
 	}
 
@@ -572,7 +588,7 @@ mod tests {
 				assert_eq!(calls[0].name, "f");
 				assert!(calls[0].arguments["items"].is_array());
 			}
-			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
+			other => panic!("Expected ToolCalls, got {:?}", other),
 		}
 	}
 
@@ -590,7 +606,7 @@ mod tests {
 				assert_eq!(calls.len(), 1);
 				assert_eq!(calls[0].name, "exec");
 			}
-			other => panic!("Expected ToolCalls, got {}", parsed_variant_name(&other)),
+			other => panic!("Expected ToolCalls, got {:?}", other),
 		}
 	}
 
