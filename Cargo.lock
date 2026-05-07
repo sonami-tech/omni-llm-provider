@@ -191,11 +191,12 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "claude-code-provider"
-version = "1.1.17"
+version = "1.1.18"
 dependencies = [
  "axum",
  "clap",
  "dirs",
+ "nu-ansi-term",
  "redb",
  "serde",
  "serde_json",

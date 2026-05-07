@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod conversation_log;
 mod error;
+mod log_color;
 mod models;
 mod replacements;
 mod routes;
@@ -47,6 +48,7 @@ async fn main() {
 	} else {
 		"claude_code_provider=info"
 	};
+	let color_mode = log_color::ColorMode::from_env();
 	tracing_subscriber::fmt()
 		.with_env_filter(
 			tracing_subscriber::EnvFilter::try_from_default_env()
@@ -54,6 +56,8 @@ async fn main() {
 		)
 		.with_target(false)
 		.with_writer(std::io::stderr)
+		.with_ansi(matches!(color_mode, log_color::ColorMode::On))
+		.fmt_fields(log_color::ColorFields::new(color_mode))
 		.compact()
 		.init();
 
