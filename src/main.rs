@@ -5,6 +5,7 @@ mod error;
 mod models;
 mod replacements;
 mod routes;
+mod session;
 mod stats;
 mod subprocess;
 mod time_util;

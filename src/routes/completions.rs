@@ -15,6 +15,7 @@ use crate::AppState;
 use crate::auth::ApiKeyId;
 use crate::error::AppError;
 use crate::models::{normalize_model_name, resolve_model, validate_effort};
+use crate::session::resolve_session_id;
 use crate::subprocess::SubprocessEvent;
 use crate::subprocess::manager::spawn_managed;
 use crate::translate::request::{
@@ -33,6 +34,12 @@ pub async fn completions_handler(
 	request: axum::http::Request<axum::body::Body>,
 ) -> Result<Response, AppError> {
 	let api_key_id = request.extensions().get::<ApiKeyId>().map(|k| k.0.clone());
+	// Extract correlation header before the body consumes the request.
+	let session_header = request
+		.headers()
+		.get("x-session-id")
+		.and_then(|v| v.to_str().ok())
+		.map(str::to_string);
 	let body = axum::body::to_bytes(request.into_body(), crate::MAX_BODY_SIZE)
 		.await
 		.map_err(|e| AppError::BadRequest(format!("Failed to read body: {}", e)))?;
@@ -45,9 +52,13 @@ pub async fn completions_handler(
 	let request_id = &uuid_str[..8];
 	let chat_id = format!("chatcmpl-{request_id}");
 
+	let session_id =
+		resolve_session_id(session_header.as_deref(), &request, api_key_id.as_deref());
+
 	let span = tracing::info_span!(
 		"request",
 		request_id = %request_id,
+		session_id = %session_id,
 		model = %request.model,
 		stream = %request.stream,
 	);

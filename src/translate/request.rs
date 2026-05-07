@@ -16,6 +16,10 @@ pub struct ChatCompletionRequest {
 	pub tools: Option<Vec<ToolDefinition>>,
 	#[serde(default)]
 	pub tool_choice: Option<ToolChoice>,
+	/// OpenAI's optional end-user identifier; used as a session-id fallback
+	/// when the `x-session-id` header is absent. See `routes::completions`.
+	#[serde(default)]
+	pub user: Option<String>,
 	// All other OpenAI fields (max_tokens, temperature, top_p, stop, etc.)
 	// are accepted and silently ignored — no #[serde(deny_unknown_fields)].
 }
@@ -444,6 +448,7 @@ mod tests {
 			reasoning_effort: None,
 			tools: None,
 			tool_choice: None,
+			user: None,
 		};
 		assert!(validate_request(&req).is_err());
 	}
@@ -457,6 +462,7 @@ mod tests {
 			reasoning_effort: None,
 			tools: None,
 			tool_choice: None,
+			user: None,
 		};
 		assert!(validate_request(&req).is_err());
 	}
@@ -470,6 +476,7 @@ mod tests {
 			reasoning_effort: None,
 			tools: None,
 			tool_choice: None,
+			user: None,
 		};
 		assert!(validate_request(&req).is_ok());
 	}
