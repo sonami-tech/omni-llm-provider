@@ -9,7 +9,7 @@ use axum::response::Response;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::AppState;
 use crate::auth::ApiKeyId;
@@ -231,14 +231,16 @@ async fn handle_non_streaming(
 		match parse_tool_response(&content) {
 			ParsedResponse::ToolCalls(calls) => {
 				let tool_calls = to_response_tool_calls(calls);
-				info!("Detected {} tool call(s)", tool_calls.len());
 
 				if let Some(ref log) = conv_log {
 					log.log(&request_id, "<<<", "Tool calls", &content);
 				}
 
+				let n = tool_calls.len();
 				let response =
 					build_tool_call_response(&chat_id, created, &model, tool_calls, &result);
+
+				log_completion_finished("tool_calls", n, false, duration_ms.round() as u64);
 
 				let headers = [(
 					header::HeaderName::from_static("x-request-id"),
@@ -248,7 +250,7 @@ async fn handle_non_streaming(
 				return Ok((headers, axum::Json(response)).into_response());
 			}
 			ParsedResponse::MalformedToolCall(err) => {
-				info!("Detected malformed tool call attempt: {}", err);
+				warn!(error = %err, "Malformed tool call attempt detected");
 				if let Some(ref log) = conv_log {
 					log.log(&request_id, "<<<", "Malformed tool call", &content);
 				}
@@ -263,6 +265,8 @@ async fn handle_non_streaming(
 	}
 
 	let response = build_response(&chat_id, created, &model, &content, &result);
+
+	log_completion_finished("stop", 0, false, duration_ms.round() as u64);
 
 	let headers = [(
 		header::HeaderName::from_static("x-request-id"),
@@ -387,6 +391,11 @@ async fn handle_streaming(
 
 					stats.record_completion(&model, ttft_ms, duration_ms, &result);
 
+					// Track what we ultimately returned so we can emit a single
+					// structured end-of-request log line after [DONE].
+					let mut finish_reason: &'static str = "stop";
+					let mut n_tool_calls: usize = 0;
+
 					// Emit buffered tool calls or text if in tool mode.
 					if tools_active {
 						if let Some(ref mut buf) = full_content {
@@ -397,6 +406,8 @@ async fn handle_streaming(
 							match parse_tool_response(buf) {
 								ParsedResponse::ToolCalls(calls) => {
 									let tool_calls = to_response_tool_calls(calls);
+									n_tool_calls = tool_calls.len();
+									finish_reason = "tool_calls";
 
 									if let Some(log) = &conv_log {
 										log.log(&conv_request_id, "<<<", "Tool calls", buf);
@@ -428,6 +439,7 @@ async fn handle_streaming(
 									}
 								}
 								ParsedResponse::MalformedToolCall(err) => {
+									warn!(error = %err, "Malformed tool call attempt detected");
 									let message = malformed_tool_call_message(&err);
 									emit_text_finish(
 										&sse_tx,
@@ -477,6 +489,8 @@ async fn handle_streaming(
 					}
 
 					let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
+
+					log_completion_finished(finish_reason, n_tool_calls, true, duration_ms.round() as u64);
 				}
 				SubprocessEvent::Error(msg) => {
 					stats.record_error(&model, &msg);
@@ -532,4 +546,25 @@ async fn emit_text_finish(
 	if let Ok(json) = serde_json::to_string(&finish) {
 		let _ = sse_tx.send(Ok(Event::default().data(json))).await;
 	}
+}
+
+/// Single structured end-of-request log line for successful responses.
+/// Operators read this to tell at a glance whether the client will continue
+/// the conversation (`tool_calls`) or whether the request was terminal
+/// (`stop`). Malformed tool-call attempts fall back to a synthetic text reply
+/// and are reported here as `stop` (see the separate `warn!` for the
+/// malformed event itself). Errors are not reported via this log.
+fn log_completion_finished(
+	finish_reason: &str,
+	tool_call_count: usize,
+	streaming: bool,
+	duration_ms: u64,
+) {
+	info!(
+		finish_reason = finish_reason,
+		tool_call_count = tool_call_count,
+		streaming = streaming,
+		duration_ms = duration_ms,
+		"Chat completion finished"
+	);
 }
