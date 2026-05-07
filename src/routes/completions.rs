@@ -9,7 +9,7 @@ use axum::response::Response;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, info, warn};
+use tracing::{Instrument, error, info, warn};
 
 use crate::AppState;
 use crate::auth::ApiKeyId;
@@ -51,7 +51,12 @@ pub async fn completions_handler(
 		model = %request.model,
 		stream = %request.stream,
 	);
-	let _guard = span.enter();
+
+	// Run the rest of the handler instrumented with the request span so the
+	// request_id is attached to every log line, including those emitted from
+	// detached tasks (subprocess driver, streaming converter) that explicitly
+	// adopt this span via `.instrument(Span::current())`.
+	async move {
 
 	// Validate.
 	validate_request(&request)?;
@@ -122,6 +127,10 @@ pub async fn completions_handler(
 		handle_non_streaming(state, request_id, chat_id, created, model_def.canonical, cli_args, prompt, conv_log, tools_active)
 			.await
 	}
+
+	}
+	.instrument(span)
+	.await
 }
 
 async fn handle_non_streaming(
@@ -301,12 +310,14 @@ async fn handle_streaming(
 	)
 	.await?;
 
-	// Converter task: SubprocessEvent → SSE Event.
+	// Converter task: SubprocessEvent → SSE Event. Inherit the request span
+	// so all logs from this detached task carry the request_id.
 	let conv_chat_id = chat_id.clone();
 	let conv_request_id = request_id.clone();
 	let conv_model = requested_model.to_string();
 	let replacements = state.replacements.clone();
 	let stats = state.stats.clone();
+	let converter_span = tracing::Span::current();
 	tokio::spawn(async move {
 		let _active = crate::stats::ActiveRequestGuard::new(&stats);
 		let start = std::time::Instant::now();
@@ -503,7 +514,7 @@ async fn handle_streaming(
 				}
 			}
 		}
-	});
+	}.instrument(converter_span));
 
 	let sse_stream = ReceiverStream::new(sse_rx);
 	let sse = Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));

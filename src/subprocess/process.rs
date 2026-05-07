@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{ChildStderr, ChildStdout};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 use crate::config::Config;
 use crate::subprocess::ndjson::{self, ResultMessage};
@@ -122,19 +122,22 @@ pub async fn run_subprocess(
 	// the child may write to stdout/stderr before consuming all of stdin.
 	let stdin = child.stdin.take().expect("stdin not captured");
 	let stdin_tx = tx.clone();
-	let stdin_task = tokio::spawn(async move {
-		let mut stdin = stdin;
-		if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
-			error!(error = %e, "Failed to write prompt to stdin");
-			let _ = stdin_tx
-				.send(SubprocessEvent::Error(format!(
-					"Failed to write prompt to subprocess stdin: {}",
-					e
-				)))
-				.await;
+	let stdin_task = tokio::spawn(
+		async move {
+			let mut stdin = stdin;
+			if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+				error!(error = %e, "Failed to write prompt to stdin");
+				let _ = stdin_tx
+					.send(SubprocessEvent::Error(format!(
+						"Failed to write prompt to subprocess stdin: {}",
+						e
+					)))
+					.await;
+			}
+			// stdin is dropped here, closing the pipe and signaling EOF.
 		}
-		// stdin is dropped here, closing the pipe and signaling EOF.
-	});
+		.instrument(tracing::Span::current()),
+	);
 
 	let stdout = child.stdout.take().expect("stdout not captured");
 	let stderr = child.stderr.take().expect("stderr not captured");

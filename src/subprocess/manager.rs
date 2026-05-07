@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::sync::Semaphore;
+use tracing::Instrument;
 
 use crate::config::Config;
 use crate::error::AppError;
@@ -34,10 +35,15 @@ pub async fn spawn_managed(
 		}
 	};
 
-	tokio::spawn(async move {
-		let _permit = permit; // Held until task completes.
-		run_subprocess(&config, &request_id, cli_args, prompt, tx).await;
-	});
+	// Inherit the caller's tracing span so subprocess logs carry the request_id.
+	let span = tracing::Span::current();
+	tokio::spawn(
+		async move {
+			let _permit = permit; // Held until task completes.
+			run_subprocess(&config, &request_id, cli_args, prompt, tx).await;
+		}
+		.instrument(span),
+	);
 
 	Ok(())
 }
