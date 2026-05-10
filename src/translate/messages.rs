@@ -98,14 +98,13 @@ pub fn reshape(messages: &[ChatMessage]) -> Result<Reshaped, AppError> {
 			}
 			"tool" | "function" => {
 				// Anthropic spec: tool_result content blocks live inside a
-				// `user` message. Coalesce consecutive tool messages into a
-				// single user message per the convention.
-				let mut blocks = vec![tool_result_block(m)?];
+				// `user` message. Coalesce consecutive tool messages.
+				let mut blocks = vec![tool_or_user_block(m)?];
 				let mut peek = idx + 1;
 				while peek < messages.len() {
 					let next = &messages[peek];
 					if matches!(next.role.as_str(), "tool" | "function") {
-						blocks.push(tool_result_block(next)?);
+						blocks.push(tool_or_user_block(next)?);
 						peek += 1;
 					} else {
 						break;
@@ -275,6 +274,18 @@ fn tool_result_block(m: &ChatMessage) -> Result<ContentBlock, AppError> {
 		},
 		is_error: None,
 	})
+}
+
+fn tool_or_user_block(m: &ChatMessage) -> Result<ContentBlock, AppError> {
+	if m.tool_call_id.is_some() {
+		tool_result_block(m)
+	} else {
+		let text = extract_text(&m.content);
+		Ok(ContentBlock::Text {
+			text,
+			cache_control: None,
+		})
+	}
 }
 
 fn extract_text(content: &Option<OaiMessageContent>) -> String {

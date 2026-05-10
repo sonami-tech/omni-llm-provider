@@ -86,7 +86,14 @@ pub fn build_messages_request(
 	} else {
 		req.temperature
 	};
-	let top_p = if thinking_active { None } else { req.top_p };
+	let top_p = if thinking_active {
+		None
+	} else if req.temperature.is_some() && req.top_p.is_some() {
+		tracing::debug!("temperature and top_p both set; dropping top_p for Anthropic compatibility");
+		None
+	} else {
+		req.top_p
+	};
 	let top_k = if thinking_active { None } else { req.top_k };
 	let stop_sequences = if thinking_active { None } else { stop_sequences };
 

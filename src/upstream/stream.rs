@@ -30,6 +30,8 @@ pub enum StreamEvent {
 	MessageStart {
 		id: String,
 		model: String,
+		input_tokens: Option<u32>,
+		output_tokens: Option<u32>,
 	},
 	ContentBlockStart {
 		index: u32,
@@ -98,10 +100,14 @@ struct AnyEvent {
 struct MessageStartInner {
 	id: String,
 	model: String,
+	#[serde(default)]
+	usage: Option<UsageDelta>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 struct UsageDelta {
+	#[serde(default)]
+	input_tokens: Option<u32>,
 	#[serde(default)]
 	output_tokens: Option<u32>,
 }
@@ -124,9 +130,12 @@ fn parse_event_data(json_str: &str) -> Result<StreamEvent, UpstreamError> {
 			let inner = any
 				.message
 				.ok_or_else(|| UpstreamError::Decode("message_start missing message".into()))?;
+			let usage = any.usage.or(inner.usage);
 			StreamEvent::MessageStart {
 				id: inner.id,
 				model: inner.model,
+				input_tokens: usage.as_ref().and_then(|u| u.input_tokens),
+				output_tokens: usage.and_then(|u| u.output_tokens),
 			}
 		}
 		"content_block_start" => {
@@ -351,9 +360,16 @@ mod tests {
 		let json = r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-haiku-4-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}"#;
 		let ev = parse_event_data(json).unwrap();
 		match ev {
-			StreamEvent::MessageStart { id, model } => {
+			StreamEvent::MessageStart {
+				id,
+				model,
+				input_tokens,
+				output_tokens,
+			} => {
 				assert_eq!(id, "msg_1");
 				assert_eq!(model, "claude-haiku-4-5");
+				assert_eq!(input_tokens, Some(10));
+				assert_eq!(output_tokens, Some(1));
 			}
 			_ => panic!("wrong variant"),
 		}

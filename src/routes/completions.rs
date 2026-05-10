@@ -27,7 +27,7 @@ pub async fn completions_handler(
 		.await
 		.map_err(|e| AppError::BadRequest(format!("Failed to read body: {}", e)))?;
 	// Parse body manually for OpenAI-format error on bad JSON.
-	let request: ChatCompletionRequest = serde_json::from_slice(&body)
+	let mut request: ChatCompletionRequest = serde_json::from_slice(&body)
 		.map_err(|e| AppError::BadRequest(format!("Invalid JSON: {}", e)))?;
 
 	// Generate request ID: first 8 hex chars of UUID v4.
@@ -63,6 +63,7 @@ pub async fn completions_handler(
 	// Validate.
 	validate_request(&request)?;
 	let model_def = resolve_model(&request.model);
+	request.model = model_def.cli_name.to_string();
 	validate_effort(request.reasoning_effort.as_deref())?;
 
 	let created = SystemTime::now()

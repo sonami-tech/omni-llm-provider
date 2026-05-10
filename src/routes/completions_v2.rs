@@ -27,6 +27,11 @@ use crate::upstream::credentials::Credentials;
 use crate::upstream::errors::UpstreamError;
 use crate::upstream::fingerprint::RequestContext;
 
+fn request_id_header(request_id: &str) -> header::HeaderValue {
+	header::HeaderValue::from_str(request_id)
+		.unwrap_or_else(|_| header::HeaderValue::from_static("unknown"))
+}
+
 pub async fn handle_non_streaming_v2(
 	state: Arc<AppState>,
 	request: ChatCompletionRequest,
@@ -91,7 +96,7 @@ pub async fn handle_non_streaming_v2(
 		"v2 completion usage"
 	);
 
-	let mut oai_response = build_oai_response(&resp, &chat_id, created, &request.model);
+	let mut oai_response = build_oai_response(&resp, &chat_id, created, model_def.canonical);
 
 	// Apply replacements to the assistant text content if present.
 	if !state.replacements.is_empty() {
@@ -121,7 +126,7 @@ pub async fn handle_non_streaming_v2(
 
 	let headers = [(
 		header::HeaderName::from_static("x-request-id"),
-		header::HeaderValue::from_str(&request_id).unwrap_or_else(|_| header::HeaderValue::from_static("unknown")),
+		request_id_header(&request_id),
 	)];
 	Ok((headers, axum::Json(oai_response)).into_response())
 }
@@ -173,7 +178,7 @@ pub async fn handle_streaming_v2(
 	let conv_request_id = request_id.clone();
 	let conv_log_for_task = conv_log.clone();
 	let replacements = state.replacements.clone();
-	let requested_model = request.model.clone();
+	let requested_model = model_def.canonical.to_string();
 	let span = tracing::Span::current();
 
 	tokio::spawn(
@@ -259,7 +264,12 @@ pub async fn handle_streaming_v2(
 
 	let stream = ReceiverStream::new(rx);
 	let sse = Sse::new(stream).keep_alive(KeepAlive::default());
-	Ok(sse.into_response())
+	let mut response = sse.into_response();
+	response.headers_mut().insert(
+		header::HeaderName::from_static("x-request-id"),
+		request_id_header(&request_id),
+	);
+	Ok(response)
 }
 
 /// Pull a `delta.content` text fragment from an outbound chunk if present.

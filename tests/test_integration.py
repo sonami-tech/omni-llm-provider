@@ -1114,4 +1114,4 @@ class TestConversationLog:
 		assert os.path.isfile(log_file), f"Log file not created at {log_file}"
 		content = open(log_file).read()
 		assert len(content) > 0
-		assert "Prompt" in content or "Response" in content
+		assert "Inbound OAI body" in content and "OAI response" in content

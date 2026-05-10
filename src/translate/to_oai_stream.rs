@@ -31,6 +31,8 @@ pub struct OaiStreamConverter {
 	blocks: HashMap<u32, TrackedBlock>,
 	next_oai_tool_index: u32,
 	stop_reason: Option<String>,
+	input_tokens: Option<u32>,
+	output_tokens: Option<u32>,
 }
 
 impl OaiStreamConverter {
@@ -45,6 +47,8 @@ impl OaiStreamConverter {
 			blocks: HashMap::new(),
 			next_oai_tool_index: 0,
 			stop_reason: None,
+			input_tokens: None,
+			output_tokens: None,
 		}
 	}
 
@@ -53,7 +57,18 @@ impl OaiStreamConverter {
 	/// then emits `data: [DONE]\n\n` after the stream ends.
 	pub fn on_event(&mut self, event: StreamEvent) -> Vec<Value> {
 		match event {
-			StreamEvent::MessageStart { id: _, model: _ } => {
+			StreamEvent::MessageStart {
+				id: _,
+				model: _,
+				input_tokens,
+				output_tokens,
+			} => {
+				if input_tokens.is_some() {
+					self.input_tokens = input_tokens;
+				}
+				if output_tokens.is_some() {
+					self.output_tokens = output_tokens;
+				}
 				// Don't switch model name to dated form — keep what the
 				// consumer requested. This avoids confusing OAI clients that
 				// echo the model back.
@@ -117,11 +132,14 @@ impl OaiStreamConverter {
 			StreamEvent::ContentBlockStop { .. } => vec![],
 			StreamEvent::MessageDelta {
 				stop_reason,
-				output_tokens: _,
+				output_tokens,
 				..
 			} => {
 				if let Some(r) = stop_reason {
 					self.stop_reason = Some(r);
+				}
+				if output_tokens.is_some() {
+					self.output_tokens = output_tokens;
 				}
 				vec![]
 			}
@@ -278,7 +296,7 @@ impl OaiStreamConverter {
 			_ if has_tool_calls => "tool_calls",
 			_ => "stop",
 		};
-		vec![json!({
+		let mut chunk = json!({
 			"id": self.chat_id,
 			"object": "chat.completion.chunk",
 			"created": self.created,
@@ -288,6 +306,20 @@ impl OaiStreamConverter {
 				"delta": {},
 				"finish_reason": finish_reason,
 			}]
-		})]
+		});
+		if let Some(usage) = self.usage_value() {
+			chunk["usage"] = usage;
+		}
+		vec![chunk]
+	}
+
+	fn usage_value(&self) -> Option<Value> {
+		let prompt_tokens = self.input_tokens?;
+		let completion_tokens = self.output_tokens.unwrap_or(0);
+		Some(json!({
+			"prompt_tokens": prompt_tokens,
+			"completion_tokens": completion_tokens,
+			"total_tokens": prompt_tokens + completion_tokens,
+		}))
 	}
 }
