@@ -183,12 +183,13 @@ pub async fn handle_streaming_v2(
 
 	tokio::spawn(
 		async move {
-			let mut converter = OaiStreamConverter::new(chat_id, created, requested_model);
+			let mut converter =
+				OaiStreamConverter::new(chat_id.clone(), created, requested_model.clone());
+			let mut stream_state = StreamReplState::new(chat_id, created, requested_model);
 			// Initial :ok comment to flush headers immediately.
 			let _ = tx.send(Ok(Event::default().comment("ok"))).await;
 
 			let mut stream = upstream_stream;
-			let mut accumulated_text = String::new();
 			let mut errored = false;
 
 			while let Some(item) = stream.next().await {
@@ -196,23 +197,24 @@ pub async fn handle_streaming_v2(
 					Ok(event) => {
 						let chunks = converter.on_event(event);
 						for chunk in chunks {
-							// Apply replacements only to plain text content deltas.
-							let chunk = if !replacements.is_empty() {
-								apply_stream_replacements(chunk, &replacements, &mut accumulated_text)
+							let chunks_to_emit = if !replacements.is_empty() {
+								stream_state.process(chunk, &replacements)
 							} else {
 								if let Some(text) = extract_content_delta(&chunk) {
-									accumulated_text.push_str(text);
+									stream_state.accumulator.push_str(text);
 								}
-								chunk
+								vec![chunk]
 							};
-							match serde_json::to_string(&chunk) {
-								Ok(s) => {
-									if tx.send(Ok(Event::default().data(s))).await.is_err() {
-										return;
+							for c in chunks_to_emit {
+								match serde_json::to_string(&c) {
+									Ok(s) => {
+										if tx.send(Ok(Event::default().data(s))).await.is_err() {
+											return;
+										}
 									}
-								}
-								Err(e) => {
-									error!("v2 stream chunk serialize: {e}");
+									Err(e) => {
+										error!("v2 stream chunk serialize: {e}");
+									}
 								}
 							}
 						}
@@ -238,6 +240,17 @@ pub async fn handle_streaming_v2(
 				}
 			}
 
+			// Flush any buffered tool-call arg fragments that didn't see a
+			// finish_reason (e.g., upstream error or client cancellation),
+			// rewritten so partial state still gets through correctly.
+			if !replacements.is_empty() {
+				for chunk in stream_state.flush(&replacements) {
+					if let Ok(s) = serde_json::to_string(&chunk) {
+						let _ = tx.send(Ok(Event::default().data(s))).await;
+					}
+				}
+			}
+
 			if !errored {
 				for chunk in converter.finalize_if_needed() {
 					if let Ok(s) = serde_json::to_string(&chunk) {
@@ -253,7 +266,7 @@ pub async fn handle_streaming_v2(
 					&conv_request_id,
 					"<<<",
 					"Streaming response (text accumulator)",
-					&accumulated_text,
+					&stream_state.accumulator,
 				);
 			}
 
@@ -283,47 +296,131 @@ fn extract_content_delta(chunk: &serde_json::Value) -> Option<&str> {
 		.as_str()
 }
 
-/// Apply replacements to a chunk's `delta.content` and `delta.tool_calls[].function.name`
-/// if present, returning the transformed chunk. Also accumulates text into
-/// `accumulator` for logging. Tool-call argument fragments are NOT rewritten —
-/// the rename strings could straddle chunk boundaries and partial-fragment
-/// replacement would corrupt arguments.
-fn apply_stream_replacements(
-	mut chunk: serde_json::Value,
-	repl: &crate::replacements::Replacements,
-	accumulator: &mut String,
-) -> serde_json::Value {
-	if let Some(text) = extract_content_delta(&chunk).map(str::to_string) {
-		let replaced = repl.apply_response(&text);
-		accumulator.push_str(&replaced);
-		if let Some(delta) = chunk
+/// Streaming-replacement state. Buffers tool-call `function.arguments`
+/// fragments per `tool_calls[i].index` so the response rewrite can run against
+/// the complete argument JSON instead of partial fragments — partial-fragment
+/// replacement would corrupt cases where a rename string straddles a chunk
+/// boundary (e.g. `claudec` + `odecodetransit`).
+struct StreamReplState {
+	/// Rewritten text content accumulator for end-of-stream logging.
+	pub accumulator: String,
+	/// Raw (pre-rewrite) per-tool-call argument buffers, keyed by index.
+	tool_args: std::collections::BTreeMap<u64, String>,
+	/// Static OAI chunk header fields used when emitting synthetic flush chunks.
+	chat_id: String,
+	created: u64,
+	model: String,
+}
+
+impl StreamReplState {
+	fn new(chat_id: String, created: u64, model: String) -> Self {
+		Self {
+			accumulator: String::new(),
+			tool_args: std::collections::BTreeMap::new(),
+			chat_id,
+			created,
+			model,
+		}
+	}
+
+	/// Process a chunk. Returns the chunks to emit downstream (typically just
+	/// the rewritten chunk; when `finish_reason` arrives, synthetic flush
+	/// chunks carrying the rewritten tool-call args are emitted first).
+	fn process(
+		&mut self,
+		mut chunk: serde_json::Value,
+		repl: &crate::replacements::Replacements,
+	) -> Vec<serde_json::Value> {
+		if let Some(text) = extract_content_delta(&chunk).map(str::to_string) {
+			let replaced = repl.apply_response(&text);
+			self.accumulator.push_str(&replaced);
+			if let Some(delta) = chunk
+				.get_mut("choices")
+				.and_then(|c| c.as_array_mut())
+				.and_then(|arr| arr.first_mut())
+				.and_then(|c| c.get_mut("delta"))
+			{
+				delta["content"] = serde_json::Value::String(replaced);
+			}
+		}
+
+		if let Some(tool_calls) = chunk
 			.get_mut("choices")
 			.and_then(|c| c.as_array_mut())
 			.and_then(|arr| arr.first_mut())
 			.and_then(|c| c.get_mut("delta"))
+			.and_then(|d| d.get_mut("tool_calls"))
+			.and_then(|t| t.as_array_mut())
 		{
-			delta["content"] = serde_json::Value::String(replaced);
-		}
-	}
-	if let Some(tool_calls) = chunk
-		.get_mut("choices")
-		.and_then(|c| c.as_array_mut())
-		.and_then(|arr| arr.first_mut())
-		.and_then(|c| c.get_mut("delta"))
-		.and_then(|d| d.get_mut("tool_calls"))
-		.and_then(|t| t.as_array_mut())
-	{
-		for call in tool_calls {
-			if let Some(function) = call.get_mut("function").and_then(|f| f.as_object_mut()) {
-				if let Some(name) = function.get_mut("name") {
-					if let Some(s) = name.as_str() {
-						*name = serde_json::Value::String(repl.apply_response(s));
+			for call in tool_calls {
+				let index = call.get("index").and_then(|v| v.as_u64());
+				if let Some(function) = call.get_mut("function").and_then(|f| f.as_object_mut()) {
+					if let Some(name) = function.get_mut("name") {
+						if let Some(s) = name.as_str() {
+							*name = serde_json::Value::String(repl.apply_response(s));
+						}
+					}
+					if let Some(idx) = index {
+						if let Some(args) = function.get("arguments").and_then(|v| v.as_str()) {
+							self.tool_args.entry(idx).or_default().push_str(args);
+							function.remove("arguments");
+						}
 					}
 				}
 			}
 		}
+
+		let has_finish = chunk
+			.get("choices")
+			.and_then(|c| c.as_array())
+			.and_then(|arr| arr.first())
+			.and_then(|c| c.get("finish_reason"))
+			.map(|v| !v.is_null())
+			.unwrap_or(false);
+
+		let mut out: Vec<serde_json::Value> = Vec::new();
+		if has_finish {
+			out.extend(self.drain_flushed(repl));
+		}
+		out.push(chunk);
+		out
 	}
-	chunk
+
+	/// Flush any leftover buffered args (called after the upstream loop exits,
+	/// covering streams that ended without a `finish_reason`).
+	fn flush(&mut self, repl: &crate::replacements::Replacements) -> Vec<serde_json::Value> {
+		self.drain_flushed(repl)
+	}
+
+	fn drain_flushed(
+		&mut self,
+		repl: &crate::replacements::Replacements,
+	) -> Vec<serde_json::Value> {
+		std::mem::take(&mut self.tool_args)
+			.into_iter()
+			.map(|(index, raw)| {
+				let rewritten = repl.apply_response(&raw);
+				serde_json::json!({
+					"id": self.chat_id,
+					"object": "chat.completion.chunk",
+					"created": self.created,
+					"model": self.model,
+					"choices": [{
+						"index": 0,
+						"delta": {
+							"tool_calls": [{
+								"index": index,
+								"function": {
+									"arguments": rewritten,
+								}
+							}]
+						},
+						"finish_reason": null
+					}]
+				})
+			})
+			.collect()
+	}
 }
 
 fn map_upstream_err(e: UpstreamError) -> AppError {
