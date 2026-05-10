@@ -18,6 +18,12 @@ enum TrackedBlock {
 	Other,
 }
 
+#[derive(Debug, Default)]
+struct ThinkingBuffer {
+	thinking: String,
+	signature: Option<String>,
+}
+
 pub struct OaiStreamConverter {
 	pub chat_id: String,
 	pub created: u64,
@@ -29,6 +35,7 @@ pub struct OaiStreamConverter {
 	role_emitted: bool,
 	finish_emitted: bool,
 	blocks: HashMap<u32, TrackedBlock>,
+	thinking_buffers: HashMap<u32, ThinkingBuffer>,
 	next_oai_tool_index: u32,
 	stop_reason: Option<String>,
 	input_tokens: Option<u32>,
@@ -45,6 +52,7 @@ impl OaiStreamConverter {
 			role_emitted: false,
 			finish_emitted: false,
 			blocks: HashMap::new(),
+			thinking_buffers: HashMap::new(),
 			next_oai_tool_index: 0,
 			stop_reason: None,
 			input_tokens: None,
@@ -98,6 +106,8 @@ impl OaiStreamConverter {
 				}
 				BlockStart::Thinking => {
 					self.blocks.insert(index, TrackedBlock::Thinking);
+					self.thinking_buffers
+						.insert(index, ThinkingBuffer::default());
 					vec![]
 				}
 				BlockStart::Other(_) => {
@@ -121,15 +131,29 @@ impl OaiStreamConverter {
 						vec![self.tool_call_args_chunk(oai_index, &s)]
 					}
 					(TrackedBlock::Thinking, BlockDelta::Thinking(s)) => {
-						vec![self.reasoning_delta_chunk(&s)]
+						self.thinking_buffers
+							.entry(index)
+							.or_default()
+							.thinking
+							.push_str(&s);
+						vec![]
 					}
 					(TrackedBlock::Thinking, BlockDelta::ThinkingSignature(s)) => {
-						vec![self.reasoning_signature_chunk(&s)]
+						self.thinking_buffers
+							.entry(index)
+							.or_default()
+							.signature = Some(s);
+						vec![]
 					}
 					_ => vec![],
 				}
 			}
-			StreamEvent::ContentBlockStop { .. } => vec![],
+			StreamEvent::ContentBlockStop { index } => {
+				match self.blocks.remove(&index) {
+					Some(TrackedBlock::Thinking) => self.flush_thinking_buffer(index),
+					_ => vec![],
+				}
+			}
 			StreamEvent::MessageDelta {
 				stop_reason,
 				output_tokens,
@@ -205,7 +229,14 @@ impl OaiStreamConverter {
 		})
 	}
 
-	fn reasoning_delta_chunk(&self, text: &str) -> Value {
+	fn reasoning_content_chunk(&self, thinking: String, signature: Option<String>) -> Value {
+		let mut reasoning_part = serde_json::Map::new();
+		reasoning_part.insert("type".into(), Value::String("thinking".into()));
+		reasoning_part.insert("thinking".into(), Value::String(thinking));
+		if let Some(signature) = signature {
+			reasoning_part.insert("signature".into(), Value::String(signature));
+		}
+
 		json!({
 			"id": self.chat_id,
 			"object": "chat.completion.chunk",
@@ -213,26 +244,30 @@ impl OaiStreamConverter {
 			"model": self.requested_model,
 			"choices": [{
 				"index": 0,
-				"delta": {"reasoning_content": text},
+				"delta": {"reasoning_content": [Value::Object(reasoning_part)]},
 				"finish_reason": null,
 			}]
 		})
 	}
 
-	fn reasoning_signature_chunk(&self, sig: &str) -> Value {
-		// Surface signature as an extension field — OpenAI clients ignore
-		// unknown delta fields.
-		json!({
-			"id": self.chat_id,
-			"object": "chat.completion.chunk",
-			"created": self.created,
-			"model": self.requested_model,
-			"choices": [{
-				"index": 0,
-				"delta": {"reasoning_signature": sig},
-				"finish_reason": null,
-			}]
-		})
+	fn flush_thinking_buffer(&mut self, index: u32) -> Vec<Value> {
+		let Some(buffer) = self.thinking_buffers.remove(&index) else {
+			return vec![];
+		};
+		if buffer.thinking.is_empty() {
+			vec![]
+		} else {
+			vec![self.reasoning_content_chunk(buffer.thinking, buffer.signature)]
+		}
+	}
+
+	fn flush_all_thinking_buffers(&mut self) -> Vec<Value> {
+		let mut indexes: Vec<u32> = self.thinking_buffers.keys().copied().collect();
+		indexes.sort_unstable();
+		indexes
+			.into_iter()
+			.flat_map(|index| self.flush_thinking_buffer(index))
+			.collect()
 	}
 
 	fn tool_call_open_chunk(&self, oai_index: u32, id: &str, name: &str) -> Value {
@@ -285,6 +320,7 @@ impl OaiStreamConverter {
 			return vec![];
 		}
 		self.finish_emitted = true;
+		let mut chunks = self.flush_all_thinking_buffers();
 		let has_tool_calls = self.next_oai_tool_index > 0;
 		let finish_reason = match self.stop_reason.as_deref() {
 			Some("end_turn") => "stop",
@@ -310,7 +346,8 @@ impl OaiStreamConverter {
 		if let Some(usage) = self.usage_value() {
 			chunk["usage"] = usage;
 		}
-		vec![chunk]
+		chunks.push(chunk);
+		chunks
 	}
 
 	fn usage_value(&self) -> Option<Value> {
@@ -321,5 +358,86 @@ impl OaiStreamConverter {
 			"completion_tokens": completion_tokens,
 			"total_tokens": prompt_tokens + completion_tokens,
 		}))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn converter() -> OaiStreamConverter {
+		OaiStreamConverter::new("chatcmpl-test".into(), 123, "claude-test".into())
+	}
+
+	#[test]
+	fn buffers_thinking_until_content_block_stop() {
+		let mut converter = converter();
+
+		assert!(converter
+			.on_event(StreamEvent::ContentBlockStart {
+				index: 3,
+				block: BlockStart::Thinking,
+			})
+			.is_empty());
+		assert!(converter
+			.on_event(StreamEvent::ContentBlockDelta {
+				index: 3,
+				delta: BlockDelta::Thinking("first ".into()),
+			})
+			.is_empty());
+		assert!(converter
+			.on_event(StreamEvent::ContentBlockDelta {
+				index: 3,
+				delta: BlockDelta::Thinking("second".into()),
+			})
+			.is_empty());
+		assert!(converter
+			.on_event(StreamEvent::ContentBlockDelta {
+				index: 3,
+				delta: BlockDelta::ThinkingSignature("sig-123".into()),
+			})
+			.is_empty());
+
+		let chunks = converter.on_event(StreamEvent::ContentBlockStop { index: 3 });
+		assert_eq!(chunks.len(), 1);
+		assert_eq!(
+			chunks[0]["choices"][0]["delta"]["reasoning_content"],
+			json!([{
+				"type": "thinking",
+				"thinking": "first second",
+				"signature": "sig-123",
+			}])
+		);
+		assert!(chunks[0]["choices"][0]["delta"]
+			.get("reasoning_signature")
+			.is_none());
+	}
+
+	#[test]
+	fn finalization_flushes_unclosed_thinking_without_null_signature() {
+		let mut converter = converter();
+
+		converter.on_event(StreamEvent::ContentBlockStart {
+			index: 1,
+			block: BlockStart::Thinking,
+		});
+		converter.on_event(StreamEvent::ContentBlockDelta {
+			index: 1,
+			delta: BlockDelta::Thinking("partial".into()),
+		});
+
+		let chunks = converter.finalize_if_needed();
+		assert_eq!(chunks.len(), 2);
+		assert_eq!(
+			chunks[0]["choices"][0]["delta"]["reasoning_content"],
+			json!([{
+				"type": "thinking",
+				"thinking": "partial",
+			}])
+		);
+		assert!(chunks[0]["choices"][0]["delta"]["reasoning_content"][0]
+			.get("signature")
+			.is_none());
+		assert_eq!(chunks[1]["choices"][0]["finish_reason"], "stop");
 	}
 }
