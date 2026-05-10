@@ -134,8 +134,7 @@ mod tests {
 		ChatMessage {
 			role: role.to_string(),
 			content: Some(MessageContent::Text(content.to_string())),
-			tool_calls: None,
-			tool_call_id: None,
+			..Default::default()
 		}
 	}
 
@@ -143,11 +142,7 @@ mod tests {
 		ChatCompletionRequest {
 			model: "opus".to_string(),
 			messages,
-			stream: false,
-			reasoning_effort: None,
-			tools: None,
-			tool_choice: None,
-			user: None,
+			..Default::default()
 		}
 	}
 

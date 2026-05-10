@@ -11,6 +11,7 @@ mod stats;
 mod subprocess;
 mod time_util;
 mod translate;
+mod upstream;
 
 pub const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 const MIN_API_KEY_LENGTH: usize = 8;
@@ -37,6 +38,7 @@ pub struct AppState {
 	pub stats: Arc<stats::Stats>,
 	pub conversation_log: Option<Arc<conversation_log::ConversationLog>>,
 	pub replacements: Arc<replacements::Replacements>,
+	pub upstream: upstream::UpstreamClient,
 }
 
 #[tokio::main]
@@ -199,12 +201,21 @@ async fn main() {
 		Arc::new(replacements::Replacements::empty())
 	};
 
+	let upstream_client = match upstream::UpstreamClient::new() {
+		Ok(c) => c,
+		Err(e) => {
+			error!("Failed to build upstream HTTPS client: {e}");
+			std::process::exit(1);
+		}
+	};
+
 	let state = Arc::new(AppState {
 		config: config.clone(),
 		semaphore,
 		stats: Arc::new(stats_db),
 		conversation_log,
 		replacements,
+		upstream: upstream_client,
 	});
 
 	// Resolve API keys: no-auth, explicit, or auto-generated.

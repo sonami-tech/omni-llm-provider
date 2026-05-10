@@ -133,10 +133,29 @@ pub async fn completions_handler(
 	let conv_log = state.conversation_log.clone();
 	let request_id = request_id.to_string();
 	if request.stream {
-		handle_streaming(state, request_id, chat_id, created, model_def.canonical, cli_args, prompt, conv_log, tools_active).await
+		crate::routes::completions_v2::handle_streaming_v2(
+			state.clone(),
+			request,
+			model_def,
+			request_id,
+			chat_id,
+			created,
+			session_id,
+			conv_log,
+		)
+		.await
 	} else {
-		handle_non_streaming(state, request_id, chat_id, created, model_def.canonical, cli_args, prompt, conv_log, tools_active)
-			.await
+		crate::routes::completions_v2::handle_non_streaming_v2(
+			state.clone(),
+			request,
+			model_def,
+			request_id,
+			chat_id,
+			created,
+			session_id,
+			conv_log,
+		)
+		.await
 	}
 
 	}

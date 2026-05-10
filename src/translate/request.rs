@@ -5,7 +5,7 @@ use crate::models::ModelDef;
 
 // ── OpenAI request types ──────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct ChatCompletionRequest {
 	pub model: String,
 	pub messages: Vec<ChatMessage>,
@@ -20,11 +20,46 @@ pub struct ChatCompletionRequest {
 	/// when the `x-session-id` header is absent. See `routes::completions`.
 	#[serde(default)]
 	pub user: Option<String>,
-	// All other OpenAI fields (max_tokens, temperature, top_p, stop, etc.)
-	// are accepted and silently ignored — no #[serde(deny_unknown_fields)].
+
+	// ── Sampling/output controls (OAI-compat, v2 forwards to Anthropic) ──
+	#[serde(default)]
+	pub max_tokens: Option<u32>,
+	#[serde(default)]
+	pub max_completion_tokens: Option<u32>,
+	#[serde(default)]
+	pub temperature: Option<f32>,
+	#[serde(default)]
+	pub top_p: Option<f32>,
+	#[serde(default)]
+	pub top_k: Option<u32>,
+	#[serde(default)]
+	pub stop: Option<StopSpec>,
+	#[serde(default)]
+	pub metadata: Option<serde_json::Value>,
+	#[serde(default)]
+	pub n: Option<u32>,
+	#[serde(default)]
+	pub response_format: Option<serde_json::Value>,
+	#[serde(default)]
+	pub seed: Option<i64>,
+	#[serde(default)]
+	pub presence_penalty: Option<f32>,
+	#[serde(default)]
+	pub frequency_penalty: Option<f32>,
+	/// Anthropic-style thinking pass-through. If consumer sets this, it
+	/// takes precedence over `reasoning_effort`.
+	#[serde(default)]
+	pub thinking: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum StopSpec {
+	One(String),
+	Many(Vec<String>),
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub struct ChatMessage {
 	pub role: String,
 	#[serde(default)]
@@ -33,6 +68,11 @@ pub struct ChatMessage {
 	pub tool_calls: Option<Vec<RequestToolCall>>,
 	#[serde(default)]
 	pub tool_call_id: Option<String>,
+	/// OAI-extension: thinking-block carryover on assistant turns.
+	/// Either a string (joined plain reasoning) or an array of
+	/// `{type:"thinking", thinking, signature?}` blocks.
+	#[serde(default)]
+	pub reasoning_content: Option<serde_json::Value>,
 }
 
 // ── Tool types ───────────────────────────────────────────────────
@@ -270,8 +310,7 @@ mod tests {
 		ChatMessage {
 			role: role.into(),
 			content: Some(MessageContent::Text(content.into())),
-			tool_calls: None,
-			tool_call_id: None,
+			..Default::default()
 		}
 	}
 
@@ -444,11 +483,7 @@ mod tests {
 		let req = ChatCompletionRequest {
 			model: String::new(),
 			messages: vec![msg("user", "hi")],
-			stream: false,
-			reasoning_effort: None,
-			tools: None,
-			tool_choice: None,
-			user: None,
+			..Default::default()
 		};
 		assert!(validate_request(&req).is_err());
 	}
@@ -457,12 +492,7 @@ mod tests {
 	fn validate_empty_messages() {
 		let req = ChatCompletionRequest {
 			model: "sonnet".into(),
-			messages: vec![],
-			stream: false,
-			reasoning_effort: None,
-			tools: None,
-			tool_choice: None,
-			user: None,
+			..Default::default()
 		};
 		assert!(validate_request(&req).is_err());
 	}
@@ -472,11 +502,7 @@ mod tests {
 		let req = ChatCompletionRequest {
 			model: "sonnet".into(),
 			messages: vec![msg("user", "hi")],
-			stream: false,
-			reasoning_effort: None,
-			tools: None,
-			tool_choice: None,
-			user: None,
+			..Default::default()
 		};
 		assert!(validate_request(&req).is_ok());
 	}
