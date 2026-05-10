@@ -273,8 +273,11 @@ fn extract_content_delta(chunk: &serde_json::Value) -> Option<&str> {
 		.as_str()
 }
 
-/// Apply replacements to a chunk's `delta.content` if present, returning the
-/// transformed chunk. Also accumulates text into `accumulator` for logging.
+/// Apply replacements to a chunk's `delta.content` and `delta.tool_calls[].function.name`
+/// if present, returning the transformed chunk. Also accumulates text into
+/// `accumulator` for logging. Tool-call argument fragments are NOT rewritten —
+/// the rename strings could straddle chunk boundaries and partial-fragment
+/// replacement would corrupt arguments.
 fn apply_stream_replacements(
 	mut chunk: serde_json::Value,
 	repl: &crate::replacements::Replacements,
@@ -290,6 +293,24 @@ fn apply_stream_replacements(
 			.and_then(|c| c.get_mut("delta"))
 		{
 			delta["content"] = serde_json::Value::String(replaced);
+		}
+	}
+	if let Some(tool_calls) = chunk
+		.get_mut("choices")
+		.and_then(|c| c.as_array_mut())
+		.and_then(|arr| arr.first_mut())
+		.and_then(|c| c.get_mut("delta"))
+		.and_then(|d| d.get_mut("tool_calls"))
+		.and_then(|t| t.as_array_mut())
+	{
+		for call in tool_calls {
+			if let Some(function) = call.get_mut("function").and_then(|f| f.as_object_mut()) {
+				if let Some(name) = function.get_mut("name") {
+					if let Some(s) = name.as_str() {
+						*name = serde_json::Value::String(repl.apply_response(s));
+					}
+				}
+			}
 		}
 	}
 	chunk
@@ -424,6 +445,22 @@ fn apply_replacements_inbound(
 			if let Some(s) = content.as_str() {
 				let replaced = repl.apply_response(s);
 				*content = serde_json::Value::String(replaced);
+			}
+		}
+		if let Some(tool_calls) = message.get_mut("tool_calls").and_then(|t| t.as_array_mut()) {
+			for call in tool_calls {
+				if let Some(function) = call.get_mut("function").and_then(|f| f.as_object_mut()) {
+					if let Some(name) = function.get_mut("name") {
+						if let Some(s) = name.as_str() {
+							*name = serde_json::Value::String(repl.apply_response(s));
+						}
+					}
+					if let Some(args) = function.get_mut("arguments") {
+						if let Some(s) = args.as_str() {
+							*args = serde_json::Value::String(repl.apply_response(s));
+						}
+					}
+				}
 			}
 		}
 	}
