@@ -36,7 +36,7 @@ mkdir -p ~/claude-code-provider && cd ~/claude-code-provider
 curl -fsSL https://raw.githubusercontent.com/sonami-tech/claude-code-provider/master/docker-compose.yml -o docker-compose.yml
 ```
 
-Edit it to adjust settings (enable logging, change concurrency, pin a version tag, etc.), then start:
+Edit it to adjust settings (enable logging, pin a version tag, etc.), then start:
 
 ```sh
 docker compose up -d
@@ -44,14 +44,14 @@ docker compose up -d
 
 ## Authentication
 
-The `docker-compose.yml` mounts the host's `~/.claude` directory into the container. This allows the CLI to read credentials and write back refreshed OAuth tokens when they expire. If you haven't logged in yet:
+The `docker-compose.yml` mounts the host's `~/.claude` directory into the container. CCP reads `~/.claude/.credentials.json` directly; the Claude CLI does not need to be installed in the container. If you haven't logged in yet on the host:
 
 ```sh
 curl -fsSL https://claude.ai/install.sh | bash
 claude login
 ```
 
-After re-authenticating (`claude login`), the container picks up the new credentials automatically on the next request — no restart needed.
+After re-authenticating (`claude login`) on the host, the container picks up the new credentials automatically on the next request; no restart is needed.
 
 ## Default Settings
 
@@ -59,8 +59,6 @@ The Docker image sets:
 
 - `CCP_HOST=0.0.0.0` (listen on all interfaces, required for port mapping).
 - `ENTRYPOINT ["claude-code-provider"]` (starts the proxy automatically).
-
-Each request gets its own isolated config directory inside the container, preventing stale OAuth caches from blocking requests after token refresh.
 
 The auto-generated API key is printed to the container log on startup (unless you provide your own via `keys.txt`).
 
@@ -96,12 +94,9 @@ Uncomment or add any of these in the `environment:` section of your `docker-comp
 | `CCP_API_KEYS_FILE` | None | Path to API keys file inside the container |
 | `CCP_REPLACE_RULES` | None | Path to replacement rules TOML inside the container |
 | `CCP_LOG_FILE` | None | Path to conversation log file inside the container |
-| `CCP_MAX_CONCURRENT` | `5` | Max simultaneous subprocesses |
-| `CCP_TIMEOUT` | `600` | Subprocess inactivity timeout (seconds) |
-| `CCP_QUEUE_TIMEOUT` | `60` | Max queue wait time (seconds) |
+| `CCP_NO_PREAMBLE` | Off | Skip the Claude Code system identifier preamble for upstream debugging |
 | `CCP_PORT` | `18321` | Listen port |
 | `CCP_NO_AUTH` | Off | Set to `true` to disable authentication |
-| `CCP_NO_TOOL_PASSTHROUGH` | Off | Set to `true` to disable tool calling |
 
 ## Verify
 

@@ -8,11 +8,8 @@ RUN cargo build --release
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-	&& apt-get install -y --no-install-recommends curl ca-certificates \
-	&& curl -fsSL https://claude.ai/install.sh | bash \
+	&& apt-get install -y --no-install-recommends ca-certificates \
 	&& apt-get clean && rm -rf /var/lib/apt/lists/*
-
-ENV PATH="/root/.local/bin:${PATH}"
 
 COPY --from=builder /build/target/release/claude-code-provider /usr/local/bin/
 

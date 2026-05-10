@@ -15,4 +15,3 @@ services:
       CCP_API_KEYS_FILE: /etc/ccp-keys
       CCP_REPLACE_RULES: /etc/ccp-rules.toml
       # CCP_LOG_FILE: /var/log/ccp/conversations.log
-      # CCP_MAX_CONCURRENT: 10

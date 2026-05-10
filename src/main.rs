@@ -8,7 +8,6 @@ mod replacements;
 mod routes;
 mod session;
 mod stats;
-mod subprocess;
 mod time_util;
 mod translate;
 mod upstream;
@@ -26,15 +25,14 @@ use axum::middleware;
 use axum::routing::{get, post};
 use clap::Parser;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 use config::Config;
 use error::AppError;
+use upstream::credentials::Credentials;
 
 pub struct AppState {
 	pub config: Config,
-	pub semaphore: Arc<Semaphore>,
 	pub stats: Arc<stats::Stats>,
 	pub conversation_log: Option<Arc<conversation_log::ConversationLog>>,
 	pub replacements: Arc<replacements::Replacements>,
@@ -65,103 +63,30 @@ async fn main() {
 
 	// ── Startup validation ────────────────────────────────────
 
-	// 1. Verify claude binary exists.
-	match tokio::process::Command::new(&config.claude_path)
-		.arg("--version")
-		.output()
-		.await
-	{
-		Ok(output) => {
-			let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-			info!("Found claude CLI: {}", version);
-		}
-		Err(e) => {
-			error!(
-				"claude CLI not found at '{}': {}. Install with: npm install -g @anthropic-ai/claude-code",
-				config.claude_path, e
-			);
-			std::process::exit(1);
-		}
-	}
-
-	// 2. Check authentication status (best-effort).
-	match tokio::process::Command::new(&config.claude_path)
-		.args(["auth", "status"])
-		.output()
-		.await
-	{
-		Ok(output) => {
-			let stdout = String::from_utf8_lossy(&output.stdout);
-			match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
-				Ok(json) => {
-					if json.get("loggedIn") == Some(&serde_json::Value::Bool(true)) {
-						if let Some(sub_type) = json.get("subscriptionType").and_then(|v| v.as_str())
-						{
-							info!("Authenticated as {} subscriber", sub_type);
-						} else {
-							info!("Authenticated (subscription type unknown)");
-						}
-					} else {
-						error!("Claude Code is not logged in. Run 'claude login' first.");
-						std::process::exit(1);
-					}
-				}
-				Err(e) => {
-					warn!("Could not parse auth status ({}), continuing anyway", e);
-				}
-			}
-		}
-		Err(e) => {
-			warn!("Could not check auth status ({}), continuing anyway", e);
-		}
-	}
-
-	// 3. Setup config directory.
-	if config.no_isolate {
-		info!("Config isolation disabled, using host Claude configuration");
-	} else {
-		let config_dir = config.isolated_config_dir();
-		// Clean stale per-request subdirs from previous runs.
-		if config_dir.exists() {
-			if let Ok(entries) = std::fs::read_dir(&config_dir) {
-				for entry in entries.flatten() {
-					let path = entry.path();
-					if path.is_dir() {
-						let _ = std::fs::remove_dir_all(&path);
-					}
-				}
-			}
-		}
-		std::fs::create_dir_all(&config_dir).unwrap_or_else(|e| {
-			error!("Failed to create config dir {:?}: {}", config_dir, e);
-			std::process::exit(1);
-		});
-
-		let creds_source = config.credentials_source();
-		if !creds_source.exists() {
-			error!(
-				"Claude Code credentials not found at {:?}. Run 'claude login' first.",
-				creds_source
-			);
-			std::process::exit(1);
-		}
-
-		info!("Isolated config dir: {:?}", config_dir);
-	}
-
-	// Ensure working directory exists.
-	let working_dir = config.resolved_working_dir();
-	std::fs::create_dir_all(&working_dir).unwrap_or_else(|e| {
-		error!("Failed to create working dir {:?}: {}", working_dir, e);
+	let creds_path = Credentials::default_path();
+	let creds = Credentials::load_fresh(&creds_path).unwrap_or_else(|e| {
+		error!(
+			"Claude OAuth credentials are not ready at {:?}: {}. Run 'claude login' first.",
+			creds_path, e
+		);
 		std::process::exit(1);
 	});
+	if let Err(e) = creds.check_expired() {
+		error!(
+			"Claude OAuth credentials at {:?} are expired: {}. Run 'claude' once to refresh.",
+			creds_path, e
+		);
+		std::process::exit(1);
+	}
+	if let Some(sub_type) = creds.subscription_type.as_deref() {
+		info!("Authenticated as {} subscriber", sub_type);
+	} else {
+		info!("Authenticated with Claude OAuth credentials");
+	}
 
-	info!("Working dir: {:?}", working_dir);
 	info!("Stats DB: {:?}", config.stats_db_path());
 
 	// ── Server setup ──────────────────────────────────────────
-
-	let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
 
 	let stats_db = stats::Stats::open(config.stats_db_path()).unwrap_or_else(|e| {
 		error!("Failed to open stats database: {}", e);
@@ -211,7 +136,6 @@ async fn main() {
 
 	let state = Arc::new(AppState {
 		config: config.clone(),
-		semaphore,
 		stats: Arc::new(stats_db),
 		conversation_log,
 		replacements,
@@ -300,10 +224,7 @@ async fn main() {
 		display_host,
 		config.port,
 	);
-	info!(
-		"max_concurrent={} timeout={}s queue_timeout={}s",
-		config.max_concurrent, config.timeout, config.queue_timeout
-	);
+	info!("Using direct Anthropic Messages upstream");
 
 	let shutdown = async {
 		let ctrl_c = tokio::signal::ctrl_c();

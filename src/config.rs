@@ -2,8 +2,6 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-const CREDENTIALS_FILENAME: &str = ".credentials.json";
-
 #[derive(Parser, Clone, Debug)]
 #[command(
 	name = "claude-code-provider",
@@ -19,35 +17,9 @@ pub struct Config {
 	#[arg(short = 'H', long, default_value = "127.0.0.1", env = "CCP_HOST")]
 	pub host: String,
 
-	/// Max in-flight requests (semaphore size).
-	#[arg(short = 'c', long, default_value = "5", env = "CCP_MAX_CONCURRENT")]
-	pub max_concurrent: usize,
-
-	/// Per-request timeout in seconds. (v1 legacy: only enforced on the
-	/// removed subprocess path. v2 uses a fixed 600s upstream timeout.)
-	#[arg(short = 't', long, default_value = "600", env = "CCP_TIMEOUT")]
-	pub timeout: u64,
-
-	/// Max time a request waits in the concurrency queue (seconds).
-	#[arg(short = 'q', long, default_value = "60", env = "CCP_QUEUE_TIMEOUT")]
-	pub queue_timeout: u64,
-
-	/// Path to the `claude` CLI binary, used at startup only to verify
-	/// installation and login state. v2 does not invoke it per request.
-	#[arg(long, default_value = "claude", env = "CCP_CLAUDE_PATH")]
-	pub claude_path: String,
-
-	/// Data directory for the stats DB (and v1 config isolation).
+	/// Data directory for the stats DB.
 	#[arg(long, env = "CCP_DATA_DIR")]
 	pub data_dir: Option<PathBuf>,
-
-	/// (v1 legacy) Working directory for subprocesses. Unused in v2.
-	#[arg(long, env = "CCP_WORKING_DIR")]
-	pub working_dir: Option<PathBuf>,
-
-	/// (v1 legacy) Disable per-request config isolation. Unused in v2.
-	#[arg(long, env = "CCP_NO_ISOLATE")]
-	pub no_isolate: bool,
 
 	/// API keys (comma-separated). If set, requests must include a valid key.
 	#[arg(long, env = "CCP_API_KEYS", value_delimiter = ',')]
@@ -60,10 +32,6 @@ pub struct Config {
 	/// Disable authentication entirely.
 	#[arg(long, env = "CCP_NO_AUTH")]
 	pub no_auth: bool,
-
-	/// Disable tool/function call passthrough.
-	#[arg(long, env = "CCP_NO_TOOL_PASSTHROUGH")]
-	pub no_tool_passthrough: bool,
 
 	/// TOML file with text replacement rules.
 	#[arg(long, env = "CCP_REPLACE_RULES")]
@@ -99,53 +67,8 @@ impl Config {
 		})
 	}
 
-	pub fn isolated_config_dir(&self) -> PathBuf {
-		self.resolved_data_dir().join("claude-config")
-	}
-
-	pub fn resolved_working_dir(&self) -> PathBuf {
-		self.working_dir.clone().unwrap_or_else(|| {
-			if self.no_isolate {
-				self.resolved_data_dir()
-			} else {
-				self.isolated_config_dir()
-			}
-		})
-	}
-
 	pub fn stats_db_path(&self) -> PathBuf {
 		self.resolved_data_dir().join("stats.redb")
-	}
-
-	/// Create a per-request config dir with a fresh credentials symlink.
-	/// Returns the path on success, or `None` if isolation is disabled or
-	/// setup fails. The caller must remove the directory when done.
-	pub fn create_request_config_dir(&self, request_id: &str) -> Option<PathBuf> {
-		if self.no_isolate {
-			return None;
-		}
-		let dir = self.isolated_config_dir().join(request_id);
-		if let Err(e) = std::fs::create_dir_all(&dir) {
-			tracing::warn!(path = ?dir, error = %e, "Failed to create request config dir");
-			return None;
-		}
-		let creds_source = self.credentials_source();
-		let creds_dest = dir.join(CREDENTIALS_FILENAME);
-		#[cfg(unix)]
-		if let Err(e) = std::os::unix::fs::symlink(&creds_source, &creds_dest) {
-			tracing::warn!(error = %e, "Failed to symlink credentials for request");
-			let _ = std::fs::remove_dir_all(&dir);
-			return None;
-		}
-		Some(dir)
-	}
-
-	/// Path to the host credentials file.
-	pub fn credentials_source(&self) -> PathBuf {
-		dirs::home_dir()
-			.expect("Could not determine home directory")
-			.join(".claude")
-			.join(CREDENTIALS_FILENAME)
 	}
 
 	/// Load all API keys from --api-keys and --api-keys-file, deduplicated.

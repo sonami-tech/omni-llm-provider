@@ -11,6 +11,5 @@ pub async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
 		"status": "ok",
 		"uptime_seconds": state.stats.uptime_secs(),
 		"active_requests": state.stats.active_count(),
-		"max_concurrent": state.config.max_concurrent,
 	}))
 }

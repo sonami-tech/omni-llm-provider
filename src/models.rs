@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use serde::Serialize;
 
 use crate::error::AppError;
@@ -73,15 +71,6 @@ pub fn resolve_model(input: &str) -> &'static ModelDef {
 
 	tracing::warn!(model = %input, "Unrecognized model, falling back to sonnet");
 	&MODELS[1]
-}
-
-/// Normalize a raw CLI model string to a canonical name.
-/// Uses substring matching. Falls back to the raw string as-is.
-pub fn normalize_model_name(raw: &str) -> Cow<'static, str> {
-	match match_by_substring(raw) {
-		Some(m) => Cow::Borrowed(m.canonical),
-		None => Cow::Owned(raw.to_string()),
-	}
 }
 
 /// Validate the reasoning_effort field.
@@ -181,27 +170,6 @@ mod tests {
 		assert_eq!(resolve_model("gpt-4").canonical, "claude-sonnet-4-6");
 		assert_eq!(resolve_model("unknown").canonical, "claude-sonnet-4-6");
 		assert_eq!(resolve_model("").canonical, "claude-sonnet-4-6");
-	}
-
-	#[test]
-	fn normalize_model_name_substring() {
-		assert_eq!(
-			normalize_model_name("claude-opus-4-6-20260101").as_ref(),
-			"claude-opus-4-6"
-		);
-		assert_eq!(
-			normalize_model_name("claude-sonnet-4-6").as_ref(),
-			"claude-sonnet-4-6"
-		);
-		assert_eq!(
-			normalize_model_name("claude-haiku-4-5-20251001").as_ref(),
-			"claude-haiku-4-5"
-		);
-	}
-
-	#[test]
-	fn normalize_model_name_unknown_returns_raw() {
-		assert_eq!(normalize_model_name("gpt-4").as_ref(), "gpt-4");
 	}
 
 	#[test]

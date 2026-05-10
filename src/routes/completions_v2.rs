@@ -353,9 +353,7 @@ fn apply_replacements_outbound(
 	req: &mut crate::translate::anthropic::MessagesRequest,
 	repl: &crate::replacements::Replacements,
 ) {
-	use crate::translate::anthropic::{
-		ContentBlock, MessageContent, SystemField, ToolResultContent,
-	};
+	use crate::translate::anthropic::{MessageContent, SystemField};
 	match &mut req.system {
 		Some(SystemField::Text(s)) => *s = repl.apply_prompt(s),
 		Some(SystemField::Blocks(blocks)) => {

@@ -7,9 +7,6 @@ use std::time::Instant;
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-use crate::models::normalize_model_name;
-use crate::subprocess::ndjson::ResultMessage;
-
 // ── redb table definitions (persistent across restarts) ───────────
 
 const TOTAL_REQUESTS: TableDefinition<&str, u64> = TableDefinition::new("total_requests");
@@ -20,7 +17,6 @@ const REQUESTS_BY_KEY: TableDefinition<&str, u64> = TableDefinition::new("reques
 const LAST_REQUEST_AT: TableDefinition<&str, &str> = TableDefinition::new("last_request_at");
 const TOTAL_KEY: &str = "total";
 
-const MAX_LATENCY_SAMPLES: usize = 100;
 const MAX_RECENT_ERRORS: usize = 50;
 
 // ── Serializable token stats for redb storage ─────────────────────
@@ -129,54 +125,6 @@ impl Stats {
 			if let Ok(mut table) = write_txn.open_table(LAST_REQUEST_AT) {
 				let now = crate::time_util::iso_now();
 				let _ = table.insert(TOTAL_KEY, now.as_str());
-			}
-			let _ = write_txn.commit();
-		}
-	}
-
-	/// Record successful completion metrics.
-	pub fn record_completion(
-		&self,
-		model: &str,
-		ttft_ms: Option<f64>,
-		duration_ms: f64,
-		result: &ResultMessage,
-	) {
-		// In-memory TTFT and duration samples.
-		if let Some(ttft) = ttft_ms
-			&& let Ok(mut samples) = self.ttft_samples.lock()
-		{
-			push_sample(samples.entry(model.to_string()).or_default(), ttft);
-		}
-		if let Ok(mut samples) = self.duration_samples.lock() {
-			push_sample(samples.entry(model.to_string()).or_default(), duration_ms);
-		}
-
-		// Persistent token stats.
-		if let Some(mu) = &result.model_usage
-			&& let Ok(write_txn) = self.db.begin_write()
-		{
-			if let Ok(mut table) = write_txn.open_table(TOKENS_BY_MODEL) {
-				for (raw_name, usage) in mu {
-					let normalized = normalize_model_name(raw_name);
-					let mut stats: TokenStats = table
-						.get(normalized.as_ref())
-						.ok()
-						.flatten()
-						.and_then(|v| serde_json::from_slice(v.value()).ok())
-						.unwrap_or_default();
-
-					stats.input_tokens += usage.input_tokens.unwrap_or(0);
-					stats.output_tokens += usage.output_tokens.unwrap_or(0);
-					stats.cache_read_input_tokens +=
-						usage.cache_read_input_tokens.unwrap_or(0);
-					stats.cache_creation_input_tokens +=
-						usage.cache_creation_input_tokens.unwrap_or(0);
-
-					if let Ok(bytes) = serde_json::to_vec(&stats) {
-						let _ = table.insert(normalized.as_ref(), bytes.as_slice());
-					}
-				}
 			}
 			let _ = write_txn.commit();
 		}
@@ -361,13 +309,6 @@ impl Drop for ActiveRequestGuard<'_> {
 	}
 }
 
-fn push_sample(buf: &mut VecDeque<f64>, value: f64) {
-	if buf.len() >= MAX_LATENCY_SAMPLES {
-		buf.pop_front();
-	}
-	buf.push_back(value);
-}
-
 fn avg(samples: &VecDeque<f64>) -> f64 {
 	if samples.is_empty() {
 		0.0
@@ -375,4 +316,3 @@ fn avg(samples: &VecDeque<f64>) -> f64 {
 		samples.iter().sum::<f64>() / samples.len() as f64
 	}
 }
-

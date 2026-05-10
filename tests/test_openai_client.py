@@ -68,8 +68,6 @@ def test_health():
 	assert isinstance(data["uptime_seconds"], int), f"Bad uptime type: {type(data['uptime_seconds'])}"
 	assert data["uptime_seconds"] >= 0, "Negative uptime"
 	assert isinstance(data["active_requests"], int), f"Bad active type"
-	assert isinstance(data["max_concurrent"], int), f"Bad max_concurrent type"
-	assert data["max_concurrent"] > 0, "max_concurrent should be > 0"
 
 
 @test("GET /v1/models structure and metadata")
@@ -186,8 +184,10 @@ def test_non_streaming_structure():
 	# Model.
 	assert resp.model is not None, "Missing model"
 
-	# System fingerprint must be null.
-	assert resp.system_fingerprint is None, f"Expected null fingerprint, got {resp.system_fingerprint}"
+	# Non-streaming responses surface Anthropic's message id when present.
+	assert resp.system_fingerprint is None or isinstance(resp.system_fingerprint, str), (
+		f"Bad fingerprint: {resp.system_fingerprint}"
+	)
 
 	# Choices.
 	assert len(resp.choices) == 1, f"Expected 1 choice, got {len(resp.choices)}"

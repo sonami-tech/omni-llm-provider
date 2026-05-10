@@ -4,126 +4,125 @@
 
 ```
 OpenAI SDK Client
-       │
-       ▼
-┌──────────────────┐
-│  Auth Middleware  │  Validates API key, attaches key ID to request
-└──────┬───────────┘
-       ▼
-┌──────────────────┐
-│  Completions     │  Parses OpenAI request, builds prompt,
-│  Handler         │  applies text replacements
-└──────┬───────────┘
-       ▼
-┌──────────────────┐
-│  Subprocess      │  Acquires semaphore slot (or queues),
-│  Manager         │  spawns `claude` process
-└──────┬───────────┘
-       ▼
-┌──────────────────┐
-│  claude CLI      │  Runs with -p --output-format stream-json
-│  Subprocess      │  Emits NDJSON on stdout
-└──────┬───────────┘
-       ▼
-┌──────────────────┐
-│  NDJSON Parser   │  Extracts model, content deltas, result,
-│                  │  usage from streaming NDJSON
-└──────┬───────────┘
-       ▼
-┌──────────────────┐
-│  Response        │  Translates to OpenAI format (JSON or SSE),
-│  Builder         │  applies response text replacements
-└──────────────────┘
+       |
+       v
++-------------------+
+| Auth Middleware   |  Validates local API key and attaches key ID
++---------+---------+
+          |
+          v
++-------------------+
+| Completions       |  Parses OpenAI request, resolves model,
+| Handler           |  records stats and request context
++---------+---------+
+          |
+          v
++-------------------+
+| OAI -> Anthropic  |  Reshapes messages, tools, tool_choice,
+| Translation       |  sampling params, thinking and system field
++---------+---------+
+          |
+          v
++-------------------+
+| OAuth Gate Layer  |  Prepends Claude Code system identifier,
+|                   |  applies outbound text replacements
++---------+---------+
+          |
+          v
++-------------------+
+| Upstream Client   |  POSTs to api.anthropic.com/v1/messages
+|                   |  with Claude Code fingerprint headers
++---------+---------+
+          |
+          v
++-------------------+
+| Anthropic -> OAI  |  Converts JSON or SSE events back into
+| Translation       |  OpenAI chat completion shapes
++---------+---------+
+          |
+          v
++-------------------+
+| Response Builder  |  Applies response replacements and emits
+|                   |  JSON or OpenAI-compatible SSE
++-------------------+
 ```
 
 ## Module Structure
 
 ```
 src/
-├── main.rs              # Server setup, startup validation, routing
-├── config.rs            # CLI args and env var parsing (clap)
+├── main.rs              # Server setup, startup credential validation, routing
+├── config.rs            # CLI args and CCP_* env var parsing
 ├── auth.rs              # API key middleware
-├── error.rs             # Unified error types → OpenAI error format
+├── error.rs             # Unified error types -> OpenAI error format
 ├── models.rs            # Model definitions, aliases, resolution
 ├── replacements.rs      # TOML text replacement engine
-├── conversation_log.rs  # Prompt/response logging
+├── conversation_log.rs  # Request/response logging
+├── session.rs           # Stable session ID derivation
 ├── stats.rs             # Persistent stats (redb) + active request tracking
 ├── routes/
-│   ├── completions.rs   # POST /v1/chat/completions handler
+│   ├── completions.rs   # POST /v1/chat/completions entrypoint
+│   ├── completions_v2.rs# Direct Anthropic Messages request handling
 │   ├── models.rs        # GET /v1/models handler
 │   ├── health.rs        # GET /health handler
 │   └── stats.rs         # GET /stats and /stats/json handlers
-├── subprocess/
-│   ├── mod.rs           # SubprocessEvent type
-│   ├── manager.rs       # Semaphore-based concurrency control
-│   ├── process.rs       # Subprocess spawning, I/O, timeout
-│   └── ndjson.rs        # NDJSON line parser for Claude CLI output
-└── translate/
-    ├── request.rs       # OpenAI messages → CLI args + prompt
-    ├── response.rs      # CLI result → OpenAI response JSON
-    ├── stream.rs        # SSE chunk builders for streaming
-    └── tools.rs         # Tool call prompt injection and response parsing
+├── translate/
+│   ├── anthropic.rs     # Native Anthropic Messages wire types
+│   ├── build.rs         # OpenAI request -> Anthropic Messages body
+│   ├── messages.rs      # Message/content/tool-result reshaping
+│   ├── tool_translate.rs# OpenAI tools -> Anthropic tools
+│   ├── from_anthropic.rs# Anthropic JSON response -> OpenAI response
+│   └── to_oai_stream.rs # Anthropic SSE events -> OpenAI SSE chunks
+└── upstream/
+    ├── client.rs        # reqwest client, retry policy, streaming
+    ├── credentials.rs   # Reads ~/.claude/.credentials.json per request
+    ├── fingerprint.rs   # Claude Code-compatible request headers
+    └── stream.rs        # Anthropic SSE parser
 ```
 
 ## Design Decisions
 
-### Subprocess Per Request
+### Direct Messages API
 
-Each request spawns a new `claude` subprocess rather than maintaining persistent connections. This is intentional:
+v2 does not invoke the Claude Code CLI per request. It translates OpenAI Chat Completions requests into Anthropic Messages API calls and sends them directly to `api.anthropic.com` with the OAuth token from `~/.claude/.credentials.json`.
 
-- The Claude CLI's `-p` (print) mode is designed for single-shot use.
-- `--no-session-persistence` ensures no state leaks between requests.
-- The trade-off is subprocess startup latency, mitigated by the CLI's relatively fast cold start.
+The credentials file is re-read for each request, and a 401 response triggers one fresh read and retry. CCP still depends on Claude Code for login and token refresh, but the CLI is not in the request path.
 
-### Config Isolation
+### OAuth Gate Compatibility
 
-By default, subprocesses run with `CLAUDE_CONFIG_DIR` pointing to a separate directory. This prevents the proxy from interfering with your personal Claude Code settings (plugins, hooks, `.claude.json`). The isolated directory is cleaned on each startup, and credentials are symlinked from `~/.claude/.credentials.json`.
+Anthropic's subscription OAuth gate expects Claude Code-shaped traffic. CCP mimics the important wire-level pieces:
 
-### Concurrency Control
+- Claude Code-compatible headers and beta flags.
+- A stable `x-claude-code-session-id` per logical session.
+- The canonical Claude Code system identifier as the first system block.
 
-A `tokio::sync::Semaphore` limits concurrent subprocesses. This prevents resource exhaustion on the host while allowing requests to queue rather than fail immediately.
+`--no-preamble` skips the system identifier and is intended only for debugging upstream behavior or for callers that provide an equivalent first system block themselves.
 
 ### Text Replacement
 
-Replacement rules are loaded once at startup and stored in an `Arc<Replacements>`. Prompt replacements happen before the prompt is passed to the CLI. Response replacements happen after content is received (per-chunk for streaming, on full content for non-streaming).
+Replacement rules are loaded once at startup and stored in an `Arc<Replacements>`. Prompt replacements are applied to outbound system text, message text, tool names, descriptions, schemas, and tool-result content before the Anthropic request is sent. Response replacements are applied to assistant text and tool-call names/arguments before the OpenAI response is returned.
 
-### Tool Call Passthrough
+For streaming responses, replacements are applied per text delta and to streamed tool names. A search string split across separate deltas will not match.
 
-The Claude Code CLI executes tools internally in its agent loop — there is no way to make it forward `tool_use` blocks to the caller. The proxy works around this with prompt injection:
+### Native Tool Calling
 
-1. When a request includes `tools`, tool definitions are converted to text and prepended to the user message.
-2. `--tools ""` remains set so Claude Code never executes tools internally.
-3. The model responds with JSON tool call arrays as plain text.
-4. The proxy parses the text response, detects tool call JSON (stripping markdown code fences if present), and converts it to OpenAI `tool_calls` format.
-5. For multi-turn, the client's `tool` role messages are formatted as `<tool_result>` XML tags in the prompt.
+v2 passes tools through as Anthropic Messages API `tools[]` and maps tool choices to native Anthropic `tool_choice` values. Assistant `tool_use` blocks are converted back to OpenAI `tool_calls`, and OpenAI `tool` messages are converted to Anthropic `tool_result` blocks.
 
-Key design constraints discovered through testing:
-- The CLI's built-in agentic system prompt is replaced wholesale via `--system-prompt` (not `--append-system-prompt`), with a minimal CCP-owned preamble that yields formatting authority to the user message. Appending was insufficient: the CLI default still dominated and triggered tool-call retry loops and `error_max_turns` failures in single-shot mode. Client-supplied system prompts are appended after the preamble so they still take effect.
-- Tool dispatch instructions live in the **user message** (prepended via `build_tool_prompt_prefix`). The system prompt deliberately stays out of formatting rules so the model treats the user-message instructions as authoritative.
-- Haiku wraps output in markdown code fences; Sonnet outputs clean JSON. The parser handles both.
-- When tools are present in streaming mode, the response is buffered to determine if it contains tool calls before emitting SSE chunks.
+The OAuth gate appears to fingerprint tool surfaces. Tool names that look unlike Claude Code tools can be rejected upstream, so PascalCase masking via text replacement is recommended: replace names such as `memory_search` with `MemorySearch` outbound and reverse them inbound.
+
+### Streaming Translation
+
+Anthropic SSE events are parsed into stateful OpenAI `chat.completion.chunk` messages. The converter emits the assistant role once, streams text deltas, streams tool-call argument fragments, carries thinking deltas in extension fields, and maps Anthropic stop reasons to OpenAI finish reasons.
 
 ### Error Format
 
-All errors use the OpenAI error format (`{"error": {"message": "...", "type": "...", "code": null}}`) so clients handle them correctly. HTTP status codes map to:
+All client-visible errors use the OpenAI error format (`{"error": {"message": "...", "type": "...", "code": null}}`) so SDK clients handle them consistently. Anthropic errors are mapped by status:
 
-- 400 → `invalid_request_error`
-- 401 → `authentication_error`
-- 404 → `invalid_request_error`
-- 500 → `server_error`
-- 503 → `server_error` (with `Retry-After: 30` header)
-- 504 → `server_error` (inactivity timeout)
-
-### NDJSON Parsing
-
-The Claude CLI outputs NDJSON with various message types. The parser extracts:
-
-- `message_start` → model name
-- Content block `text_delta` events → streamed content
-- `result` → final message with usage stats, cost, session ID
-
-Assistant role messages from `--include-partial-messages` are ignored since their content is already captured via deltas.
+- 400 -> `invalid_request_error`
+- 401/403 -> `authentication_error`
+- 429 -> `rate_limit_error`
+- 500/503/504 -> `server_error`
 
 ### Stats Persistence
 
-Statistics are stored in a `redb` embedded database rather than in-memory. This survives restarts and provides accurate historical data for the dashboard without external dependencies.
+Statistics are stored in a `redb` embedded database rather than in-memory. This survives restarts and provides historical data for the dashboard without external dependencies.

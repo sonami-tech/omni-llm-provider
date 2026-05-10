@@ -100,9 +100,7 @@ fn build_hash_anchor(request: &ChatCompletionRequest, api_key_id: Option<&str>) 
 
 fn first_user_text(messages: &[ChatMessage]) -> String {
 	for msg in messages {
-		// "user", "function", and unknown roles all surface as user-side
-		// content per request.rs::build_prompt_and_system, but the session
-		// anchor only needs the first true user message.
+		// The session anchor only needs the first true user message.
 		if msg.role == "user" {
 			let text = extract_text(&msg.content);
 			if !text.is_empty() {

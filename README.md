@@ -147,7 +147,7 @@ Unrecognized model names fall back to Sonnet. See [configuration reference](docs
 
 - [Configuration reference](docs/configuration.md) — all flags, env vars, models, endpoints, and defaults.
 - [Docker guide](docs/docker.md) — image tags, auth options, production setup.
-- [Architecture](docs/architecture.md) — request flow, subprocess lifecycle, design decisions.
+- [Architecture](docs/architecture.md) — request flow, OAuth gate handling, design decisions.
 
 ## License
 

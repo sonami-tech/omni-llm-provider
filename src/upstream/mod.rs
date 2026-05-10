@@ -11,5 +11,3 @@ pub mod fingerprint;
 pub mod stream;
 
 pub use client::UpstreamClient;
-pub use credentials::Credentials;
-pub use errors::UpstreamError;

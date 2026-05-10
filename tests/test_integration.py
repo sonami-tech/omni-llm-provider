@@ -41,8 +41,6 @@ class TestHealth:
 		assert isinstance(data["uptime_seconds"], int)
 		assert data["uptime_seconds"] >= 0
 		assert isinstance(data["active_requests"], int)
-		assert isinstance(data["max_concurrent"], int)
-		assert data["max_concurrent"] > 0
 
 	def test_health_uptime_increases(self, base_url):
 		r1 = httpx.get(f"{base_url}/health")
@@ -150,7 +148,7 @@ class TestNonStreaming:
 		assert isinstance(resp.created, int)
 		assert abs(resp.created - int(time.time())) < 120
 		assert resp.model is not None
-		assert resp.system_fingerprint is None
+		assert resp.system_fingerprint is None or isinstance(resp.system_fingerprint, str)
 		assert len(resp.choices) == 1
 
 		choice = resp.choices[0]
@@ -971,7 +969,7 @@ class TestAuth:
 
 
 # ════════════════════════════════════════════════════════════════
-# Large Prompts (stdin piping verification)
+# Large Prompts
 # ════════════════════════════════════════════════════════════════
 
 
@@ -985,20 +983,6 @@ class TestLargePrompts:
 			stream=False,
 		)
 		assert "PONG" in resp.choices[0].message.content
-
-	def test_200kb_prompt_via_stdin(self, api_base_url):
-		"""200KB prompt exceeds MAX_ARG_STRLEN — only works with stdin piping."""
-		filler = "B" * 200_000
-		r = httpx.post(
-			f"{api_base_url}/chat/completions",
-			json={
-				"model": "sonnet",
-				"messages": [{"role": "user", "content": f"Filler: {filler}\n\nReply with exactly: PONG"}],
-			},
-			timeout=180,
-		)
-		assert r.status_code == 200
-		assert "PONG" in r.json()["choices"][0]["message"]["content"]
 
 	def test_200kb_prompt_streaming(self, api_base_url):
 		"""Large prompt should also work in streaming mode."""

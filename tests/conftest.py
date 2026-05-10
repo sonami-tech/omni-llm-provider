@@ -2,7 +2,7 @@
 Pytest fixtures for claude-code-provider integration tests.
 
 Automatically builds the binary and starts a CCP server instance
-with isolated config per test session.
+with a temporary data directory per test session.
 """
 
 import json
@@ -46,7 +46,7 @@ def _start_ccp_server(binary: str, name: str, extra_args: list[str], data_dir: s
 	Redirects stdout/stderr to a file rather than `subprocess.PIPE`. With
 	`--verbose` and many sequential requests, the unread pipe buffer fills
 	(~64KB) and CCP blocks on its next stderr write — deadlocking all tokio
-	tasks and producing zombie subprocesses with stuck handlers.
+	tasks and leaving server processes with stuck handlers.
 
 	Returns a dict with base_url, api_base_url, port, data_dir, process.
 	On startup failure, calls `pytest.fail` with the tail of the stderr log.
@@ -122,9 +122,6 @@ def ccp_server(ccp_binary):
 		name="default",
 		extra_args=[
 			"--no-auth",
-			"--max-concurrent", "3",
-			"--timeout", "60",
-			"--queue-timeout", "10",
 			"--log-file", log_file,
 			"--verbose",
 		],
@@ -145,9 +142,6 @@ def ccp_auth_server(ccp_binary):
 		name="auth",
 		extra_args=[
 			"--api-keys", api_key,
-			"--max-concurrent", "2",
-			"--timeout", "60",
-			"--queue-timeout", "10",
 		],
 		data_dir=data_dir,
 	)
@@ -178,9 +172,6 @@ def ccp_replace_server(ccp_binary):
 		name="replace",
 		extra_args=[
 			"--no-auth",
-			"--max-concurrent", "2",
-			"--timeout", "60",
-			"--queue-timeout", "10",
 			"--replace-rules", rules_file,
 		],
 		data_dir=data_dir,
