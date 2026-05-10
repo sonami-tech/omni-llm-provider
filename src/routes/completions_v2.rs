@@ -41,7 +41,7 @@ pub async fn handle_non_streaming_v2(
 	let start = std::time::Instant::now();
 
 	// Build the Anthropic request body.
-	let mut anth_req = build_messages_request(&request, model_def)?;
+	let mut anth_req = build_messages_request(&request, model_def, !state.config.no_preamble)?;
 	// Force non-streaming on the upstream call.
 	anth_req.stream = Some(false);
 
@@ -138,7 +138,7 @@ pub async fn handle_streaming_v2(
 ) -> Result<Response, AppError> {
 	let _active = crate::stats::ActiveRequestGuard::new(&state.stats);
 
-	let mut anth_req = build_messages_request(&request, model_def)?;
+	let mut anth_req = build_messages_request(&request, model_def, !state.config.no_preamble)?;
 	anth_req.stream = Some(true);
 
 	if !state.replacements.is_empty() {

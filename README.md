@@ -7,31 +7,34 @@
 [![built with Claude Code](https://img.shields.io/badge/built_with-Claude_Code-D97757?logo=claude&logoColor=white)](https://claude.ai/code)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-An OpenAI-compatible API server that routes requests through the Claude Code CLI. Drop it in front of any OpenAI SDK client, no code changes required.
+An OpenAI compatibility layer for **Claude Max** accounts. CCP exposes the OpenAI Chat Completions API, accepts your existing OpenAI SDK clients with no code changes, and serves them using your Claude Max subscription — mimicking the Claude Code CLI on the wire so Anthropic accepts the calls.
+
+> **v1 → v2.** v1 shelled out to the `claude` CLI subprocess for every request. v2 talks directly to `api.anthropic.com/v1/messages`, reusing the OAuth token and request fingerprint Claude Code itself uses. Faster, no subprocess startup, full control over streaming and parameters.
 
 ## How It Works
 
 ```
 ┌──────────────────────────┐
 │  Anthropic (Claude Max)  │  Provides Claude access via your subscription.
-└────────────┬─────────────┘
-             │
-┌────────────▼─────────────┐
-│     Claude Code CLI      │  Authenticates and communicates with Anthropic.
-└────────────┬─────────────┘
-             │
-┌────────────▼─────────────┐
-│   Claude Code Provider   │  Translates OpenAI API requests into CLI calls.
-└────────────┬─────────────┘
-             │
-┌────────────▼─────────────┐
+└────────────▲─────────────┘
+             │ Native Messages API + Claude Code OAuth token
+┌────────────┴─────────────┐
+│   Claude Code Provider   │  Translates OAI ⇄ Anthropic and mimics the CLI's
+│                          │  request signature so the gate doesn't fire.
+└────────────▲─────────────┘
+             │ OpenAI /v1/chat/completions
+┌────────────┴─────────────┐
 │     Your Application     │  Any OpenAI SDK client, no code changes required.
 └──────────────────────────┘
 ```
 
+The only artifact CCP still needs from Claude Code is the OAuth token in `~/.claude/.credentials.json`, written by `claude login`. The CLI itself doesn't need to be running.
+
 ## Quick Start
 
-### 1. Install the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
+### 1. Authenticate with [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+
+CCP reads the OAuth token from `~/.claude/.credentials.json`, written by `claude login`. The CLI is only needed for this one-time login.
 
 ```sh
 curl -fsSL https://claude.ai/install.sh | bash
@@ -136,9 +139,9 @@ Unrecognized model names fall back to Sonnet. See [configuration reference](docs
 
 ## Limitations
 
-- **Text only** — image and audio content parts are silently ignored.
-- **Ignored parameters** — `max_tokens`, `temperature`, `top_p`, and `stop` are accepted for compatibility but not forwarded to the CLI.
-- **Subprocess per request** — each request spawns a new `claude` process, adding startup latency.
+- **Text only** — `image_url` content parts are not yet translated to Anthropic image blocks; audio is unsupported.
+- **Subscription-bound** — uses your Claude Max OAuth token. Per-call billing keys are not supported.
+- **Tool surface fingerprinting** — Anthropic's OAuth gate flags tool names that don't look like Claude Code's. Use the text-replacement layer to PascalCase them on the way out (e.g. `memory_search` → `MemorySearch`) and reverse on the way back.
 
 ## Documentation
 

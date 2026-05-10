@@ -20,9 +20,15 @@ const CLAUDE_CODE_SYSTEM_PREAMBLE: &str =
 	"You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// Build an Anthropic MessagesRequest from an OAI ChatCompletionRequest.
+///
+/// `inject_preamble` controls whether the canonical Claude Code system
+/// identifier block is prepended to the system field. Required for opus/
+/// sonnet to pass Anthropic's OAuth subscription gate; pass `false` only
+/// when the consumer is providing its own equivalent or for debugging.
 pub fn build_messages_request(
 	req: &ChatCompletionRequest,
 	model_def: &ModelDef,
+	inject_preamble: bool,
 ) -> Result<MessagesRequest, AppError> {
 	if req.n.unwrap_or(1) > 1 {
 		return Err(AppError::BadRequest(
@@ -31,7 +37,9 @@ pub fn build_messages_request(
 	}
 
 	let mut reshaped = reshape(&req.messages)?;
-	reshaped.system = Some(prepend_claude_code_preamble(reshaped.system));
+	if inject_preamble {
+		reshaped.system = Some(prepend_claude_code_preamble(reshaped.system));
+	}
 
 	let tools = match req.tools.as_ref() {
 		Some(t) if !t.is_empty() => Some(translate_tools(t)?),

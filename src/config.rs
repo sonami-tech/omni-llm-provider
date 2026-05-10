@@ -8,7 +8,7 @@ const CREDENTIALS_FILENAME: &str = ".credentials.json";
 #[command(
 	name = "claude-code-provider",
 	version,
-	about = "OpenAI-compatible API proxy backed by Claude Code CLI"
+	about = "OpenAI-compatible API proxy for Claude Max accounts"
 )]
 pub struct Config {
 	/// Listen port.
@@ -19,31 +19,33 @@ pub struct Config {
 	#[arg(short = 'H', long, default_value = "127.0.0.1", env = "CCP_HOST")]
 	pub host: String,
 
-	/// Max concurrent subprocesses.
+	/// Max in-flight requests (semaphore size).
 	#[arg(short = 'c', long, default_value = "5", env = "CCP_MAX_CONCURRENT")]
 	pub max_concurrent: usize,
 
-	/// Subprocess inactivity timeout in seconds.
+	/// Per-request timeout in seconds. (v1 legacy: only enforced on the
+	/// removed subprocess path. v2 uses a fixed 600s upstream timeout.)
 	#[arg(short = 't', long, default_value = "600", env = "CCP_TIMEOUT")]
 	pub timeout: u64,
 
-	/// Max time a request waits in queue (seconds).
+	/// Max time a request waits in the concurrency queue (seconds).
 	#[arg(short = 'q', long, default_value = "60", env = "CCP_QUEUE_TIMEOUT")]
 	pub queue_timeout: u64,
 
-	/// Path to claude CLI binary.
+	/// Path to the `claude` CLI binary, used at startup only to verify
+	/// installation and login state. v2 does not invoke it per request.
 	#[arg(long, default_value = "claude", env = "CCP_CLAUDE_PATH")]
 	pub claude_path: String,
 
-	/// Data directory for config isolation and stats DB.
+	/// Data directory for the stats DB (and v1 config isolation).
 	#[arg(long, env = "CCP_DATA_DIR")]
 	pub data_dir: Option<PathBuf>,
 
-	/// Working directory for subprocesses (defaults to isolated config dir).
+	/// (v1 legacy) Working directory for subprocesses. Unused in v2.
 	#[arg(long, env = "CCP_WORKING_DIR")]
 	pub working_dir: Option<PathBuf>,
 
-	/// Disable config isolation (use host's ~/.claude directly).
+	/// (v1 legacy) Disable per-request config isolation. Unused in v2.
 	#[arg(long, env = "CCP_NO_ISOLATE")]
 	pub no_isolate: bool,
 
@@ -74,6 +76,14 @@ pub struct Config {
 	/// File to write conversation logs to (implies --log-conversations).
 	#[arg(long, env = "CCP_LOG_FILE")]
 	pub log_file: Option<PathBuf>,
+
+	/// Skip prepending the canonical Claude Code system identifier block
+	/// to outbound requests. The preamble is required for opus/sonnet
+	/// calls to bypass Anthropic's OAuth subscription gate; disable only
+	/// if the consumer is providing its own equivalent system prompt or
+	/// for upstream debugging.
+	#[arg(long, env = "CCP_NO_PREAMBLE")]
+	pub no_preamble: bool,
 
 	/// Enable debug logging.
 	#[arg(short = 'v', long)]
