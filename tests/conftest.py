@@ -76,6 +76,7 @@ def _start_ccp_server(binary: str, name: str, extra_args: list[str], data_dir: s
 		"port": port,
 		"data_dir": data_dir,
 		"process": proc,
+		"stderr_file": stderr_file,
 	}
 
 

@@ -24,7 +24,7 @@ cargo test
 ./tests/run.sh
 ```
 
-This automatically builds the binary, starts CCP server instances on random ports, runs all tests, and tears down. Uses `uv run` with inline deps (httpx, openai, pytest, pytest-asyncio).
+This automatically builds the binary, starts CCP server instances on random ports, runs the live integration tests, and tears down. It requires valid local Claude OAuth credentials because completion tests call Anthropic through CCP. Uses `uv run` with inline deps (httpx, openai, pytest, pytest-asyncio).
 
 Useful flags:
 
@@ -58,6 +58,7 @@ cargo run -- --no-auth --port 18321
 
 - CCP reads Claude OAuth credentials from `~/.claude/.credentials.json` fresh for each request and retries once after a 401 with a fresh read.
 - Requests include Claude Code-compatible headers, beta flags, and session IDs so subscription OAuth calls are accepted by Anthropic.
+- Claude Code fingerprint profiles are selected with `--fingerprint-profile` / `CCP_FINGERPRINT_PROFILE`; `latest` resolves to the newest known-good pinned profile.
 - The canonical Claude Code system identifier is prepended by default to satisfy the OAuth gate. `--no-preamble` is for upstream debugging only.
 - Tools are passed natively to Anthropic Messages API. PascalCase masking for tool names is often required via text replacement to satisfy OAuth gate fingerprinting.
 - Text replacement applies outbound to prompts and tool surfaces, then inbound to assistant text and tool call names/arguments.

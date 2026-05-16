@@ -14,17 +14,143 @@ Run with: ./tests/run.sh
 #     "openai>=1.0",
 #     "pytest>=8.0",
 #     "pytest-asyncio>=0.24",
+#     "xxhash>=3.5",
 # ]
 # ///
 
 import asyncio
 import json
 import os
+import re
+import shutil
+import subprocess
+import tempfile
 import time
 
 import httpx
 import pytest
+import xxhash
 from openai import AsyncOpenAI, BadRequestError, OpenAI
+
+
+DEFAULT_PROFILE = {
+	"name": "cc-2.1.142-sdk-cli",
+	"version": "2.1.142",
+	"say_ok_suffix": "73b",
+}
+CLAUDE_CODE_PREAMBLE = "You are Claude Code, Anthropic's official CLI for Claude."
+CCH_SEED = 0x4D659218E32A3268
+CCH_RE = re.compile(r"(cc_entrypoint=sdk-cli; cch=)([0-9a-f]{5})(;)")
+
+
+def _extract_logged_anthropic_requests(log_file):
+	# Conversation logs write the serialized JSON body followed by a dashed
+	# separator line; this parser deliberately keys off that separator so
+	# braces inside JSON strings do not terminate a match early.
+	content = open(log_file).read()
+	requests = []
+	for match in re.finditer(r"\n(\{.*?\})\n-+\n", content, re.DOTALL):
+		raw = match.group(1)
+		try:
+			obj = json.loads(raw)
+		except json.JSONDecodeError:
+			continue
+		if "messages" in obj and "system" in obj:
+			requests.append((obj, raw))
+	return requests
+
+
+def _anthropic_request_matches_profile(req, profile, expected_suffix=None):
+	system = req["system"]
+	if not isinstance(system, list):
+		return False
+	if len(system) < 2:
+		return False
+	header = system[0].get("text")
+	return (
+		_billing_header_matches_profile(header, profile, expected_suffix)
+		and system[1].get("text") == CLAUDE_CODE_PREAMBLE
+	)
+
+
+def _billing_header_matches_profile(header, profile, expected_suffix=None):
+	if not isinstance(header, str):
+		return False
+	if expected_suffix is None:
+		expected_suffix = re.escape(profile["say_ok_suffix"])
+	elif expected_suffix == "*":
+		expected_suffix = r"[0-9a-f]{3}"
+	else:
+		expected_suffix = re.escape(expected_suffix)
+	return re.fullmatch(
+		rf"x-anthropic-billing-header: cc_version={re.escape(profile['version'])}\."
+		rf"{expected_suffix}; cc_entrypoint=sdk-cli; cch=[0-9a-f]{{5}};",
+		header,
+	) is not None
+
+
+def _assert_logged_request_cch_is_self_consistent(req, raw_body, profile, expected_suffix=None):
+	system = req["system"]
+	header = system[0]["text"]
+	header_match = CCH_RE.search(header)
+	assert header_match is not None, header
+	actual = header_match.group(2)
+	assert actual != "00000"
+
+	placeholder_header = CCH_RE.sub(r"\g<1>00000\g<3>", header, count=1)
+	assert placeholder_header != header
+	placeholder = raw_body.replace(header, placeholder_header, 1).encode()
+	expected = f"{xxhash.xxh64(placeholder, seed=CCH_SEED).intdigest() & 0xfffff:05x}"
+	assert actual == expected
+	assert _anthropic_request_matches_profile(req, profile, expected_suffix)
+
+
+def _logged_anthropic_request_count(log_file):
+	if not os.path.exists(log_file):
+		return 0
+	return len(_extract_logged_anthropic_requests(log_file))
+
+
+def _wait_for_new_logged_anthropic_request(log_file, previous_count):
+	deadline = time.monotonic() + 10
+	while time.monotonic() < deadline:
+		requests = _extract_logged_anthropic_requests(log_file)
+		if len(requests) > previous_count:
+			return requests[-1]
+		time.sleep(0.2)
+	raise AssertionError(
+		f"No new Anthropic request found in {log_file}; "
+		f"previous_count={previous_count}"
+	)
+
+
+def _assert_profile_identity(log_file, profile, previous_count):
+	req, raw_body = _wait_for_new_logged_anthropic_request(log_file, previous_count)
+	system = req["system"]
+	assert isinstance(system, list)
+	_assert_logged_request_cch_is_self_consistent(req, raw_body, profile)
+
+
+def _wait_for_logged_profile_request(log_file, profile, previous_count, expected_suffix=None):
+	deadline = time.monotonic() + 10
+	last_seen = previous_count
+	while time.monotonic() < deadline:
+		requests = _extract_logged_anthropic_requests(log_file)
+		last_seen = len(requests)
+		for req, raw_body in requests[previous_count:]:
+			if _anthropic_request_matches_profile(req, profile, expected_suffix):
+				_assert_logged_request_cch_is_self_consistent(
+					req,
+					raw_body,
+					profile,
+					expected_suffix,
+				)
+				return req, raw_body
+		time.sleep(0.2)
+	raise AssertionError(
+		f"No new Anthropic request with profile {profile['name']} found in "
+		f"{log_file}; previous_count={previous_count}; last_seen={last_seen}"
+	)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1115,3 +1241,78 @@ class TestConversationLog:
 		content = open(log_file).read()
 		assert len(content) > 0
 		assert "Inbound OAI body" in content and "OAI response" in content
+
+
+# ════════════════════════════════════════════════════════════════
+# Fingerprint Profiles
+# ════════════════════════════════════════════════════════════════
+
+
+class TestFingerprintProfiles:
+	def test_default_profile_outbound_identity(self, ccp_server, client):
+		previous_count = _logged_anthropic_request_count(ccp_server["log_file"])
+		client.chat.completions.create(
+			model="haiku",
+			messages=[{"role": "user", "content": "Say OK"}],
+			stream=False,
+		)
+		_assert_profile_identity(ccp_server["log_file"], DEFAULT_PROFILE, previous_count)
+
+	def test_default_profile_streaming_outbound_identity(self, ccp_server, client):
+		previous_count = _logged_anthropic_request_count(ccp_server["log_file"])
+		stream = client.chat.completions.create(
+			model="haiku",
+			messages=[{"role": "user", "content": "Say OK"}],
+			stream=True,
+		)
+		for _chunk in stream:
+			pass
+		_wait_for_logged_profile_request(
+			ccp_server["log_file"],
+			DEFAULT_PROFILE,
+			previous_count,
+		)
+
+	def test_user_content_cch_sentinel_is_not_rewritten(self, ccp_server, client):
+		previous_count = _logged_anthropic_request_count(ccp_server["log_file"])
+		user_text = "Leave this user text alone: cch=00000; 日本語"
+		client.chat.completions.create(
+			model="haiku",
+			messages=[{"role": "user", "content": user_text}],
+			stream=False,
+		)
+		req, raw_body = _wait_for_logged_profile_request(
+			ccp_server["log_file"],
+			DEFAULT_PROFILE,
+			previous_count,
+			expected_suffix="*",
+		)
+		assert user_text in raw_body
+		assert "cch=00000;" in raw_body
+		assert req["messages"][0]["content"][0]["text"] == user_text
+		assert "cc_entrypoint=sdk-cli; cch=00000;" not in req["system"][0]["text"]
+
+	def test_invalid_profile_fails_startup(self, ccp_binary):
+		data_dir = tempfile.mkdtemp(prefix="ccp-test-bad-profile-")
+		try:
+			proc = subprocess.run(
+				[
+					ccp_binary,
+					"--port", "0",
+					"--host", "127.0.0.1",
+					"--data-dir", data_dir,
+					"--fingerprint-profile", "not-a-real-profile",
+				],
+				capture_output=True,
+				text=True,
+				timeout=20,
+			)
+		finally:
+			shutil.rmtree(data_dir, ignore_errors=True)
+
+		assert proc.returncode != 0
+		stderr = proc.stderr + proc.stdout
+		assert "Unknown Claude Code fingerprint profile" in stderr
+		assert DEFAULT_PROFILE["name"] in stderr
+		assert DEFAULT_PROFILE["version"] in stderr
+		assert "2.1.138" not in stderr

@@ -1,6 +1,12 @@
-# claude CLI baseline wire fingerprint (captured 2026-05-10)
+# claude CLI baseline wire fingerprint
 
-Captured via mitmproxy 11.x against `claude --print --model claude-haiku-4-5 "..."` (SDK CLI mode, claude version 2.1.138, SDK package 0.93.0).
+Active baseline: 2026-05-15 against local Claude Code 2.1.142 after update. CCP keeps coherent compatibility profiles for 2.1.142 and newer only:
+
+| Profile | Claude Code | SDK package | Runtime | Entrypoint | Source |
+|---|---|---|---|---|---|
+| `cc-2.1.142-sdk-cli` | `2.1.142` | `0.94.0` | `v24.3.0` | `sdk-cli` | local debug probe, 2026-05-15 |
+
+`latest` resolves to `cc-2.1.142-sdk-cli`, the newest known-good pinned profile. Do not make the default an automatic max-version calculation; only move `latest` after a profile has been re-baselined and live-smoked.
 
 Source flow: `tools/fingerprint/scenarios/01-plain-text.flow`. Replay with:
 
@@ -22,15 +28,15 @@ The `?beta=true` query parameter is sent on every Messages request.
 | `Accept` | `application/json` | always |
 | `Authorization` | `Bearer <oauth>` | OAuth subscription token from credentials.json |
 | `Content-Type` | `application/json` | always |
-| `User-Agent` | `claude-cli/2.1.138 (external, sdk-cli)` | versioned with claude CLI release |
+| `User-Agent` | `claude-cli/<profile version> (external, sdk-cli)` | versioned with pinned Claude Code compatibility profile |
 | `X-Claude-Code-Session-Id` | UUIDv4 | per-session, stable across requests in same session |
 | `X-Stainless-Arch` | `x64` | Anthropic Node SDK telemetry |
 | `X-Stainless-Lang` | `js` | |
 | `X-Stainless-OS` | `Linux` | |
-| `X-Stainless-Package-Version` | `0.93.0` | Anthropic SDK version bundled with claude CLI |
+| `X-Stainless-Package-Version` | `<profile SDK package>` | Anthropic SDK version bundled with pinned Claude Code profile |
 | `X-Stainless-Retry-Count` | `0` | increments on retries |
 | `X-Stainless-Runtime` | `node` | |
-| `X-Stainless-Runtime-Version` | `v24.3.0` | Node bundled by claude CLI |
+| `X-Stainless-Runtime-Version` | `<profile runtime>` | Node bundled by claude CLI |
 | `X-Stainless-Timeout` | `600` | request timeout in seconds |
 | `anthropic-beta` | (see below) | comma-separated list, varies by request kind |
 | `anthropic-dangerous-direct-browser-access` | `true` | always |
@@ -59,9 +65,16 @@ CCP v2 will use the **Default** list for all requests as a starting point; revis
 - `system` is an **array of text blocks** (not a flat string).
 - The FIRST `system` block claude sends is a billing/telemetry header:
   ```
-  x-anthropic-billing-header: cc_version=2.1.138.40b; cc_entrypoint=sdk-cli; cch=cd8d6;
+  x-anthropic-billing-header: cc_version=2.1.142.73b; cc_entrypoint=sdk-cli; cch=00000;
   ```
-  This is structured *as if* it were instruction text but is just claude's identity marker. CCP v2 should emit a similar marker as the first system block to ensure billing routes correctly to Max subscription.
+  This is structured *as if* it were instruction text but is just claude's identity marker. CCP v2 emits this marker as the first system block, followed by the canonical Claude Code preamble block, before user-provided system content.
+- Claude Code 2.1.142's visible attribution builder and debug log emit `cch=00000`, but the final HTTP body rewrites that sentinel to a deterministic five-hex checksum. CCP mirrors the recovered final-body algorithm for this pinned profile: standard `xxHash64` over the exact serialized body bytes while `cch=00000` is still present, seed `0x4d659218e32a3268`, then `hash & 0xfffff` formatted as five lowercase hex digits. See `tools/fingerprint/CCH_ALGORITHM.md`.
+- The `cc_version` suffix is dynamic per request:
+  ```
+  suffix = sha256("59cf53e54c78" + chars + claude_version).hex()[0..3]
+  chars = first_user_text[4] + first_user_text[7] + first_user_text[20]
+  ```
+  Missing positions are the literal ASCII `0`. Indices are JavaScript UTF-16 string indices, not Rust scalar-value indices. The source text is the first text content in the first user message after CCP outbound replacements. If the first user message has no text block, use empty text and do not fall through to later user messages.
 - `metadata.user_id` is a **JSON-encoded string** containing `{device_id, account_uuid, session_id}`. Anthropic accepts this opaquely.
 - `tools: []` empty array sent even when no tools used (so the field is always present).
 - `temperature: 1`, `max_tokens: 32000` are claude defaults for haiku-4-5.
@@ -69,12 +82,11 @@ CCP v2 will use the **Default** list for all requests as a starting point; revis
 
 ## Step 0 verification — confirmed working
 
-The Step 0 minimal request (Haiku 4-5, OAuth Bearer, anthropic-beta with claude-code+oauth, custom non-CC system prompt) returned 200 with these headers — proving CCP v2 doesn't need byte-exact fingerprint match to function. Phase 5 (fingerprint hardening) is when we tighten to exact match.
+The Step 0 minimal request (Haiku 4-5, OAuth Bearer, anthropic-beta with claude-code+oauth, custom non-CC system prompt) returned 200 with these headers — proving CCP v2 doesn't need byte-exact fingerprint match to function. CCP now implements the recovered 2.1.142 `cch` body checksum for the active profile.
 
-## TODO during Phase 5
+## Remaining Baseline Work
 
 - Capture remaining 7 scenarios (with-tools, multi-turn, streaming, image, token-refresh, prompt-caching, errors).
 - Diff CCP v2 captures against this baseline.
-- Decide policy on `X-Stainless-*` (do we match exactly, or use our own values?).
-- Consider whether `X-Claude-Code-Session-Id` should be derived from CCP request_id or be a stable per-process UUID.
-- Verify HTTP/2 vs HTTP/1.1 — capture above is 1.1 because mitmproxy downgrades; re-check with TLS-passthrough or by capturing CCP's outbound.
+- Watch documented differences that have not blocked OAuth use so far, including omitted `tools: []`, omitted default `temperature: 1`, and CCP-specific body field ordering.
+- Run `tools/fingerprint/check_claude_code_drift.py` after Claude Code updates to detect installed-version or `cch` algorithm drift before moving `latest`.
