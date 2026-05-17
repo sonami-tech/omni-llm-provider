@@ -78,6 +78,7 @@ pub async fn handle_non_streaming_v2(
         // cch algorithm uses per-attempt request context fields.
         if let Ok(bytes) = state.fingerprint_profile.finalize_body_json(&body, &ctx) {
             log.log(
+                &session_id,
                 &request_id,
                 ">>>",
                 "Anthropic request",
@@ -117,7 +118,7 @@ pub async fn handle_non_streaming_v2(
 
     if let Some(ref log) = conv_log {
         if let Ok(text) = serde_json::to_string(&oai_response) {
-            log.log(&request_id, "<<<", "OAI response", &text);
+            log.log(&session_id, &request_id, "<<<", "OAI response", &text);
         }
     }
 
@@ -180,6 +181,7 @@ pub async fn handle_streaming_v2(
         // cch algorithm uses per-attempt request context fields.
         if let Ok(bytes) = state.fingerprint_profile.finalize_body_json(&body, &ctx) {
             log.log(
+                &session_id,
                 &request_id,
                 ">>>",
                 "Anthropic streaming request",
@@ -197,6 +199,7 @@ pub async fn handle_streaming_v2(
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
 
     let conv_request_id = request_id.clone();
+    let conv_session_id = session_id.clone();
     let conv_log_for_task = conv_log.clone();
     let replacements = state.replacements.clone();
     let requested_model = model_def.canonical.to_string();
@@ -286,6 +289,7 @@ pub async fn handle_streaming_v2(
 
             if let Some(log) = conv_log_for_task {
                 log.log(
+                    &conv_session_id,
                     &conv_request_id,
                     "<<<",
                     "Streaming response (text accumulator)",

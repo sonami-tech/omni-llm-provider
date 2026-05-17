@@ -194,9 +194,10 @@ fn translate_parts(parts: &[ContentPart]) -> Result<Vec<ContentBlock>, AppError>
 fn translate_assistant(m: &ChatMessage) -> Result<Vec<ContentBlock>, AppError> {
 	let mut blocks: Vec<ContentBlock> = Vec::new();
 
-	// Thinking blocks first (Anthropic invariant when reasoning_content
-	// precedes a tool_use turn).
-	if let Some(reasoning) = &m.reasoning_content {
+	// Thinking blocks first (Anthropic invariant when signed thinking precedes
+	// a tool_use turn). Plain reasoning_content is display text in OAI clients;
+	// replaying it as Anthropic thinking would be unsigned and rejected.
+	if let Some(reasoning) = &m.reasoning_content_blocks {
 		blocks.extend(reasoning_to_blocks(reasoning));
 	}
 
@@ -221,24 +222,28 @@ fn translate_assistant(m: &ChatMessage) -> Result<Vec<ContentBlock>, AppError> {
 
 fn reasoning_to_blocks(value: &Value) -> Vec<ContentBlock> {
 	match value {
-		Value::String(s) if !s.is_empty() => vec![ContentBlock::Thinking {
-			thinking: s.clone(),
-			signature: None,
-		}],
-		Value::Array(arr) => arr
-			.iter()
-			.filter_map(|v| {
-				let obj = v.as_object()?;
-				let thinking = obj.get("thinking").and_then(|x| x.as_str())?.to_string();
-				let signature = obj
-					.get("signature")
-					.and_then(|x| x.as_str())
-					.map(str::to_string);
-				Some(ContentBlock::Thinking { thinking, signature })
-			})
-			.collect(),
+		Value::Array(arr) => arr.iter().filter_map(signed_reasoning_block).collect(),
 		_ => vec![],
 	}
+}
+
+fn signed_reasoning_block(value: &Value) -> Option<ContentBlock> {
+	let obj = value.as_object()?;
+	if obj.get("type").and_then(|x| x.as_str()) != Some("thinking") {
+		return None;
+	}
+	let thinking = obj.get("thinking").and_then(|x| x.as_str())?;
+	if thinking.is_empty() {
+		return None;
+	}
+	let signature = obj
+		.get("signature")
+		.and_then(|x| x.as_str())
+		.filter(|s| !s.is_empty())?;
+	Some(ContentBlock::Thinking {
+		thinking: thinking.to_string(),
+		signature: Some(signature.to_string()),
+	})
 }
 
 fn tool_use_block(call: &RequestToolCall) -> Result<ContentBlock, AppError> {
@@ -305,4 +310,84 @@ fn extract_text(content: &Option<OaiMessageContent>) -> String {
 fn _unused_image_marker() -> ImageSource {
 	// Placeholder to keep ImageSource import live until image support is added.
 	ImageSource::Url { url: String::new() }
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use serde_json::json;
+
+	fn assistant_with_reasoning(
+		reasoning_content: Option<Value>,
+		reasoning_content_blocks: Option<Value>,
+	) -> ChatMessage {
+		ChatMessage {
+			role: "assistant".into(),
+			reasoning_content,
+			reasoning_content_blocks,
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn reasoning_string_is_not_forwarded_as_unsigned_thinking() {
+		let msg = assistant_with_reasoning(Some(json!("[object Object]")), None);
+
+		let blocks = translate_assistant(&msg).expect("assistant translation");
+		assert!(blocks.is_empty());
+	}
+
+	#[test]
+	fn unsigned_reasoning_blocks_are_dropped() {
+		let msg = assistant_with_reasoning(
+			Some(json!([{
+				"type": "thinking",
+				"thinking": "no usable signature",
+			}])),
+			None,
+		);
+
+		let blocks = translate_assistant(&msg).expect("assistant translation");
+		assert!(blocks.is_empty());
+	}
+
+	#[test]
+	fn legacy_reasoning_content_arrays_are_display_only() {
+		let msg = assistant_with_reasoning(
+			Some(json!([{
+				"type": "thinking",
+				"thinking": "safe replay",
+				"signature": "sig-123",
+			}])),
+			None,
+		);
+
+		let blocks = translate_assistant(&msg).expect("assistant translation");
+		assert!(blocks.is_empty());
+	}
+
+	#[test]
+	fn reasoning_content_blocks_extension_is_forwarded() {
+		let msg = assistant_with_reasoning(
+			Some(json!("display only")),
+			Some(json!([{
+				"type": "thinking",
+				"thinking": "extension replay",
+				"signature": "sig-456",
+			}])),
+		);
+
+		let blocks = translate_assistant(&msg).expect("assistant translation");
+		assert_eq!(blocks.len(), 1);
+		match &blocks[0] {
+			ContentBlock::Thinking {
+				thinking,
+				signature,
+			} => {
+				assert_eq!(thinking, "extension replay");
+				assert_eq!(signature.as_deref(), Some("sig-456"));
+			}
+			other => panic!("unexpected block: {other:?}"),
+		}
+	}
 }

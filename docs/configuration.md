@@ -15,6 +15,9 @@ All options can be set via CLI flags or environment variables. CLI flags take pr
 | `--replace-rules` | `CCP_REPLACE_RULES` | None | TOML file with text replacement rules |
 | `--log-conversations` | `CCP_LOG_CONVERSATIONS` | Off | Log full prompts and responses to stderr |
 | `--log-file` | `CCP_LOG_FILE` | None | Write conversation logs to file (implies `--log-conversations`) |
+| `--log-dir` | `CCP_LOG_DIR` | None | Write one conversation log file per resolved session id |
+| `--log-max-bytes` | `CCP_LOG_MAX_BYTES` | `67108864` | Rotate `--log-file` after this many bytes; `0` disables rotation |
+| `--log-backups` | `CCP_LOG_BACKUPS` | `5` | Number of rotated conversation log files to keep |
 | `--no-preamble` | `CCP_NO_PREAMBLE` | Off | Skip the canonical Claude Code system identifier preamble; only useful for debugging upstream |
 | `-v, --verbose` | | Off | Debug logging |
 
@@ -112,23 +115,33 @@ Additional details:
 
 ## Conversation Logging
 
-Two output targets:
+Three output targets:
 
 - `--log-conversations` logs to stderr, interleaved with server logs.
 - `--log-file /path/to/file` logs to a dedicated file (also implies `--log-conversations`).
+- `--log-dir /path/to/dir` logs each resolved session id to its own file
+  named `<session-id>.log` after filename sanitization. Requests without a
+  stable session id use `request-<request-id>.log`.
+
+File logging rotates by default when the active log exceeds 64 MiB. CCP keeps five
+backups named by appending numeric suffixes to the configured path, for example
+`conversations.log.1` through `conversations.log.5`. Tune this with
+`--log-max-bytes` and `--log-backups`; set `--log-max-bytes 0` to disable
+rotation. Directory logging does not rotate because each session gets a separate
+file.
 
 Log format:
 
 ```
-[HH:MM:SS] <request-id> >>> Inbound OAI body
+[HH:MM:SS] session=<session-id> request=<request-id> >>> Inbound OAI body
 <raw request body>
 ------------------------------
 
-[HH:MM:SS] <request-id> >>> Anthropic body
+[HH:MM:SS] session=<session-id> request=<request-id> >>> Anthropic body
 <translated Anthropic request body>
 ------------------------------
 
-[HH:MM:SS] <request-id> <<< OpenAI response
+[HH:MM:SS] session=<session-id> request=<request-id> <<< OpenAI response
 <translated response>
 --------------------------------
 ```

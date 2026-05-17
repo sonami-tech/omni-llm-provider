@@ -113,18 +113,36 @@ async fn main() {
     });
 
     // Setup conversation logging.
-    let log_conversations = config.log_conversations || config.log_file.is_some();
+    let log_conversations =
+        config.log_conversations || config.log_file.is_some() || config.log_dir.is_some();
     let conversation_log = if log_conversations {
-        let log = if let Some(ref path) = config.log_file {
-            conversation_log::ConversationLog::to_file(path).unwrap_or_else(|e| {
+        let log = if let Some(ref path) = config.log_dir {
+            conversation_log::ConversationLog::to_dir(path).unwrap_or_else(|e| {
+                error!("Failed to open log directory {:?}: {}", path, e);
+                std::process::exit(1);
+            })
+        } else if let Some(ref path) = config.log_file {
+            conversation_log::ConversationLog::to_file(
+                path,
+                config.log_max_bytes,
+                config.log_backups,
+            )
+            .unwrap_or_else(|e| {
                 error!("Failed to open log file {:?}: {}", path, e);
                 std::process::exit(1);
             })
         } else {
             conversation_log::ConversationLog::to_stderr()
         };
-        if let Some(ref path) = config.log_file {
-            info!("Conversation logging to file: {:?}", path);
+        if let Some(ref path) = config.log_dir {
+            info!("Conversation logging to directory: {:?}", path);
+        } else if let Some(ref path) = config.log_file {
+            info!(
+                max_bytes = config.log_max_bytes,
+                backups = config.log_backups,
+                "Conversation logging to file: {:?}",
+                path
+            );
         } else {
             info!("Conversation logging to stderr");
         }

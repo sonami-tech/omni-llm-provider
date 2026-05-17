@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use crate::conversation_log::{DEFAULT_LOG_BACKUPS, DEFAULT_LOG_MAX_BYTES};
+
 #[derive(Parser, Clone, Debug)]
 #[command(
     name = "claude-code-provider",
@@ -42,8 +44,20 @@ pub struct Config {
     pub log_conversations: bool,
 
     /// File to write conversation logs to (implies --log-conversations).
-    #[arg(long, env = "CCP_LOG_FILE")]
+    #[arg(long, env = "CCP_LOG_FILE", conflicts_with = "log_dir")]
     pub log_file: Option<PathBuf>,
+
+    /// Directory to write one conversation log file per session id.
+    #[arg(long, env = "CCP_LOG_DIR", conflicts_with = "log_file")]
+    pub log_dir: Option<PathBuf>,
+
+    /// Rotate --log-file after this many bytes. Set to 0 to disable rotation.
+    #[arg(long, env = "CCP_LOG_MAX_BYTES", default_value_t = DEFAULT_LOG_MAX_BYTES)]
+    pub log_max_bytes: u64,
+
+    /// Number of rotated conversation log files to keep.
+    #[arg(long, env = "CCP_LOG_BACKUPS", default_value_t = DEFAULT_LOG_BACKUPS)]
+    pub log_backups: usize,
 
     /// Skip prepending Claude Code identity blocks to outbound requests.
     /// This disables both the billing marker and canonical Claude Code
@@ -103,5 +117,54 @@ impl Config {
         keys.sort();
         keys.dedup();
         keys
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn conversation_log_rotation_defaults_are_set() {
+        let config = Config::try_parse_from(["ccp"]).unwrap();
+
+        assert_eq!(config.log_max_bytes, DEFAULT_LOG_MAX_BYTES);
+        assert_eq!(config.log_backups, DEFAULT_LOG_BACKUPS);
+    }
+
+    #[test]
+    fn conversation_log_rotation_options_parse() {
+        let config = Config::try_parse_from([
+            "ccp",
+            "--log-max-bytes",
+            "1024",
+            "--log-backups",
+            "2",
+        ])
+        .unwrap();
+
+        assert_eq!(config.log_max_bytes, 1024);
+        assert_eq!(config.log_backups, 2);
+    }
+
+    #[test]
+    fn conversation_log_dir_option_parse() {
+        let config = Config::try_parse_from(["ccp", "--log-dir", "/tmp/ccp-logs"]).unwrap();
+
+        assert_eq!(config.log_dir, Some(PathBuf::from("/tmp/ccp-logs")));
+    }
+
+    #[test]
+    fn conversation_log_dir_conflicts_with_log_file() {
+        let result = Config::try_parse_from([
+            "ccp",
+            "--log-file",
+            "/tmp/ccp.log",
+            "--log-dir",
+            "/tmp/ccp-logs",
+        ]);
+
+        assert!(result.is_err());
     }
 }

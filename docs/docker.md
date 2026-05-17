@@ -82,7 +82,7 @@ The `docker-compose.yml` mounts `./rules.toml` by default. To enable conversatio
 volumes:
   - ./logs:/var/log/ccp
 environment:
-  CCP_LOG_FILE: /var/log/ccp/conversations.log
+  CCP_LOG_DIR: /var/log/ccp
 ```
 
 ## All Environment Variables
@@ -94,6 +94,9 @@ Uncomment or add any of these in the `environment:` section of your `docker-comp
 | `CCP_API_KEYS_FILE` | None | Path to API keys file inside the container |
 | `CCP_REPLACE_RULES` | None | Path to replacement rules TOML inside the container |
 | `CCP_LOG_FILE` | None | Path to conversation log file inside the container |
+| `CCP_LOG_DIR` | None | Directory for one conversation log file per resolved session id |
+| `CCP_LOG_MAX_BYTES` | `67108864` | Rotate `CCP_LOG_FILE` after this many bytes; `0` disables rotation |
+| `CCP_LOG_BACKUPS` | `5` | Number of rotated conversation log files to keep |
 | `CCP_NO_PREAMBLE` | Off | Skip the Claude Code system identifier preamble for upstream debugging |
 | `CCP_PORT` | `18321` | Listen port |
 | `CCP_NO_AUTH` | Off | Set to `true` to disable authentication |

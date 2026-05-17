@@ -229,13 +229,12 @@ impl OaiStreamConverter {
 		})
 	}
 
-	fn reasoning_content_chunk(&self, thinking: String, signature: Option<String>) -> Value {
-		let mut reasoning_part = serde_json::Map::new();
-		reasoning_part.insert("type".into(), Value::String("thinking".into()));
-		reasoning_part.insert("thinking".into(), Value::String(thinking));
-		if let Some(signature) = signature {
-			reasoning_part.insert("signature".into(), Value::String(signature));
-		}
+	fn reasoning_content_chunk(&self, thinking: String, signature: String) -> Value {
+		let reasoning_part = json!({
+			"type": "thinking",
+			"thinking": thinking.clone(),
+			"signature": signature,
+		});
 
 		json!({
 			"id": self.chat_id,
@@ -244,7 +243,10 @@ impl OaiStreamConverter {
 			"model": self.requested_model,
 			"choices": [{
 				"index": 0,
-				"delta": {"reasoning_content": [Value::Object(reasoning_part)]},
+				"delta": {
+					"reasoning_content": thinking,
+					"reasoning_content_blocks": [reasoning_part],
+				},
 				"finish_reason": null,
 			}]
 		})
@@ -254,10 +256,11 @@ impl OaiStreamConverter {
 		let Some(buffer) = self.thinking_buffers.remove(&index) else {
 			return vec![];
 		};
-		if buffer.thinking.is_empty() {
-			vec![]
-		} else {
-			vec![self.reasoning_content_chunk(buffer.thinking, buffer.signature)]
+		match (buffer.thinking.is_empty(), buffer.signature) {
+			(false, Some(signature)) if !signature.is_empty() => {
+				vec![self.reasoning_content_chunk(buffer.thinking, signature)]
+			}
+			_ => vec![],
 		}
 	}
 
@@ -402,6 +405,10 @@ mod tests {
 		assert_eq!(chunks.len(), 1);
 		assert_eq!(
 			chunks[0]["choices"][0]["delta"]["reasoning_content"],
+			"first second"
+		);
+		assert_eq!(
+			chunks[0]["choices"][0]["delta"]["reasoning_content_blocks"],
 			json!([{
 				"type": "thinking",
 				"thinking": "first second",
@@ -414,7 +421,7 @@ mod tests {
 	}
 
 	#[test]
-	fn finalization_flushes_unclosed_thinking_without_null_signature() {
+	fn finalization_drops_unclosed_thinking_without_signature() {
 		let mut converter = converter();
 
 		converter.on_event(StreamEvent::ContentBlockStart {
@@ -427,17 +434,10 @@ mod tests {
 		});
 
 		let chunks = converter.finalize_if_needed();
-		assert_eq!(chunks.len(), 2);
-		assert_eq!(
-			chunks[0]["choices"][0]["delta"]["reasoning_content"],
-			json!([{
-				"type": "thinking",
-				"thinking": "partial",
-			}])
-		);
-		assert!(chunks[0]["choices"][0]["delta"]["reasoning_content"][0]
-			.get("signature")
+		assert_eq!(chunks.len(), 1);
+		assert!(chunks[0]["choices"][0]["delta"]
+			.get("reasoning_content")
 			.is_none());
-		assert_eq!(chunks[1]["choices"][0]["finish_reason"], "stop");
+		assert_eq!(chunks[0]["choices"][0]["finish_reason"], "stop");
 	}
 }

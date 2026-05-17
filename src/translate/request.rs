@@ -67,11 +67,15 @@ pub struct ChatMessage {
 	pub tool_calls: Option<Vec<RequestToolCall>>,
 	#[serde(default)]
 	pub tool_call_id: Option<String>,
-	/// OAI-extension: thinking-block carryover on assistant turns.
-	/// Either a string (joined plain reasoning) or an array of
-	/// `{type:"thinking", thinking, signature?}` blocks.
+	/// OAI-compatible reasoning text on assistant turns. This is display-only
+	/// for Anthropic replay because strings do not carry thinking signatures.
 	#[serde(default)]
+	#[allow(dead_code)]
 	pub reasoning_content: Option<serde_json::Value>,
+	/// CCP extension: signed Anthropic thinking-block carryover.
+	/// Only blocks with a non-empty `signature` can be safely replayed.
+	#[serde(default)]
+	pub reasoning_content_blocks: Option<serde_json::Value>,
 }
 
 // ── Tool types ───────────────────────────────────────────────────

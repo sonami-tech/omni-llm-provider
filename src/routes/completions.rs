@@ -35,17 +35,17 @@ pub async fn completions_handler(
 	let request_id = &uuid_str[..8];
 	let chat_id = format!("chatcmpl-{request_id}");
 
+	let session_id =
+		resolve_session_id(session_header.as_deref(), &request, api_key_id.as_deref());
+
 	// Log the raw inbound body for end-to-end diagnostics. Falls back to a
 	// utf8-lossy rendering if the body isn't valid UTF-8.
 	if let Some(ref log) = state.conversation_log {
 		let raw = std::str::from_utf8(&body)
 			.map(str::to_string)
 			.unwrap_or_else(|_| String::from_utf8_lossy(&body).into_owned());
-		log.log(request_id, ">>>", "Inbound OAI body", &raw);
+		log.log(&session_id, request_id, ">>>", "Inbound OAI body", &raw);
 	}
-
-	let session_id =
-		resolve_session_id(session_header.as_deref(), &request, api_key_id.as_deref());
 
 	let span = tracing::info_span!(
 		"request",
