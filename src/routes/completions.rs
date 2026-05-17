@@ -8,7 +8,7 @@ use tracing::{Instrument, info};
 use crate::AppState;
 use crate::auth::ApiKeyId;
 use crate::error::AppError;
-use crate::models::{resolve_model, validate_effort};
+use crate::models::validate_effort;
 use crate::session::resolve_session_id;
 use crate::translate::request::{ChatCompletionRequest, validate_request};
 
@@ -62,7 +62,7 @@ pub async fn completions_handler(
 	async move {
 	// Validate.
 	validate_request(&request)?;
-	let model_def = resolve_model(&request.model);
+	let model_def = state.fingerprint_profile.resolve_model(&request.model);
 	request.model = model_def.cli_name.to_string();
 	validate_effort(request.reasoning_effort.as_deref())?;
 

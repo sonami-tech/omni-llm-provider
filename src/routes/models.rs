@@ -1,9 +1,14 @@
+use std::sync::Arc;
+
+use axum::extract::State;
 use axum::Json;
 use axum::response::IntoResponse;
 
-pub async fn models_handler() -> impl IntoResponse {
+use crate::AppState;
+
+pub async fn models_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 	Json(serde_json::json!({
 		"object": "list",
-		"data": crate::models::models_list(),
+		"data": state.fingerprint_profile.models_list(),
 	}))
 }

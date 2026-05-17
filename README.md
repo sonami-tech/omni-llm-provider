@@ -131,11 +131,14 @@ cargo build --release
 
 | Model | Aliases |
 |-------|---------|
-| `claude-opus-4-6` | `opus`, `claude-opus` |
+| `claude-opus-4-7` | `opus`, `claude-opus`, `claude-opus-4-6` |
 | `claude-sonnet-4-6` | `sonnet`, `claude-sonnet` |
 | `claude-haiku-4-5` | `haiku`, `claude-haiku` |
 
-Unrecognized model names fall back to Sonnet. See [configuration reference](docs/configuration.md#models) for date-suffixed names and [reasoning effort](docs/configuration.md#reasoning-effort) levels.
+Model names are tied to the active Claude Code fingerprint profile. The default
+profile currently mimics Claude Code `2.1.142`; `claude-opus-4-6` is accepted as
+a compatibility alias and resolves to the profile's Opus model. Unrecognized
+model names fall back to the profile's default model, currently Sonnet. See [configuration reference](docs/configuration.md#models) for date-suffixed names and [reasoning effort](docs/configuration.md#reasoning-effort) levels.
 
 ## Limitations
 

@@ -196,7 +196,7 @@ class TestModels:
 		assert len(models.data) == 3
 
 		names = [m.id for m in models.data]
-		assert "claude-opus-4-6" in names
+		assert "claude-opus-4-7" in names
 		assert "claude-sonnet-4-6" in names
 		assert "claude-haiku-4-5" in names
 
@@ -211,8 +211,8 @@ class TestModels:
 
 		by_id = {m["id"]: m for m in data["data"]}
 
-		assert by_id["claude-opus-4-6"]["context_window"] == 1_000_000
-		assert by_id["claude-opus-4-6"]["max_tokens"] == 128_000
+		assert by_id["claude-opus-4-7"]["context_window"] == 1_000_000
+		assert by_id["claude-opus-4-7"]["max_tokens"] == 128_000
 		assert by_id["claude-sonnet-4-6"]["context_window"] == 1_000_000
 		assert by_id["claude-sonnet-4-6"]["max_tokens"] == 64_000
 		assert by_id["claude-haiku-4-5"]["context_window"] == 200_000
@@ -554,6 +554,8 @@ class TestModelAliases:
 		("sonnet", "sonnet"),
 		("opus", "opus"),
 		("haiku", "haiku"),
+		("claude-opus-4-6", "opus"),
+		("claude-opus-4-6-20260101", "opus"),
 		("claude-sonnet", "sonnet"),
 		("claude-haiku", "haiku"),
 		("claude-sonnet-4-6-20260101", "sonnet"),
@@ -566,6 +568,14 @@ class TestModelAliases:
 		)
 		assert expected_substr in resp.model
 		assert "PONG" in resp.choices[0].message.content
+
+	def test_opus_alias_returns_profile_canonical_model(self, client):
+		resp = client.chat.completions.create(
+			model="opus",
+			messages=[{"role": "user", "content": "Reply PONG"}],
+			stream=False,
+		)
+		assert resp.model == "claude-opus-4-7"
 
 	def test_unknown_model_falls_back_to_sonnet(self, client):
 		resp = client.chat.completions.create(

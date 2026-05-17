@@ -701,13 +701,12 @@ fn apply_replacements_inbound(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::resolve_model;
     use crate::translate::anthropic::{CacheControl, ImageSource};
     use crate::translate::request::{ChatMessage, MessageContent as OaiMessageContent};
     use crate::upstream::fingerprint::{CLAUDE_CODE_SYSTEM_PREAMBLE, default_profile};
 
     fn haiku_model() -> &'static ModelDef {
-        resolve_model("claude-haiku-4-5")
+        default_profile().resolve_model("claude-haiku-4-5")
     }
 
     fn anthropic_request(user_text: &str) -> MessagesRequest {

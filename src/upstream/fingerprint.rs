@@ -9,6 +9,10 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use ring::digest;
 use uuid::Uuid;
 
+use crate::models::{
+    CATALOG_CC_2_1_142, ModelDef, ModelInfo, models_list_from_catalog, resolve_model_in_catalog,
+};
+
 use super::credentials::Credentials;
 
 /// Static identity CCP claims on the wire. These values must move together
@@ -23,6 +27,8 @@ pub struct FingerprintProfile {
     pub entrypoint: &'static str,
     pub beta_reply: &'static str,
     pub system_preamble: &'static str,
+    pub models: &'static [ModelDef],
+    pub default_model: &'static str,
     billing: BillingScheme,
 }
 
@@ -51,6 +57,14 @@ impl FingerprintProfile {
             "claude-cli/{} (external, {})",
             self.claude_cli_version, self.entrypoint
         )
+    }
+
+    pub fn resolve_model(&self, input: &str) -> &'static ModelDef {
+        resolve_model_in_catalog(input, self.models, self.default_model)
+    }
+
+    pub fn models_list(&self) -> Vec<ModelInfo> {
+        models_list_from_catalog(self.models)
     }
 
     pub fn billing_header_text(&self, first_user_text: &str) -> String {
@@ -187,6 +201,8 @@ pub const PROFILE_CLAUDE_2_1_142_SDK_CLI: FingerprintProfile = FingerprintProfil
     entrypoint: "sdk-cli",
     beta_reply: DEFAULT_BETA,
     system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
+    models: CATALOG_CC_2_1_142,
+    default_model: "sonnet",
     billing: BILLING_SCHEME_V1_CCH_XXH64_BODY,
 };
 
@@ -647,6 +663,16 @@ mod tests {
             profile.user_agent(),
             "claude-cli/2.1.142 (external, sdk-cli)"
         );
+        assert_eq!(profile.default_model, "sonnet");
+        assert_eq!(profile.resolve_model("opus").canonical, "claude-opus-4-7");
+        assert_eq!(
+            profile.resolve_model("sonnet").canonical,
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(
+            profile.resolve_model("haiku").canonical,
+            "claude-haiku-4-5"
+        );
     }
 
     #[test]
@@ -673,6 +699,11 @@ mod tests {
             assert!(!profile.claude_cli_version.is_empty());
             assert!(!profile.stainless_package_version.is_empty());
             assert!(!profile.aliases.contains(&LATEST_PROFILE_ALIAS));
+            assert!(!profile.models.is_empty());
+            assert!(crate::models::catalog_contains_unique_names(profile.models));
+            assert!(profile.models.iter().any(|model| {
+                model.cli_name == profile.default_model || model.canonical == profile.default_model
+            }));
             for other in FINGERPRINT_PROFILES.iter().skip(idx + 1) {
                 assert_ne!(profile.name, other.name);
                 for alias in profile.aliases {
@@ -883,6 +914,8 @@ mod tests {
             entrypoint: "sdk-cli",
             beta_reply: DEFAULT_BETA,
             system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
+            models: CATALOG_CC_2_1_142,
+            default_model: "sonnet",
             billing: BILLING_SCHEME_V1_CCH_00000,
         };
         let ctx = RequestContext::new_reply();
