@@ -25,8 +25,8 @@ except ImportError:
 	sys.exit(2)
 
 
-PINNED_VERSION = "2.1.142"
-PINNED_PROFILE = "cc-2.1.142-sdk-cli"
+PINNED_VERSION = "2.1.150"
+PINNED_PROFILE = "cc-2.1.150-sdk-cli"
 CCH_SEED = 0x4D659218E32A3268
 CCH_RE = re.compile(r"(cc_entrypoint=sdk-cli; cch=)([0-9a-f]{5})(;)")
 

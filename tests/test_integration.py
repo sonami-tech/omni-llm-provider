@@ -34,9 +34,9 @@ from openai import AsyncOpenAI, BadRequestError, OpenAI
 
 
 DEFAULT_PROFILE = {
-	"name": "cc-2.1.142-sdk-cli",
-	"version": "2.1.142",
-	"say_ok_suffix": "73b",
+	"name": "cc-2.1.150-sdk-cli",
+	"version": "2.1.150",
+	"say_ok_suffix": "5bd",
 }
 CLAUDE_CODE_PREAMBLE = "You are Claude Code, Anthropic's official CLI for Claude."
 CCH_SEED = 0x4D659218E32A3268
@@ -198,7 +198,7 @@ class TestModels:
 		names = [m.id for m in models.data]
 		assert "claude-opus-4-7" in names
 		assert "claude-sonnet-4-6" in names
-		assert "claude-haiku-4-5" in names
+		assert "claude-haiku-4-5-20251001" in names
 
 		for m in models.data:
 			assert m.object == "model"
@@ -215,8 +215,8 @@ class TestModels:
 		assert by_id["claude-opus-4-7"]["max_tokens"] == 128_000
 		assert by_id["claude-sonnet-4-6"]["context_window"] == 1_000_000
 		assert by_id["claude-sonnet-4-6"]["max_tokens"] == 64_000
-		assert by_id["claude-haiku-4-5"]["context_window"] == 200_000
-		assert by_id["claude-haiku-4-5"]["max_tokens"] == 64_000
+		assert by_id["claude-haiku-4-5-20251001"]["context_window"] == 200_000
+		assert by_id["claude-haiku-4-5-20251001"]["max_tokens"] == 64_000
 
 		for m in data["data"]:
 			assert m["created"] == 0
@@ -1006,8 +1006,8 @@ class TestStats:
 		)
 		data = httpx.get(f"{base_url}/stats/json").json()
 		models = data["models"]
-		assert "claude-haiku-4-5" in models
-		haiku = models["claude-haiku-4-5"]
+		assert "claude-haiku-4-5-20251001" in models
+		haiku = models["claude-haiku-4-5-20251001"]
 		assert haiku["requests"] > 0
 
 		for field in [

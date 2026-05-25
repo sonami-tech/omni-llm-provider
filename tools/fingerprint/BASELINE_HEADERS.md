@@ -1,12 +1,13 @@
 # claude CLI baseline wire fingerprint
 
-Active baseline: 2026-05-15 against local Claude Code 2.1.142 after update. CCP keeps coherent compatibility profiles for 2.1.142 and newer only:
+Active baseline: 2026-05-25 against local Claude Code 2.1.150. CCP keeps coherent compatibility profiles for 2.1.142 and newer only:
 
 | Profile | Claude Code | SDK package | Runtime | Entrypoint | Source |
 |---|---|---|---|---|---|
+| `cc-2.1.150-sdk-cli` | `2.1.150` | `0.94.0` | `v24.3.0` | `sdk-cli` | local MITM reverse-proxy probe, 2026-05-25 |
 | `cc-2.1.142-sdk-cli` | `2.1.142` | `0.94.0` | `v24.3.0` | `sdk-cli` | local debug probe, 2026-05-15 |
 
-`latest` resolves to `cc-2.1.142-sdk-cli`, the newest known-good pinned profile. Do not make the default an automatic max-version calculation; only move `latest` after a profile has been re-baselined and live-smoked.
+`latest` resolves to `cc-2.1.150-sdk-cli`, the newest known-good pinned profile. Do not make the default an automatic max-version calculation; only move `latest` after a profile has been re-baselined and live-smoked.
 
 Source flow: `tools/fingerprint/scenarios/01-plain-text.flow`. Replay with:
 
@@ -65,10 +66,10 @@ CCP v2 will use the **Default** list for all requests as a starting point; revis
 - `system` is an **array of text blocks** (not a flat string).
 - The FIRST `system` block claude sends is a billing/telemetry header:
   ```
-  x-anthropic-billing-header: cc_version=2.1.142.73b; cc_entrypoint=sdk-cli; cch=00000;
+  x-anthropic-billing-header: cc_version=2.1.150.5bd; cc_entrypoint=sdk-cli; cch=00000;
   ```
   This is structured *as if* it were instruction text but is just claude's identity marker. CCP v2 emits this marker as the first system block, followed by the canonical Claude Code preamble block, before user-provided system content.
-- Claude Code 2.1.142's visible attribution builder and debug log emit `cch=00000`, but the final HTTP body rewrites that sentinel to a deterministic five-hex checksum. CCP mirrors the recovered final-body algorithm for this pinned profile: standard `xxHash64` over the exact serialized body bytes while `cch=00000` is still present, seed `0x4d659218e32a3268`, then `hash & 0xfffff` formatted as five lowercase hex digits. See `tools/fingerprint/CCH_ALGORITHM.md`.
+- Claude Code 2.1.142 and 2.1.150's visible attribution builder and debug log emit `cch=00000`, but the final HTTP body rewrites that sentinel to a deterministic five-hex checksum. CCP mirrors the recovered final-body algorithm for these pinned profiles: standard `xxHash64` over the exact serialized body bytes while `cch=00000` is still present, seed `0x4d659218e32a3268`, then `hash & 0xfffff` formatted as five lowercase hex digits. See `tools/fingerprint/CCH_ALGORITHM.md`.
 - The `cc_version` suffix is dynamic per request:
   ```
   suffix = sha256("59cf53e54c78" + chars + claude_version).hex()[0..3]
@@ -82,7 +83,7 @@ CCP v2 will use the **Default** list for all requests as a starting point; revis
 
 ## Step 0 verification — confirmed working
 
-The Step 0 minimal request (Haiku 4-5, OAuth Bearer, anthropic-beta with claude-code+oauth, custom non-CC system prompt) returned 200 with these headers — proving CCP v2 doesn't need byte-exact fingerprint match to function. CCP now implements the recovered 2.1.142 `cch` body checksum for the active profile.
+The Step 0 minimal request (Haiku 4-5, OAuth Bearer, anthropic-beta with claude-code+oauth, custom non-CC system prompt) returned 200 with these headers — proving CCP v2 doesn't need byte-exact fingerprint match to function. CCP now implements the recovered `cch` body checksum for active profiles.
 
 ## Remaining Baseline Work
 

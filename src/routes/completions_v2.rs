@@ -981,9 +981,9 @@ mod tests {
 
         assert_eq!(json.matches("x-anthropic-billing-header:").count(), 1);
         assert_eq!(json.matches("cc_entrypoint=sdk-cli; cch=00000;").count(), 0);
-        assert!(json.contains(
-            "x-anthropic-billing-header: cc_version=2.1.142.73b; cc_entrypoint=sdk-cli; cch="
-        ));
+		assert!(json.contains(
+			"x-anthropic-billing-header: cc_version=2.1.150.5bd; cc_entrypoint=sdk-cli; cch="
+		));
     }
 
     #[test]

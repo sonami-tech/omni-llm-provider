@@ -1,7 +1,7 @@
 //! Build the outbound header set for api.anthropic.com requests, mimicking
 //! the claude CLI wire fingerprint.
 //!
-//! Active baseline captured 2026-05-15 against claude CLI 2.1.142
+//! Active baseline captured 2026-05-25 against claude CLI 2.1.150
 //! SDK 0.94.0. See
 //! `tools/fingerprint/BASELINE_HEADERS.md` for the source-of-truth notes.
 
@@ -10,7 +10,8 @@ use ring::digest;
 use uuid::Uuid;
 
 use crate::models::{
-    CATALOG_CC_2_1_142, ModelDef, ModelInfo, models_list_from_catalog, resolve_model_in_catalog,
+    CATALOG_CC_2_1_142, CATALOG_CC_2_1_150, ModelDef, ModelInfo, models_list_from_catalog,
+    resolve_model_in_catalog,
 };
 
 use super::credentials::Credentials;
@@ -87,7 +88,7 @@ impl FingerprintProfile {
     }
 
     fn finalize_body_bytes(&self, bytes: Vec<u8>, _ctx: &RequestContext) -> Vec<u8> {
-        // Claude Code 2.1.142's cch is a pure body-byte hash. Keep the
+        // Claude Code 2.1.142 and 2.1.150 cch is a pure body-byte hash. Keep the
         // context in this API so future pinned profiles can add ctx-sensitive
         // behavior without changing call sites.
         match self.billing.cch {
@@ -189,11 +190,11 @@ pub const CLAUDE_CODE_SYSTEM_PREAMBLE: &str =
 /// (Bearer-token acceptance).
 pub const DEFAULT_BETA: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,advisor-tool-2026-03-01,extended-cache-ttl-2025-04-11";
 
-pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.142-sdk-cli";
+pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.150-sdk-cli";
 pub const LATEST_PROFILE_ALIAS: &str = "latest";
 
 pub const PROFILE_CLAUDE_2_1_142_SDK_CLI: FingerprintProfile = FingerprintProfile {
-    name: DEFAULT_PROFILE_NAME,
+    name: "cc-2.1.142-sdk-cli",
     aliases: &["2.1.142"],
     claude_cli_version: "2.1.142",
     stainless_package_version: "0.94.0",
@@ -206,7 +207,24 @@ pub const PROFILE_CLAUDE_2_1_142_SDK_CLI: FingerprintProfile = FingerprintProfil
     billing: BILLING_SCHEME_V1_CCH_XXH64_BODY,
 };
 
-pub static FINGERPRINT_PROFILES: &[FingerprintProfile] = &[PROFILE_CLAUDE_2_1_142_SDK_CLI];
+pub const PROFILE_CLAUDE_2_1_150_SDK_CLI: FingerprintProfile = FingerprintProfile {
+    name: DEFAULT_PROFILE_NAME,
+    aliases: &["2.1.150"],
+    claude_cli_version: "2.1.150",
+    stainless_package_version: "0.94.0",
+    stainless_runtime_version: "v24.3.0",
+    entrypoint: "sdk-cli",
+    beta_reply: DEFAULT_BETA,
+    system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
+    models: CATALOG_CC_2_1_150,
+    default_model: "sonnet",
+    billing: BILLING_SCHEME_V1_CCH_XXH64_BODY,
+};
+
+pub static FINGERPRINT_PROFILES: &[FingerprintProfile] = &[
+    PROFILE_CLAUDE_2_1_150_SDK_CLI,
+    PROFILE_CLAUDE_2_1_142_SDK_CLI,
+];
 
 pub fn default_profile() -> &'static FingerprintProfile {
     resolve_profile(DEFAULT_PROFILE_NAME).expect("default fingerprint profile must exist")
@@ -655,13 +673,13 @@ mod tests {
     #[test]
     fn default_profile_matches_refreshed_claude_code_baseline() {
         let profile = default_profile();
-        assert_eq!(profile.name, "cc-2.1.142-sdk-cli");
-        assert_eq!(profile.claude_cli_version, "2.1.142");
+        assert_eq!(profile.name, "cc-2.1.150-sdk-cli");
+        assert_eq!(profile.claude_cli_version, "2.1.150");
         assert_eq!(profile.stainless_package_version, "0.94.0");
         assert_eq!(profile.stainless_runtime_version, "v24.3.0");
         assert_eq!(
             profile.user_agent(),
-            "claude-cli/2.1.142 (external, sdk-cli)"
+            "claude-cli/2.1.150 (external, sdk-cli)"
         );
         assert_eq!(profile.default_model, "sonnet");
         assert_eq!(profile.resolve_model("opus").canonical, "claude-opus-4-7");
@@ -671,7 +689,7 @@ mod tests {
         );
         assert_eq!(
             profile.resolve_model("haiku").canonical,
-            "claude-haiku-4-5"
+            "claude-haiku-4-5-20251001"
         );
     }
 
@@ -679,7 +697,17 @@ mod tests {
     fn profile_registry_resolves_known_selectors() {
         assert_eq!(
             resolve_profile("latest").unwrap().name,
-            "cc-2.1.142-sdk-cli"
+            "cc-2.1.150-sdk-cli"
+        );
+        assert_eq!(
+            resolve_profile("cc-2.1.150-sdk-cli")
+                .unwrap()
+                .claude_cli_version,
+            "2.1.150"
+        );
+        assert_eq!(
+            resolve_profile("2.1.150").unwrap().name,
+            "cc-2.1.150-sdk-cli"
         );
         assert_eq!(
             resolve_profile("cc-2.1.142-sdk-cli")
@@ -719,9 +747,12 @@ mod tests {
         // Captured from Claude Code 2.1.142 with CLAUDE_CODE_ENTRYPOINT=sdk-cli
         // and prompt "Say OK" on 2026-05-15.
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.142"), "73b");
+        // Captured from Claude Code 2.1.150 with CLAUDE_CODE_ENTRYPOINT=sdk-cli
+        // and prompt "Say OK" on 2026-05-25.
+        assert_eq!(claude_code_version_suffix("Say OK", "2.1.150"), "5bd");
         assert_eq!(
             default_profile().billing_header_text("Say OK"),
-            "x-anthropic-billing-header: cc_version=2.1.142.73b; cc_entrypoint=sdk-cli; cch=00000;"
+            "x-anthropic-billing-header: cc_version=2.1.150.5bd; cc_entrypoint=sdk-cli; cch=00000;"
         );
     }
 
@@ -789,7 +820,7 @@ mod tests {
 		});
 		let json = String::from_utf8(profile.finalize_body_json(&body, &ctx).unwrap()).unwrap();
 
-		assert!(json.contains("cc_entrypoint=sdk-cli; cch=37cb4;"));
+		assert!(json.contains("cc_entrypoint=sdk-cli; cch=f3e3e;"));
 	}
 
 	#[test]
@@ -839,7 +870,7 @@ mod tests {
         assert!(json.contains(user_text));
         assert_eq!(json.matches("cch=00000").count(), 1);
         assert!(json.contains(
-            "x-anthropic-billing-header: cc_version=2.1.142.73b; cc_entrypoint=sdk-cli; cch="
+            "x-anthropic-billing-header: cc_version=2.1.150.5bd; cc_entrypoint=sdk-cli; cch="
         ));
         assert!(!json.contains("cc_entrypoint=sdk-cli; cch=00000;"));
     }

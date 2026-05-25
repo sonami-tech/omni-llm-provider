@@ -115,12 +115,14 @@ pub enum ContentBlock {
 #[serde(untagged)]
 pub enum ToolResultContent {
     Text(String),
+    #[allow(dead_code)]
     Blocks(Vec<ContentBlock>),
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageSource {
+    #[allow(dead_code)]
     Base64 { media_type: String, data: String },
     Url { url: String },
 }
@@ -182,11 +184,14 @@ pub struct CacheControl {
 pub struct MessagesResponse {
     pub id: String,
     #[serde(rename = "type")]
+    #[allow(dead_code)]
     pub kind: String, // "message"
+    #[allow(dead_code)]
     pub role: String, // "assistant"
     pub model: String,
     pub content: Vec<ResponseContentBlock>,
     pub stop_reason: Option<String>,
+    #[allow(dead_code)]
     pub stop_sequence: Option<String>,
     pub usage: Usage,
 }

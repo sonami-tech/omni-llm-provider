@@ -30,6 +30,7 @@ pub struct OaiStreamConverter {
 	/// Model name to echo back to the consumer. Set from message_start, or
 	/// from the originally requested model if message_start has been seen
 	/// but specified a dated form the caller wants normalized.
+	#[allow(dead_code)]
 	pub model: String,
 	pub requested_model: String,
 	role_emitted: bool,

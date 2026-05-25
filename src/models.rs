@@ -35,6 +35,30 @@ pub static CATALOG_CC_2_1_142: &[ModelDef] = &[
 	},
 ];
 
+pub static CATALOG_CC_2_1_150: &[ModelDef] = &[
+	ModelDef {
+		canonical: "claude-opus-4-7",
+		cli_name: "opus",
+		aliases: &["opus", "claude-opus", "claude-opus-4-6"],
+		context_window: 1_000_000,
+		max_tokens: 128_000,
+	},
+	ModelDef {
+		canonical: "claude-sonnet-4-6",
+		cli_name: "sonnet",
+		aliases: &["sonnet", "claude-sonnet"],
+		context_window: 1_000_000,
+		max_tokens: 64_000,
+	},
+	ModelDef {
+		canonical: "claude-haiku-4-5-20251001",
+		cli_name: "haiku",
+		aliases: &["haiku", "claude-haiku", "claude-haiku-4-5"],
+		context_window: 200_000,
+		max_tokens: 64_000,
+	},
+];
+
 /// Resolve an input model string within one Claude Code profile catalog.
 ///
 /// Resolution intentionally mirrors Claude Code's alias-heavy model UX:
@@ -190,7 +214,7 @@ mod tests {
 		);
 		assert_eq!(
 			profile().resolve_model("claude-haiku-4-5").canonical,
-			"claude-haiku-4-5"
+			"claude-haiku-4-5-20251001"
 		);
 	}
 
@@ -203,7 +227,7 @@ mod tests {
 		);
 		assert_eq!(
 			profile().resolve_model("haiku").canonical,
-			"claude-haiku-4-5"
+			"claude-haiku-4-5-20251001"
 		);
 	}
 
@@ -219,7 +243,7 @@ mod tests {
 		);
 		assert_eq!(
 			profile().resolve_model("claude-haiku").canonical,
-			"claude-haiku-4-5"
+			"claude-haiku-4-5-20251001"
 		);
 	}
 
@@ -243,7 +267,7 @@ mod tests {
 			profile()
 				.resolve_model("claude-haiku-4-5-20251001")
 				.canonical,
-			"claude-haiku-4-5"
+			"claude-haiku-4-5-20251001"
 		);
 	}
 
@@ -287,7 +311,7 @@ mod tests {
 		assert_eq!(list.len(), 3);
 		assert_eq!(list[0].id, "claude-opus-4-7");
 		assert_eq!(list[1].id, "claude-sonnet-4-6");
-		assert_eq!(list[2].id, "claude-haiku-4-5");
+		assert_eq!(list[2].id, "claude-haiku-4-5-20251001");
 		assert_eq!(list[0].context_window, 1_000_000);
 		assert_eq!(list[2].max_tokens, 64_000);
 	}

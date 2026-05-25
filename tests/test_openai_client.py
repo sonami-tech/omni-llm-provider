@@ -79,7 +79,7 @@ def test_models_metadata():
 	names = [m.id for m in models.data]
 	assert "claude-opus-4-7" in names, f"Missing opus in {names}"
 	assert "claude-sonnet-4-6" in names, f"Missing sonnet in {names}"
-	assert "claude-haiku-4-5" in names, f"Missing haiku in {names}"
+	assert "claude-haiku-4-5-20251001" in names, f"Missing haiku in {names}"
 
 	for m in models.data:
 		assert m.object == "model", f"Wrong object: {m.object}"
@@ -99,7 +99,7 @@ def test_models_metadata():
 	assert sonnet["context_window"] == 1_000_000
 	assert sonnet["max_tokens"] == 64_000
 
-	haiku = models_by_id["claude-haiku-4-5"]
+	haiku = models_by_id["claude-haiku-4-5-20251001"]
 	assert haiku["context_window"] == 200_000
 	assert haiku["max_tokens"] == 64_000
 
@@ -490,7 +490,7 @@ def test_alias_legacy_opus():
 	assert "PONG" in resp.choices[0].message.content
 
 
-@test("Model alias: 'haiku' resolves to claude-haiku-4-5")
+@test("Model alias: 'haiku' resolves to current profile haiku")
 def test_alias_haiku():
 	resp = client.chat.completions.create(
 		model="haiku",
@@ -821,8 +821,8 @@ def test_stats_per_model():
 	models = data["models"]
 
 	# haiku should be in the model stats.
-	assert "claude-haiku-4-5" in models, f"haiku not in models: {list(models.keys())}"
-	haiku_stats = models["claude-haiku-4-5"]
+	assert "claude-haiku-4-5-20251001" in models, f"haiku not in models: {list(models.keys())}"
+	haiku_stats = models["claude-haiku-4-5-20251001"]
 	assert haiku_stats["requests"] > 0, "haiku requests should be > 0"
 
 	# Model stats should have the expected fields.
