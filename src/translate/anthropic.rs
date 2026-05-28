@@ -47,6 +47,9 @@ pub struct MessagesRequest {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<Thinking>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
 }
 
 /// `system` may be a flat string OR an array of typed text blocks. The block
@@ -55,6 +58,7 @@ pub struct MessagesRequest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum SystemField {
+    #[allow(dead_code)]
     Text(String),
     Blocks(Vec<SystemBlock>),
 }
@@ -77,6 +81,7 @@ pub struct Message {
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum MessageContent {
+    #[allow(dead_code)]
     Text(String),
     Blocks(Vec<ContentBlock>),
 }
@@ -106,6 +111,7 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
+    #[allow(dead_code)]
     Image {
         source: ImageSource,
     },
@@ -168,6 +174,11 @@ pub struct Thinking {
     pub kind: String, // "enabled" or "disabled"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OutputConfig {
+    pub effort: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

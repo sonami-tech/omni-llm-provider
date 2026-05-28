@@ -77,7 +77,7 @@ def test_models_metadata():
 	assert len(models.data) == 3, f"Expected 3 models, got {len(models.data)}"
 
 	names = [m.id for m in models.data]
-	assert "claude-opus-4-7" in names, f"Missing opus in {names}"
+	assert "claude-opus-4-8" in names, f"Missing opus in {names}"
 	assert "claude-sonnet-4-6" in names, f"Missing sonnet in {names}"
 	assert "claude-haiku-4-5-20251001" in names, f"Missing haiku in {names}"
 
@@ -91,7 +91,7 @@ def test_models_metadata():
 	assert data["object"] == "list", f"Bad list object: {data['object']}"
 
 	models_by_id = {m["id"]: m for m in data["data"]}
-	opus = models_by_id["claude-opus-4-7"]
+	opus = models_by_id["claude-opus-4-8"]
 	assert opus["context_window"] == 1_000_000, f"Bad opus context: {opus['context_window']}"
 	assert opus["max_tokens"] == 128_000, f"Bad opus max_tokens: {opus['max_tokens']}"
 
@@ -468,25 +468,25 @@ def test_alias_sonnet():
 	assert "PONG" in resp.choices[0].message.content
 
 
-@test("Model alias: 'opus' resolves to claude-opus-4-7")
+@test("Model alias: 'opus' resolves to claude-opus-4-8")
 def test_alias_opus():
 	resp = client.chat.completions.create(
 		model="opus",
 		messages=[{"role": "user", "content": "Reply PONG"}],
 		stream=False,
 	)
-	assert resp.model == "claude-opus-4-7", f"Expected claude-opus-4-7, got: {resp.model}"
+	assert resp.model == "claude-opus-4-8", f"Expected claude-opus-4-8, got: {resp.model}"
 	assert "PONG" in resp.choices[0].message.content
 
 
-@test("Legacy model alias: 'claude-opus-4-6' resolves to claude-opus-4-7")
+@test("Explicit model name: 'claude-opus-4-6' is preserved")
 def test_alias_legacy_opus():
 	resp = client.chat.completions.create(
 		model="claude-opus-4-6",
 		messages=[{"role": "user", "content": "Reply PONG"}],
 		stream=False,
 	)
-	assert resp.model == "claude-opus-4-7", f"Expected claude-opus-4-7, got: {resp.model}"
+	assert resp.model == "claude-opus-4-6", f"Expected claude-opus-4-6, got: {resp.model}"
 	assert "PONG" in resp.choices[0].message.content
 
 

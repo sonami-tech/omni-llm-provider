@@ -121,6 +121,7 @@ pub fn build_messages_request(
         stream: Some(req.stream),
         metadata,
         thinking,
+        output_config: None,
     })
 }
 

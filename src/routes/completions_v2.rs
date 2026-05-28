@@ -19,7 +19,8 @@ use crate::AppState;
 use crate::error::AppError;
 use crate::models::ModelDef;
 use crate::translate::anthropic::{
-    ContentBlock, MessageContent, MessagesRequest, MessagesResponse, SystemBlock, SystemField,
+    ContentBlock, MessageContent, MessagesRequest, MessagesResponse, OutputConfig, SystemBlock,
+    SystemField,
 };
 use crate::translate::build::build_messages_request;
 use crate::translate::from_anthropic::build_oai_response;
@@ -67,7 +68,9 @@ pub async fn handle_non_streaming_v2(
     // Build per-request context. Session ID is derived from CCP's resolved
     // session id so multi-turn requests share an identifier.
     let session_uuid = derive_session_uuid(&session_id);
-    let ctx = RequestContext::new_reply().with_session(session_uuid);
+    let ctx = RequestContext::new_reply()
+        .with_session(session_uuid)
+        .with_model(anth_req.model.clone());
 
     let body = serde_json::to_value(&anth_req).map_err(|e| {
         AppError::ServerError(format!("failed to serialize anthropic request: {e}"))
@@ -109,7 +112,7 @@ pub async fn handle_non_streaming_v2(
         "v2 completion usage"
     );
 
-    let mut oai_response = build_oai_response(&resp, &chat_id, created, model_def.canonical);
+    let mut oai_response = build_oai_response(&resp, &chat_id, created, &anth_req.model);
 
     // Apply replacements to the assistant text content if present.
     if !state.replacements.is_empty() {
@@ -170,7 +173,9 @@ pub async fn handle_streaming_v2(
     creds.check_expired().map_err(map_upstream_err)?;
 
     let session_uuid = derive_session_uuid(&session_id);
-    let ctx = RequestContext::new_reply().with_session(session_uuid);
+    let ctx = RequestContext::new_reply()
+        .with_session(session_uuid)
+        .with_model(anth_req.model.clone());
 
     let body = serde_json::to_value(&anth_req).map_err(|e| {
         AppError::ServerError(format!("failed to serialize anthropic request: {e}"))
@@ -202,7 +207,7 @@ pub async fn handle_streaming_v2(
     let conv_session_id = session_id.clone();
     let conv_log_for_task = conv_log.clone();
     let replacements = state.replacements.clone();
-    let requested_model = model_def.canonical.to_string();
+    let requested_model = anth_req.model.clone();
     let span = tracing::Span::current();
 
     tokio::spawn(
@@ -502,6 +507,8 @@ fn build_outbound_messages_request(
     inject_identity: bool,
 ) -> Result<MessagesRequest, AppError> {
     let mut anth_req = build_messages_request(request, model_def)?;
+    anth_req.model = profile.outbound_model(&request.model, model_def);
+    apply_profile_wire_defaults(&mut anth_req, request, profile);
     anth_req.stream = Some(stream);
 
     // Apply replacements before identity injection: Claude Code's dynamic
@@ -512,6 +519,27 @@ fn build_outbound_messages_request(
     prepend_claude_code_identity(&mut anth_req, profile, inject_identity);
 
     Ok(anth_req)
+}
+
+fn apply_profile_wire_defaults(
+    req: &mut MessagesRequest,
+    source: &ChatCompletionRequest,
+    profile: &FingerprintProfile,
+) {
+    if source.max_tokens.is_none() && source.max_completion_tokens.is_none() {
+        req.max_tokens = profile.wire_defaults_for_model(&req.model).max_tokens;
+    }
+    let wire_defaults = profile.wire_defaults_for_model(&req.model);
+    if req.temperature.is_none() {
+        req.temperature = wire_defaults.temperature;
+    }
+    if req.output_config.is_none() {
+        if let Some(effort) = wire_defaults.output_effort {
+            req.output_config = Some(OutputConfig {
+                effort: effort.to_string(),
+            });
+        }
+    }
 }
 
 fn prepend_claude_code_identity(
@@ -709,16 +737,21 @@ mod tests {
         default_profile().resolve_model("claude-haiku-4-5")
     }
 
-    fn anthropic_request(user_text: &str) -> MessagesRequest {
-        let req = ChatCompletionRequest {
-            model: "claude-haiku-4-5".into(),
+    fn chat_request(model: &str) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.into(),
             messages: vec![ChatMessage {
                 role: "user".into(),
-                content: Some(OaiMessageContent::Text(user_text.into())),
+                content: Some(OaiMessageContent::Text("Say OK".into())),
                 ..Default::default()
             }],
             ..Default::default()
-        };
+        }
+    }
+
+    fn anthropic_request(user_text: &str) -> MessagesRequest {
+        let mut req = chat_request("claude-haiku-4-5");
+        req.messages[0].content = Some(OaiMessageContent::Text(user_text.into()));
         build_messages_request(&req, haiku_model()).unwrap()
     }
 
@@ -867,6 +900,7 @@ mod tests {
             stream: Some(false),
             metadata: None,
             thinking: None,
+            output_config: None,
         };
 
         assert_eq!(first_user_text_for_billing(&req), None);
@@ -915,15 +949,7 @@ mod tests {
 
     #[test]
     fn outbound_build_streaming_and_non_streaming_are_parity_paths() {
-        let req = ChatCompletionRequest {
-            model: "claude-haiku-4-5".into(),
-            messages: vec![ChatMessage {
-                role: "user".into(),
-                content: Some(OaiMessageContent::Text("Say OK".into())),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
+        let req = chat_request("claude-haiku-4-5");
         let replacements = crate::replacements::Replacements::empty();
 
         let mut non_stream = build_outbound_messages_request(
@@ -954,16 +980,127 @@ mod tests {
     }
 
     #[test]
+    fn claude_2_1_154_short_alias_body_defaults_match_capture() {
+        let replacements = crate::replacements::Replacements::empty();
+        let cases = [
+            ("opus", "claude-opus-4-8", 64_000, None, Some("high")),
+            ("sonnet", "claude-sonnet-4-6", 32_000, Some(1.0), Some("high")),
+            (
+                "haiku",
+                "claude-haiku-4-5-20251001",
+                32_000,
+                Some(1.0),
+                None,
+            ),
+        ];
+
+        for (input, expected_model, expected_max, expected_temperature, expected_effort) in cases {
+            let req = chat_request(input);
+            let model_def = default_profile().resolve_model(input);
+            let anth_req = build_outbound_messages_request(
+                &req,
+                model_def,
+                true,
+                &replacements,
+                default_profile(),
+                true,
+            )
+            .unwrap();
+
+            assert_eq!(anth_req.model, expected_model);
+            assert_eq!(anth_req.max_tokens, expected_max);
+            assert_eq!(anth_req.temperature, expected_temperature);
+            assert_eq!(
+                anth_req.output_config.as_ref().map(|config| config.effort.as_str()),
+                expected_effort
+            );
+        }
+    }
+
+    #[test]
+    fn claude_2_1_154_explicit_claude_models_are_preserved() {
+        let replacements = crate::replacements::Replacements::empty();
+        let cases = [
+            "claude-opus",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-sonnet",
+            "claude-haiku",
+            "claude-haiku-4-5",
+        ];
+
+        for input in cases {
+            let req = chat_request(input);
+            let model_def = default_profile().resolve_model(input);
+            let anth_req = build_outbound_messages_request(
+                &req,
+                model_def,
+                true,
+                &replacements,
+                default_profile(),
+                true,
+            )
+            .unwrap();
+            assert_eq!(anth_req.model, input);
+        }
+    }
+
+    #[test]
+    fn claude_2_1_154_explicit_model_body_defaults_match_capture() {
+        let replacements = crate::replacements::Replacements::empty();
+        let cases = [
+            ("claude-opus-4-8", 64_000, None, Some("high")),
+            ("claude-opus-4-7", 64_000, None, Some("high")),
+            ("claude-opus-4-6", 64_000, Some(1.0), Some("high")),
+            ("claude-sonnet-4-6", 32_000, Some(1.0), Some("high")),
+            ("claude-haiku-4-5", 32_000, Some(1.0), None),
+            ("claude-haiku-4-5-20251001", 32_000, Some(1.0), None),
+        ];
+
+        for (input, expected_max, expected_temperature, expected_effort) in cases {
+            let req = chat_request(input);
+            let model_def = default_profile().resolve_model(input);
+            let anth_req = build_outbound_messages_request(
+                &req,
+                model_def,
+                true,
+                &replacements,
+                default_profile(),
+                true,
+            )
+            .unwrap();
+
+            assert_eq!(anth_req.model, input);
+            assert_eq!(anth_req.max_tokens, expected_max);
+            assert_eq!(anth_req.temperature, expected_temperature);
+            assert_eq!(
+                anth_req.output_config.as_ref().map(|config| config.effort.as_str()),
+                expected_effort
+            );
+        }
+    }
+
+    #[test]
+    fn claude_2_1_154_unknown_non_claude_model_still_falls_back_to_sonnet() {
+        let req = chat_request("gpt-4");
+        let model_def = default_profile().resolve_model(&req.model);
+        let anth_req = build_outbound_messages_request(
+            &req,
+            model_def,
+            true,
+            &crate::replacements::Replacements::empty(),
+            default_profile(),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(anth_req.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
     fn outbound_build_has_exactly_one_billing_cch_marker() {
-        let req = ChatCompletionRequest {
-            model: "claude-haiku-4-5".into(),
-            messages: vec![ChatMessage {
-                role: "user".into(),
-                content: Some(OaiMessageContent::Text("Say OK".into())),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
+        let req = chat_request("claude-haiku-4-5");
         let anth_req = build_outbound_messages_request(
             &req,
             haiku_model(),
@@ -982,7 +1119,7 @@ mod tests {
         assert_eq!(json.matches("x-anthropic-billing-header:").count(), 1);
         assert_eq!(json.matches("cc_entrypoint=sdk-cli; cch=00000;").count(), 0);
 		assert!(json.contains(
-			"x-anthropic-billing-header: cc_version=2.1.150.5bd; cc_entrypoint=sdk-cli; cch="
+			"x-anthropic-billing-header: cc_version=2.1.154.cea; cc_entrypoint=sdk-cli; cch="
 		));
     }
 

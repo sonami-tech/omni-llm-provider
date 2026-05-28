@@ -19,7 +19,7 @@ All options can be set via CLI flags or environment variables. CLI flags take pr
 | `--log-max-bytes` | `CCP_LOG_MAX_BYTES` | `67108864` | Rotate `--log-file` after this many bytes; `0` disables rotation |
 | `--log-backups` | `CCP_LOG_BACKUPS` | `5` | Number of rotated conversation log files to keep |
 | `--no-preamble` | `CCP_NO_PREAMBLE` | Off | Skip the canonical Claude Code system identifier preamble; only useful for debugging upstream |
-| `--fingerprint-profile` | `CCP_FINGERPRINT_PROFILE` | `latest` | Claude Code fingerprint profile to mimic; currently `latest`, `cc-2.1.150-sdk-cli`, `2.1.150`, `cc-2.1.142-sdk-cli`, or `2.1.142` |
+| `--fingerprint-profile` | `CCP_FINGERPRINT_PROFILE` | `latest` | Claude Code fingerprint profile to mimic; currently `latest`, `cc-2.1.154-sdk-cli`, `2.1.154`, `cc-2.1.150-sdk-cli`, `2.1.150`, `cc-2.1.142-sdk-cli`, or `2.1.142` |
 | `-v, --verbose` | | Off | Debug logging |
 
 The `RUST_LOG` environment variable overrides `-v` when set, allowing fine-grained log filtering (for example, `RUST_LOG=claude_code_provider=debug`).
@@ -28,15 +28,16 @@ The `RUST_LOG` environment variable overrides `-v` when set, allowing fine-grain
 
 | Model | Aliases |
 |-------|---------|
-| `claude-opus-4-7` | `opus`, `claude-opus`, `claude-opus-4-6` |
-| `claude-sonnet-4-6` | `sonnet`, `claude-sonnet` |
-| `claude-haiku-4-5-20251001` | `haiku`, `claude-haiku`, `claude-haiku-4-5` |
+| `claude-opus-4-8` | `opus` |
+| `claude-sonnet-4-6` | `sonnet` |
+| `claude-haiku-4-5-20251001` | `haiku` |
 
 Model names are resolved from the active Claude Code fingerprint profile. The
-default `latest` profile currently resolves to `cc-2.1.150-sdk-cli`. For that
-profile, `claude-opus-4-6` is retained as a compatibility alias and resolves to
-`claude-opus-4-7`. Date-suffixed model names are also resolved via substring
-matching. Unrecognized names fall back to the profile's default model, currently
+default `latest` profile currently resolves to `cc-2.1.154-sdk-cli`. For that
+profile, short aliases resolve to captured Claude Code model names, while explicit
+`claude-*` model names are preserved when possible. Date-suffixed Claude model
+names are resolved by family but emitted unchanged to preserve fingerprinting.
+Unrecognized names fall back to the profile's default model, currently
 Sonnet. The catalog returned by `/v1/models` follows the selected fingerprint
 profile.
 

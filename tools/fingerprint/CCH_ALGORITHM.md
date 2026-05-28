@@ -1,7 +1,8 @@
 # Claude Code cch fingerprint
 
-Canonical target: Claude Code `2.1.150`, profile `cc-2.1.150-sdk-cli`.
-The same checksum algorithm remains verified for `cc-2.1.142-sdk-cli`.
+Canonical target: Claude Code `2.1.154`, profile `cc-2.1.154-sdk-cli`.
+The same checksum algorithm remains verified for `cc-2.1.142-sdk-cli` and
+`cc-2.1.150-sdk-cli`.
 
 This document is the repo-canonical record for the `cch` field in Claude
 Code's billing marker. If this conflicts with an agent memory note, update the
@@ -12,13 +13,13 @@ memory to point here.
 Claude Code first builds this system text block:
 
 ```text
-x-anthropic-billing-header: cc_version=2.1.150.5bd; cc_entrypoint=sdk-cli; cch=00000;
+x-anthropic-billing-header: cc_version=2.1.154.cea; cc_entrypoint=sdk-cli; cch=00000;
 ```
 
 Before the final HTTP request leaves the process, Claude Code rewrites the five
 zeroes. The rewrite is deterministic for the exact request-body bytes.
 
-Algorithm recovered for `2.1.142` and re-verified for `2.1.150`:
+Algorithm recovered for `2.1.142` and re-verified for `2.1.150` and `2.1.154`:
 
 1. Serialize the final `/v1/messages` JSON request body with `cch=00000;`
    still present.
@@ -37,7 +38,7 @@ must re-check serializer order.
 
 ## CCP implementation notes
 
-- The active profile `cc-2.1.150-sdk-cli` owns the checksum behavior.
+- The active profile `cc-2.1.154-sdk-cli` owns the checksum behavior.
 - The visible billing header still starts with `cch=00000;`; the final-body
   hook rewrites it immediately before logging/sending the upstream body.
 - The rewrite targets the first matching billing header under the serialized

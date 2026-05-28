@@ -34,9 +34,9 @@ from openai import AsyncOpenAI, BadRequestError, OpenAI
 
 
 DEFAULT_PROFILE = {
-	"name": "cc-2.1.150-sdk-cli",
-	"version": "2.1.150",
-	"say_ok_suffix": "5bd",
+	"name": "cc-2.1.154-sdk-cli",
+	"version": "2.1.154",
+	"say_ok_suffix": "cea",
 }
 CLAUDE_CODE_PREAMBLE = "You are Claude Code, Anthropic's official CLI for Claude."
 CCH_SEED = 0x4D659218E32A3268
@@ -196,7 +196,7 @@ class TestModels:
 		assert len(models.data) == 3
 
 		names = [m.id for m in models.data]
-		assert "claude-opus-4-7" in names
+		assert "claude-opus-4-8" in names
 		assert "claude-sonnet-4-6" in names
 		assert "claude-haiku-4-5-20251001" in names
 
@@ -211,8 +211,8 @@ class TestModels:
 
 		by_id = {m["id"]: m for m in data["data"]}
 
-		assert by_id["claude-opus-4-7"]["context_window"] == 1_000_000
-		assert by_id["claude-opus-4-7"]["max_tokens"] == 128_000
+		assert by_id["claude-opus-4-8"]["context_window"] == 1_000_000
+		assert by_id["claude-opus-4-8"]["max_tokens"] == 128_000
 		assert by_id["claude-sonnet-4-6"]["context_window"] == 1_000_000
 		assert by_id["claude-sonnet-4-6"]["max_tokens"] == 64_000
 		assert by_id["claude-haiku-4-5-20251001"]["context_window"] == 200_000
@@ -575,7 +575,15 @@ class TestModelAliases:
 			messages=[{"role": "user", "content": "Reply PONG"}],
 			stream=False,
 		)
-		assert resp.model == "claude-opus-4-7"
+		assert resp.model == "claude-opus-4-8"
+
+	def test_explicit_claude_model_is_preserved(self, client):
+		resp = client.chat.completions.create(
+			model="claude-opus-4-6",
+			messages=[{"role": "user", "content": "Reply PONG"}],
+			stream=False,
+		)
+		assert resp.model == "claude-opus-4-6"
 
 	def test_unknown_model_falls_back_to_sonnet(self, client):
 		resp = client.chat.completions.create(

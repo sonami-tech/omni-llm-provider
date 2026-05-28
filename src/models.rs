@@ -59,6 +59,30 @@ pub static CATALOG_CC_2_1_150: &[ModelDef] = &[
 	},
 ];
 
+pub static CATALOG_CC_2_1_154: &[ModelDef] = &[
+	ModelDef {
+		canonical: "claude-opus-4-8",
+		cli_name: "opus",
+		aliases: &["opus"],
+		context_window: 1_000_000,
+		max_tokens: 128_000,
+	},
+	ModelDef {
+		canonical: "claude-sonnet-4-6",
+		cli_name: "sonnet",
+		aliases: &["sonnet"],
+		context_window: 1_000_000,
+		max_tokens: 64_000,
+	},
+	ModelDef {
+		canonical: "claude-haiku-4-5-20251001",
+		cli_name: "haiku",
+		aliases: &["haiku"],
+		context_window: 200_000,
+		max_tokens: 64_000,
+	},
+];
+
 /// Resolve an input model string within one Claude Code profile catalog.
 ///
 /// Resolution intentionally mirrors Claude Code's alias-heavy model UX:
@@ -205,8 +229,8 @@ mod tests {
 	#[test]
 	fn resolve_canonical_names() {
 		assert_eq!(
-			profile().resolve_model("claude-opus-4-7").canonical,
-			"claude-opus-4-7"
+			profile().resolve_model("claude-opus-4-8").canonical,
+			"claude-opus-4-8"
 		);
 		assert_eq!(
 			profile().resolve_model("claude-sonnet-4-6").canonical,
@@ -220,7 +244,7 @@ mod tests {
 
 	#[test]
 	fn resolve_short_aliases() {
-		assert_eq!(profile().resolve_model("opus").canonical, "claude-opus-4-7");
+		assert_eq!(profile().resolve_model("opus").canonical, "claude-opus-4-8");
 		assert_eq!(
 			profile().resolve_model("sonnet").canonical,
 			"claude-sonnet-4-6"
@@ -235,7 +259,7 @@ mod tests {
 	fn resolve_claude_prefix_aliases() {
 		assert_eq!(
 			profile().resolve_model("claude-opus").canonical,
-			"claude-opus-4-7"
+			"claude-opus-4-8"
 		);
 		assert_eq!(
 			profile().resolve_model("claude-sonnet").canonical,
@@ -250,12 +274,12 @@ mod tests {
 	#[test]
 	fn resolve_date_suffixed_via_substring() {
 		assert_eq!(
-			profile().resolve_model("claude-opus-4-7-20260101").canonical,
-			"claude-opus-4-7"
+			profile().resolve_model("claude-opus-4-8-20260101").canonical,
+			"claude-opus-4-8"
 		);
 		assert_eq!(
 			profile().resolve_model("claude-opus-4-6-20260101").canonical,
-			"claude-opus-4-7"
+			"claude-opus-4-8"
 		);
 		assert_eq!(
 			profile()
@@ -275,7 +299,7 @@ mod tests {
 	fn old_opus_canonical_alias_resolves_to_profile_opus() {
 		assert_eq!(
 			profile().resolve_model("claude-opus-4-6").canonical,
-			"claude-opus-4-7"
+			"claude-opus-4-8"
 		);
 	}
 
@@ -309,7 +333,7 @@ mod tests {
 	fn models_list_returns_three() {
 		let list = profile().models_list();
 		assert_eq!(list.len(), 3);
-		assert_eq!(list[0].id, "claude-opus-4-7");
+		assert_eq!(list[0].id, "claude-opus-4-8");
 		assert_eq!(list[1].id, "claude-sonnet-4-6");
 		assert_eq!(list[2].id, "claude-haiku-4-5-20251001");
 		assert_eq!(list[0].context_window, 1_000_000);

@@ -15,6 +15,7 @@ pub enum AppError {
 	#[error("{0}")]
 	Timeout(String),
 	#[error("{0}")]
+	#[allow(dead_code)]
 	ServiceUnavailable(String),
 	#[error("{0}")]
 	RateLimited(String),
