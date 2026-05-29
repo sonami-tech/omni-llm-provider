@@ -37,6 +37,9 @@ fn request_id_header(request_id: &str) -> header::HeaderValue {
         .unwrap_or_else(|_| header::HeaderValue::from_static("unknown"))
 }
 
+// Request context is threaded as discrete params rather than a struct; the
+// handler is the single call site (from completions::completions_handler).
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_non_streaming_v2(
     state: Arc<AppState>,
     request: ChatCompletionRequest,
@@ -90,11 +93,14 @@ pub async fn handle_non_streaming_v2(
         }
     }
 
-    let resp_value = state
-        .upstream
-        .send_messages_json(&creds, &ctx, &body)
-        .await
-        .map_err(map_upstream_err)?;
+    let resp_value = match state.upstream.send_messages_json(&creds, &ctx, &body).await {
+        Ok(v) => v,
+        Err(e) => {
+            let app_err = map_upstream_err(e);
+            state.stats.record_error(model_def.canonical, &app_err.to_string());
+            return Err(app_err);
+        }
+    };
 
     let resp: MessagesResponse = serde_json::from_value(resp_value.clone()).map_err(|e| {
         AppError::ServerError(format!(
@@ -104,6 +110,21 @@ pub async fn handle_non_streaming_v2(
     })?;
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    // Record per-model token usage and duration. Keyed by canonical model so it
+    // joins the request counts recorded in completions::completions_handler.
+    // TTFT is None: it is only meaningful for streaming responses.
+    state.stats.record_response(
+        model_def.canonical,
+        crate::stats::TokenUsage {
+            input_tokens: resp.usage.input_tokens as u64,
+            output_tokens: resp.usage.output_tokens as u64,
+            cache_read_input_tokens: resp.usage.cache_read_input_tokens.unwrap_or(0) as u64,
+            cache_creation_input_tokens: resp.usage.cache_creation_input_tokens.unwrap_or(0) as u64,
+        },
+        None,
+        duration_ms,
+    );
 
     tracing::debug!(
         input_tokens = resp.usage.input_tokens,
@@ -119,11 +140,10 @@ pub async fn handle_non_streaming_v2(
         apply_replacements_inbound(&mut oai_response, state.replacements.as_ref());
     }
 
-    if let Some(ref log) = conv_log {
-        if let Ok(text) = serde_json::to_string(&oai_response) {
+    if let Some(ref log) = conv_log
+        && let Ok(text) = serde_json::to_string(&oai_response) {
             log.log(&session_id, &request_id, "<<<", "OAI response", &text);
         }
-    }
 
     let finish_reason = oai_response
         .get("choices")
@@ -147,6 +167,7 @@ pub async fn handle_non_streaming_v2(
     Ok((headers, axum::Json(oai_response)).into_response())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_streaming_v2(
     state: Arc<AppState>,
     request: ChatCompletionRequest,
@@ -157,7 +178,12 @@ pub async fn handle_streaming_v2(
     session_id: String,
     conv_log: Option<Arc<crate::conversation_log::ConversationLog>>,
 ) -> Result<Response, AppError> {
-    let _active = crate::stats::ActiveRequestGuard::new(&state.stats);
+    let start = std::time::Instant::now();
+    // Owned guard: counts this streaming request as active from setup onward,
+    // then moves into the spawned task so the count spans the whole stream
+    // lifetime (setup + body), and decrements on every task exit including
+    // early returns and setup failures.
+    let active = crate::stats::OwnedActiveRequestGuard::new(state.stats.clone());
 
     let anth_req = build_outbound_messages_request(
         &request,
@@ -208,10 +234,17 @@ pub async fn handle_streaming_v2(
     let conv_log_for_task = conv_log.clone();
     let replacements = state.replacements.clone();
     let requested_model = anth_req.model.clone();
+    let stats = state.stats.clone();
+    let model_canonical = model_def.canonical;
     let span = tracing::Span::current();
 
     tokio::spawn(
         async move {
+            // Keep the active-request guard (created before setup) alive for
+            // the whole task so the active count spans setup + stream body and
+            // decrements on every exit path (including early returns).
+            let _active = active;
+            let mut ttft_ms: Option<f64> = None;
             let mut converter =
                 OaiStreamConverter::new(chat_id.clone(), created, requested_model.clone());
             let mut stream_state = StreamReplState::new(chat_id, created, requested_model);
@@ -235,9 +268,19 @@ pub async fn handle_streaming_v2(
                                 vec![chunk]
                             };
                             for c in chunks_to_emit {
+                                if ttft_ms.is_none() && chunk_carries_content(&c) {
+                                    ttft_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+                                }
                                 match serde_json::to_string(&c) {
                                     Ok(s) => {
                                         if tx.send(Ok(Event::default().data(s))).await.is_err() {
+                                            // Client disconnected: no consumer
+                                            // remains, so skip the trailing
+                                            // flush / [DONE] / stats recording.
+                                            // The ActiveRequestGuard still
+                                            // decrements on this return (Drop),
+                                            // and the request was already counted
+                                            // by record_request at dispatch.
                                             return;
                                         }
                                     }
@@ -257,32 +300,53 @@ pub async fn handle_streaming_v2(
                             _ => e.to_string(),
                         };
                         warn!(error = %msg, "v2 stream upstream error");
-                        let payload = serde_json::json!({
-                            "error": {
-                                "type": "upstream_error",
-                                "message": msg,
+                        stats.record_error(model_canonical, &msg);
+
+                        // Order matters: flush any buffered (rewritten) tool-call
+                        // arg fragments BEFORE the error frame so a client that
+                        // was mid tool-call sees the completed arguments first,
+                        // not after an error object.
+                        if !replacements.is_empty() {
+                            for chunk in stream_state.flush(&replacements) {
+                                if let Ok(s) = serde_json::to_string(&chunk) {
+                                    let _ = tx.send(Ok(Event::default().data(s))).await;
+                                }
                             }
-                        });
-                        if let Ok(s) = serde_json::to_string(&payload) {
-                            let _ = tx.send(Ok(Event::default().data(s))).await;
+                        }
+
+                        // Emit a single terminal chunk that carries both the
+                        // error detail AND choices[0].finish_reason:"error", so
+                        // clients keying off finish_reason see a clean stream end
+                        // instead of a truncated stream. Routing the error
+                        // through the converter reuses the canonical chunk shape
+                        // and marks the converter finished (no double-finish).
+                        for chunk in converter.on_event(
+                            crate::upstream::stream::StreamEvent::Error {
+                                kind: "upstream_error".into(),
+                                message: msg,
+                            },
+                        ) {
+                            if let Ok(s) = serde_json::to_string(&chunk) {
+                                let _ = tx.send(Ok(Event::default().data(s))).await;
+                            }
                         }
                         break;
                     }
                 }
             }
 
-            // Flush any buffered tool-call arg fragments that didn't see a
-            // finish_reason (e.g., upstream error or client cancellation),
-            // rewritten so partial state still gets through correctly.
-            if !replacements.is_empty() {
-                for chunk in stream_state.flush(&replacements) {
-                    if let Ok(s) = serde_json::to_string(&chunk) {
-                        let _ = tx.send(Ok(Event::default().data(s))).await;
+            // Clean-finish path: flush buffered tool-call arg fragments that
+            // didn't see a finish_reason (e.g. client cancellation), then emit
+            // the terminal chunk if message_stop never arrived. The error path
+            // above has already flushed and finalized.
+            if !errored {
+                if !replacements.is_empty() {
+                    for chunk in stream_state.flush(&replacements) {
+                        if let Ok(s) = serde_json::to_string(&chunk) {
+                            let _ = tx.send(Ok(Event::default().data(s))).await;
+                        }
                     }
                 }
-            }
-
-            if !errored {
                 for chunk in converter.finalize_if_needed() {
                     if let Ok(s) = serde_json::to_string(&chunk) {
                         let _ = tx.send(Ok(Event::default().data(s))).await;
@@ -291,6 +355,22 @@ pub async fn handle_streaming_v2(
             }
 
             let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+
+            // Record token usage + timing after the client has its terminal
+            // frame so the stats write never adds to perceived latency. On the
+            // error path the counts may be partial, which is still real usage.
+            let (input_tokens, output_tokens) = converter.token_usage();
+            let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+            stats.record_response(
+                model_canonical,
+                crate::stats::TokenUsage {
+                    input_tokens: input_tokens as u64,
+                    output_tokens: output_tokens as u64,
+                    ..Default::default()
+                },
+                ttft_ms,
+                duration_ms,
+            );
 
             if let Some(log) = conv_log_for_task {
                 log.log(
@@ -315,6 +395,26 @@ pub async fn handle_streaming_v2(
         request_id_header(&request_id),
     );
     Ok(response)
+}
+
+/// Whether an outbound chunk carries actual generated content (a non-empty text
+/// delta or any tool-call delta), as opposed to the role-only opener or a
+/// finish/usage trailer. Used to time TTFT at the first real token.
+fn chunk_carries_content(chunk: &serde_json::Value) -> bool {
+    let Some(delta) = chunk
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("delta"))
+    else {
+        return false;
+    };
+    let has_text = delta
+        .get("content")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty());
+    let has_tool_calls = delta.get("tool_calls").is_some();
+    has_text || has_tool_calls
 }
 
 /// Pull a `delta.content` text fragment from an outbound chunk if present.
@@ -387,17 +487,15 @@ impl StreamReplState {
             for call in tool_calls {
                 let index = call.get("index").and_then(|v| v.as_u64());
                 if let Some(function) = call.get_mut("function").and_then(|f| f.as_object_mut()) {
-                    if let Some(name) = function.get_mut("name") {
-                        if let Some(s) = name.as_str() {
+                    if let Some(name) = function.get_mut("name")
+                        && let Some(s) = name.as_str() {
                             *name = serde_json::Value::String(repl.apply_response(s));
                         }
-                    }
-                    if let Some(idx) = index {
-                        if let Some(args) = function.get("arguments").and_then(|v| v.as_str()) {
+                    if let Some(idx) = index
+                        && let Some(args) = function.get("arguments").and_then(|v| v.as_str()) {
                             self.tool_args.entry(idx).or_default().push_str(args);
                             function.remove("arguments");
                         }
-                    }
                 }
             }
         }
@@ -477,16 +575,34 @@ fn map_upstream_err(e: UpstreamError) -> AppError {
                 status, p.error.kind, p.error.message
             );
         } else if let UpstreamError::Anthropic { status, body, .. } = &e {
-            msg = format!("upstream {}: {}", status, body);
+            // Bound the raw upstream body before surfacing it to the client;
+            // the full body is preserved server-side via tracing on the error
+            // paths. Avoids forwarding an unbounded upstream blob downstream.
+            msg = format!("upstream {}: {}", status, truncate_for_client(body));
         }
     }
     match surface {
         429 => AppError::RateLimited(msg),
         401 | 403 => AppError::Unauthorized(msg),
         400..=499 => AppError::BadRequest(msg),
+        503 => AppError::ServiceUnavailable(msg),
+        502 => AppError::BadGateway(msg),
         504 => AppError::Timeout(msg),
+        // Includes 500 and any other 5xx Anthropic status we don't special-case.
         _ => AppError::ServerError(msg),
     }
+}
+
+/// Cap a string surfaced to API clients so an unbounded upstream error body is
+/// not echoed verbatim. Operates on char boundaries.
+fn truncate_for_client(s: &str) -> String {
+    const MAX: usize = 500;
+    if s.chars().count() <= MAX {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(MAX).collect();
+    out.push_str("… (truncated)");
+    out
 }
 
 fn derive_session_uuid(session_id: &str) -> uuid::Uuid {
@@ -508,7 +624,7 @@ fn build_outbound_messages_request(
 ) -> Result<MessagesRequest, AppError> {
     let mut anth_req = build_messages_request(request, model_def)?;
     anth_req.model = profile.outbound_model(&request.model, model_def);
-    apply_profile_wire_defaults(&mut anth_req, request, profile);
+    apply_profile_wire_defaults(&mut anth_req, request, model_def, profile);
     anth_req.stream = Some(stream);
 
     // Apply replacements before identity injection: Claude Code's dynamic
@@ -524,22 +640,40 @@ fn build_outbound_messages_request(
 fn apply_profile_wire_defaults(
     req: &mut MessagesRequest,
     source: &ChatCompletionRequest,
+    model_def: &ModelDef,
     profile: &FingerprintProfile,
 ) {
     if source.max_tokens.is_none() && source.max_completion_tokens.is_none() {
         req.max_tokens = profile.wire_defaults_for_model(&req.model).max_tokens;
+        // The wire-default override can drop max_tokens below the thinking
+        // budget that build_messages_request already reconciled against the
+        // model's own ceiling (e.g. reasoning_effort:"max" -> budget 32768 on a
+        // 32k-default model). Anthropic rejects max_tokens <= budget_tokens, so
+        // re-apply the invariant here. The wire default is a default, not a cap:
+        // an explicit thinking budget must win over it. Cap at the model's
+        // catalog ceiling (not the wire default — that is what caused the bug),
+        // mirroring build_messages_request's reconciliation.
+        if let Some(budget) = req
+            .thinking
+            .as_ref()
+            .filter(|t| t.kind == "enabled")
+            .and_then(|t| t.budget_tokens)
+            && req.max_tokens <= budget
+        {
+            let ceiling = model_def.max_tokens.min(u32::MAX as u64) as u32;
+            req.max_tokens = budget.saturating_add(1024).min(ceiling);
+        }
     }
     let wire_defaults = profile.wire_defaults_for_model(&req.model);
     if req.temperature.is_none() {
         req.temperature = wire_defaults.temperature;
     }
-    if req.output_config.is_none() {
-        if let Some(effort) = wire_defaults.output_effort {
+    if req.output_config.is_none()
+        && let Some(effort) = wire_defaults.output_effort {
             req.output_config = Some(OutputConfig {
                 effort: effort.to_string(),
             });
         }
-    }
 }
 
 fn prepend_claude_code_identity(
@@ -701,25 +835,22 @@ fn apply_replacements_inbound(
         let Some(message) = c.get_mut("message").and_then(|m| m.as_object_mut()) else {
             continue;
         };
-        if let Some(content) = message.get_mut("content") {
-            if let Some(s) = content.as_str() {
+        if let Some(content) = message.get_mut("content")
+            && let Some(s) = content.as_str() {
                 let replaced = repl.apply_response(s);
                 *content = serde_json::Value::String(replaced);
             }
-        }
         if let Some(tool_calls) = message.get_mut("tool_calls").and_then(|t| t.as_array_mut()) {
             for call in tool_calls {
                 if let Some(function) = call.get_mut("function").and_then(|f| f.as_object_mut()) {
-                    if let Some(name) = function.get_mut("name") {
-                        if let Some(s) = name.as_str() {
+                    if let Some(name) = function.get_mut("name")
+                        && let Some(s) = name.as_str() {
                             *name = serde_json::Value::String(repl.apply_response(s));
                         }
-                    }
-                    if let Some(args) = function.get_mut("arguments") {
-                        if let Some(s) = args.as_str() {
+                    if let Some(args) = function.get_mut("arguments")
+                        && let Some(s) = args.as_str() {
                             *args = serde_json::Value::String(repl.apply_response(s));
                         }
-                    }
                 }
             }
         }
@@ -1018,16 +1149,17 @@ mod tests {
     }
 
     #[test]
-    fn claude_2_1_154_explicit_claude_models_are_preserved() {
+    fn claude_2_1_154_real_versioned_models_are_preserved_verbatim() {
+        // Only real, Anthropic-acceptable versioned ids are forwarded verbatim:
+        // exact catalog canonicals and model_wire_overrides keys.
         let replacements = crate::replacements::Replacements::empty();
         let cases = [
-            "claude-opus",
             "claude-opus-4-6",
             "claude-opus-4-7",
             "claude-opus-4-8",
-            "claude-sonnet",
-            "claude-haiku",
+            "claude-sonnet-4-6",
             "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001",
         ];
 
         for input in cases {
@@ -1042,7 +1174,40 @@ mod tests {
                 true,
             )
             .unwrap();
-            assert_eq!(anth_req.model, input);
+            assert_eq!(anth_req.model, input, "{input} must be sent verbatim");
+        }
+    }
+
+    #[test]
+    fn claude_2_1_154_bare_family_names_resolve_to_canonical() {
+        // Regression: bare family names and fake dated forms are NOT valid
+        // Anthropic model ids. They must resolve to a real canonical, not be
+        // forwarded verbatim (which produced live 400s: "model: claude-sonnet").
+        let replacements = crate::replacements::Replacements::empty();
+        let cases = [
+            ("claude-opus", "claude-opus-4-8"),
+            ("claude-sonnet", "claude-sonnet-4-6"),
+            ("claude-haiku", "claude-haiku-4-5-20251001"),
+            ("claude-sonnet-4-6-20260101", "claude-sonnet-4-6"),
+            ("claude-opus-4-6-20260101", "claude-opus-4-8"),
+        ];
+
+        for (input, expected) in cases {
+            let req = chat_request(input);
+            let model_def = default_profile().resolve_model(input);
+            let anth_req = build_outbound_messages_request(
+                &req,
+                model_def,
+                true,
+                &replacements,
+                default_profile(),
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                anth_req.model, expected,
+                "{input} must resolve to canonical {expected}, not be sent verbatim"
+            );
         }
     }
 
@@ -1079,6 +1244,62 @@ mod tests {
                 expected_effort
             );
         }
+    }
+
+    #[test]
+    fn wire_default_max_tokens_never_drops_below_thinking_budget() {
+        // Regression: reasoning_effort:"max" on a 32k-default model (haiku,
+        // sonnet) must not emit max_tokens <= thinking.budget_tokens, which
+        // Anthropic rejects with a 400. opus has a 64k default and is already
+        // above the 32768 "max" budget.
+        let replacements = crate::replacements::Replacements::empty();
+        for model in ["haiku", "sonnet", "opus"] {
+            let mut req = chat_request(model);
+            req.reasoning_effort = Some("max".into());
+            let model_def = default_profile().resolve_model(model);
+            let anth_req = build_outbound_messages_request(
+                &req,
+                model_def,
+                true,
+                &replacements,
+                default_profile(),
+                true,
+            )
+            .unwrap();
+            let budget = anth_req
+                .thinking
+                .as_ref()
+                .and_then(|t| t.budget_tokens)
+                .expect("reasoning_effort:max enables a thinking budget");
+            assert!(
+                anth_req.max_tokens > budget,
+                "{model}: max_tokens {} must exceed thinking budget {budget}",
+                anth_req.max_tokens
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_max_tokens_is_respected_even_with_thinking() {
+        // When the caller sets max_tokens explicitly, we do NOT apply the wire
+        // default at all, so the reconciliation branch must not fire. The
+        // caller owns the value (build_messages_request still bumps it above
+        // the budget if needed, but that is the caller-set path).
+        let replacements = crate::replacements::Replacements::empty();
+        let mut req = chat_request("haiku");
+        req.reasoning_effort = Some("low".into()); // budget 1024
+        req.max_tokens = Some(2048);
+        let model_def = default_profile().resolve_model("haiku");
+        let anth_req = build_outbound_messages_request(
+            &req,
+            model_def,
+            true,
+            &replacements,
+            default_profile(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(anth_req.max_tokens, 2048);
     }
 
     #[test]

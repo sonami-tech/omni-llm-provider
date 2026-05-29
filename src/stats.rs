@@ -19,6 +19,21 @@ const TOTAL_KEY: &str = "total";
 
 const MAX_RECENT_ERRORS: usize = 50;
 
+/// Per-model rolling window for TTFT / duration averages. Bounds the in-memory
+/// sample deques so a long-running process does not grow them without limit.
+const MAX_SAMPLES: usize = 1000;
+
+/// Token counts to fold into per-model persistent stats. Mirrors the fields of
+/// the Anthropic usage object; kept as a plain struct so `stats` does not depend
+/// on the translation layer's types.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TokenUsage {
+	pub input_tokens: u64,
+	pub output_tokens: u64,
+	pub cache_read_input_tokens: u64,
+	pub cache_creation_input_tokens: u64,
+}
+
 // ── Serializable token stats for redb storage ─────────────────────
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -116,12 +131,11 @@ impl Stats {
 				let current = table.get(model).ok().flatten().map(|v| v.value()).unwrap_or(0);
 				let _ = table.insert(model, current + 1);
 			}
-			if let Some(key_id) = api_key_id {
-				if let Ok(mut table) = write_txn.open_table(REQUESTS_BY_KEY) {
+			if let Some(key_id) = api_key_id
+				&& let Ok(mut table) = write_txn.open_table(REQUESTS_BY_KEY) {
 					let current = table.get(key_id).ok().flatten().map(|v| v.value()).unwrap_or(0);
 					let _ = table.insert(key_id, current + 1);
 				}
-			}
 			if let Ok(mut table) = write_txn.open_table(LAST_REQUEST_AT) {
 				let now = crate::time_util::iso_now();
 				let _ = table.insert(TOTAL_KEY, now.as_str());
@@ -149,6 +163,49 @@ impl Stats {
 				model: model.to_string(),
 				message: message.to_string(),
 			});
+		}
+	}
+
+	/// Record a successful completion: fold token usage into the persistent
+	/// per-model totals and push duration / TTFT samples into the bounded
+	/// rolling windows used for the dashboard averages.
+	///
+	/// `ttft_ms` is the time to first streamed token (None for non-streaming
+	/// responses, where TTFT is not meaningful). `duration_ms` is the total
+	/// wall-clock time for the request.
+	pub fn record_response(
+		&self,
+		model: &str,
+		usage: TokenUsage,
+		ttft_ms: Option<f64>,
+		duration_ms: f64,
+	) {
+		if let Ok(write_txn) = self.db.begin_write() {
+			if let Ok(mut table) = write_txn.open_table(TOKENS_BY_MODEL) {
+				let mut stats: TokenStats = table
+					.get(model)
+					.ok()
+					.flatten()
+					.and_then(|v| serde_json::from_slice(v.value()).ok())
+					.unwrap_or_default();
+				stats.input_tokens = stats.input_tokens.saturating_add(usage.input_tokens);
+				stats.output_tokens = stats.output_tokens.saturating_add(usage.output_tokens);
+				stats.cache_read_input_tokens = stats
+					.cache_read_input_tokens
+					.saturating_add(usage.cache_read_input_tokens);
+				stats.cache_creation_input_tokens = stats
+					.cache_creation_input_tokens
+					.saturating_add(usage.cache_creation_input_tokens);
+				if let Ok(bytes) = serde_json::to_vec(&stats) {
+					let _ = table.insert(model, bytes.as_slice());
+				}
+			}
+			let _ = write_txn.commit();
+		}
+
+		push_sample(&self.duration_samples, model, duration_ms);
+		if let Some(ttft) = ttft_ms {
+			push_sample(&self.ttft_samples, model, ttft);
 		}
 	}
 
@@ -309,10 +366,120 @@ impl Drop for ActiveRequestGuard<'_> {
 	}
 }
 
+/// Owned active-request guard — like [`ActiveRequestGuard`] but holds an
+/// `Arc<Stats>` instead of a borrow, so it can be created before a request's
+/// async setup and `move`d into a spawned task that outlives the handler. Used
+/// by the streaming path so the active count covers the full request lifetime
+/// (setup through stream completion), not just one or the other.
+pub struct OwnedActiveRequestGuard {
+	stats: std::sync::Arc<Stats>,
+}
+
+impl OwnedActiveRequestGuard {
+	pub fn new(stats: std::sync::Arc<Stats>) -> Self {
+		stats.increment_active();
+		Self { stats }
+	}
+}
+
+impl Drop for OwnedActiveRequestGuard {
+	fn drop(&mut self) {
+		self.stats.decrement_active();
+	}
+}
+
 fn avg(samples: &VecDeque<f64>) -> f64 {
 	if samples.is_empty() {
 		0.0
 	} else {
 		samples.iter().sum::<f64>() / samples.len() as f64
+	}
+}
+
+/// Push a timing sample into a per-model bounded rolling window, evicting the
+/// oldest sample once the window is full.
+fn push_sample(samples: &Mutex<HashMap<String, VecDeque<f64>>>, model: &str, value: f64) {
+	let mut map = samples.lock().unwrap_or_else(|e| e.into_inner());
+	let window = map.entry(model.to_string()).or_default();
+	if window.len() >= MAX_SAMPLES {
+		window.pop_front();
+	}
+	window.push_back(value);
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn temp_stats() -> (Stats, std::path::PathBuf) {
+		let path = std::env::temp_dir()
+			.join(format!("ccp-stats-test-{}.redb", uuid::Uuid::new_v4()));
+		(Stats::open(&path).unwrap(), path)
+	}
+
+	#[test]
+	fn record_response_persists_tokens_and_timing_into_snapshot() {
+		// Intent: the /stats dashboard must reflect real token + latency data.
+		// Before this wiring these were always zero regardless of traffic.
+		let (stats, path) = temp_stats();
+		stats.record_request("claude-sonnet-4-6", Some("k1"));
+		stats.record_response(
+			"claude-sonnet-4-6",
+			TokenUsage {
+				input_tokens: 100,
+				output_tokens: 40,
+				cache_read_input_tokens: 10,
+				cache_creation_input_tokens: 5,
+			},
+			Some(123.0),
+			456.0,
+		);
+		// A second response accumulates and averages timing.
+		stats.record_response(
+			"claude-sonnet-4-6",
+			TokenUsage { input_tokens: 50, output_tokens: 20, ..Default::default() },
+			Some(223.0),
+			544.0,
+		);
+
+		let snap = stats.snapshot();
+		assert_eq!(snap.total_input_tokens, 150);
+		assert_eq!(snap.total_output_tokens, 60);
+		assert_eq!(snap.total_cache_read_input_tokens, 10);
+		assert_eq!(snap.total_cache_creation_input_tokens, 5);
+
+		let m = snap.models.get("claude-sonnet-4-6").expect("model present");
+		assert_eq!(m.input_tokens, 150);
+		assert_eq!(m.output_tokens, 60);
+		// Averages of the two samples: (123+223)/2=173, (456+544)/2=500.
+		assert_eq!(m.avg_ttft_ms, 173.0);
+		assert_eq!(m.avg_duration_ms, 500.0);
+
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn record_error_counts_and_keeps_recent() {
+		let (stats, path) = temp_stats();
+		stats.record_error("claude-haiku-4-5", "boom");
+		stats.record_error("claude-haiku-4-5", "kaboom");
+		let snap = stats.snapshot();
+		assert_eq!(snap.errors, 2);
+		// recent_errors is newest-first in the snapshot.
+		assert_eq!(snap.recent_errors.len(), 2);
+		assert_eq!(snap.recent_errors[0].message, "kaboom");
+		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn timing_samples_are_bounded() {
+		let (stats, path) = temp_stats();
+		for i in 0..(MAX_SAMPLES + 50) {
+			push_sample(&stats.duration_samples, "m", i as f64);
+		}
+		let map = stats.duration_samples.lock().unwrap();
+		assert_eq!(map.get("m").unwrap().len(), MAX_SAMPLES);
+		drop(map);
+		let _ = std::fs::remove_file(path);
 	}
 }
