@@ -85,7 +85,7 @@ impl UpstreamClient {
                     // 401: re-read credentials once, then retry.
                     if status == Some(401) && !refreshed_credentials {
                         refreshed_credentials = true;
-                        match Credentials::load_fresh(&Credentials::default_path()) {
+                        match Credentials::load_fresh_async(&Credentials::default_path()).await {
                             Ok(fresh) => {
                                 warn!("upstream 401, re-reading credentials.json and retrying");
                                 creds_owned = fresh;
@@ -191,7 +191,9 @@ impl UpstreamClient {
                     };
                     if status == Some(401) && !refreshed_credentials {
                         refreshed_credentials = true;
-                        if let Ok(fresh) = Credentials::load_fresh(&Credentials::default_path()) {
+                        if let Ok(fresh) =
+                            Credentials::load_fresh_async(&Credentials::default_path()).await
+                        {
                             warn!("upstream 401 on stream open, re-reading credentials.json");
                             creds_owned = fresh;
                             ctx_owned.next_attempt();

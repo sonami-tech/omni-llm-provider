@@ -2,13 +2,53 @@ use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::mpsc::{SyncSender, sync_channel};
 
 pub const DEFAULT_LOG_MAX_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_LOG_BACKUPS: usize = 5;
 
+/// Bound on the pending-log queue. Generous, but caps memory if the disk writer
+/// falls behind under heavy load; excess records are dropped with a warning
+/// rather than blocking a request or growing without limit.
+const LOG_QUEUE_CAPACITY: usize = 8192;
+
+/// How long `Drop` waits for the writer to finish flushing before giving up, so
+/// a wedged disk cannot block process/teardown indefinitely.
+const SHUTDOWN_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A single log record handed to the writer thread. Holds exactly one copy of
+/// the formatted `record` (header + content + separator); the writer reuses it
+/// for every target, so a large payload is not cloned multiple times per entry.
+struct LogMsg {
+	session_id: String,
+	request_id: String,
+	record: String,
+}
+
 /// Logs conversation prompts and responses to a file or stderr.
+///
+/// Writes happen on a dedicated OS thread fed by a bounded channel, so logging
+/// never blocks a Tokio worker on disk I/O and concurrent requests do not
+/// serialize on a shared mutex during the write. Dropping the log closes the
+/// queue and waits (bounded) for the writer to flush pending records.
 pub struct ConversationLog {
-	target: Mutex<Target>,
+	tx: Option<SyncSender<LogMsg>>,
+	/// Signalled by the writer thread when its loop exits (channel drained).
+	/// Wrapped in a Mutex so `ConversationLog` stays `Sync` (a bare `Receiver`
+	/// is `Send` but not `Sync`, and this type is shared via `Arc` in AppState).
+	done: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl Drop for ConversationLog {
+	fn drop(&mut self) {
+		// Close the channel so the writer loop ends after draining, then wait a
+		// bounded time for it to finish. A wedged disk must not hang shutdown.
+		self.tx.take();
+		let done = self.done.get_mut().unwrap_or_else(|e| e.into_inner());
+		if done.recv_timeout(SHUTDOWN_FLUSH_TIMEOUT).is_err() {
+			tracing::warn!("conversation log writer did not flush within timeout on shutdown");
+		}
+	}
 }
 
 enum Target {
@@ -17,6 +57,67 @@ enum Target {
 	Stderr,
 }
 
+impl Target {
+	fn write(&mut self, msg: &LogMsg) {
+		match self {
+			Target::File(f) => {
+				if let Err(e) = f.write_record(&msg.record) {
+					tracing::warn!("failed to write conversation log: {e}");
+				}
+			}
+			Target::Directory(dir) => {
+				if let Err(e) = dir.write_record(&msg.session_id, &msg.request_id, &msg.record) {
+					tracing::warn!("failed to write conversation log: {e}");
+				}
+			}
+			Target::Stderr => {
+				// `record` is already "header\ncontent\nseparator\n\n".
+				tracing::info!("{}", msg.record.trim_end());
+			}
+		}
+	}
+}
+
+/// Spawn the writer thread that owns `target` and drains the queue until all
+/// senders are dropped. Returns the sender plus a receiver that is signalled
+/// when the writer's loop exits (used for a bounded flush on drop). A panic in a
+/// single write is caught so it cannot silently kill the writer.
+fn spawn_writer(mut target: Target) -> (SyncSender<LogMsg>, std::sync::mpsc::Receiver<()>) {
+	let (tx, rx) = sync_channel::<LogMsg>(LOG_QUEUE_CAPACITY);
+	let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+	let spawned = std::thread::Builder::new()
+		.name("ccp-conversation-log".into())
+		.spawn(move || {
+			for msg in rx {
+				// One wedged/oversized record must not kill the writer thread.
+				if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| target.write(&msg)))
+					.is_err()
+				{
+					tracing::warn!("conversation log writer recovered from a write panic");
+				}
+			}
+			let _ = done_tx.send(());
+		});
+	if spawned.is_err() {
+		// Could not spawn the writer: signal "done" immediately so Drop never
+		// blocks, and let sends fail/drop. Logging silently degrades but the
+		// request path is unaffected.
+		tracing::warn!("failed to spawn conversation log writer thread; logging disabled");
+		let (immediate_tx, immediate_rx) = std::sync::mpsc::channel::<()>();
+		let _ = immediate_tx.send(());
+		return (tx, immediate_rx);
+	}
+	(tx, done_rx)
+}
+
+/// Directory logging: one append-only file per session id under `path`.
+///
+/// Note: unlike [`RotatingFile`], per-session files are intentionally NOT
+/// size-capped or rotated. For normal use a session file is bounded by the
+/// conversation's length, so this is acceptable; a very long-running session
+/// (e.g. an agent loop reusing one session id) can grow its file without bound.
+/// If that becomes a problem, prefer single-file mode (`--log-file`), which
+/// honours `--log-max-bytes`/backups.
 struct LogDirectory {
 	path: PathBuf,
 }
@@ -32,24 +133,21 @@ struct RotatingFile {
 impl ConversationLog {
 	pub fn to_file(path: &Path, max_bytes: u64, backups: usize) -> Result<Self, std::io::Error> {
 		let file = RotatingFile::open(path, max_bytes, backups)?;
-		Ok(Self {
-			target: Mutex::new(Target::File(file)),
-		})
+		let (tx, done) = spawn_writer(Target::File(file));
+		Ok(Self { tx: Some(tx), done: Mutex::new(done) })
 	}
 
 	pub fn to_dir(path: &Path) -> Result<Self, std::io::Error> {
 		std::fs::create_dir_all(path)?;
-		Ok(Self {
-			target: Mutex::new(Target::Directory(LogDirectory {
-				path: path.to_path_buf(),
-			})),
-		})
+		let (tx, done) = spawn_writer(Target::Directory(LogDirectory {
+			path: path.to_path_buf(),
+		}));
+		Ok(Self { tx: Some(tx), done: Mutex::new(done) })
 	}
 
 	pub fn to_stderr() -> Self {
-		Self {
-			target: Mutex::new(Target::Stderr),
-		}
+		let (tx, done) = spawn_writer(Target::Stderr);
+		Self { tx: Some(tx), done: Mutex::new(done) }
 	}
 
 	pub fn log(
@@ -68,21 +166,18 @@ impl ConversationLog {
 		let separator = "-".repeat(header.len().min(72));
 		let record = format!("{}\n{}\n{}\n\n", header, content, separator);
 
-		let mut target = self.target.lock().unwrap_or_else(|e| e.into_inner());
-		match *target {
-			Target::File(ref mut f) => {
-				if let Err(e) = f.write_record(&record) {
-					tracing::warn!("failed to write conversation log: {e}");
-				}
-			}
-			Target::Directory(ref dir) => {
-				if let Err(e) = dir.write_record(session_id, request_id, &record) {
-					tracing::warn!("failed to write conversation log: {e}");
-				}
-			}
-			Target::Stderr => {
-				tracing::info!("{}\n{}\n{}", header, content, separator);
-			}
+		let msg = LogMsg {
+			session_id: session_id.to_string(),
+			request_id: request_id.to_string(),
+			record,
+		};
+
+		// Never block a request on logging: if the writer is behind (queue full)
+		// or gone, drop the record with a warning.
+		if let Some(tx) = self.tx.as_ref()
+			&& let Err(e) = tx.try_send(msg)
+		{
+			tracing::warn!("conversation log queue full or closed, dropping record: {e}");
 		}
 	}
 }
@@ -129,10 +224,13 @@ impl RotatingFile {
 			self.rotate()?;
 		}
 
-		let file = self
-			.file
-			.as_mut()
-			.expect("rotating log file should be open before write");
+		// Surface a clean error instead of panicking if the file handle is somehow
+		// absent (e.g. a prior rotate() failed to reopen). The writer thread's
+		// catch_unwind would contain a panic, but returning Err is tidier and lets
+		// the caller log it.
+		let Some(file) = self.file.as_mut() else {
+			return Err(std::io::Error::other("rotating log file is not open"));
+		};
 		file.write_all(record.as_bytes())?;
 		file.flush()?;
 		self.current_len = self.current_len.saturating_add(record_len);
@@ -233,6 +331,9 @@ mod tests {
 			);
 		}
 
+		// Drop the log to flush the writer thread before reading files.
+		drop(log);
+
 		let active_len = std::fs::metadata(&path).unwrap().len();
 		assert!(active_len > 0);
 		assert!(active_len <= 220);
@@ -259,6 +360,7 @@ mod tests {
 			);
 		}
 
+		drop(log);
 		assert!(std::fs::metadata(&path).unwrap().len() > 220);
 		assert!(!path.with_file_name("conversations.log.1").exists());
 
@@ -274,6 +376,7 @@ mod tests {
 		log.log("x:alpha beta", "reqtwo", "<<<", "Second", "two");
 		log.log("u:other/session", "reqthree", ">>>", "Other", "three");
 
+		drop(log);
 		let alpha = std::fs::read_to_string(dir.join("x_alpha_beta.log")).unwrap();
 		assert!(alpha.contains("request=reqone"));
 		assert!(alpha.contains("request=reqtwo"));
@@ -290,6 +393,7 @@ mod tests {
 
 		log.log("-", "reqsolo", ">>>", "Only", "payload");
 
+		drop(log);
 		assert!(dir.join("request-reqsolo.log").exists());
 
 		let _ = std::fs::remove_dir_all(dir);

@@ -47,11 +47,28 @@ impl Credentials {
 		}
 	}
 
-	/// Read and parse the credentials file. Never cached.
+	/// Read and parse the credentials file synchronously. Never cached. Use this
+	/// only outside the async request path (e.g. startup validation); request
+	/// handlers should use [`Credentials::load_fresh_async`] to avoid blocking a
+	/// Tokio worker on the file read.
 	pub fn load_fresh(path: &Path) -> Result<Self, UpstreamError> {
 		let bytes = std::fs::read(path).map_err(UpstreamError::CredentialsRead)?;
-		let parsed: CredentialsFile = serde_json::from_slice(&bytes)
-			.map_err(UpstreamError::CredentialsParse)?;
+		Self::from_bytes(&bytes)
+	}
+
+	/// Read and parse the credentials file without blocking the async executor.
+	/// Performs the file read via `tokio::fs` so a slow/stalled filesystem cannot
+	/// stall a Tokio worker thread. Never cached.
+	pub async fn load_fresh_async(path: &Path) -> Result<Self, UpstreamError> {
+		let bytes = tokio::fs::read(path)
+			.await
+			.map_err(UpstreamError::CredentialsRead)?;
+		Self::from_bytes(&bytes)
+	}
+
+	fn from_bytes(bytes: &[u8]) -> Result<Self, UpstreamError> {
+		let parsed: CredentialsFile =
+			serde_json::from_slice(bytes).map_err(UpstreamError::CredentialsParse)?;
 		if parsed.claude_ai_oauth.access_token.is_empty() {
 			return Err(UpstreamError::CredentialsMissingToken);
 		}
