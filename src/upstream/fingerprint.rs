@@ -99,16 +99,27 @@ impl FingerprintProfile {
         }
     }
 
+    /// Whether `input` is a real, Anthropic-acceptable Claude model id that
+    /// should be forwarded verbatim (an explicit version pin) rather than
+    /// resolved to the profile canonical.
+    ///
+    /// Uses an explicit allowlist — exact catalog canonical, or a key present in
+    /// `model_wire_overrides` (the real versions this profile knows how to send)
+    /// — NOT a loose `contains(cli_name)` substring. The substring form wrongly
+    /// preserved bare family names (`claude-sonnet`, `claude-haiku`) and fake
+    /// dated forms (`claude-sonnet-4-6-20260101`), which Anthropic rejects with
+    /// a 400. The trade-off is staleness: a brand-new real model id not yet in
+    /// the catalog/overrides is canonicalized instead of pinned, which is
+    /// strictly safer than forwarding an unknown string and 400ing.
     fn is_explicit_claude_model(&self, input: &str) -> bool {
         if !input.starts_with("claude-") {
             return false;
         }
-        self.models.iter().any(|model| {
-            input == model.canonical
-                || input == model.cli_name
-                || model.aliases.contains(&input)
-                || input.contains(model.cli_name)
-        })
+        self.models.iter().any(|model| input == model.canonical)
+            || self
+                .model_wire_overrides
+                .iter()
+                .any(|override_| override_.model == input)
     }
 
     pub fn beta_reply_for_model(&self, model: &str) -> &'static str {
@@ -195,9 +206,7 @@ impl FingerprintProfile {
         let search = &bytes[system_start..];
         let mut cursor = 0;
         while cursor < search.len() {
-            let Some(prefix_rel) = find_subslice(&search[cursor..], prefix.as_bytes()) else {
-                return None;
-            };
+            let prefix_rel = find_subslice(&search[cursor..], prefix.as_bytes())?;
             let prefix_pos = system_start + cursor + prefix_rel;
             let suffix_pos = prefix_pos + prefix.len() + 3;
             let suffix_end = suffix_pos + tail.len();
@@ -427,7 +436,7 @@ pub fn resolve_profile(selector: &str) -> Option<&'static FingerprintProfile> {
     };
 
     FINGERPRINT_PROFILES.iter().find(|profile| {
-        profile.name == selector || profile.aliases.iter().any(|alias| *alias == selector)
+        profile.name == selector || profile.aliases.contains(&selector)
     })
 }
 

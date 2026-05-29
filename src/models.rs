@@ -116,12 +116,7 @@ pub fn resolve_model_in_catalog(
 }
 
 fn match_by_substring(input: &str, models: &'static [ModelDef]) -> Option<&'static ModelDef> {
-	for m in models {
-		if input.contains(m.cli_name) {
-			return Some(m);
-		}
-	}
-	None
+	models.iter().find(|&m| input.contains(m.cli_name)).map(|v| v as _)
 }
 
 fn default_model_def(
