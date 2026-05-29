@@ -30,12 +30,14 @@ pub enum UpstreamError {
 impl UpstreamError {
 	/// Classify whether the operation should be retried.
 	///
-	/// 429 and 5xx are transient. 401/403/400 are terminal (no retry helps).
-	/// Network errors are transient.
+	/// 5xx and transient network errors are retryable. 429 is NOT retried — it
+	/// is surfaced as-is per the locked rate-limit-passthrough decision (the
+	/// retry loops also guard 429 explicitly before consulting this, so the
+	/// invariant holds in one place here). 401/403/400 are terminal.
 	pub fn is_transient(&self) -> bool {
 		match self {
 			UpstreamError::Transport(e) => e.is_timeout() || e.is_connect() || e.is_request(),
-			UpstreamError::Anthropic { status, .. } => *status >= 500 || *status == 429,
+			UpstreamError::Anthropic { status, .. } => *status >= 500,
 			_ => false,
 		}
 	}

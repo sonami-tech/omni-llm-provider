@@ -15,8 +15,9 @@ pub enum AppError {
 	#[error("{0}")]
 	Timeout(String),
 	#[error("{0}")]
-	#[allow(dead_code)]
 	ServiceUnavailable(String),
+	#[error("{0}")]
+	BadGateway(String),
 	#[error("{0}")]
 	RateLimited(String),
 }
@@ -30,6 +31,7 @@ impl IntoResponse for AppError {
 			AppError::ServerError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
 			AppError::Timeout(_) => (StatusCode::GATEWAY_TIMEOUT, "server_error"),
 			AppError::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "server_error"),
+			AppError::BadGateway(_) => (StatusCode::BAD_GATEWAY, "server_error"),
 			AppError::RateLimited(_) => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
 		};
 		let body = serde_json::json!({
