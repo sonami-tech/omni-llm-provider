@@ -120,8 +120,13 @@ struct ErrorInner {
 }
 
 fn parse_event_data(json_str: &str) -> Result<StreamEvent, UpstreamError> {
-	let raw_value: Value = serde_json::from_str(json_str)
-		.map_err(|e| UpstreamError::Decode(format!("sse data parse: {e} (data: {json_str})")))?;
+	let raw_value: Value = serde_json::from_str(json_str).map_err(|e| {
+		// Keep the raw SSE payload out of the client-visible error message; log
+		// it server-side instead so a malformed upstream frame is not reflected
+		// back to the consumer.
+		tracing::debug!("sse data parse failed: {e}; data: {json_str}");
+		UpstreamError::Decode(format!("sse data parse: {e}"))
+	})?;
 	let any: AnyEvent = serde_json::from_value(raw_value.clone())
 		.map_err(|e| UpstreamError::Decode(format!("sse event shape: {e}")))?;
 

@@ -216,6 +216,11 @@ async fn main() {
 
     // API routes (auth-protected).
     let api_keys_clone = api_keys.clone();
+    // Stats endpoints live behind the same auth layer as the rest of the API so
+    // their exposure matches the API's: open under --no-auth (the layer is a
+    // pass-through when no keys are configured), gated otherwise. Without this
+    // they leaked truncated key ids + per-key usage to any unauthenticated (and,
+    // under permissive CORS, cross-origin) caller even when API auth was enabled.
     let api_routes = Router::new()
         .route("/v1/models", get(routes::models::models_handler))
         .route("/models", get(routes::models::models_handler))
@@ -227,6 +232,8 @@ async fn main() {
             "/chat/completions",
             post(routes::completions::completions_handler),
         )
+        .route("/stats", get(routes::stats::stats_html_handler))
+        .route("/stats/json", get(routes::stats::stats_json_handler))
         .layer(middleware::from_fn(move |req, next| {
             auth::auth_layer(api_keys_clone.clone(), req, next)
         }));
@@ -234,9 +241,10 @@ async fn main() {
     let app = Router::new()
         .merge(api_routes)
         .route("/health", get(routes::health::health_handler))
-        .route("/stats", get(routes::stats::stats_html_handler))
-        .route("/stats/json", get(routes::stats::stats_json_handler))
         .fallback(fallback_handler)
+        // Permissive CORS is intentional: clients are server-to-server (no browser
+        // origin to restrict), and API access is gated by the bearer-key auth
+        // layer rather than by CORS. Revisit if a browser client is ever added.
         .layer(tower_http::cors::CorsLayer::permissive())
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .with_state(state);

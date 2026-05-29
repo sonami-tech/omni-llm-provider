@@ -61,9 +61,12 @@ pub async fn stats_html_handler(State(state): State<Arc<AppState>>) -> impl Into
 		));
 	}
 
-	// Cache efficiency.
-	let total_cache_input =
-		snap.total_cache_read_input_tokens + snap.total_cache_creation_input_tokens + snap.total_input_tokens;
+	// Cache efficiency. Saturating to avoid a debug-build panic / release wrap if
+	// counters ever reach extreme values.
+	let total_cache_input = snap
+		.total_cache_read_input_tokens
+		.saturating_add(snap.total_cache_creation_input_tokens)
+		.saturating_add(snap.total_input_tokens);
 	let cache_ratio = if total_cache_input > 0 {
 		(snap.total_cache_read_input_tokens as f64 / total_cache_input as f64) * 100.0
 	} else {

@@ -350,18 +350,30 @@ class TestNonStreaming:
 		assert "PONG" in resp.choices[0].message.content
 
 	def test_multipart_mixed_types(self, client):
-		"""image_url parts should be silently ignored, only text extracted."""
+		"""image_url parts are translated to Anthropic image blocks (vision
+		passthrough), not dropped. Uses an inline base64 data URL so the test is
+		hermetic (no external image fetch) and exercises the base64 path."""
+		# A real 16x16 solid-red PNG (a 1x1 image is rejected by the vision model).
+		png_b64 = (
+			"iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAFklEQVR42mO4"
+			"IydHEmIY1TCqYfhqAACaMxgQdrf9VwAAAABJRU5ErkJggg=="
+		)
 		resp = client.chat.completions.create(
 			model="claude-sonnet-4-6",
 			messages=[{
 				"role": "user",
 				"content": [
 					{"type": "text", "text": "Reply with exactly: PONG"},
-					{"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
+					{
+						"type": "image_url",
+						"image_url": {"url": f"data:image/png;base64,{png_b64}"},
+					},
 				],
 			}],
 			stream=False,
 		)
+		# A successful completion proves the image block was accepted by Anthropic
+		# (a dropped image would still answer; a malformed one would 400).
 		assert "PONG" in resp.choices[0].message.content
 
 	def test_multiple_text_parts_concatenated(self, client):
@@ -1077,9 +1089,18 @@ class TestAuth:
 		assert r.status_code == 200
 		assert r.json()["status"] == "ok"
 
-	def test_stats_bypasses_auth(self, ccp_auth_server):
-		"""Stats endpoints should be accessible without auth."""
+	def test_stats_requires_auth(self, ccp_auth_server):
+		"""Stats endpoints sit behind the same auth layer as the rest of the API:
+		when API auth is enabled they require a key (no anonymous key-id/usage
+		exposure), and they succeed with a valid key."""
+		# Without a key: rejected, same as the other API routes.
 		r = httpx.get(f"{ccp_auth_server['base_url']}/stats/json")
+		assert r.status_code == 401
+		# With a valid key: accessible.
+		r = httpx.get(
+			f"{ccp_auth_server['base_url']}/stats/json",
+			headers={"Authorization": f"Bearer {ccp_auth_server['api_key']}"},
+		)
 		assert r.status_code == 200
 		assert "total_requests" in r.json()
 
@@ -1107,7 +1128,10 @@ class TestAuth:
 			headers={"Authorization": f"Bearer {ccp_auth_server['api_key']}"},
 			timeout=120,
 		)
-		data = httpx.get(f"{ccp_auth_server['base_url']}/stats/json").json()
+		data = httpx.get(
+			f"{ccp_auth_server['base_url']}/stats/json",
+			headers={"Authorization": f"Bearer {ccp_auth_server['api_key']}"},
+		).json()
 		assert "api_keys" in data
 		assert len(data["api_keys"]) > 0
 
