@@ -81,9 +81,18 @@ pub struct Config {
 impl Config {
     pub fn resolved_data_dir(&self) -> PathBuf {
         self.data_dir.clone().unwrap_or_else(|| {
-            dirs::data_dir()
-                .expect("Could not determine data directory")
-                .join("claude-code-provider")
+            // Fall back to a relative directory rather than panicking when the
+            // OS data dir can't be determined; `--data-dir` / CCP_DATA_DIR
+            // overrides this entirely.
+            dirs::data_dir().map_or_else(
+                || {
+                    tracing::warn!(
+                        "Could not determine OS data directory; using ./claude-code-provider-data. Set --data-dir to override."
+                    );
+                    PathBuf::from("claude-code-provider-data")
+                },
+                |d| d.join("claude-code-provider"),
+            )
         })
     }
 

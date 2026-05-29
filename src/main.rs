@@ -195,10 +195,10 @@ async fn main() {
             // Validate minimum length.
             for key in &explicit {
                 if key.len() < MIN_API_KEY_LENGTH {
+                    let preview: String = key.chars().take(4).collect();
                     error!(
                         "API key too short (minimum {} characters): \"{}...\"",
-                        MIN_API_KEY_LENGTH,
-                        &key[..key.len().min(4)]
+                        MIN_API_KEY_LENGTH, preview
                     );
                     std::process::exit(1);
                 }

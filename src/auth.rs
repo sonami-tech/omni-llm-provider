@@ -43,11 +43,16 @@ pub async fn auth_layer(
 	}
 }
 
-/// Generate a short identifier for a key (first 4 + last 4, or just last 4 for short keys).
+/// Generate a short identifier for a key (first 4 + last 4, or just last 4 for
+/// short keys). Operates on chars, not bytes, so a key containing multi-byte
+/// UTF-8 cannot panic on a non-char-boundary slice.
 fn key_id(key: &str) -> String {
-	if key.len() < 12 {
-		let suffix_len = key.len().min(4);
-		return format!("...{}", &key[key.len() - suffix_len..]);
+	let chars: Vec<char> = key.chars().collect();
+	if chars.len() < 12 {
+		let suffix: String = chars.iter().rev().take(4).rev().collect();
+		return format!("...{}", suffix);
 	}
-	format!("{}...{}", &key[..4], &key[key.len() - 4..])
+	let prefix: String = chars.iter().take(4).collect();
+	let suffix: String = chars.iter().rev().take(4).rev().collect();
+	format!("{}...{}", prefix, suffix)
 }

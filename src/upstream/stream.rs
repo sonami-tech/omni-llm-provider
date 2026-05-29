@@ -229,6 +229,12 @@ fn parse_block_delta(v: &Value) -> BlockDelta {
 
 // ── SSE byte-stream → event-stream ────────────────────────────────
 
+/// Hard cap on the SSE reassembly buffer. A well-behaved Anthropic stream
+/// emits an event-terminating blank line frequently, so this is only reached
+/// if the upstream (or an intermediary) sends an unbounded run of bytes with
+/// no event boundary. We fail the stream rather than grow memory without limit.
+const MAX_EVENT_BUFFER: usize = 16 * 1024 * 1024;
+
 /// Stream adapter: byte stream → typed event stream.
 pub struct EventStream<S> {
 	inner: S,
@@ -287,6 +293,12 @@ where
 				}
 				Poll::Ready(Some(Ok(chunk))) => {
 					self.buf.extend_from_slice(&chunk);
+					if self.buf.len() > MAX_EVENT_BUFFER {
+						self.closed = true;
+						return Poll::Ready(Some(Err(UpstreamError::Decode(format!(
+							"SSE reassembly buffer exceeded {MAX_EVENT_BUFFER} bytes without an event boundary"
+						)))));
+					}
 				}
 			}
 		}

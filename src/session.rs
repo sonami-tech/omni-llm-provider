@@ -62,17 +62,23 @@ fn has_anchor_material(request: &ChatCompletionRequest, api_key_id: Option<&str>
 /// Sanitize an operator-supplied session identifier for safe log embedding.
 /// Replaces whitespace and control characters with `_` (rather than deleting,
 /// which could collapse distinct values like `"alice bob"` and `"alicebob"`),
-/// and length-caps by character count. Returns `None` for empty input.
+/// and caps the result to MAX_EXPLICIT_LEN *bytes* (on a char boundary) so a
+/// multi-byte id cannot bloat log lines or the derived filename. Returns
+/// `None` for empty input.
 fn sanitize_explicit(value: &str) -> Option<String> {
 	let trimmed = value.trim();
 	if trimmed.is_empty() {
 		return None;
 	}
-	let cleaned: String = trimmed
-		.chars()
-		.take(MAX_EXPLICIT_LEN)
-		.map(|c| if c.is_control() || c.is_whitespace() { '_' } else { c })
-		.collect();
+	let mut cleaned = String::with_capacity(trimmed.len().min(MAX_EXPLICIT_LEN));
+	for c in trimmed.chars() {
+		let mapped = if c.is_control() || c.is_whitespace() { '_' } else { c };
+		// Stop before exceeding the byte budget; never split a char.
+		if cleaned.len() + mapped.len_utf8() > MAX_EXPLICIT_LEN {
+			break;
+		}
+		cleaned.push(mapped);
+	}
 	if cleaned.is_empty() { None } else { Some(cleaned) }
 }
 
