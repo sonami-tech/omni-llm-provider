@@ -183,10 +183,16 @@ fn translate_parts(parts: &[ContentPart]) -> Result<Vec<ContentBlock>, AppError>
 					}
 			}
 			Some("image_url") => {
-				// OAI image_url shape: {type:"image_url", image_url:{url:"data:image/png;base64,..."}}
-				// The current OAI deserialization (ContentPart) only captures `text`,
-				// so image_url passthrough requires a richer ContentPart. Defer.
-				tracing::warn!("image_url content not yet supported in v2 — skipping");
+				// OAI: {type:"image_url", image_url:{url:"data:image/...;base64,..." | "https://..."}}
+				if let Some(image) = &part.image_url {
+					out.push(ContentBlock::Image {
+						source: parse_image_url(&image.url)?,
+					});
+				} else {
+					return Err(AppError::BadRequest(
+						"image_url content part is missing the image_url field".into(),
+					));
+				}
 			}
 			Some(other) => {
 				tracing::warn!(content_type = %other, "unknown content part type — skipping");
@@ -194,6 +200,64 @@ fn translate_parts(parts: &[ContentPart]) -> Result<Vec<ContentBlock>, AppError>
 		}
 	}
 	Ok(out)
+}
+
+/// Translate an OpenAI `image_url` value into an Anthropic image source.
+///
+/// - `data:<media-type>[;param]*;base64,<data>` → base64 source. The media type
+///   is the segment before the first `;`; intervening parameters (e.g.
+///   `;charset=utf-8`) are tolerated as long as `base64` is present. A non-base64
+///   data URL, a missing/empty media type, or empty payload is a 400.
+/// - `http(s)://…` (scheme case-insensitive) → url source (Anthropic fetches it).
+///
+/// A malformed data URL is a client error rather than a silently dropped image.
+fn parse_image_url(url: &str) -> Result<ImageSource, AppError> {
+	// Case-insensitive scheme detection without allocating for the common path.
+	// `get(..n)` (not `[..n]`) so a multibyte char straddling byte n returns None
+	// instead of panicking on a non-char-boundary slice of attacker-controlled input.
+	let lower = url.trim_start();
+	let scheme_is = |p: &str| lower.get(..p.len()).is_some_and(|s| s.eq_ignore_ascii_case(p));
+
+	if scheme_is("data:") {
+		let rest = &lower[5..];
+		// rest = "<media-type>[;param]*[;base64],<data>"
+		let (meta, data) = rest.split_once(',').ok_or_else(|| {
+			AppError::BadRequest("malformed data URL in image_url (missing comma)".into())
+		})?;
+		let mut parts = meta.split(';');
+		let media_type = parts.next().unwrap_or("").trim();
+		let is_base64 = meta
+			.split(';')
+			.skip(1)
+			.any(|p| p.trim().eq_ignore_ascii_case("base64"));
+		if !is_base64 {
+			return Err(AppError::BadRequest(
+				"unsupported data URL in image_url (only ;base64 payloads are supported)".into(),
+			));
+		}
+		if media_type.is_empty() {
+			return Err(AppError::BadRequest(
+				"data URL in image_url is missing a media type".into(),
+			));
+		}
+		if data.is_empty() {
+			return Err(AppError::BadRequest(
+				"data URL in image_url has an empty payload".into(),
+			));
+		}
+		Ok(ImageSource::Base64 {
+			media_type: media_type.to_string(),
+			data: data.to_string(),
+		})
+	} else if scheme_is("http://") || scheme_is("https://") {
+		Ok(ImageSource::Url {
+			url: url.trim().to_string(),
+		})
+	} else {
+		Err(AppError::BadRequest(
+			"image_url must be an http(s) URL or a base64 data URL".into(),
+		))
+	}
 }
 
 fn translate_assistant(m: &ChatMessage) -> Result<Vec<ContentBlock>, AppError> {
@@ -452,5 +516,102 @@ mod tests {
 			}
 			other => panic!("unexpected block: {other:?}"),
 		}
+	}
+
+	#[test]
+	fn image_url_data_url_becomes_base64_image_block() {
+		use crate::translate::request::{ContentPart, ImageUrl, MessageContent as OaiContent};
+		let msg = ChatMessage {
+			role: "user".into(),
+			content: Some(OaiContent::Parts(vec![
+				ContentPart {
+					part_type: Some("text".into()),
+					text: Some("what is this?".into()),
+					image_url: None,
+				},
+				ContentPart {
+					part_type: Some("image_url".into()),
+					text: None,
+					image_url: Some(ImageUrl {
+						url: "data:image/png;base64,iVBORw0KGgo=".into(),
+						detail: None,
+					}),
+				},
+			])),
+			..Default::default()
+		};
+		let reshaped = reshape(&[msg]).unwrap();
+		let blocks = match &reshaped.messages[0].content {
+			MessageContent::Blocks(b) => b,
+			_ => panic!("expected blocks"),
+		};
+		// text block then image block.
+		assert!(matches!(&blocks[0], ContentBlock::Text { text, .. } if text == "what is this?"));
+		match &blocks[1] {
+			ContentBlock::Image { source: ImageSource::Base64 { media_type, data } } => {
+				assert_eq!(media_type, "image/png");
+				assert_eq!(data, "iVBORw0KGgo=");
+			}
+			other => panic!("expected base64 image, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn image_url_http_becomes_url_image_block() {
+		use crate::translate::request::{ContentPart, ImageUrl, MessageContent as OaiContent};
+		let msg = ChatMessage {
+			role: "user".into(),
+			content: Some(OaiContent::Parts(vec![ContentPart {
+				part_type: Some("image_url".into()),
+				text: None,
+				image_url: Some(ImageUrl {
+					url: "https://example.com/cat.jpg".into(),
+					detail: Some("high".into()),
+				}),
+			}])),
+			..Default::default()
+		};
+		let reshaped = reshape(&[msg]).unwrap();
+		let blocks = match &reshaped.messages[0].content {
+			MessageContent::Blocks(b) => b,
+			_ => panic!("expected blocks"),
+		};
+		match &blocks[0] {
+			ContentBlock::Image { source: ImageSource::Url { url } } => {
+				assert_eq!(url, "https://example.com/cat.jpg");
+			}
+			other => panic!("expected url image, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn malformed_image_data_url_is_a_client_error() {
+		use crate::translate::request::{ContentPart, ImageUrl, MessageContent as OaiContent};
+		let msg = ChatMessage {
+			role: "user".into(),
+			content: Some(OaiContent::Parts(vec![ContentPart {
+				part_type: Some("image_url".into()),
+				text: None,
+				image_url: Some(ImageUrl {
+					// not base64, not http(s)
+					url: "ftp://nope".into(),
+					detail: None,
+				}),
+			}])),
+			..Default::default()
+		};
+		assert!(reshape(&[msg]).is_err());
+	}
+
+	#[test]
+	fn parse_image_url_does_not_panic_on_multibyte_or_short_input() {
+		// Attacker-controlled image_url with a multibyte char straddling the scheme
+		// prefix length must yield a clean 400, never a non-char-boundary panic.
+		for url in ["abcd\u{20ac}xyz", "\u{1f389}\u{1f389}", "d", "da", "\u{20ac}", "", "   ", "DATA:nope"] {
+			let _ = super::parse_image_url(url); // must not panic
+		}
+		// And a valid uppercase scheme is still accepted (case-insensitive).
+		assert!(super::parse_image_url("HTTPS://example.com/a.png").is_ok());
+		assert!(super::parse_image_url("DATA:image/png;base64,QQ==").is_ok());
 	}
 }

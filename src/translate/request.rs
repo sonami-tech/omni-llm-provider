@@ -144,6 +144,19 @@ pub struct ContentPart {
 	#[serde(rename = "type")]
 	pub part_type: Option<String>,
 	pub text: Option<String>,
+	/// OpenAI vision input: `{"type":"image_url","image_url":{"url":"..."}}`.
+	pub image_url: Option<ImageUrl>,
+}
+
+/// OpenAI `image_url` part payload. `url` is either a public http(s) URL or a
+/// base64 data URL (`data:image/png;base64,...`). `detail` is accepted but
+/// ignored (Anthropic has no equivalent knob).
+#[derive(Debug, Deserialize)]
+pub struct ImageUrl {
+	pub url: String,
+	#[serde(default)]
+	#[allow(dead_code)]
+	pub detail: Option<String>,
 }
 
 // ── Text extraction ───────────────────────────────────────────────
@@ -217,14 +230,20 @@ mod tests {
 			ContentPart {
 				part_type: Some("text".into()),
 				text: Some("Hello ".into()),
+				image_url: None,
 			},
 			ContentPart {
 				part_type: Some("text".into()),
 				text: Some("world".into()),
+				image_url: None,
 			},
 			ContentPart {
 				part_type: Some("image_url".into()),
 				text: None,
+				image_url: Some(ImageUrl {
+					url: "data:image/png;base64,AAAA".into(),
+					detail: None,
+				}),
 			},
 		]));
 		assert_eq!(extract_text(&content), "Hello world");
