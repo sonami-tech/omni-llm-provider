@@ -63,9 +63,15 @@ pub async fn handle_non_streaming_v2(
     )?;
 
     let creds_path = Credentials::default_path();
-    let creds = Credentials::load_fresh(&creds_path).map_err(map_upstream_err)?;
+    let creds = Credentials::load_fresh_async(&creds_path).await.map_err(|e| {
+        let app_err = map_upstream_err(e);
+        state.stats.record_error(model_def.canonical, &app_err.to_string());
+        app_err
+    })?;
     if let Err(e) = creds.check_expired() {
-        return Err(map_upstream_err(e));
+        let app_err = map_upstream_err(e);
+        state.stats.record_error(model_def.canonical, &app_err.to_string());
+        return Err(app_err);
     }
 
     // Build per-request context. Session ID is derived from CCP's resolved
@@ -76,7 +82,9 @@ pub async fn handle_non_streaming_v2(
         .with_model(anth_req.model.clone());
 
     let body = serde_json::to_value(&anth_req).map_err(|e| {
-        AppError::ServerError(format!("failed to serialize anthropic request: {e}"))
+        let app_err = AppError::ServerError(format!("failed to serialize anthropic request: {e}"));
+        state.stats.record_error(model_def.canonical, &app_err.to_string());
+        app_err
     })?;
 
     if let Some(ref log) = conv_log {
@@ -103,9 +111,13 @@ pub async fn handle_non_streaming_v2(
     };
 
     let resp: MessagesResponse = serde_json::from_value(resp_value.clone()).map_err(|e| {
+        // Log the full upstream body server-side for debugging, but only send a
+        // bounded summary to the client (mirrors truncate_for_client used on the
+        // upstream-error path; avoids echoing an unbounded upstream body).
+        tracing::warn!("anthropic response decode failed: {e}; raw body: {resp_value}");
         AppError::ServerError(format!(
             "anthropic response decode: {e} (raw: {})",
-            resp_value
+            truncate_for_client(&resp_value.to_string())
         ))
     })?;
 
@@ -195,8 +207,16 @@ pub async fn handle_streaming_v2(
     )?;
 
     let creds_path = Credentials::default_path();
-    let creds = Credentials::load_fresh(&creds_path).map_err(map_upstream_err)?;
-    creds.check_expired().map_err(map_upstream_err)?;
+    let creds = Credentials::load_fresh_async(&creds_path).await.map_err(|e| {
+        let app_err = map_upstream_err(e);
+        state.stats.record_error(model_def.canonical, &app_err.to_string());
+        app_err
+    })?;
+    creds.check_expired().map_err(|e| {
+        let app_err = map_upstream_err(e);
+        state.stats.record_error(model_def.canonical, &app_err.to_string());
+        app_err
+    })?;
 
     let session_uuid = derive_session_uuid(&session_id);
     let ctx = RequestContext::new_reply()
@@ -204,7 +224,9 @@ pub async fn handle_streaming_v2(
         .with_model(anth_req.model.clone());
 
     let body = serde_json::to_value(&anth_req).map_err(|e| {
-        AppError::ServerError(format!("failed to serialize anthropic request: {e}"))
+        let app_err = AppError::ServerError(format!("failed to serialize anthropic request: {e}"));
+        state.stats.record_error(model_def.canonical, &app_err.to_string());
+        app_err
     })?;
 
     if let Some(ref log) = conv_log {
@@ -225,7 +247,13 @@ pub async fn handle_streaming_v2(
         .upstream
         .send_messages_stream(&creds, &ctx, &body)
         .await
-        .map_err(map_upstream_err)?;
+        .map_err(|e| {
+            let app_err = map_upstream_err(e);
+            state
+                .stats
+                .record_error(model_def.canonical, &app_err.to_string());
+            app_err
+        })?;
 
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
 
@@ -247,7 +275,8 @@ pub async fn handle_streaming_v2(
             let mut ttft_ms: Option<f64> = None;
             let mut converter =
                 OaiStreamConverter::new(chat_id.clone(), created, requested_model.clone());
-            let mut stream_state = StreamReplState::new(chat_id, created, requested_model);
+            let mut stream_state =
+                StreamReplState::new(chat_id, created, requested_model, &replacements);
             // Initial :ok comment to flush headers immediately.
             let _ = tx.send(Ok(Event::default().comment("ok"))).await;
 
@@ -428,6 +457,19 @@ fn extract_content_delta(chunk: &serde_json::Value) -> Option<&str> {
         .as_str()
 }
 
+/// True if `choices[0].delta` is present and an empty object (e.g. after content
+/// was stripped for deferred replacement). A chunk like this carries no useful
+/// delta; we suppress it unless it also carries a terminal `finish_reason`.
+fn chunk_delta_is_empty(chunk: &serde_json::Value) -> bool {
+    chunk
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("delta"))
+        .and_then(|d| d.as_object())
+        .is_some_and(|d| d.is_empty())
+}
+
 /// Streaming-replacement state. Buffers tool-call `function.arguments`
 /// fragments per `tool_calls[i].index` so the response rewrite can run against
 /// the complete argument JSON instead of partial fragments — partial-fragment
@@ -436,6 +478,25 @@ fn extract_content_delta(chunk: &serde_json::Value) -> Option<&str> {
 struct StreamReplState {
     /// Rewritten text content accumulator for end-of-stream logging.
     pub accumulator: String,
+    /// Whether any response-scope replacement rules exist. When false (the common
+    /// case) text streams through untouched with zero buffering. When true, text
+    /// is buffered in `text_buffer` and rewritten once at end of stream — see the
+    /// note on `text_buffer`.
+    has_response_rules: bool,
+    /// RAW (pre-rewrite) assistant text buffered ONLY when `has_response_rules`.
+    ///
+    /// Streaming text replacement is deliberately deferred to end-of-stream when
+    /// rules are active. Doing it incrementally and correctly is surprisingly
+    /// hard: a search string can straddle chunk boundaries, and length-changing
+    /// or overlapping ordered rules (e.g. `ab→Q`, `a→LONG`) make any "emit a
+    /// stable prefix" scheme either emit text a later chunk should have rewritten
+    /// or slice a rewritten string at a non-char boundary (panic). Buffering the
+    /// whole response and applying `apply_response` once is simple, correct, and
+    /// O(n·rules) rather than O(n²). The cost — text is not streamed
+    /// incrementally while replacement rules are configured — is acceptable
+    /// because replacement is opt-in and rare. Bounded by one response's length
+    /// (the same text `accumulator` already holds).
+    text_buffer: String,
     /// Raw (pre-rewrite) per-tool-call argument buffers, keyed by index.
     tool_args: std::collections::BTreeMap<u64, String>,
     /// Static OAI chunk header fields used when emitting synthetic flush chunks.
@@ -445,9 +506,16 @@ struct StreamReplState {
 }
 
 impl StreamReplState {
-    fn new(chat_id: String, created: u64, model: String) -> Self {
+    fn new(
+        chat_id: String,
+        created: u64,
+        model: String,
+        repl: &crate::replacements::Replacements,
+    ) -> Self {
         Self {
             accumulator: String::new(),
+            has_response_rules: repl.max_response_search_len() > 0,
+            text_buffer: String::new(),
             tool_args: std::collections::BTreeMap::new(),
             chat_id,
             created,
@@ -455,24 +523,55 @@ impl StreamReplState {
         }
     }
 
-    /// Process a chunk. Returns the chunks to emit downstream (typically just
-    /// the rewritten chunk; when `finish_reason` arrives, synthetic flush
-    /// chunks carrying the rewritten tool-call args are emitted first).
+    /// Build a content-delta chunk carrying `text`.
+    fn text_chunk(&self, text: String) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.chat_id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "delta": { "content": text },
+                "finish_reason": null,
+            }]
+        })
+    }
+
+    /// Process a chunk. Returns the chunks to emit downstream.
+    ///
+    /// With no response rules, text and tool-call argument chunks pass through
+    /// unchanged (the common, zero-overhead path). With response rules, non-empty
+    /// text content is stripped and the buffered text is rewritten and emitted as
+    /// one chunk at end of stream (see `text_buffer`); tool-call argument
+    /// fragments are likewise buffered per index and the complete arguments
+    /// rewritten at end of stream. Tool-call *names* are rewritten in place.
     fn process(
         &mut self,
         mut chunk: serde_json::Value,
         repl: &crate::replacements::Replacements,
     ) -> Vec<serde_json::Value> {
         if let Some(text) = extract_content_delta(&chunk).map(str::to_string) {
-            let replaced = repl.apply_response(&text);
-            self.accumulator.push_str(&replaced);
-            if let Some(delta) = chunk
-                .get_mut("choices")
-                .and_then(|c| c.as_array_mut())
-                .and_then(|arr| arr.first_mut())
-                .and_then(|c| c.get_mut("delta"))
-            {
-                delta["content"] = serde_json::Value::String(replaced);
+            // Only divert NON-EMPTY content. An empty content delta (notably the
+            // role-opener `{"role":"assistant","content":""}`) must pass through
+            // unchanged: stripping it would drop the `content:""` some strict OAI
+            // clients rely on to initialize their content accumulator.
+            if self.has_response_rules && !text.is_empty() {
+                // Defer rewriting to end of stream: buffer the raw text and strip
+                // content from this chunk so nothing is emitted half-rewritten.
+                self.text_buffer.push_str(&text);
+                if let Some(delta) = chunk
+                    .get_mut("choices")
+                    .and_then(|c| c.as_array_mut())
+                    .and_then(|arr| arr.first_mut())
+                    .and_then(|c| c.get_mut("delta"))
+                    .and_then(|d| d.as_object_mut())
+                {
+                    delta.remove("content");
+                }
+            } else {
+                // No rules (or empty content): stream through; track for logging.
+                self.accumulator.push_str(&text);
             }
         }
 
@@ -491,11 +590,18 @@ impl StreamReplState {
                         && let Some(s) = name.as_str() {
                             *name = serde_json::Value::String(repl.apply_response(s));
                         }
-                    if let Some(idx) = index
-                        && let Some(args) = function.get("arguments").and_then(|v| v.as_str()) {
-                            self.tool_args.entry(idx).or_default().push_str(args);
-                            function.remove("arguments");
-                        }
+                    // Buffer arguments for end-of-stream rewriting ONLY when
+                    // response rules exist and the fragment is non-empty. Otherwise
+                    // let fragments (including the `arguments:""` open sentinel)
+                    // stream through incrementally as OAI clients expect.
+                    if self.has_response_rules
+                        && let Some(idx) = index
+                        && let Some(args) = function.get("arguments").and_then(|v| v.as_str())
+                        && !args.is_empty()
+                    {
+                        self.tool_args.entry(idx).or_default().push_str(args);
+                        function.remove("arguments");
+                    }
                 }
             }
         }
@@ -510,16 +616,42 @@ impl StreamReplState {
 
         let mut out: Vec<serde_json::Value> = Vec::new();
         if has_finish {
+            // Flush any buffered text first (so the client sees the full content
+            // before the terminal chunk), then the buffered tool-call args.
+            out.extend(self.flush_pending_text(repl));
             out.extend(self.drain_flushed(repl));
         }
-        out.push(chunk);
+        // Push the (possibly content-stripped) chunk, unless stripping left an
+        // empty delta with no terminal signal — emitting a bare `delta:{}` chunk
+        // is pointless and some clients mis-sequence it.
+        if has_finish || !chunk_delta_is_empty(&chunk) {
+            out.push(chunk);
+        }
         out
     }
 
-    /// Flush any leftover buffered args (called after the upstream loop exits,
+    /// Apply response rules over the buffered text once and emit it as a single
+    /// content chunk. No-op when there are no response rules (text already
+    /// streamed through) or the buffer is empty.
+    fn flush_pending_text(
+        &mut self,
+        repl: &crate::replacements::Replacements,
+    ) -> Vec<serde_json::Value> {
+        if self.text_buffer.is_empty() {
+            return vec![];
+        }
+        let rewritten = repl.apply_response(&self.text_buffer);
+        self.text_buffer.clear();
+        self.accumulator.push_str(&rewritten);
+        vec![self.text_chunk(rewritten)]
+    }
+
+    /// Flush leftover buffered text + args (called after the upstream loop exits,
     /// covering streams that ended without a `finish_reason`).
     fn flush(&mut self, repl: &crate::replacements::Replacements) -> Vec<serde_json::Value> {
-        self.drain_flushed(repl)
+        let mut out = self.flush_pending_text(repl);
+        out.extend(self.drain_flushed(repl));
+        out
     }
 
     fn drain_flushed(
@@ -529,7 +661,7 @@ impl StreamReplState {
         std::mem::take(&mut self.tool_args)
             .into_iter()
             .map(|(index, raw)| {
-                let rewritten = repl.apply_response(&raw);
+                let rewritten = apply_response_to_args_string(&raw, repl);
                 serde_json::json!({
                     "id": self.chat_id,
                     "object": "chat.completion.chunk",
@@ -555,11 +687,14 @@ impl StreamReplState {
 
 fn map_upstream_err(e: UpstreamError) -> AppError {
     let surface = e.surface_status();
+    // Bound every client-facing message: a parsed Anthropic error message or a
+    // raw Display string can both be arbitrarily large. The full detail is still
+    // available server-side via tracing on the error paths.
     let mut msg = match &e {
         UpstreamError::Anthropic {
             parsed: Some(p), ..
-        } => p.error.message.clone(),
-        _ => e.to_string(),
+        } => truncate_for_client(&p.error.message),
+        _ => truncate_for_client(&e.to_string()),
     };
     // Anthropic frequently returns the literal string "Error" as the
     // message; surface enough context for operators.
@@ -572,7 +707,9 @@ fn map_upstream_err(e: UpstreamError) -> AppError {
         {
             msg = format!(
                 "upstream {} ({}): {}",
-                status, p.error.kind, p.error.message
+                status,
+                p.error.kind,
+                truncate_for_client(&p.error.message)
             );
         } else if let UpstreamError::Anthropic { status, body, .. } = &e {
             // Bound the raw upstream body before surfacing it to the client;
@@ -778,8 +915,15 @@ fn apply_replacements_outbound(
             if let Some(d) = t.description.as_mut() {
                 *d = repl.apply_prompt(d);
             }
-            apply_prompt_to_json(&mut t.input_schema, repl);
+            apply_prompt_to_schema(&mut t.input_schema, repl);
         }
+    }
+    // A forced tool_choice carries the tool name too; it must be masked with the
+    // same prompt rules as tools[].name, or the names will not match and
+    // Anthropic rejects the request.
+    if let Some(crate::translate::anthropic::ToolChoice::Tool { name, .. }) = req.tool_choice.as_mut()
+    {
+        *name = repl.apply_prompt(name);
     }
 }
 
@@ -824,6 +968,74 @@ fn apply_prompt_to_json(value: &mut serde_json::Value, repl: &crate::replacement
     }
 }
 
+/// Apply prompt-scope rules to a JSON Schema, touching only the natural-language
+/// fields (`description`, `title`) wherever they appear in the schema tree. The
+/// structural strings of a schema — `"type": "string"`, `enum` values, `format`,
+/// `pattern`, property *names* — must not be rewritten, or a rule like
+/// `string -> text` would turn a valid schema into an invalid one and Anthropic
+/// would 400 the request.
+fn apply_prompt_to_schema(value: &mut serde_json::Value, repl: &crate::replacements::Replacements) {
+    match value {
+        serde_json::Value::Object(obj) => {
+            for (key, v) in obj.iter_mut() {
+                if (key == "description" || key == "title")
+                    && let serde_json::Value::String(s) = v
+                {
+                    *s = repl.apply_prompt(s);
+                } else {
+                    apply_prompt_to_schema(v, repl);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                apply_prompt_to_schema(v, repl);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Apply response-scope rules to the string leaves of a JSON value, leaving
+/// object keys and structural punctuation untouched (mirror of
+/// `apply_prompt_to_json` for the inbound direction).
+fn apply_response_to_json(value: &mut serde_json::Value, repl: &crate::replacements::Replacements) {
+    match value {
+        serde_json::Value::String(s) => *s = repl.apply_response(s),
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                apply_response_to_json(v, repl);
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            for (_, v) in obj.iter_mut() {
+                apply_response_to_json(v, repl);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Rewrite a tool-call `arguments` string (which carries serialized JSON) by
+/// applying response rules only to its JSON string *values*, never to keys or
+/// structural characters. This prevents a rule whose search/replace contains
+/// JSON metacharacters from producing a syntactically broken `arguments` string
+/// the client cannot parse. If `args` is not valid JSON (e.g. a truncated
+/// upstream tool call), fall back to a plain whole-string replacement so partial
+/// args are still rewritten rather than dropped.
+fn apply_response_to_args_string(
+    args: &str,
+    repl: &crate::replacements::Replacements,
+) -> String {
+    match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(mut value) => {
+            apply_response_to_json(&mut value, repl);
+            serde_json::to_string(&value).unwrap_or_else(|_| repl.apply_response(args))
+        }
+        Err(_) => repl.apply_response(args),
+    }
+}
+
 fn apply_replacements_inbound(
     resp: &mut serde_json::Value,
     repl: &crate::replacements::Replacements,
@@ -849,7 +1061,7 @@ fn apply_replacements_inbound(
                         }
                     if let Some(args) = function.get_mut("arguments")
                         && let Some(s) = args.as_str() {
-                            *args = serde_json::Value::String(repl.apply_response(s));
+                            *args = serde_json::Value::String(apply_response_to_args_string(s, repl));
                         }
                 }
             }
@@ -1357,5 +1569,352 @@ mod tests {
             assert_eq!(texts[1], profile.system_preamble);
             assert_eq!(texts[2], "consumer system");
         }
+    }
+
+    // A response rule that masks a tool name (or any token) must rewrite only the
+    // JSON *values* inside tool-call arguments, never structural characters, so the
+    // client always receives parseable JSON. Regression for the inbound path that
+    // previously ran the rule over the whole serialized arguments string.
+    #[test]
+    fn response_rule_rewrites_arg_values_without_breaking_json() {
+        let repl = crate::replacements::Replacements::parse_for_test(
+            r#"
+            [[rule]]
+            scope = "response"
+            search = "WriteFile"
+            replace = "fs_write"
+            "#,
+        )
+        .unwrap();
+
+        // The tool name appears both as a value and embedded in another value.
+        let args = r#"{"tool":"WriteFile","note":"call WriteFile now"}"#;
+        let out = apply_response_to_args_string(args, &repl);
+
+        // Still valid JSON, structure intact, values rewritten.
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .expect("rewritten arguments must remain valid JSON");
+        assert_eq!(parsed["tool"], "fs_write");
+        assert_eq!(parsed["note"], "call fs_write now");
+    }
+
+    // A rule whose replacement contains JSON metacharacters would corrupt the
+    // arguments string under a blind whole-string replace; the leaf-aware path
+    // must keep the surrounding structure intact.
+    #[test]
+    fn response_rule_with_metachars_does_not_corrupt_structure() {
+        let repl = crate::replacements::Replacements::parse_for_test(
+            r#"
+            [[rule]]
+            scope = "response"
+            search = "X"
+            replace = "a\"b"
+            "#,
+        )
+        .unwrap();
+
+        let args = r#"{"k":"X"}"#;
+        let out = apply_response_to_args_string(args, &repl);
+
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .expect("metachar replacement must not break JSON structure");
+        // The value carries the literal replacement (with the embedded quote),
+        // and there is still exactly one key.
+        assert_eq!(parsed["k"], "a\"b");
+        assert_eq!(parsed.as_object().unwrap().len(), 1);
+    }
+
+    // Invalid/partial JSON args (e.g. a truncated upstream tool call) fall back to
+    // a plain whole-string replacement rather than being dropped.
+    #[test]
+    fn response_rule_falls_back_on_invalid_json_args() {
+        let repl = crate::replacements::Replacements::parse_for_test(
+            r#"
+            [[rule]]
+            scope = "response"
+            search = "foo"
+            replace = "bar"
+            "#,
+        )
+        .unwrap();
+
+        let partial = r#"{"k":"foo"#; // unterminated
+        let out = apply_response_to_args_string(partial, &repl);
+        assert_eq!(out, r#"{"k":"bar"#);
+    }
+
+    // Outbound prompt rules must rewrite only natural-language schema fields
+    // (description/title), never structural strings like the "type" value, or a
+    // tool-name mask like string->text would produce an invalid JSON Schema that
+    // Anthropic rejects.
+    #[test]
+    fn prompt_rule_rewrites_schema_descriptions_not_structure() {
+        let repl = crate::replacements::Replacements::parse_for_test(
+            r#"
+            [[rule]]
+            scope = "prompt"
+            search = "string"
+            replace = "text"
+            "#,
+        )
+        .unwrap();
+
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "a string path"
+                }
+            }
+        });
+        apply_prompt_to_schema(&mut schema, &repl);
+
+        // Structural values untouched...
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["path"]["type"], "string");
+        // ...natural-language description rewritten.
+        assert_eq!(schema["properties"]["path"]["description"], "a text path");
+    }
+
+    // A forced tool_choice carries the tool name; it must be masked with the same
+    // prompt rules as tools[].name so the two names match (else Anthropic 400s).
+    #[test]
+    fn outbound_masks_tool_choice_name_to_match_tool_name() {
+        use crate::translate::anthropic::{MessagesRequest, ToolChoice};
+
+        let repl = crate::replacements::Replacements::parse_for_test(
+            r#"
+            [[rule]]
+            scope = "prompt"
+            search = "WriteFile"
+            replace = "fs_write"
+            "#,
+        )
+        .unwrap();
+
+        let mut req = MessagesRequest {
+            tool_choice: Some(ToolChoice::Tool {
+                name: "WriteFile".into(),
+                disable_parallel_tool_use: None,
+            }),
+            ..anthropic_request("hi")
+        };
+        apply_replacements_outbound(&mut req, &repl);
+
+        match req.tool_choice {
+            Some(ToolChoice::Tool { name, .. }) => assert_eq!(name, "fs_write"),
+            other => panic!("expected forced tool, got {other:?}"),
+        }
+    }
+
+    // Build a streaming content-delta chunk.
+    fn content_chunk(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+        })
+    }
+
+    // Concatenate the content deltas out of a sequence of emitted chunks.
+    fn collect_content(chunks: &[serde_json::Value]) -> String {
+        let mut s = String::new();
+        for c in chunks {
+            if let Some(t) = c["choices"][0]["delta"]["content"].as_str() {
+                s.push_str(t);
+            }
+        }
+        s
+    }
+
+    // A response rule whose search string is split across two streamed chunks
+    // must still be rewritten — the buffered look-back makes streaming match the
+    // non-streaming behavior. Regression for the per-chunk-only replacement.
+    #[test]
+    fn streaming_replacement_matches_across_chunk_boundary() {
+        let repl = crate::replacements::Replacements::parse_for_test(
+            r#"
+            [[rule]]
+            scope = "response"
+            search = "foobar"
+            replace = "X"
+            "#,
+        )
+        .unwrap();
+
+        let mut state = StreamReplState::new("id".into(), 0, "m".into(), &repl);
+        let mut out = Vec::new();
+        // "foo" then "bar" arrive in separate chunks; "foobar" straddles them.
+        out.extend(state.process(content_chunk("foo"), &repl));
+        out.extend(state.process(content_chunk("bar"), &repl));
+        // End of stream flushes any held-back tail.
+        out.extend(state.flush(&repl));
+
+        assert_eq!(collect_content(&out), "X");
+        assert_eq!(state.accumulator, "X");
+    }
+
+    // Text not part of any match still streams through, and the final flush emits
+    // the held-back remainder exactly once.
+    #[test]
+    fn streaming_replacement_passes_through_unmatched_text() {
+        let repl = crate::replacements::Replacements::parse_for_test(
+            r#"
+            [[rule]]
+            scope = "response"
+            search = "foobar"
+            replace = "X"
+            "#,
+        )
+        .unwrap();
+
+        let mut state = StreamReplState::new("id".into(), 0, "m".into(), &repl);
+        let mut out = Vec::new();
+        out.extend(state.process(content_chunk("hello "), &repl));
+        out.extend(state.process(content_chunk("world"), &repl));
+        out.extend(state.flush(&repl));
+
+        assert_eq!(collect_content(&out), "hello world");
+    }
+
+    // The core invariant: for ANY way the text is split into chunks, the
+    // concatenated streamed output equals the non-streaming rewrite of the whole
+    // text. Exercises every split point of a string containing overlapping and
+    // adjacent matches.
+    #[test]
+    fn streaming_replacement_equals_nonstreaming_for_every_split() {
+        let repl = crate::replacements::Replacements::parse_for_test(
+            r#"
+            [[rule]]
+            scope = "response"
+            search = "ab"
+            replace = "Z"
+
+            [[rule]]
+            scope = "response"
+            search = "abc"
+            replace = "Q"
+            "#,
+        )
+        .unwrap();
+
+        let full = "xabcabxababcy";
+        let expected = repl.apply_response(full);
+
+        let chars: Vec<char> = full.chars().collect();
+        for split in 0..=chars.len() {
+            let (a, b): (String, String) = (
+                chars[..split].iter().collect(),
+                chars[split..].iter().collect(),
+            );
+            let mut state = StreamReplState::new("id".into(), 0, "m".into(), &repl);
+            let mut out = Vec::new();
+            if !a.is_empty() {
+                out.extend(state.process(content_chunk(&a), &repl));
+            }
+            if !b.is_empty() {
+                out.extend(state.process(content_chunk(&b), &repl));
+            }
+            out.extend(state.flush(&repl));
+            assert_eq!(
+                collect_content(&out),
+                expected,
+                "split at {split} ({a:?} | {b:?}) diverged from non-streaming"
+            );
+        }
+    }
+
+    // Length-changing overlapping ordered rules across a chunk boundary: a prior
+    // incremental scheme emitted a partial rewrite (and could panic slicing a
+    // multibyte boundary). Buffering to end-of-stream makes streaming match
+    // non-streaming exactly. Regression for both prior HIGH bugs.
+    #[test]
+    fn streaming_replacement_handles_length_changing_rules_across_chunks() {
+        let repl = crate::replacements::Replacements::parse_for_test(
+            r#"
+            [[rule]]
+            scope = "response"
+            search = "ab"
+            replace = "é"
+
+            [[rule]]
+            scope = "response"
+            search = "a"
+            replace = "LONG"
+            "#,
+        )
+        .unwrap();
+
+        let mut state = StreamReplState::new("id".into(), 0, "m".into(), &repl);
+        let mut out = Vec::new();
+        out.extend(state.process(content_chunk("a"), &repl));
+        out.extend(state.process(content_chunk("b"), &repl));
+        out.extend(state.flush(&repl));
+
+        // Non-streaming: "ab" -> "é" (first rule wins on the combined buffer).
+        assert_eq!(collect_content(&out), repl.apply_response("ab"));
+        assert_eq!(collect_content(&out), "é");
+    }
+
+    // Even with response rules active, the role-opener's empty `content:""` must
+    // pass through unstripped (strict OAI clients use it to init their content
+    // accumulator). Regression: previously stripped to `{"role":"assistant"}`.
+    #[test]
+    fn role_opener_keeps_empty_content_under_response_rules() {
+        let repl = crate::replacements::Replacements::parse_for_test(
+            r#"
+            [[rule]]
+            scope = "response"
+            search = "foo"
+            replace = "bar"
+            "#,
+        )
+        .unwrap();
+
+        let role_chunk = serde_json::json!({
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]
+        });
+        let mut state = StreamReplState::new("id".into(), 0, "m".into(), &repl);
+        let out = state.process(role_chunk, &repl);
+
+        assert_eq!(out.len(), 1, "role chunk passes through");
+        assert_eq!(out[0]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(
+            out[0]["choices"][0]["delta"]["content"], "",
+            "empty content must be preserved, not stripped"
+        );
+    }
+
+    // With NO response rules, tool-call argument fragments (including the
+    // `arguments:""` open sentinel) stream through incrementally rather than
+    // being buffered to end-of-stream. Regression for unconditional arg buffering.
+    #[test]
+    fn tool_args_stream_through_without_response_rules() {
+        // Prompt-only rule => has_response_rules is false.
+        let repl = crate::replacements::Replacements::parse_for_test(
+            r#"
+            [[rule]]
+            scope = "prompt"
+            search = "x"
+            replace = "y"
+            "#,
+        )
+        .unwrap();
+
+        let arg_chunk = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"a\":1}"}}]},
+                "finish_reason": null
+            }]
+        });
+        let mut state = StreamReplState::new("id".into(), 0, "m".into(), &repl);
+        let out = state.process(arg_chunk, &repl);
+
+        // The arguments fragment must still be present (not buffered away).
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            "{\"a\":1}"
+        );
     }
 }

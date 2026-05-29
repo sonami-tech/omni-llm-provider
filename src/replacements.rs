@@ -109,6 +109,17 @@ impl Replacements {
         apply_rules(text, &self.response_rules)
     }
 
+    /// Length in bytes of the longest response-rule search string, or 0 if there
+    /// are no response rules. Used by the streaming path to size the look-back
+    /// buffer so a search string split across chunks still matches.
+    pub fn max_response_search_len(&self) -> usize {
+        self.response_rules
+            .iter()
+            .map(|r| r.search.len())
+            .max()
+            .unwrap_or(0)
+    }
+
     #[cfg(test)]
     pub(crate) fn parse_for_test(toml_str: &str) -> Result<Self, String> {
         Self::parse(toml_str)
