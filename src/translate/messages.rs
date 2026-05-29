@@ -99,22 +99,28 @@ pub fn reshape(messages: &[ChatMessage]) -> Result<Reshaped, AppError> {
 			"tool" | "function" => {
 				// Anthropic spec: tool_result content blocks live inside a
 				// `user` message. Coalesce consecutive tool messages.
-				let mut blocks = vec![tool_or_user_block(m)?];
+				let mut blocks: Vec<ContentBlock> = Vec::new();
+				blocks.extend(tool_or_user_block(m)?);
 				let mut peek = idx + 1;
 				while peek < messages.len() {
 					let next = &messages[peek];
 					if matches!(next.role.as_str(), "tool" | "function") {
-						blocks.push(tool_or_user_block(next)?);
+						blocks.extend(tool_or_user_block(next)?);
 						peek += 1;
 					} else {
 						break;
 					}
 				}
-				out.push(Message {
-					role: "user".into(),
-					content: MessageContent::Blocks(blocks),
-				});
-				has_user = true;
+				// Only emit a user turn if the coalesced block list is
+				// non-empty; an all-empty tool batch would otherwise produce
+				// a user message with zero content blocks (Anthropic rejects).
+				if !blocks.is_empty() {
+					out.push(Message {
+						role: "user".into(),
+						content: MessageContent::Blocks(blocks),
+					});
+					has_user = true;
+				}
 				idx = peek;
 				continue;
 			}
@@ -168,14 +174,13 @@ fn translate_parts(parts: &[ContentPart]) -> Result<Vec<ContentBlock>, AppError>
 	for part in parts {
 		match part.part_type.as_deref() {
 			Some("text") | None => {
-				if let Some(text) = &part.text {
-					if !text.is_empty() {
+				if let Some(text) = &part.text
+					&& !text.is_empty() {
 						out.push(ContentBlock::Text {
 							text: text.clone(),
 							cache_control: None,
 						});
 					}
-				}
 			}
 			Some("image_url") => {
 				// OAI image_url shape: {type:"image_url", image_url:{url:"data:image/png;base64,..."}}
@@ -281,15 +286,23 @@ fn tool_result_block(m: &ChatMessage) -> Result<ContentBlock, AppError> {
 	})
 }
 
-fn tool_or_user_block(m: &ChatMessage) -> Result<ContentBlock, AppError> {
+/// Translate a single `tool`/`function` message into zero or one content
+/// blocks. A message with a `tool_call_id` becomes a `tool_result`; one
+/// without is treated as plain user text. Empty text yields no block so the
+/// caller never emits an empty (Anthropic-rejected) text block.
+fn tool_or_user_block(m: &ChatMessage) -> Result<Vec<ContentBlock>, AppError> {
 	if m.tool_call_id.is_some() {
-		tool_result_block(m)
+		Ok(vec![tool_result_block(m)?])
 	} else {
 		let text = extract_text(&m.content);
-		Ok(ContentBlock::Text {
-			text,
-			cache_control: None,
-		})
+		if text.is_empty() {
+			Ok(vec![])
+		} else {
+			Ok(vec![ContentBlock::Text {
+				text,
+				cache_control: None,
+			}])
+		}
 	}
 }
 
@@ -326,6 +339,56 @@ mod tests {
 			reasoning_content,
 			reasoning_content_blocks,
 			..Default::default()
+		}
+	}
+
+	fn user_msg(text: &str) -> ChatMessage {
+		ChatMessage {
+			role: "user".into(),
+			content: Some(crate::translate::request::MessageContent::Text(text.into())),
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn empty_tool_message_does_not_emit_empty_text_block() {
+		// A tool/function message with no tool_call_id and empty content must
+		// not produce a {"type":"text","text":""} block (Anthropic rejects
+		// empty text blocks).
+		let msgs = vec![
+			user_msg("hi"),
+			ChatMessage { role: "tool".into(), content: Some(crate::translate::request::MessageContent::Text(String::new())), ..Default::default() },
+		];
+		let reshaped = reshape(&msgs).unwrap();
+		// The empty tool batch yields no user turn; only the original user msg.
+		assert_eq!(reshaped.messages.len(), 1);
+		for m in &reshaped.messages {
+			if let MessageContent::Blocks(blocks) = &m.content {
+				for b in blocks {
+					if let ContentBlock::Text { text, .. } = b {
+						assert!(!text.is_empty(), "no empty text block may be emitted");
+					}
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn tool_result_with_id_is_still_emitted_when_empty() {
+		// A real tool_result (has tool_call_id) with empty content is valid:
+		// it becomes a tool_result block with content:None, NOT dropped.
+		let msgs = vec![
+			user_msg("hi"),
+			ChatMessage { role: "tool".into(), tool_call_id: Some("t1".into()), content: Some(crate::translate::request::MessageContent::Text(String::new())), ..Default::default() },
+		];
+		let reshaped = reshape(&msgs).unwrap();
+		assert_eq!(reshaped.messages.len(), 2);
+		match &reshaped.messages[1].content {
+			MessageContent::Blocks(blocks) => {
+				assert_eq!(blocks.len(), 1);
+				assert!(matches!(blocks[0], ContentBlock::ToolResult { content: None, .. }));
+			}
+			_ => panic!("expected blocks"),
 		}
 	}
 

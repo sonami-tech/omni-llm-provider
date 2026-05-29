@@ -31,22 +31,37 @@ pub fn translate_tools(tools: &[ToolDefinition]) -> Result<Vec<Tool>, AppError> 
 	Ok(out)
 }
 
-pub fn translate_tool_choice(choice: &Option<OaiToolChoice>) -> Option<ToolChoice> {
+/// Translate an OpenAI tool_choice into the Anthropic shape. `disable_parallel`
+/// carries OpenAI `parallel_tool_calls: false` onto the modes where Anthropic
+/// accepts `disable_parallel_tool_use` (auto / any / specific tool).
+pub fn translate_tool_choice(
+	choice: &Option<OaiToolChoice>,
+	disable_parallel: Option<bool>,
+) -> Option<ToolChoice> {
+	// Anthropic only accepts the flag as `true` (false is the default and is
+	// rejected by some API versions); send Some(true) or omit.
+	let dptu = if disable_parallel == Some(true) { Some(true) } else { None };
 	match choice {
-		None => None, // omit field; Anthropic defaults to auto
+		// No explicit choice: Anthropic defaults to auto. Normally we omit the
+		// field, but if the caller asked to disable parallel tool use we must
+		// emit an explicit `auto` carrying the flag, since there is nowhere
+		// else to attach it.
+		None => dptu.map(|_| ToolChoice::Auto {
+			disable_parallel_tool_use: dptu,
+		}),
 		Some(OaiToolChoice::Mode(s)) => match s.as_str() {
 			"auto" => Some(ToolChoice::Auto {
-				disable_parallel_tool_use: None,
+				disable_parallel_tool_use: dptu,
 			}),
 			"none" => Some(ToolChoice::None {}),
 			"required" | "any" => Some(ToolChoice::Any {
-				disable_parallel_tool_use: None,
+				disable_parallel_tool_use: dptu,
 			}),
 			_ => None,
 		},
 		Some(OaiToolChoice::Specific { function, .. }) => Some(ToolChoice::Tool {
 			name: function.name.clone(),
-			disable_parallel_tool_use: None,
+			disable_parallel_tool_use: dptu,
 		}),
 	}
 }

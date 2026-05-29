@@ -16,14 +16,17 @@ pub fn build_oai_response(
 	let mut reasoning_blocks: Vec<Value> = Vec::new();
 	let mut tool_calls: Vec<Value> = Vec::new();
 
-	for (i, block) in resp.content.iter().enumerate() {
+	// Non-streaming OpenAI `message.tool_calls[]` has no `index` field
+	// (index belongs to streaming deltas only). Omitting it also keeps
+	// this path consistent with the streaming converter, which assigns a
+	// 0-based per-tool index rather than the Anthropic content-block index.
+	for block in resp.content.iter() {
 		match block {
 			ResponseContentBlock::Text { text } => {
 				text_parts.push(text.clone());
 			}
 			ResponseContentBlock::ToolUse { id, name, input } => {
 				tool_calls.push(json!({
-					"index": i,
 					"id": id,
 					"type": "function",
 					"function": {
@@ -82,7 +85,8 @@ pub fn build_oai_response(
 		"completion_tokens".into(),
 		Value::Number(resp.usage.output_tokens.into()),
 	);
-	let total = resp.usage.input_tokens + resp.usage.output_tokens;
+	// u64 to avoid overflow on pathological/hostile usage values.
+	let total = resp.usage.input_tokens as u64 + resp.usage.output_tokens as u64;
 	usage.insert("total_tokens".into(), Value::Number(total.into()));
 	if let Some(c) = resp.usage.cache_creation_input_tokens {
 		usage.insert("cache_write_tokens".into(), Value::Number(c.into()));
@@ -157,6 +161,23 @@ mod tests {
 				"signature": "sig-123",
 			}])
 		);
+	}
+
+	#[test]
+	fn tool_calls_have_no_index_even_after_thinking_and_text() {
+		// Regression (F17): non-streaming OpenAI message.tool_calls has no
+		// `index` field, and emitting the Anthropic content-block index would
+		// disagree with the streaming converter (0-based per-tool).
+		let resp = response_with(vec![
+			ResponseContentBlock::Thinking { thinking: "t".into(), signature: Some("s".into()) },
+			ResponseContentBlock::Text { text: "hi".into() },
+			ResponseContentBlock::ToolUse { id: "tu1".into(), name: "f".into(), input: serde_json::json!({}) },
+		]);
+		let out = build_oai_response(&resp, "c", 1, "m");
+		let calls = out["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+		assert_eq!(calls.len(), 1);
+		assert!(calls[0].get("index").is_none(), "non-streaming tool_calls must omit index");
+		assert_eq!(calls[0]["id"], "tu1");
 	}
 
 	#[test]

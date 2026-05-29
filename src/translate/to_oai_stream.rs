@@ -171,6 +171,13 @@ impl OaiStreamConverter {
 			StreamEvent::MessageStop => self.finish_chunks(),
 			StreamEvent::Ping => vec![],
 			StreamEvent::Error { kind, message } => {
+				// This is a terminal chunk: mark finish emitted so a later
+				// finalize_if_needed() (the stream may still hit EOF) does not
+				// append a second, contradictory finish_reason chunk.
+				if self.finish_emitted {
+					return vec![];
+				}
+				self.finish_emitted = true;
 				vec![json!({
 					"id": self.chat_id,
 					"object": "chat.completion.chunk",
@@ -336,7 +343,7 @@ impl OaiStreamConverter {
 			_ if has_tool_calls => "tool_calls",
 			_ => "stop",
 		};
-		let mut chunk = json!({
+		chunks.push(json!({
 			"id": self.chat_id,
 			"object": "chat.completion.chunk",
 			"created": self.created,
@@ -346,12 +353,33 @@ impl OaiStreamConverter {
 				"delta": {},
 				"finish_reason": finish_reason,
 			}]
-		});
+		}));
+
+		// OpenAI emits usage in a SEPARATE trailing chunk with an empty
+		// `choices` array (the official python client parses this trailer
+		// specially). Emit it after the finish chunk rather than gluing it
+		// onto a populated choices entry.
 		if let Some(usage) = self.usage_value() {
-			chunk["usage"] = usage;
+			chunks.push(json!({
+				"id": self.chat_id,
+				"object": "chat.completion.chunk",
+				"created": self.created,
+				"model": self.requested_model,
+				"choices": [],
+				"usage": usage,
+			}));
 		}
-		chunks.push(chunk);
 		chunks
+	}
+
+	/// Token usage observed so far (input from message_start, output from the
+	/// latest message_delta). Used by the streaming handler to record stats
+	/// after the stream completes.
+	pub fn token_usage(&self) -> (u32, u32) {
+		(
+			self.input_tokens.unwrap_or(0),
+			self.output_tokens.unwrap_or(0),
+		)
 	}
 
 	fn usage_value(&self) -> Option<Value> {
@@ -360,7 +388,8 @@ impl OaiStreamConverter {
 		Some(json!({
 			"prompt_tokens": prompt_tokens,
 			"completion_tokens": completion_tokens,
-			"total_tokens": prompt_tokens + completion_tokens,
+			// u64 sum: token counts are small in practice but guard overflow.
+			"total_tokens": prompt_tokens as u64 + completion_tokens as u64,
 		}))
 	}
 }
@@ -371,6 +400,32 @@ mod tests {
 
 	fn converter() -> OaiStreamConverter {
 		OaiStreamConverter::new("chatcmpl-test".into(), 123, "claude-test".into())
+	}
+
+	#[test]
+	fn usage_is_emitted_as_separate_trailer_with_empty_choices() {
+		// F14: OpenAI streaming usage is a trailing chunk with choices:[] —
+		// NOT glued onto the finish chunk.
+		let mut c = converter();
+		c.on_event(StreamEvent::MessageStart {
+			id: "m".into(), model: "claude-test".into(),
+			input_tokens: Some(10), output_tokens: Some(0),
+		});
+		c.on_event(StreamEvent::ContentBlockStart { index: 0, block: BlockStart::Text });
+		c.on_event(StreamEvent::ContentBlockDelta { index: 0, delta: BlockDelta::Text("hi".into()) });
+		c.on_event(StreamEvent::MessageDelta { stop_reason: Some("end_turn".into()), stop_sequence: None, output_tokens: Some(3) });
+		let finish = c.on_event(StreamEvent::MessageStop);
+
+		// Last two chunks: finish chunk (with finish_reason, no usage), then
+		// the usage trailer (empty choices).
+		let finish_chunk = &finish[finish.len() - 2];
+		let usage_chunk = &finish[finish.len() - 1];
+		assert_eq!(finish_chunk["choices"][0]["finish_reason"], "stop");
+		assert!(finish_chunk.get("usage").is_none(), "finish chunk must not carry usage");
+		assert_eq!(usage_chunk["choices"].as_array().unwrap().len(), 0);
+		assert_eq!(usage_chunk["usage"]["prompt_tokens"], 10);
+		assert_eq!(usage_chunk["usage"]["completion_tokens"], 3);
+		assert_eq!(usage_chunk["usage"]["total_tokens"], 13);
 	}
 
 	#[test]
@@ -419,6 +474,30 @@ mod tests {
 		assert!(chunks[0]["choices"][0]["delta"]
 			.get("reasoning_signature")
 			.is_none());
+	}
+
+	#[test]
+	fn anthropic_error_event_is_terminal_and_finalize_does_not_double_finish() {
+		let mut converter = converter();
+		converter.on_event(StreamEvent::MessageStart {
+			id: "m".into(),
+			model: "claude-test".into(),
+			input_tokens: Some(5),
+			output_tokens: Some(0),
+		});
+		let err_chunks = converter.on_event(StreamEvent::Error {
+			kind: "overloaded_error".into(),
+			message: "Overloaded".into(),
+		});
+		assert_eq!(err_chunks.len(), 1);
+		assert_eq!(err_chunks[0]["choices"][0]["finish_reason"], "error");
+
+		// EOF after a mid-stream error: must NOT emit a second finish chunk.
+		let after = converter.finalize_if_needed();
+		assert!(
+			after.is_empty(),
+			"finalize must not double-emit after a terminal error chunk: {after:?}"
+		);
 	}
 
 	#[test]

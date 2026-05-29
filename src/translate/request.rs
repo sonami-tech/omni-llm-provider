@@ -15,6 +15,10 @@ pub struct ChatCompletionRequest {
 	pub tools: Option<Vec<ToolDefinition>>,
 	#[serde(default)]
 	pub tool_choice: Option<ToolChoice>,
+	/// OpenAI `parallel_tool_calls`. When false, CCP sets Anthropic
+	/// `disable_parallel_tool_use: true` on the tool_choice.
+	#[serde(default)]
+	pub parallel_tool_calls: Option<bool>,
 	/// OpenAI's optional end-user identifier; used as a session-id fallback
 	/// when the `x-session-id` header is absent. See `routes::completions`.
 	#[serde(default)]
