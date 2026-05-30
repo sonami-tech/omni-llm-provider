@@ -34,9 +34,9 @@ from openai import AsyncOpenAI, BadRequestError, OpenAI
 
 
 DEFAULT_PROFILE = {
-	"name": "cc-2.1.154-sdk-cli",
-	"version": "2.1.154",
-	"say_ok_suffix": "cea",
+	"name": "cc-2.1.158-sdk-cli",
+	"version": "2.1.158",
+	"say_ok_suffix": "175",
 }
 CLAUDE_CODE_PREAMBLE = "You are Claude Code, Anthropic's official CLI for Claude."
 CCH_SEED = 0x4D659218E32A3268
@@ -597,13 +597,14 @@ class TestModelAliases:
 		)
 		assert resp.model == "claude-opus-4-6"
 
-	def test_unknown_model_falls_back_to_sonnet(self, client):
+	def test_unknown_model_falls_back_to_default(self, client):
 		resp = client.chat.completions.create(
 			model="gpt-4-turbo",
 			messages=[{"role": "user", "content": "Reply PONG"}],
 			stream=False,
 		)
-		assert "sonnet" in resp.model
+		# 2.1.158 default_model is opus (captured 2026-05-30); older profiles used sonnet.
+		assert "opus" in resp.model
 		assert "PONG" in resp.choices[0].message.content
 
 

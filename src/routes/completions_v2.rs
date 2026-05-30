@@ -1323,7 +1323,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_2_1_154_short_alias_body_defaults_match_capture() {
+    fn default_profile_short_alias_body_defaults_match_capture() {
         let replacements = crate::replacements::Replacements::empty();
         let cases = [
             ("opus", "claude-opus-4-8", 64_000, None, Some("high")),
@@ -1361,7 +1361,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_2_1_154_real_versioned_models_are_preserved_verbatim() {
+    fn default_profile_real_versioned_models_are_preserved_verbatim() {
         // Only real, Anthropic-acceptable versioned ids are forwarded verbatim:
         // exact catalog canonicals and model_wire_overrides keys.
         let replacements = crate::replacements::Replacements::empty();
@@ -1391,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_2_1_154_bare_family_names_resolve_to_canonical() {
+    fn default_profile_bare_family_names_resolve_to_canonical() {
         // Regression: bare family names and fake dated forms are NOT valid
         // Anthropic model ids. They must resolve to a real canonical, not be
         // forwarded verbatim (which produced live 400s: "model: claude-sonnet").
@@ -1424,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_2_1_154_explicit_model_body_defaults_match_capture() {
+    fn default_profile_explicit_model_body_defaults_match_capture() {
         let replacements = crate::replacements::Replacements::empty();
         let cases = [
             ("claude-opus-4-8", 64_000, None, Some("high")),
@@ -1515,7 +1515,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_2_1_154_unknown_non_claude_model_still_falls_back_to_sonnet() {
+    fn default_profile_unknown_non_claude_model_still_falls_back_to_default() {
         let req = chat_request("gpt-4");
         let model_def = default_profile().resolve_model(&req.model);
         let anth_req = build_outbound_messages_request(
@@ -1528,7 +1528,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(anth_req.model, "claude-sonnet-4-6");
+        // 2.1.158 default_model is opus (captured), so an unknown model
+        // canonicalizes to opus-4-8 rather than the old sonnet default.
+        assert_eq!(anth_req.model, "claude-opus-4-8");
     }
 
     #[test]
@@ -1552,7 +1554,7 @@ mod tests {
         assert_eq!(json.matches("x-anthropic-billing-header:").count(), 1);
         assert_eq!(json.matches("cc_entrypoint=sdk-cli; cch=00000;").count(), 0);
 		assert!(json.contains(
-			"x-anthropic-billing-header: cc_version=2.1.154.cea; cc_entrypoint=sdk-cli; cch="
+			"x-anthropic-billing-header: cc_version=2.1.158.175; cc_entrypoint=sdk-cli; cch="
 		));
     }
 

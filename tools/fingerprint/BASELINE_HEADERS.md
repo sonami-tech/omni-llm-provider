@@ -1,14 +1,15 @@
 # claude CLI baseline wire fingerprint
 
-Active baseline: 2026-05-28 against local Claude Code 2.1.154. CCP keeps coherent compatibility profiles for 2.1.142 and newer only:
+Active baseline: 2026-05-30 against local Claude Code 2.1.158 (re-baselined per REBASELINE.md + capture_baseline.sh). CCP keeps coherent compatibility profiles for 2.1.142 and newer only:
 
 | Profile | Claude Code | SDK package | Runtime | Entrypoint | Source |
 |---|---|---|---|---|---|
+| `cc-2.1.158-sdk-cli` | `2.1.158` | `0.94.0` | `v24.3.0` | `sdk-cli` | mitmproxy reverse-proxy capture (haiku/sonnet/opus + default), 2026-05-30 |
 | `cc-2.1.154-sdk-cli` | `2.1.154` | `0.94.0` | `v24.3.0` | `sdk-cli` | local `ANTHROPIC_BASE_URL` fake-server probe, 2026-05-28 |
 | `cc-2.1.150-sdk-cli` | `2.1.150` | `0.94.0` | `v24.3.0` | `sdk-cli` | local MITM reverse-proxy probe, 2026-05-25 |
 | `cc-2.1.142-sdk-cli` | `2.1.142` | `0.94.0` | `v24.3.0` | `sdk-cli` | local debug probe, 2026-05-15 |
 
-`latest` resolves to `cc-2.1.154-sdk-cli`, the newest known-good pinned profile. Do not make the default an automatic max-version calculation; only move `latest` after a profile has been re-baselined and live-smoked.
+`latest` resolves to `cc-2.1.158-sdk-cli`, the newest known-good pinned profile. Do not make the default an automatic max-version calculation; only move `latest` after a profile has been re-baselined and live-smoked.
 
 Source flow: `tools/fingerprint/scenarios/01-plain-text.flow`. Replay with:
 
@@ -48,6 +49,21 @@ The `?beta=true` query parameter is sent on every Messages request.
 
 ## anthropic-beta lists observed
 
+**Claude Code 2.1.158 DEFAULT (and opus resolution; captured with context-1m):**
+```
+claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11
+```
+
+**Claude Code 2.1.158 Sonnet reply:**
+```
+claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11
+```
+
+**Claude Code 2.1.158 Haiku reply:**
+```
+oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,extended-cache-ttl-2025-04-11
+```
+
 **Claude Code 2.1.154 default / Opus 4.8 reply:**
 ```
 claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11
@@ -86,8 +102,8 @@ retain their original default list.
   x-anthropic-billing-header: cc_version=2.1.154.cea; cc_entrypoint=sdk-cli; cch=00000;
   ```
   This is structured *as if* it were instruction text but is just claude's identity marker. CCP v2 emits this marker as the first system block, followed by the canonical Claude Code preamble block, before user-provided system content.
-- Claude Code 2.1.142, 2.1.150, and 2.1.154's visible attribution builder and debug log emit `cch=00000`, but the final HTTP body rewrites that sentinel to a deterministic five-hex checksum. CCP mirrors the recovered final-body algorithm for these pinned profiles: standard `xxHash64` over the exact serialized body bytes while `cch=00000` is still present, seed `0x4d659218e32a3268`, then `hash & 0xfffff` formatted as five lowercase hex digits. See `tools/fingerprint/CCH_ALGORITHM.md`.
-- The `cc_version` suffix is dynamic per request:
+- Claude Code 2.1.142, 2.1.150, 2.1.154, and 2.1.158's visible attribution builder and debug log emit `cch=00000`, but the final HTTP body rewrites that sentinel to a deterministic five-hex checksum. CCP mirrors the recovered final-body algorithm for these pinned profiles: standard `xxHash64` over the exact serialized body bytes while `cch=00000` is still present, seed `0x4d659218e32a3268`, then `hash & 0xfffff` formatted as five lowercase hex digits. See `tools/fingerprint/CCH_ALGORITHM.md`.
+- The `cc_version` suffix is dynamic per request (2.1.158 "Say OK" suffix = 175):
   ```
   suffix = sha256("59cf53e54c78" + chars + claude_version).hex()[0..3]
   chars = first_user_text[4] + first_user_text[7] + first_user_text[20]
@@ -96,17 +112,20 @@ retain their original default list.
 - `metadata.user_id` is a **JSON-encoded string** containing `{device_id, account_uuid, session_id}`. Anthropic accepts this opaquely.
 - Claude Code `--tools ""` still sends a non-empty default SDK tool surface;
   CCP only sends consumer-provided tools.
-- `temperature: 1`, `max_tokens: 32000` are Claude Code 2.1.154 defaults for
-  Sonnet and Haiku. Opus 4.8 omits temperature and uses `max_tokens: 64000`.
+- `temperature: 1`, `max_tokens: 32000` are Claude Code 2.1.154/2.1.158 defaults for
+  Sonnet and Haiku (confirmed in 2026-05-30 capture). Opus 4.8 omits temperature and uses `max_tokens: 64000`.
 - `stream: true` is the default; non-streaming is rare from the CLI.
+- 2.1.158 default_model (no --model) resolves to opus (observed: body "model":"claude-opus-4-8").
+- 2.1.158 catalog copied from 2.1.154 (no model-list GET in capture; bodies confirmed opus-4-8/sonnet-4-6/haiku-4-5 acceptance).
+- context-1m-2025-08-07 flag appears in some 2.1.158 DEFAULT/opus calls (included in 158 DEFAULT beta).
 
 ## Step 0 verification — confirmed working
 
-The Step 0 minimal request (Haiku 4-5, OAuth Bearer, anthropic-beta with claude-code+oauth, custom non-CC system prompt) returned 200 with these headers — proving CCP v2 doesn't need byte-exact fingerprint match to function. CCP now implements the recovered `cch` body checksum for active profiles.
+The Step 0 minimal request (Haiku 4-5, OAuth Bearer, anthropic-beta with claude-code+oauth, custom non-CC system prompt) returned 200 with these headers — proving CCP v2 doesn't need byte-exact fingerprint match to function. CCP now implements the recovered `cch` body checksum for active profiles (including 2.1.158).
 
 ## Remaining Baseline Work
 
 - Capture remaining 7 scenarios (with-tools, multi-turn, streaming, image, token-refresh, prompt-caching, errors).
 - Diff CCP v2 captures against this baseline.
 - Watch documented differences that have not blocked OAuth use so far, including omitted `tools: []`, omitted default `temperature: 1`, and CCP-specific body field ordering.
-- Run `tools/fingerprint/check_claude_code_drift.py` after Claude Code updates to detect installed-version or `cch` algorithm drift before moving `latest`.
+- Run `tools/fingerprint/check_claude_code_drift.py` after Claude Code updates to detect installed-version or `cch` algorithm drift before moving `latest`. (Current active: 2.1.158).

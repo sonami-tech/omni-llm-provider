@@ -83,6 +83,35 @@ pub static CATALOG_CC_2_1_154: &[ModelDef] = &[
 	},
 ];
 
+/// 2.1.158 catalog: identical to 2.1.154 (no model-list GET was present in the
+/// 2026-05-30 capture, so no confirmed renames or window changes). Bodies
+/// confirmed claude-opus-4-8, claude-sonnet-4-6, and claude-haiku-4-5 (non-dated)
+/// are accepted by the CLI. Haiku canonical kept as dated per 154 for alias
+/// resolution consistency; non-dated form is handled via overrides elsewhere.
+pub static CATALOG_CC_2_1_158: &[ModelDef] = &[
+	ModelDef {
+		canonical: "claude-opus-4-8",
+		cli_name: "opus",
+		aliases: &["opus"],
+		context_window: 1_000_000,
+		max_tokens: 128_000,
+	},
+	ModelDef {
+		canonical: "claude-sonnet-4-6",
+		cli_name: "sonnet",
+		aliases: &["sonnet"],
+		context_window: 1_000_000,
+		max_tokens: 64_000,
+	},
+	ModelDef {
+		canonical: "claude-haiku-4-5-20251001",
+		cli_name: "haiku",
+		aliases: &["haiku"],
+		context_window: 200_000,
+		max_tokens: 64_000,
+	},
+];
+
 /// Resolve an input model string within one Claude Code profile catalog.
 ///
 /// Resolution intentionally mirrors Claude Code's alias-heavy model UX:
@@ -299,13 +328,14 @@ mod tests {
 	}
 
 	#[test]
-	fn resolve_unknown_falls_back_to_sonnet() {
-		assert_eq!(profile().resolve_model("gpt-4").canonical, "claude-sonnet-4-6");
+	fn resolve_unknown_falls_back_to_default() {
+		// 2.1.158+ default_model is "opus" (captured); older profiles used "sonnet".
+		assert_eq!(profile().resolve_model("gpt-4").canonical, "claude-opus-4-8");
 		assert_eq!(
 			profile().resolve_model("unknown").canonical,
-			"claude-sonnet-4-6"
+			"claude-opus-4-8"
 		);
-		assert_eq!(profile().resolve_model("").canonical, "claude-sonnet-4-6");
+		assert_eq!(profile().resolve_model("").canonical, "claude-opus-4-8");
 	}
 
 	#[test]

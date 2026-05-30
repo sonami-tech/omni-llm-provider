@@ -184,6 +184,20 @@ Use the existing tooling in this directory — don't reinvent it. Read
 exact capture command (reproduced below). Read `CCH_ALGORITHM.md` before touching
 any cch logic.
 
+**Easiest path — the `capture_baseline.sh` helper.** It does the mitmproxy
+intercept method below for you: picks a free port, starts the recorder, drives
+the real `claude` CLI for the default model + each model id you pass, and prints
+the extracted report. Run it with the models you intend to pin:
+
+```sh
+tools/fingerprint/capture_baseline.sh claude-haiku-4-5 claude-sonnet-4-6 claude-opus-4-8
+```
+
+It writes the raw flow to `/tmp/cc-baseline.flow` (which contains a live bearer
+token — **delete it when done**, never commit it) and the report to
+`/tmp/cc-baseline-extract.md`. The manual steps below are the same thing spelled
+out, for when you need to vary the capture.
+
 There are two capture methods; they are **not** interchangeable — pick by what
 you need:
 

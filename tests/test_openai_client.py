@@ -523,15 +523,16 @@ def test_alias_claude_haiku():
 	assert "PONG" in resp.choices[0].message.content
 
 
-@test("Model: unknown model falls back to sonnet (no error)")
+@test("Model: unknown model falls back to the profile default (no error)")
 def test_unknown_model_fallback():
-	"""Unknown models should silently fall back to sonnet, not error."""
+	"""Unknown models should silently fall back to the profile's default_model
+	(opus as of Claude Code 2.1.158; was sonnet on older profiles), not error."""
 	resp = client.chat.completions.create(
 		model="gpt-4-turbo",
 		messages=[{"role": "user", "content": "Reply PONG"}],
 		stream=False,
 	)
-	assert "sonnet" in resp.model, f"Expected fallback to sonnet, got: {resp.model}"
+	assert "opus" in resp.model, f"Expected fallback to default (opus), got: {resp.model}"
 	assert "PONG" in resp.choices[0].message.content
 
 
