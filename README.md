@@ -136,11 +136,11 @@ cargo build --release
 | `claude-haiku-4-5-20251001` | `haiku` |
 
 Model names are tied to the active Claude Code fingerprint profile. The default
-profile currently mimics Claude Code `2.1.154`; short aliases resolve to
+profile currently mimics Claude Code `2.1.158`; short aliases resolve to
 captured Claude Code model names. Explicit `claude-*` model names are preserved
 when possible to keep the outbound body fingerprint aligned with Claude Code.
 Unrecognized model names fall back to the profile's default model, currently
-Sonnet. See [configuration reference](docs/configuration.md#models) for
+Opus. See [configuration reference](docs/configuration.md#models) for
 date-suffixed names and [reasoning effort](docs/configuration.md#reasoning-effort)
 levels.
 
