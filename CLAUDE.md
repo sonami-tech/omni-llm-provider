@@ -62,3 +62,9 @@ cargo run -- --no-auth --port 18321
 - The canonical Claude Code system identifier is prepended by default to satisfy the OAuth gate. `--no-preamble` is for upstream debugging only.
 - Tools are passed natively to Anthropic Messages API. PascalCase masking for tool names is often required via text replacement to satisfy OAuth gate fingerprinting.
 - Text replacement applies outbound to prompts and tool surfaces, then inbound to assistant text and tool call names/arguments.
+
+## Fingerprint exactness (the core invariant)
+
+For every Claude Code version CCP supports, it MUST reproduce that version's wire fingerprint **byte-for-byte** — the version string, `anthropic-beta` flags, stainless versions, the `x-anthropic-billing-header` cch checksum, the model catalog, and wire defaults. This exactness is the entire point of the application: an inexact fingerprint is eventually rejected by Anthropic's subscription OAuth gate. "Close" is a failure, not a partial success.
+
+When the installed Claude Code CLI is newer than the newest pinned profile (or after any CC update), re-baseline before relying on it. Exactness is won by a **live capture of real Claude Code traffic** (the authoritative source for beta flags, stainless versions, and wire defaults) plus the drift checker (version + cch); the live test suite proves Anthropic *accepts* the profile, not that it is byte-identical. The full procedure is in [`tools/fingerprint/REBASELINE.md`](tools/fingerprint/REBASELINE.md). Start by running `uv run tools/fingerprint/check_claude_code_drift.py` to detect drift — but a green checker is **not** sufficient on its own (it sees only version + cch); a full re-baseline always requires the live capture in Step 3.
