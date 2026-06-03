@@ -1,8 +1,10 @@
 //! Build the outbound header set for api.anthropic.com requests, mimicking
 //! the claude CLI wire fingerprint.
 //!
-//! Active baseline captured 2026-05-30 against claude CLI 2.1.158
-//! SDK 0.94.0. See
+//! Active baseline captured 2026-06-03 against claude CLI 2.1.161
+//! SDK 0.94.0 (a pure version bump from 2.1.158: beta flags, stainless
+//! versions, wire defaults, default model, and the cch algorithm were all
+//! re-confirmed unchanged from a live mitmproxy capture). See
 //! `tools/fingerprint/BASELINE_HEADERS.md` for the source-of-truth notes.
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -176,7 +178,7 @@ impl FingerprintProfile {
     }
 
     fn finalize_body_bytes(&self, bytes: Vec<u8>, _ctx: &RequestContext) -> Vec<u8> {
-        // Claude Code 2.1.142, 2.1.150, 2.1.154, and 2.1.158 cch is a pure body-byte hash. Keep the
+        // Claude Code 2.1.142, 2.1.150, 2.1.154, 2.1.158, and 2.1.161 cch is a pure body-byte hash. Keep the
         // context in this API so future pinned profiles can add ctx-sensitive
         // behavior without changing call sites.
         match self.billing.cch {
@@ -287,6 +289,14 @@ pub const BETA_CC_2_1_158_DEFAULT: &str = "claude-code-20250219,oauth-2025-04-20
 pub const BETA_CC_2_1_158_SONNET: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11";
 pub const BETA_CC_2_1_158_HAIKU: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,extended-cache-ttl-2025-04-11";
 
+/// 2.1.161 betas captured 2026-06-03 via mitmproxy reverse proxy + real claude
+/// CLI 2.1.161 (default/opus, sonnet, haiku). Byte-identical to the 2.1.158
+/// per-model lists — aliased rather than re-typed so a future drift is a single
+/// edit. Confirmed from live traffic, not carried forward blind.
+pub const BETA_CC_2_1_161_DEFAULT: &str = BETA_CC_2_1_158_DEFAULT;
+pub const BETA_CC_2_1_161_SONNET: &str = BETA_CC_2_1_158_SONNET;
+pub const BETA_CC_2_1_161_HAIKU: &str = BETA_CC_2_1_158_HAIKU;
+
 const MODEL_BETA_OVERRIDES_CC_2_1_154: &[ModelBetaOverride] = &[
     ModelBetaOverride {
         model: "claude-opus-4-7",
@@ -346,6 +356,40 @@ const MODEL_BETA_OVERRIDES_CC_2_1_158: &[ModelBetaOverride] = &[
     ModelBetaOverride {
         model: "haiku",
         beta_reply: BETA_CC_2_1_158_HAIKU,
+    },
+];
+
+// 2.1.161 per-model beta overrides. Same shape and (captured-identical) values
+// as 2.1.158; opus-4-7/4-6 remain off-catalog carry-forward fallbacks mapped to
+// the closest captured beta (SONNET).
+const MODEL_BETA_OVERRIDES_CC_2_1_161: &[ModelBetaOverride] = &[
+    ModelBetaOverride {
+        model: "claude-opus-4-8",
+        beta_reply: BETA_CC_2_1_161_DEFAULT,
+    },
+    ModelBetaOverride {
+        model: "claude-opus-4-7",
+        beta_reply: BETA_CC_2_1_161_SONNET,
+    },
+    ModelBetaOverride {
+        model: "claude-opus-4-6",
+        beta_reply: BETA_CC_2_1_161_SONNET,
+    },
+    ModelBetaOverride {
+        model: "claude-sonnet-4-6",
+        beta_reply: BETA_CC_2_1_161_SONNET,
+    },
+    ModelBetaOverride {
+        model: "claude-haiku-4-5",
+        beta_reply: BETA_CC_2_1_161_HAIKU,
+    },
+    ModelBetaOverride {
+        model: "claude-haiku-4-5-20251001",
+        beta_reply: BETA_CC_2_1_161_HAIKU,
+    },
+    ModelBetaOverride {
+        model: "haiku",
+        beta_reply: BETA_CC_2_1_161_HAIKU,
     },
 ];
 
@@ -427,6 +471,48 @@ const MODEL_WIRE_OVERRIDES_CC_2_1_158: &[ModelWireOverride] = &[
     },
 ];
 
+// 2.1.161 per-model wire overrides. Captured 2026-06-03 and byte-identical to
+// 2.1.158: opus 64k/no-temp/high-effort, sonnet & haiku 32k/temp=1, haiku no
+// effort. Re-typed (not aliased) to keep each profile's wire surface explicit.
+const MODEL_WIRE_OVERRIDES_CC_2_1_161: &[ModelWireOverride] = &[
+    ModelWireOverride {
+        model: "claude-opus-4-8",
+        max_tokens: 64_000,
+        temperature: None,
+        output_effort: Some("high"),
+    },
+    ModelWireOverride {
+        model: "claude-opus-4-7",
+        max_tokens: 64_000,
+        temperature: None,
+        output_effort: Some("high"),
+    },
+    ModelWireOverride {
+        model: "claude-opus-4-6",
+        max_tokens: 64_000,
+        temperature: Some(1.0),
+        output_effort: Some("high"),
+    },
+    ModelWireOverride {
+        model: "claude-sonnet-4-6",
+        max_tokens: 32_000,
+        temperature: Some(1.0),
+        output_effort: Some("high"),
+    },
+    ModelWireOverride {
+        model: "claude-haiku-4-5",
+        max_tokens: 32_000,
+        temperature: Some(1.0),
+        output_effort: None,
+    },
+    ModelWireOverride {
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 32_000,
+        temperature: Some(1.0),
+        output_effort: None,
+    },
+];
+
 pub const WIRE_DEFAULTS_LEGACY: WireDefaults = WireDefaults {
     max_tokens: 64_000,
     opus_max_tokens: 128_000,
@@ -448,7 +534,15 @@ pub const WIRE_DEFAULTS_CC_2_1_158: WireDefaults = WireDefaults {
     output_effort: Some("high"),
 };
 
-pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.158-sdk-cli";
+// 2.1.161 wire defaults — captured 2026-06-03, identical to 2.1.158.
+pub const WIRE_DEFAULTS_CC_2_1_161: WireDefaults = WireDefaults {
+    max_tokens: 32_000,
+    opus_max_tokens: 64_000,
+    temperature: Some(1.0),
+    output_effort: Some("high"),
+};
+
+pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.161-sdk-cli";
 pub const LATEST_PROFILE_ALIAS: &str = "latest";
 
 pub const PROFILE_CLAUDE_2_1_142_SDK_CLI: FingerprintProfile = FingerprintProfile {
@@ -506,7 +600,7 @@ pub const PROFILE_CLAUDE_2_1_154_SDK_CLI: FingerprintProfile = FingerprintProfil
 };
 
 pub const PROFILE_CLAUDE_2_1_158_SDK_CLI: FingerprintProfile = FingerprintProfile {
-    name: DEFAULT_PROFILE_NAME,
+    name: "cc-2.1.158-sdk-cli",
     aliases: &["2.1.158"],
     claude_cli_version: "2.1.158",
     stainless_package_version: "0.94.0",
@@ -523,7 +617,26 @@ pub const PROFILE_CLAUDE_2_1_158_SDK_CLI: FingerprintProfile = FingerprintProfil
     billing: BILLING_SCHEME_V1_CCH_XXH64_BODY,
 };
 
+pub const PROFILE_CLAUDE_2_1_161_SDK_CLI: FingerprintProfile = FingerprintProfile {
+    name: DEFAULT_PROFILE_NAME,
+    aliases: &["2.1.161"],
+    claude_cli_version: "2.1.161",
+    stainless_package_version: "0.94.0",
+    stainless_runtime_version: "v24.3.0",
+    entrypoint: "sdk-cli",
+    beta_reply: BETA_CC_2_1_161_DEFAULT,
+    model_beta_overrides: MODEL_BETA_OVERRIDES_CC_2_1_161,
+    system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
+    models: CATALOG_CC_2_1_158,
+    default_model: "opus",
+    preserve_explicit_model: true,
+    wire_defaults: WIRE_DEFAULTS_CC_2_1_161,
+    model_wire_overrides: MODEL_WIRE_OVERRIDES_CC_2_1_161,
+    billing: BILLING_SCHEME_V1_CCH_XXH64_BODY,
+};
+
 pub static FINGERPRINT_PROFILES: &[FingerprintProfile] = &[
+    PROFILE_CLAUDE_2_1_161_SDK_CLI,
     PROFILE_CLAUDE_2_1_158_SDK_CLI,
     PROFILE_CLAUDE_2_1_154_SDK_CLI,
     PROFILE_CLAUDE_2_1_150_SDK_CLI,
@@ -937,10 +1050,47 @@ mod tests {
         // against live capture.
         let profile = resolve_profile("2.1.158").unwrap();
         let creds = fixture_creds();
+        // All six pinned model ids, including the off-catalog opus-4-7/4-6
+        // carry-forward fallbacks — every override row gets a full-string lock,
+        // not just the three on-catalog models.
         let cases = [
             ("claude-opus-4-8", BETA_CC_2_1_158_DEFAULT),
+            ("claude-opus-4-7", BETA_CC_2_1_158_SONNET),
+            ("claude-opus-4-6", BETA_CC_2_1_158_SONNET),
             ("claude-sonnet-4-6", BETA_CC_2_1_158_SONNET),
+            ("claude-haiku-4-5", BETA_CC_2_1_158_HAIKU),
             ("claude-haiku-4-5-20251001", BETA_CC_2_1_158_HAIKU),
+        ];
+        for (model, expected_beta) in cases {
+            let ctx = RequestContext::new_reply().with_model(model.to_string());
+            let beta = build_headers(&creds, &ctx, profile)
+                .get("anthropic-beta")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(beta, expected_beta, "unexpected beta list for {model}");
+        }
+    }
+
+    #[test]
+    fn claude_2_1_161_uses_captured_beta_list_per_model() {
+        // Independent by-name full-string lock for the NEWEST DEFAULT profile.
+        // 2.1.161's beta constants are aliases of 2.1.158's, so this asserts the
+        // *resolved* per-model header equals the captured value rather than
+        // trusting the alias wiring. Without this, a future edit that repoints
+        // 2.1.161 betas (or breaks an override row) would only be caught for the
+        // 3 aliases exercised by the default_profile() test. Mirrors the 154/158
+        // by-name tests so all three live profiles have parity coverage.
+        let profile = resolve_profile("2.1.161").unwrap();
+        let creds = fixture_creds();
+        let cases = [
+            ("claude-opus-4-8", BETA_CC_2_1_161_DEFAULT),
+            ("claude-opus-4-7", BETA_CC_2_1_161_SONNET),
+            ("claude-opus-4-6", BETA_CC_2_1_161_SONNET),
+            ("claude-sonnet-4-6", BETA_CC_2_1_161_SONNET),
+            ("claude-haiku-4-5", BETA_CC_2_1_161_HAIKU),
+            ("claude-haiku-4-5-20251001", BETA_CC_2_1_161_HAIKU),
         ];
         for (model, expected_beta) in cases {
             let ctx = RequestContext::new_reply().with_model(model.to_string());
@@ -963,12 +1113,12 @@ mod tests {
         // ever regresses, a `sonnet` request would silently leak the opus DEFAULT
         // beta (with context-1m) — an inexact fingerprint. Covers the alias gap
         // the canonical-only test above does not exercise.
-        let profile = default_profile(); // 2.1.158
+        let profile = default_profile(); // 2.1.161
         let creds = fixture_creds();
         let cases = [
-            ("opus", BETA_CC_2_1_158_DEFAULT, true),    // default has context-1m
-            ("sonnet", BETA_CC_2_1_158_SONNET, false),  // sonnet must NOT
-            ("haiku", BETA_CC_2_1_158_HAIKU, false),
+            ("opus", BETA_CC_2_1_161_DEFAULT, true),    // default has context-1m
+            ("sonnet", BETA_CC_2_1_161_SONNET, false),  // sonnet must NOT
+            ("haiku", BETA_CC_2_1_161_HAIKU, false),
         ];
         for (alias, expected_beta, has_context_1m) in cases {
             // Mirror the handler: resolve + canonicalize before building headers.
@@ -1037,8 +1187,39 @@ mod tests {
         assert_eq!(h.get("x-stainless-os").unwrap(), "Linux");
         assert_eq!(h.get("x-stainless-runtime").unwrap(), "node");
 
-        // Beta list must include the two load-bearing tokens.
+        // EXACT per-profile values, not just "contains". A wrong fingerprint is
+        // only caught LATER by Anthropic (a 200 today does not prove exactness),
+        // so the unit suite must pin the bytes itself. The stainless versions
+        // and User-Agent are version-coupled and a prime silent-drift vector on
+        // a rebaseline (carry-forward leaves a stale value that still 200s).
+        assert_eq!(
+            h.get("x-stainless-package-version").unwrap().to_str().unwrap(),
+            profile.stainless_package_version,
+            "x-stainless-package-version drifted from profile field on {}",
+            profile.name
+        );
+        assert_eq!(
+            h.get("x-stainless-runtime-version").unwrap().to_str().unwrap(),
+            profile.stainless_runtime_version,
+            "x-stainless-runtime-version drifted from profile field on {}",
+            profile.name
+        );
+
+        // The default-reply anthropic-beta header must be the profile's EXACT
+        // captured string, byte-for-byte (order included), not merely contain a
+        // few tokens — beta-flag order and membership are part of the
+        // fingerprint. Per-model variants are locked separately by the
+        // claude_2_1_<ver>_uses_captured_beta_list_per_model tests; this asserts
+        // the no-model reply path for every registered profile.
         let beta = h.get("anthropic-beta").unwrap().to_str().unwrap();
+        assert_eq!(
+            beta, profile.beta_reply,
+            "default-reply beta drifted from profile.beta_reply on {}",
+            profile.name
+        );
+        // The two load-bearing tokens must always be present in any profile's
+        // default reply (kept as an explicit invariant beyond the equality
+        // above, so a bad future constant fails with a pointed message).
         assert!(
             beta.contains("oauth-2025-04-20"),
             "beta list missing oauth-2025-04-20: {beta}"
@@ -1047,19 +1228,20 @@ mod tests {
             beta.contains("claude-code-20250219"),
             "beta list missing claude-code-20250219: {beta}"
         );
-        assert!(
-            beta.contains("interleaved-thinking-2025-05-14"),
-            "beta list missing interleaved-thinking-2025-05-14: {beta}"
-        );
 
         // Authorization is Bearer-shaped with the OAuth prefix.
         let auth = h.get("authorization").unwrap().to_str().unwrap();
         assert!(auth.starts_with("Bearer sk-ant-oat01-"));
 
-        // User-Agent claims to be claude-cli, including the version.
+        // User-Agent must equal the profile's exact UA string (version +
+        // entrypoint baked in), not just contain the version.
         let ua = h.get("user-agent").unwrap().to_str().unwrap();
-        assert!(ua.contains(profile.claude_cli_version), "user-agent: {ua}");
-        assert!(ua.contains(profile.entrypoint), "user-agent: {ua}");
+        assert_eq!(
+            ua,
+            profile.user_agent(),
+            "user-agent drifted from profile.user_agent() on {}",
+            profile.name
+        );
     }
 
     #[test]
@@ -1074,13 +1256,13 @@ mod tests {
     #[test]
     fn default_profile_matches_refreshed_claude_code_baseline() {
         let profile = default_profile();
-        assert_eq!(profile.name, "cc-2.1.158-sdk-cli");
-        assert_eq!(profile.claude_cli_version, "2.1.158");
+        assert_eq!(profile.name, "cc-2.1.161-sdk-cli");
+        assert_eq!(profile.claude_cli_version, "2.1.161");
         assert_eq!(profile.stainless_package_version, "0.94.0");
         assert_eq!(profile.stainless_runtime_version, "v24.3.0");
         assert_eq!(
             profile.user_agent(),
-            "claude-cli/2.1.158 (external, sdk-cli)"
+            "claude-cli/2.1.161 (external, sdk-cli)"
         );
         assert_eq!(profile.default_model, "opus");
         assert_eq!(profile.resolve_model("opus").canonical, "claude-opus-4-8");
@@ -1098,7 +1280,13 @@ mod tests {
     fn profile_registry_resolves_known_selectors() {
         assert_eq!(
             resolve_profile("latest").unwrap().name,
-            "cc-2.1.158-sdk-cli"
+            "cc-2.1.161-sdk-cli"
+        );
+        assert_eq!(
+            resolve_profile("cc-2.1.161-sdk-cli")
+                .unwrap()
+                .claude_cli_version,
+            "2.1.161"
         );
         assert_eq!(
             resolve_profile("cc-2.1.158-sdk-cli")
@@ -1164,9 +1352,13 @@ mod tests {
         // Captured from Claude Code 2.1.154 with CLAUDE_CODE_ENTRYPOINT=sdk-cli
         // and prompt "Say OK" on 2026-05-28.
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.154"), "cea");
+        // Captured from Claude Code 2.1.161 with CLAUDE_CODE_ENTRYPOINT=sdk-cli
+        // and prompt "Say OK" on 2026-06-03 (live mitmproxy capture: the real
+        // billing header read `cc_version=2.1.161.d2b`).
+        assert_eq!(claude_code_version_suffix("Say OK", "2.1.161"), "d2b");
         assert_eq!(
             default_profile().billing_header_text("Say OK"),
-            "x-anthropic-billing-header: cc_version=2.1.158.175; cc_entrypoint=sdk-cli; cch=00000;"
+            "x-anthropic-billing-header: cc_version=2.1.161.d2b; cc_entrypoint=sdk-cli; cch=00000;"
         );
     }
 
@@ -1234,7 +1426,7 @@ mod tests {
 		});
 		let json = String::from_utf8(profile.finalize_body_json(&body, &ctx).unwrap()).unwrap();
 
-		assert!(json.contains("cc_entrypoint=sdk-cli; cch=fad26;"));
+		assert!(json.contains("cc_entrypoint=sdk-cli; cch=481bd;"));
 	}
 
 	#[test]
@@ -1284,7 +1476,7 @@ mod tests {
         assert!(json.contains(user_text));
         assert_eq!(json.matches("cch=00000").count(), 1);
         assert!(json.contains(
-            "x-anthropic-billing-header: cc_version=2.1.158.175; cc_entrypoint=sdk-cli; cch="
+            "x-anthropic-billing-header: cc_version=2.1.161.d2b; cc_entrypoint=sdk-cli; cch="
         ));
         assert!(!json.contains("cc_entrypoint=sdk-cli; cch=00000;"));
     }
@@ -1427,6 +1619,61 @@ mod tests {
 	}
 
 	#[test]
+	fn cch_matches_real_2_1_161_clean_room_capture_vectors() {
+		// Breaks the self-consistency circularity the live tests have: these are
+		// REAL Claude Code 2.1.161 request bodies (one per pinned model),
+		// captured in a clean room and committed under tools/fingerprint/vectors/
+		// by `check_claude_code_drift.py --emit-vectors`. The cch baked into each
+		// body is the value REAL Claude Code 2.1.161 emitted (after normalizing
+		// only the volatile session_id / device_id / HOME-path / account-email
+		// fields and recomputing). This asserts CCP's own claude_code_cch_checksum
+		// reproduces that value over Claude Code's full real body shape —
+		// metadata, context_management, thinking, tools, cache_control, multiple
+		// system blocks — not just the hand-minimized 2.1.142 bodies above and
+		// not CCP's own re-serialized output. If this fails, CCP's body
+		// serialization or cch has diverged from real 2.1.161 traffic.
+		//
+		// To refresh after a rebaseline: run
+		//   uv run tools/fingerprint/check_claude_code_drift.py --emit-vectors tools/fingerprint/vectors
+		// which regenerates these files (and the expected cch) deterministically.
+		let vectors = [
+			(
+				"claude-haiku-4-5",
+				include_str!("../../tools/fingerprint/vectors/vector-2.1.161-claude-haiku-4-5.json"),
+			),
+			(
+				"claude-sonnet-4-6",
+				include_str!("../../tools/fingerprint/vectors/vector-2.1.161-claude-sonnet-4-6.json"),
+			),
+			(
+				"claude-opus-4-8",
+				include_str!("../../tools/fingerprint/vectors/vector-2.1.161-claude-opus-4-8.json"),
+			),
+		];
+		for (model, body) in vectors {
+			// Read the cch the captured body claims, then prove we reproduce it.
+			let marker = "cc_entrypoint=sdk-cli; cch=";
+			let idx = body
+				.find(marker)
+				.unwrap_or_else(|| panic!("no billing cch marker in {model} vector"));
+			let start = idx + marker.len();
+			let embedded = &body[start..start + 5];
+			let placeholder_body = body.replacen(
+				&format!("{marker}{embedded};"),
+				&format!("{marker}00000;"),
+				1,
+			);
+			// The substitution must have changed exactly the billing sentinel.
+			assert_ne!(placeholder_body, body, "{model}: cch substitution was a no-op");
+			assert_eq!(
+				format!("{:05x}", claude_code_cch_checksum(placeholder_body.as_bytes())),
+				embedded,
+				"CCP cch != real Claude Code 2.1.161 cch for the {model} capture vector"
+			);
+		}
+	}
+
+	#[test]
 	fn xxh64_matches_independent_small_input_vectors() {
 		// Cross-checked against Bun.hash.xxHash64 with the recovered seed.
 		assert_eq!(xxh64(b"", CCH_XXH64_SEED), 0xb8b30e7de65b46c5);
@@ -1466,5 +1713,50 @@ mod tests {
         // surrogate halves from different original code points adjacent;
         // JavaScript encodes that joined string as a valid surrogate pair.
         assert_eq!(claude_code_version_suffix("abcd😀😀", "2.1.142"), "052");
+    }
+
+    #[test]
+    fn billing_header_text_end_to_end_matches_suffix_oracle_for_varied_first_text() {
+        // END-TO-END coverage of the suffix on the path that actually composes
+        // the wire header (billing_header_text), across the input shapes the
+        // isolated suffix tests cover only at the function level: empty, short
+        // (< the sampled index 20), exactly-boundary, non-ASCII multibyte, and
+        // emoji/surrogate-bearing first-user-text.
+        //
+        // Not circular: claude_code_version_suffix() is the SAME oracle the
+        // isolated tests cross-check against Node's JS string indexing + crypto,
+        // so this proves billing_header_text() routes that oracle correctly and
+        // formats the full `cc_version=<ver>.<suffix>; cc_entrypoint=...; cch=`
+        // envelope for the real default profile (2.1.161) — it does not
+        // re-derive the suffix from the implementation under test.
+        let profile = default_profile();
+        let ver = profile.claude_cli_version;
+        let inputs = [
+            "",                                   // missing -> all sampled positions are ASCII '0'
+            "Say OK",                             // shorter than index 20
+            "abc",                                // shorter than index 7
+            "0123456789abcdefghijuvwxyz",         // all sampled indices [4],[7],[20] present, ASCII
+            "héllo wörld with nön-ascii café 99", // multibyte UTF-8, BMP
+            "abc😀efghijklmnopqrstuv",            // non-BMP emoji shifts UTF-16 indices
+            "abcd😀😀",                            // adjacent sampled surrogate halves
+        ];
+        for input in inputs {
+            let expected_suffix = claude_code_version_suffix(input, ver);
+            // Suffix is always exactly three lowercase hex chars.
+            assert_eq!(expected_suffix.len(), 3, "suffix len for {input:?}");
+            assert!(
+                expected_suffix.chars().all(|c| c.is_ascii_hexdigit()),
+                "suffix not hex for {input:?}: {expected_suffix}"
+            );
+            let header = profile.billing_header_text(input);
+            assert_eq!(
+                header,
+                format!(
+                    "x-anthropic-billing-header: cc_version={ver}.{expected_suffix}; \
+                     cc_entrypoint=sdk-cli; cch=00000;"
+                ),
+                "billing_header_text diverged from suffix oracle for first_user_text {input:?}"
+            );
+        }
     }
 }
