@@ -34,9 +34,9 @@ from openai import AsyncOpenAI, BadRequestError, OpenAI
 
 
 DEFAULT_PROFILE = {
-	"name": "cc-2.1.161-sdk-cli",
-	"version": "2.1.161",
-	"say_ok_suffix": "d2b",
+	"name": "cc-2.1.162-sdk-cli",
+	"version": "2.1.162",
+	"say_ok_suffix": "b87",
 }
 CLAUDE_CODE_PREAMBLE = "You are Claude Code, Anthropic's official CLI for Claude."
 CCH_SEED = 0x4D659218E32A3268
@@ -603,7 +603,7 @@ class TestModelAliases:
 			messages=[{"role": "user", "content": "Reply PONG"}],
 			stream=False,
 		)
-		# 2.1.161 default_model is opus (captured 2026-06-03); older profiles used sonnet.
+		# 2.1.162 default_model is opus (captured 2026-06-04); older profiles used sonnet.
 		assert "opus" in resp.model
 		assert "PONG" in resp.choices[0].message.content
 

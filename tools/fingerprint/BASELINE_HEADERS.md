@@ -1,18 +1,21 @@
 # claude CLI baseline wire fingerprint
 
-Active baseline: 2026-06-03 against local Claude Code 2.1.161 (re-baselined per REBASELINE.md + capture_baseline.sh). CCP keeps coherent compatibility profiles for 2.1.142 and newer only:
+Active baseline: 2026-06-04 against local Claude Code 2.1.162 (re-baselined per REBASELINE.md + capture_baseline.sh). CCP keeps coherent compatibility profiles for 2.1.142 and newer only:
 
 | Profile | Claude Code | SDK package | Runtime | Entrypoint | Source |
 |---|---|---|---|---|---|
+| `cc-2.1.162-sdk-cli` | `2.1.162` | `0.94.0` | `v24.3.0` | `sdk-cli` | mitmproxy reverse-proxy capture (haiku/sonnet/opus + default), clean CWD, 2026-06-04 |
 | `cc-2.1.161-sdk-cli` | `2.1.161` | `0.94.0` | `v24.3.0` | `sdk-cli` | mitmproxy reverse-proxy capture (haiku/sonnet/opus + default), 2026-06-03 |
 | `cc-2.1.158-sdk-cli` | `2.1.158` | `0.94.0` | `v24.3.0` | `sdk-cli` | mitmproxy reverse-proxy capture (haiku/sonnet/opus + default), 2026-05-30 |
 | `cc-2.1.154-sdk-cli` | `2.1.154` | `0.94.0` | `v24.3.0` | `sdk-cli` | local `ANTHROPIC_BASE_URL` fake-server probe, 2026-05-28 |
 | `cc-2.1.150-sdk-cli` | `2.1.150` | `0.94.0` | `v24.3.0` | `sdk-cli` | local MITM reverse-proxy probe, 2026-05-25 |
 | `cc-2.1.142-sdk-cli` | `2.1.142` | `0.94.0` | `v24.3.0` | `sdk-cli` | local debug probe, 2026-05-15 |
 
-`latest` resolves to `cc-2.1.161-sdk-cli`, the newest known-good pinned profile. Do not make the default an automatic max-version calculation; only move `latest` after a profile has been re-baselined and live-smoked.
+`latest` resolves to `cc-2.1.162-sdk-cli`, the newest known-good pinned profile. Do not make the default an automatic max-version calculation; only move `latest` after a profile has been re-baselined and live-smoked.
 
-2.1.161 is a pure version bump from 2.1.158: the 2026-06-03 capture re-confirmed that the per-model beta lists, stainless versions (`0.94.0` / `v24.3.0`), wire defaults (opus 64k/no-temp/effort=high; sonnet & haiku 32k/temp=1; haiku no effort), default-model resolution (opus → `claude-opus-4-8`), the model catalog, and the cch algorithm (xxh64 seed `0x4d659218e32a3268`, validated `ok`) are all unchanged. Only the version string and the version-derived `cc_version` suffix moved (`2.1.161.d2b` for the "Say OK" probe).
+2.1.162 is a pure version bump from 2.1.161: the 2026-06-04 capture re-confirmed that the per-model beta lists, stainless versions (`0.94.0` / `v24.3.0`), wire defaults (opus 64k/no-temp/effort=high; sonnet & haiku 32k/temp=1; haiku no effort), default-model resolution (opus → `claude-opus-4-8`), the model catalog, and the cch algorithm (xxh64 seed `0x4d659218e32a3268`, validated `ok`) are all unchanged. Only the version string and the version-derived `cc_version` suffix moved (`2.1.162.b87` for the "Say OK" probe). The model catalog is carried forward from 2.1.158/2.1.161 (the capture sets `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, which suppresses the startup `/v1/models` GET, so the catalog is not freshly GET-enumerable; all three pinned ids were confirmed accepted in real bodies and 2.1.162 carries no model rename).
+
+2.1.161 was likewise a pure version bump from 2.1.158 (2026-06-03 capture; "Say OK" suffix `2.1.161.d2b`).
 
 Source flow: `tools/fingerprint/scenarios/01-plain-text.flow`. Replay with:
 
@@ -52,11 +55,12 @@ The `?beta=true` query parameter is sent on every Messages request.
 
 ## anthropic-beta lists observed
 
-**Claude Code 2.1.161** (captured 2026-06-03): the DEFAULT/opus, Sonnet, and Haiku
-beta lists are **byte-identical** to the 2.1.158 lists below — verified per-model
-from the live capture, not assumed. The 2.1.158 strings therefore stand as the
-2.1.161 reference; no separate 2.1.161 listing is reproduced to avoid drift between
-two copies of the same value.
+**Claude Code 2.1.162** (captured 2026-06-04, clean CWD) **and 2.1.161** (captured
+2026-06-03): the DEFAULT/opus, Sonnet, and Haiku beta lists are **byte-identical**
+to the 2.1.158 lists below — verified per-model from each live capture, not
+assumed. The 2.1.158 strings therefore stand as the 2.1.161/2.1.162 reference; no
+separate 2.1.161/2.1.162 listing is reproduced to avoid drift between copies of the
+same value.
 
 **Claude Code 2.1.158 DEFAULT (and opus resolution; captured with context-1m):**
 ```
@@ -111,8 +115,8 @@ retain their original default list.
   x-anthropic-billing-header: cc_version=2.1.154.cea; cc_entrypoint=sdk-cli; cch=00000;
   ```
   This is structured *as if* it were instruction text but is just claude's identity marker. CCP v2 emits this marker as the first system block, followed by the canonical Claude Code preamble block, before user-provided system content.
-- Claude Code 2.1.142, 2.1.150, 2.1.154, 2.1.158, and 2.1.161's visible attribution builder and debug log emit `cch=00000`, but the final HTTP body rewrites that sentinel to a deterministic five-hex checksum. CCP mirrors the recovered final-body algorithm for these pinned profiles: standard `xxHash64` over the exact serialized body bytes while `cch=00000` is still present, seed `0x4d659218e32a3268`, then `hash & 0xfffff` formatted as five lowercase hex digits. See `tools/fingerprint/CCH_ALGORITHM.md`.
-- The `cc_version` suffix is dynamic per request (2.1.161 "Say OK" suffix = d2b; 2.1.158 was 175):
+- Claude Code 2.1.142, 2.1.150, 2.1.154, 2.1.158, 2.1.161, and 2.1.162's visible attribution builder and debug log emit `cch=00000`, but the final HTTP body rewrites that sentinel to a deterministic five-hex checksum. CCP mirrors the recovered final-body algorithm for these pinned profiles: standard `xxHash64` over the exact serialized body bytes while `cch=00000` is still present, seed `0x4d659218e32a3268`, then `hash & 0xfffff` formatted as five lowercase hex digits. See `tools/fingerprint/CCH_ALGORITHM.md`.
+- The `cc_version` suffix is dynamic per request (2.1.162 "Say OK" suffix = b87; 2.1.161 was d2b; 2.1.158 was 175):
   ```
   suffix = sha256("59cf53e54c78" + chars + claude_version).hex()[0..3]
   chars = first_user_text[4] + first_user_text[7] + first_user_text[20]
@@ -121,12 +125,12 @@ retain their original default list.
 - `metadata.user_id` is a **JSON-encoded string** containing `{device_id, account_uuid, session_id}`. Anthropic accepts this opaquely.
 - Claude Code `--tools ""` still sends a non-empty default SDK tool surface;
   CCP only sends consumer-provided tools.
-- `temperature: 1`, `max_tokens: 32000` are Claude Code 2.1.154/2.1.158/2.1.161 defaults for
-  Sonnet and Haiku (confirmed in 2026-05-30 and 2026-06-03 captures). Opus 4.8 omits temperature and uses `max_tokens: 64000`.
+- `temperature: 1`, `max_tokens: 32000` are Claude Code 2.1.154/2.1.158/2.1.161/2.1.162 defaults for
+  Sonnet and Haiku (confirmed in 2026-05-30, 2026-06-03, and 2026-06-04 captures). Opus 4.8 omits temperature and uses `max_tokens: 64000`. On the wire, effort=high is carried as `output_config: {"effort":"high"}` (present on opus + sonnet, absent on haiku).
 - `stream: true` is the default; non-streaming is rare from the CLI.
-- 2.1.161 default_model (no --model) resolves to opus (observed 2026-06-03: body "model":"claude-opus-4-8"); same as 2.1.158.
-- 2.1.161 catalog identical to 2.1.158/2.1.154 (no model-list GET in capture; bodies confirmed opus-4-8/sonnet-4-6/haiku-4-5 acceptance). The 161 profile reuses `CATALOG_CC_2_1_158` rather than duplicating an identical catalog.
-- context-1m-2025-08-07 flag appears in 2.1.161 and 2.1.158 DEFAULT/opus calls (included in the DEFAULT beta).
+- 2.1.162 default_model (no --model) resolves to opus (observed 2026-06-04: body "model":"claude-opus-4-8"); same as 2.1.158/2.1.161.
+- 2.1.162 catalog identical to 2.1.158/2.1.161/2.1.154 (no model-list GET in capture under `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`; bodies confirmed opus-4-8/sonnet-4-6/haiku-4-5 acceptance). The 162 profile reuses `CATALOG_CC_2_1_158` rather than duplicating an identical catalog.
+- context-1m-2025-08-07 flag appears in 2.1.162/2.1.161/2.1.158 DEFAULT/opus calls (included in the DEFAULT beta).
 
 ## Step 0 verification — confirmed working
 
@@ -137,4 +141,4 @@ The Step 0 minimal request (Haiku 4-5, OAuth Bearer, anthropic-beta with claude-
 - Capture remaining 7 scenarios (with-tools, multi-turn, streaming, image, token-refresh, prompt-caching, errors).
 - Diff CCP v2 captures against this baseline.
 - Watch documented differences that have not blocked OAuth use so far, including omitted `tools: []`, omitted default `temperature: 1`, and CCP-specific body field ordering.
-- Run `tools/fingerprint/check_claude_code_drift.py` after Claude Code updates to detect installed-version or `cch` algorithm drift before moving `latest`. (Current active: 2.1.161).
+- Run `tools/fingerprint/check_claude_code_drift.py` after Claude Code updates to detect installed-version or `cch` algorithm drift before moving `latest`. (Current active: 2.1.162).
