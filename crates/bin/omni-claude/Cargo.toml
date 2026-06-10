@@ -20,3 +20,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+clap = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
