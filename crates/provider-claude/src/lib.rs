@@ -651,6 +651,17 @@ mod tests {
         // (which would otherwise change what `default_path()` resolves to mid-call).
         // Mirrors the Grok live test's CRED_ENV_LOCK discipline.
         let _guard = CREDS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Also skip when CLAUDE_CREDENTIALS_PATH is set: that means a hermetic test
+        // (or an operator) is pointing the loader at a throwaway dummy creds file,
+        // which must not be trusted for a real network call. Mirrors Grok's
+        // live_grok_key() bailing when XAI_CREDENTIALS_PATH is set; this prevents a
+        // live api.anthropic.com call with a dummy bearer if env cleanup ever failed.
+        if std::env::var_os("CLAUDE_CREDENTIALS_PATH").is_some() {
+            eprintln!(
+                "skipping claude_send_exercises_full_fingerprint_path: CLAUDE_CREDENTIALS_PATH override is set"
+            );
+            return;
+        }
         if !crate::credentials::Credentials::default_path().exists() {
             eprintln!(
                 "skipping claude_send_exercises_full_fingerprint_path: no Claude credentials at {}",
@@ -942,6 +953,7 @@ mod tests {
                 "authorization",
                 format!("Bearer {}", TempCreds::dummy_token()).as_str(),
             ))
+            .and(header("anthropic-version", "2023-06-01"))
             .respond_with(ResponseTemplate::new(200).set_body_json(body))
             .expect(1)
             .mount(&server)
@@ -1044,5 +1056,71 @@ mod tests {
             .count();
         assert_eq!(finishes, 1, "exactly one terminal Finish, got {finishes}");
         assert_eq!(events.len(), 3, "no extra events: {events:?}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn claude_streaming_eof_without_message_stop_emits_single_finish() {
+        // WHY: pins the OTHER branch of the send_stream tail guard. When the
+        // upstream byte stream closes WITHOUT a message_stop frame (a truncated or
+        // abruptly-closed stream), the converter never ran finish_events, so
+        // `finished` is false and the EOF guard must synthesize EXACTLY ONE
+        // terminal Finish. The happy-path test above pins the message_stop branch;
+        // this pins that a regression breaking only the EOF guard (e.g. dropping
+        // the synthesized Finish, or re-introducing a double-emit) would be caught.
+        let _guard = CREDS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _creds = TempCreds::install("stream-eof");
+
+        // Ends after message_delta — NO message_stop frame.
+        let sse_body = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_e\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(query_param("beta", "true"))
+            .and(header(
+                "authorization",
+                format!("Bearer {}", TempCreds::dummy_token()).as_str(),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_body),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let p = ClaudeProvider::new_for_test_with_base(default_profile(), server.uri())
+            .expect("test provider against mock base");
+        let stream = p
+            .send_stream(sample_req("hi"))
+            .await
+            .expect("hermetic claude stream must open");
+        let events: Vec<CanonicalStreamEvent> =
+            stream.map(|r| r.expect("no stream error")).collect().await;
+
+        assert_eq!(events[0], CanonicalStreamEvent::TextDelta("Hi".into()));
+        // EOF guard synthesizes Usage (tokens were seen) + exactly one Finish.
+        let finishes = events
+            .iter()
+            .filter(|e| matches!(e, CanonicalStreamEvent::Finish { .. }))
+            .count();
+        assert_eq!(
+            finishes, 1,
+            "EOF-without-message_stop must still yield exactly one Finish, got {finishes}: {events:?}"
+        );
+        // The mapped stop_reason from message_delta is carried into the Finish.
+        assert_eq!(
+            events.last(),
+            Some(&CanonicalStreamEvent::Finish {
+                finish_reason: Some("stop".into())
+            })
+        );
     }
 }
