@@ -346,7 +346,10 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
             "none" => Some(CanonicalToolChoice::None),
             other => return Err(format!("unsupported tool_choice mode: {other}")),
         },
-        Some(ResponsesToolChoice::Function { name, .. }) => {
+        Some(ResponsesToolChoice::Function { kind, name }) => {
+            if kind != "function" {
+                return Err(format!("unsupported tool_choice type: {kind}"));
+            }
             Some(CanonicalToolChoice::Specific { name: name.clone() })
         }
         None => None,
@@ -977,6 +980,23 @@ mod tests {
         assert!(
             err.contains("web_search"),
             "error must name the unsupported tool type, got: {err}"
+        );
+    }
+
+    #[test]
+    fn responses_rejects_non_function_tool_choice_type() {
+        // WHY: a forced tool_choice must select a `function`. A non-function type
+        // (e.g. "retrieval") is unsupported; coercing it to Specific would force a
+        // tool the model cannot dispatch. Reject loudly, naming the type, rather
+        // than silently mistranslating it. Mirrors the Chat protocol's contract.
+        let req = parse(
+            r#"{"model":"m","input":"q","tools":[{"type":"function","name":"f"}],
+                "tool_choice":{"type":"retrieval","name":"f"}}"#,
+        );
+        let err = responses_to_canonical(&req).expect_err("non-function tool_choice must reject");
+        assert!(
+            err.contains("retrieval") || err.contains("type"),
+            "error must name the bad tool_choice type, got: {err}"
         );
     }
 

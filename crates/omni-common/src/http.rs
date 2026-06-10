@@ -220,9 +220,14 @@ pub fn to_canonical(req: &ChatCompletionRequest) -> Result<CanonicalRequest, Str
             "none" => Some(CanonicalToolChoice::None),
             other => return Err(format!("unsupported tool_choice mode: {other}")),
         },
-        Some(ChatToolChoice::Function { function, .. }) => Some(CanonicalToolChoice::Specific {
-            name: function.name.clone(),
-        }),
+        Some(ChatToolChoice::Function { kind, function }) => {
+            if kind != "function" {
+                return Err(format!("unsupported tool_choice type: {kind}"));
+            }
+            Some(CanonicalToolChoice::Specific {
+                name: function.name.clone(),
+            })
+        }
         None => None,
     };
 
@@ -261,8 +266,16 @@ fn chat_message_to_canonical(m: &ChatMessage) -> Result<CanonicalMessage, String
         });
     }
 
-    // An assistant message may interleave text with tool calls.
+    // An assistant message may interleave text with tool calls. tool_calls are
+    // only valid on the assistant role (OpenAI contract); reject them elsewhere
+    // rather than forwarding a malformed history shape to a backend.
     if let Some(tool_calls) = m.tool_calls.as_ref().filter(|tc| !tc.is_empty()) {
+        if m.role != "assistant" {
+            return Err(format!(
+                "tool_calls are only valid on an assistant message, not role \"{}\"",
+                m.role
+            ));
+        }
         let mut blocks: Vec<CanonicalBlock> = Vec::new();
         if let Some(text) = m.content.as_ref().filter(|t| !t.is_empty()) {
             blocks.push(CanonicalBlock::Text(text.clone()));
@@ -679,9 +692,7 @@ mod tests {
         assert!(err.contains("retrieval"), "error must name the type: {err}");
 
         // tool message missing tool_call_id.
-        let req = req_from_json(
-            r#"{"model":"m","messages":[{"role":"tool","content":"42"}]}"#,
-        );
+        let req = req_from_json(r#"{"model":"m","messages":[{"role":"tool","content":"42"}]}"#);
         let err = to_canonical(&req).expect_err("tool msg without id must reject");
         assert!(
             err.contains("tool_call_id"),
@@ -696,6 +707,43 @@ mod tests {
         );
         let err = to_canonical(&req).expect_err("unknown mode must reject");
         assert!(err.contains("bogus"), "error must name the mode: {err}");
+    }
+
+    #[test]
+    fn to_canonical_rejects_non_function_tool_choice_type() {
+        // WHY: a forced tool_choice object must select a `function`. A non-function
+        // type (e.g. "retrieval") is a shape we do not support; coercing it to
+        // Specific would force a tool the model cannot dispatch. Reject loudly,
+        // naming the offending type, instead of silently mistranslating it.
+        let req = req_from_json(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"function","function":{"name":"f"}}],
+                "tool_choice":{"type":"retrieval","function":{"name":"f"}}}"#,
+        );
+        let err = to_canonical(&req).expect_err("non-function tool_choice type must reject");
+        assert!(
+            err.contains("retrieval") || err.contains("type"),
+            "error must name the bad tool_choice type: {err}"
+        );
+    }
+
+    #[test]
+    fn to_canonical_rejects_tool_calls_on_non_assistant_role() {
+        // WHY: tool_calls are only valid on an assistant message (OpenAI
+        // contract). A user/other role carrying tool_calls is a malformed history
+        // shape; forwarding it would feed a backend an invalid turn. Reject it,
+        // naming the role/field, rather than silently accepting.
+        let req = req_from_json(
+            r#"{"model":"m","messages":[
+                {"role":"user","content":"hi","tool_calls":[
+                    {"id":"x","type":"function","function":{"name":"f","arguments":"{}"}}]}
+            ]}"#,
+        );
+        let err = to_canonical(&req).expect_err("tool_calls on non-assistant must reject");
+        assert!(
+            err.contains("assistant") || err.contains("tool_calls"),
+            "error must explain tool_calls are assistant-only: {err}"
+        );
     }
 
     #[test]

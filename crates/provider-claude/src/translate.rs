@@ -271,32 +271,8 @@ pub fn build_messages_request_from_canonical(
             CanonicalContent::Blocks(blocks) => {
                 let out: Vec<ContentBlock> = blocks
                     .iter()
-                    .map(|b| match b {
-                        CanonicalBlock::Text(t) => ContentBlock::Text {
-                            text: repl.apply_prompt(t),
-                            cache_control: None,
-                        },
-                        CanonicalBlock::ToolUse {
-                            id,
-                            name,
-                            arguments,
-                        } => ContentBlock::ToolUse {
-                            id: id.clone(),
-                            name: name.clone(),
-                            input: serde_json::from_str(arguments)
-                                .unwrap_or_else(|_| serde_json::json!({})),
-                        },
-                        CanonicalBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            is_error,
-                        } => ContentBlock::ToolResult {
-                            tool_use_id: tool_use_id.clone(),
-                            content: Some(ToolResultContent::Text(repl.apply_prompt(content))),
-                            is_error: if *is_error { Some(true) } else { None },
-                        },
-                    })
-                    .collect();
+                    .map(|b| canonical_block_to_anthropic(b, repl))
+                    .collect::<Result<_, String>>()?;
                 MessageContent::Blocks(out)
             }
         };
@@ -304,11 +280,31 @@ pub fn build_messages_request_from_canonical(
         // carrying tool_result blocks. The canonical "tool" role (from the
         // OpenAI-shaped surfaces) maps to "user" here; everything else passes
         // through. See https://docs.claude.com/en/docs/build-with-claude/tool-use.
-        let role = if m.role == "tool" {
+        let is_tool_result = m.role == "tool";
+        let role = if is_tool_result {
             "user".to_string()
         } else {
             m.role.clone()
         };
+
+        // Anthropic expects multiple tool results for one assistant turn to be
+        // sibling tool_result blocks inside a SINGLE user message, not a run of
+        // consecutive user messages. The OpenAI-shaped surfaces emit one
+        // `tool` message per result, so coalesce a tool-result message into the
+        // immediately preceding message when that one is itself a user message
+        // made only of tool_result blocks.
+        if is_tool_result
+            && let MessageContent::Blocks(new_blocks) = &content
+            && let Some(prev) = messages.last_mut()
+            && prev.role == "user"
+            && let MessageContent::Blocks(prev_blocks) = &mut prev.content
+            && prev_blocks
+                .iter()
+                .all(|b| matches!(b, ContentBlock::ToolResult { .. }))
+        {
+            prev_blocks.extend(new_blocks.iter().cloned());
+            continue;
+        }
         messages.push(Message { role, content });
     }
 
@@ -390,6 +386,58 @@ pub fn build_messages_request_from_canonical(
         thinking,
         output_config: None,
     })
+}
+
+/// Convert one canonical content block into its Anthropic `ContentBlock`.
+/// Fallible because a malformed tool-call arguments string must surface as an
+/// error rather than be silently coerced.
+fn canonical_block_to_anthropic(
+    block: &CanonicalBlock,
+    repl: &Replacements,
+) -> Result<ContentBlock, String> {
+    Ok(match block {
+        CanonicalBlock::Text(t) => ContentBlock::Text {
+            text: repl.apply_prompt(t),
+            cache_control: None,
+        },
+        CanonicalBlock::ToolUse {
+            id,
+            name,
+            arguments,
+        } => ContentBlock::ToolUse {
+            id: id.clone(),
+            name: name.clone(),
+            input: parse_tool_arguments(arguments)?,
+        },
+        CanonicalBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.clone(),
+            content: Some(ToolResultContent::Text(repl.apply_prompt(content))),
+            is_error: if *is_error { Some(true) } else { None },
+        },
+    })
+}
+
+/// Parse a tool-call `arguments` string into the JSON object Anthropic expects
+/// for tool `input`. An empty string means "no arguments" (-> `{}`). A non-empty
+/// string that is not a JSON object is a malformed call: error loudly rather
+/// than coerce it to `{}` and silently corrupt tool dispatch.
+fn parse_tool_arguments(arguments: &str) -> Result<Value, String> {
+    if arguments.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(v) if v.is_object() => Ok(v),
+        Ok(_) => Err(format!(
+            "tool_call arguments must be a JSON object, got: {arguments}"
+        )),
+        Err(e) => Err(format!(
+            "tool_call arguments is not valid JSON ({e}): {arguments}"
+        )),
+    }
 }
 
 fn default_max_tokens(model_def: &ModelDef) -> u32 {
@@ -1187,5 +1235,113 @@ mod tests {
         assert_eq!(bsys[0].text, psys[0].text);
         assert_eq!(bsys[1].text, psys[1].text);
         assert_eq!(built.model, prepped.model);
+    }
+
+    #[test]
+    fn consecutive_tool_results_coalesce_into_one_user_message() {
+        // WHY: Anthropic requires the results of a parallel tool turn to be
+        // sibling tool_result blocks inside ONE `user` message. The OpenAI-shaped
+        // surfaces emit one `tool` message per result, so two consecutive
+        // tool-result messages must be merged here; emitting two separate user
+        // messages is a 400 on a live request. This pins the coalesce path.
+        use omni_core::CanonicalBlock;
+        let req = CanonicalRequest {
+            model: "haiku".into(),
+            messages: vec![
+                CanonicalMessage {
+                    role: "assistant".into(),
+                    content: CanonicalContent::Blocks(vec![
+                        CanonicalBlock::ToolUse {
+                            id: "t1".into(),
+                            name: "f".into(),
+                            arguments: "{}".into(),
+                        },
+                        CanonicalBlock::ToolUse {
+                            id: "t2".into(),
+                            name: "g".into(),
+                            arguments: "{}".into(),
+                        },
+                    ]),
+                },
+                CanonicalMessage {
+                    role: "tool".into(),
+                    content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
+                        tool_use_id: "t1".into(),
+                        content: "A".into(),
+                        is_error: false,
+                    }]),
+                },
+                CanonicalMessage {
+                    role: "tool".into(),
+                    content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
+                        tool_use_id: "t2".into(),
+                        content: "B".into(),
+                        is_error: false,
+                    }]),
+                },
+            ],
+            ..Default::default()
+        };
+        let profile = crate::fingerprint::default_profile();
+        let model_def = profile.resolve_model("haiku");
+        let anth = build_messages_request_from_canonical(&req, model_def, &empty_repl()).unwrap();
+
+        // Exactly ONE user message carries tool_result blocks (not two).
+        let tool_result_user_msgs: Vec<&Message> = anth
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == "user"
+                    && matches!(
+                        &m.content,
+                        MessageContent::Blocks(blocks)
+                            if blocks.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                    )
+            })
+            .collect();
+        assert_eq!(
+            tool_result_user_msgs.len(),
+            1,
+            "both tool results must coalesce into a single user message, not two"
+        );
+
+        // That one message holds BOTH results (t1 and t2), in order.
+        let ids: Vec<&str> = match &tool_result_user_msgs[0].content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(
+                    blocks.len(),
+                    2,
+                    "the merged user message must carry both results"
+                );
+                blocks
+                    .iter()
+                    .map(|b| match b {
+                        ContentBlock::ToolResult { tool_use_id, .. } => tool_use_id.as_str(),
+                        other => panic!("expected ToolResult block, got {other:?}"),
+                    })
+                    .collect()
+            }
+            other => panic!("expected Blocks, got {other:?}"),
+        };
+        assert!(ids.contains(&"t1"), "merged message must keep t1");
+        assert!(ids.contains(&"t2"), "merged message must keep t2");
+    }
+
+    #[test]
+    fn tool_arguments_parsing_rejects_malformed_and_accepts_empty() {
+        // WHY: a tool-call `arguments` string must become the JSON object
+        // Anthropic expects for `input`. An empty string means "no arguments"
+        // (-> {}), but any non-object (a JSON array/string/scalar) or invalid
+        // JSON is a malformed call: surface it as an error rather than coerce to
+        // {} and silently corrupt tool dispatch.
+        let empty = parse_tool_arguments("").expect("empty args is allowed");
+        assert_eq!(empty, serde_json::json!({}), "empty args must be {{}}");
+
+        let obj = parse_tool_arguments(r#"{"a":1}"#).expect("object args is allowed");
+        assert_eq!(obj["a"], 1);
+
+        parse_tool_arguments("not json").expect_err("invalid JSON must reject");
+        parse_tool_arguments("[1,2]").expect_err("a JSON array is not an object: must reject");
+        parse_tool_arguments("\"x\"").expect_err("a JSON string is not an object: must reject");
     }
 }

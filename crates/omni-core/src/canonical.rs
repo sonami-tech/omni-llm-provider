@@ -95,7 +95,9 @@ pub struct CanonicalTool {
 pub enum CanonicalToolChoice {
     Auto,
     Required,
-    Specific { name: String },
+    Specific {
+        name: String,
+    },
     /// Tools remain visible to the model, but it must not call any of them.
     /// Distinct from "no tools": the schemas are still sent upstream. Maps to
     /// Anthropic `tool_choice:{type:"none"}` and OpenAI `tool_choice:"none"`.

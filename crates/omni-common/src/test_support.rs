@@ -77,6 +77,8 @@ pub fn build_workspace_bin(package: &str) -> PathBuf {
     }
 
     found.unwrap_or_else(|| {
-        panic!("cargo build -p {package} produced no bin executable artifact for target '{package}'")
+        panic!(
+            "cargo build -p {package} produced no bin executable artifact for target '{package}'"
+        )
     })
 }

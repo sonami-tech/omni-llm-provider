@@ -182,20 +182,32 @@ fn to_xai_chat_request(req: &CanonicalRequest, repl: &Replacements) -> Value {
                 messages.push(json!({ "role": m.role, "content": repl.apply_prompt(t) }));
             }
             CanonicalContent::Blocks(blocks) => {
-                // OpenAI/xAI wire shape for multi-turn tools: a tool result becomes its own
-                // `role:"tool"` message; an assistant turn with tool calls becomes a single
-                // assistant message carrying text (or null) plus a `tool_calls` array.
-                let has_tool_result = blocks
-                    .iter()
-                    .any(|b| matches!(b, CanonicalBlock::ToolResult { .. }));
-                if has_tool_result {
-                    for b in blocks {
-                        if let CanonicalBlock::ToolResult {
+                // OpenAI/xAI wire shape for multi-turn tools: each tool RESULT is
+                // its own `role:"tool"` message; the text + tool CALLS in the
+                // turn go in one message for `m.role`. A block message may mix
+                // both (e.g. an assistant turn plus its results), so emit every
+                // block rather than dropping siblings.
+                let mut text = String::new();
+                let mut tool_calls: Vec<Value> = Vec::new();
+                for b in blocks {
+                    match b {
+                        CanonicalBlock::Text(t) => text.push_str(&repl.apply_prompt(t)),
+                        CanonicalBlock::ToolUse {
+                            id,
+                            name,
+                            arguments,
+                        } => {
+                            tool_calls.push(json!({
+                                "id": id,
+                                "type": "function",
+                                "function": { "name": name, "arguments": arguments }
+                            }));
+                        }
+                        CanonicalBlock::ToolResult {
                             tool_use_id,
                             content,
                             ..
-                        } = b
-                        {
+                        } => {
                             messages.push(json!({
                                 "role": "tool",
                                 "tool_call_id": tool_use_id,
@@ -203,37 +215,26 @@ fn to_xai_chat_request(req: &CanonicalRequest, repl: &Replacements) -> Value {
                             }));
                         }
                     }
-                } else {
-                    let mut text = String::new();
-                    let mut tool_calls: Vec<Value> = Vec::new();
-                    for b in blocks {
-                        match b {
-                            CanonicalBlock::Text(t) => text.push_str(&repl.apply_prompt(t)),
-                            CanonicalBlock::ToolUse {
-                                id,
-                                name,
-                                arguments,
-                            } => {
-                                tool_calls.push(json!({
-                                    "id": id,
-                                    "type": "function",
-                                    "function": { "name": name, "arguments": arguments }
-                                }));
-                            }
-                            CanonicalBlock::ToolResult { .. } => {}
-                        }
+                }
+                // Emit the role's own message only when it carries text or tool
+                // calls (a message of pure tool results adds nothing here). When
+                // there are tool_calls but no text, content is null per the
+                // OpenAI contract; omit an empty tool_calls array otherwise.
+                if !text.is_empty() || !tool_calls.is_empty() {
+                    let mut msg = serde_json::Map::new();
+                    msg.insert("role".into(), json!(m.role));
+                    msg.insert(
+                        "content".into(),
+                        if text.is_empty() {
+                            Value::Null
+                        } else {
+                            json!(text)
+                        },
+                    );
+                    if !tool_calls.is_empty() {
+                        msg.insert("tool_calls".into(), json!(tool_calls));
                     }
-                    // OpenAI contract: when there are tool_calls but no text, content is null.
-                    let content = if text.is_empty() && !tool_calls.is_empty() {
-                        Value::Null
-                    } else {
-                        json!(text)
-                    };
-                    messages.push(json!({
-                        "role": m.role,
-                        "content": content,
-                        "tool_calls": tool_calls
-                    }));
+                    messages.push(Value::Object(msg));
                 }
             }
         }
@@ -899,6 +900,94 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "get_weather");
         assert_eq!(body["tool_choice"]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn mixed_block_message_emits_tool_result_and_assistant_without_dropping() {
+        // WHY: an assistant turn that mixes Text with a ToolUse must keep BOTH:
+        // the text becomes the assistant message `content` and the call becomes a
+        // `tool_calls` entry. A prior bug dropped the Text sibling when a block
+        // message also produced a tool message, silently losing the model's
+        // reasoning/answer. A following tool result is its own `role:"tool"`
+        // message keyed by tool_call_id.
+        let req = CanonicalRequest {
+            model: "grok-4.3".into(),
+            messages: vec![
+                CanonicalMessage {
+                    role: "assistant".into(),
+                    content: CanonicalContent::Blocks(vec![
+                        CanonicalBlock::Text("thinking".into()),
+                        CanonicalBlock::ToolUse {
+                            id: "c1".into(),
+                            name: "f".into(),
+                            arguments: "{}".into(),
+                        },
+                    ]),
+                },
+                CanonicalMessage {
+                    role: "tool".into(),
+                    content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
+                        tool_use_id: "c1".into(),
+                        content: "R".into(),
+                        is_error: false,
+                    }]),
+                },
+            ],
+            ..Default::default()
+        };
+        let body = to_xai_chat_request(&req, &empty_repl());
+        let messages = body["messages"].as_array().unwrap();
+
+        // The assistant message keeps its Text sibling as `content` AND carries
+        // the tool call (the sibling is NOT dropped).
+        let assistant = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message must be present");
+        assert_eq!(
+            assistant["content"], "thinking",
+            "the Text sibling must survive as the assistant content"
+        );
+        let calls = assistant["tool_calls"]
+            .as_array()
+            .expect("assistant must carry tool_calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"], "c1");
+
+        // The tool result is a separate role:"tool" message keyed by id.
+        let tool_msg = messages
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("tool result message must be present");
+        assert_eq!(tool_msg["tool_call_id"], "c1");
+        assert_eq!(tool_msg["content"], "R");
+    }
+
+    #[test]
+    fn plain_assistant_block_message_omits_empty_tool_calls_key() {
+        // WHY: a plain assistant block message (no tool calls) must NOT emit an
+        // empty `tool_calls` array; the OpenAI contract only includes the key
+        // when the assistant actually called tools, and an empty array can be
+        // rejected upstream.
+        let req = CanonicalRequest {
+            model: "grok-4.3".into(),
+            messages: vec![CanonicalMessage {
+                role: "assistant".into(),
+                content: CanonicalContent::Blocks(vec![CanonicalBlock::Text("hi".into())]),
+            }],
+            ..Default::default()
+        };
+        let body = to_xai_chat_request(&req, &empty_repl());
+        let messages = body["messages"].as_array().unwrap();
+        let assistant = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message must be present");
+        assert_eq!(assistant["content"], "hi");
+        assert!(
+            assistant.get("tool_calls").is_none(),
+            "no tool_calls key when the assistant called no tools"
+        );
     }
 
     #[test]
