@@ -23,3 +23,6 @@ uuid.workspace = true
 reqwest.workspace = true
 clap = { workspace = true }
 anyhow = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

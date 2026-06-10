@@ -517,6 +517,20 @@ fn map_provider_err(e: ProviderError) -> AppError {
     }
 }
 
+/// Handler for POST /v1/responses (OpenAI Responses API protocol).
+///
+/// Contract (pinned by the responses tests below + omni-common::responses):
+/// same prefix routing as chat completions; unsupported input shapes map to
+/// BadRequest; non-stream returns the Responses envelope; stream:true returns
+/// Responses SSE events (response.created ... response.completed, no [DONE]).
+#[allow(dead_code)] // TDD red phase: registered in the router in the green phase
+async fn responses_handler(
+    State(_state): State<Arc<AppState>>,
+    Json(_body): Json<omni_common::ResponsesRequest>,
+) -> Result<axum::response::Response, AppError> {
+    todo!("TDD green phase: implement the Responses protocol handler")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1507,5 +1521,224 @@ rule = [
         assert!(body.contains("[DONE]"), "stream must terminate with [DONE]");
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    // ---- OpenAI Responses protocol (/v1/responses): TDD contract tests ----
+
+    fn responses_req(body: &str) -> omni_common::ResponsesRequest {
+        serde_json::from_str(body).expect("responses request json")
+    }
+
+    #[tokio::test]
+    async fn test_responses_unsupported_input_is_bad_request() {
+        // WHY: v1 rejects non-message input items (function_call_output needs
+        // richer-than-text canonical content) LOUDLY as an OAI-shaped 400 naming
+        // the offender; a 500 or silent mangling would corrupt tool conversations.
+        let c = Arc::new(ClaudeProvider::new().expect("c"));
+        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+        map.insert("claude".into(), c);
+        let state = Arc::new(AppState { providers: map });
+        let req = responses_req(
+            r#"{"model":"claude:sonnet","input":[{"type":"function_call_output","call_id":"c1","output":"42"}]}"#,
+        );
+        let res = responses_handler(State(state), Json(req)).await;
+        match res {
+            Err(AppError::BadRequest(msg)) => assert!(
+                msg.contains("function_call_output"),
+                "400 must name the unsupported item type: {msg}"
+            ),
+            other => panic!("expected BadRequest for unsupported input, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_responses_bare_model_multi_requires_prefix() {
+        // WHY: the aggregator's prefix-routing contract applies to EVERY inbound
+        // protocol; Responses requests route exactly like chat completions.
+        let c = Arc::new(ClaudeProvider::new().expect("c"));
+        let g = Arc::new(GrokProvider::new_for_test("k", "http://127.0.0.1:9"));
+        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+        map.insert("claude".into(), c);
+        map.insert("grok".into(), g);
+        let state = Arc::new(AppState { providers: map });
+        let req = responses_req(r#"{"model":"bare-model","input":"hi"}"#);
+        let res = responses_handler(State(state), Json(req)).await;
+        match res {
+            Err(AppError::BadRequest(msg)) => assert!(msg.contains("must use prefix")),
+            other => panic!("expected prefix-required BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_responses_nonstream_routes_via_prefix_to_grok() {
+        // WHY: proves the Responses handler delegates through the same provider
+        // map: a dead grok upstream surfaces as ServerError (delegation reached
+        // the provider), never as a routing-level BadRequest.
+        let g = Arc::new(GrokProvider::new_for_test("dummy", "http://127.0.0.1:1"));
+        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+        map.insert("grok".into(), g);
+        let state = Arc::new(AppState { providers: map });
+        let req = responses_req(r#"{"model":"grok:grok-3","input":"ping"}"#);
+        let res = responses_handler(State(state), Json(req)).await;
+        match res {
+            Err(AppError::ServerError(msg)) => {
+                assert!(msg.contains("upstream") || msg.contains("network"))
+            }
+            other => panic!("expected upstream ServerError via grok route, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_responses_stream_is_routed_to_sse_with_failed_event_on_dead_upstream() {
+        // WHY: grok's send_stream defers the HTTP call into the stream body, so
+        // even a dead upstream yields an SSE response whose terminal event is
+        // response.failed. This pins both halves hermetically: stream:true is
+        // routed (not rejected) AND errors surface in Responses SSE framing.
+        let g = Arc::new(GrokProvider::new_for_test("dummy", "http://127.0.0.1:1"));
+        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+        map.insert("grok".into(), g);
+        let state = Arc::new(AppState { providers: map });
+        let req = responses_req(r#"{"model":"grok:grok-3","input":"ping","stream":true}"#);
+        let res = responses_handler(State(state), Json(req)).await;
+        let resp = match res {
+            Ok(r) => r,
+            Err(e) => panic!("stream must not be rejected; got error {e:?}"),
+        };
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("text/event-stream"),
+            "Responses stream must be SSE, got content-type {ct:?}"
+        );
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            body.contains("event: response.failed"),
+            "dead upstream must terminate the stream with response.failed: {body}"
+        );
+        assert!(
+            !body.contains("[DONE]"),
+            "Responses SSE has no [DONE] sentinel"
+        );
+    }
+
+    #[test]
+    fn test_subprocess_omni_binary_responses_route_exists() {
+        // WHY: the route must be registered in the PRODUCTION router (not just a
+        // test router). A parseable-but-unsupported body is rejected at parse
+        // level (400) before any upstream call, so this is hermetic; a 404 means
+        // /v1/responses is not wired.
+        let port = free_port();
+        let mut child = Command::new(omni_bin_path())
+            .env("OMNI_PROVIDERS", "claude")
+            .args(["--no-auth", "--port", &port.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+        let out = Command::new("curl")
+            .args([
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "-X",
+                "POST",
+                "-H",
+                "content-type: application/json",
+                "-d",
+                r#"{"model":"claude:sonnet","input":[{"type":"function_call_output","call_id":"c","output":"x"}]}"#,
+                &format!("http://127.0.0.1:{}/v1/responses", port),
+            ])
+            .output()
+            .unwrap();
+        let code = String::from_utf8_lossy(&out.stdout);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            code.trim(),
+            "400",
+            "POST /v1/responses must exist and reject unsupported input with 400 (404 = route not registered)"
+        );
+    }
+
+    #[test]
+    fn test_subprocess_omni_binary_responses_live_roundtrip() {
+        // WHY: end-to-end proof over real HTTP: a Responses request returns the
+        // Responses envelope (non-stream) and Responses SSE events (stream)
+        // through the aggregator's prefix routing. Live-conditional on grok
+        // creds so the suite stays green offline.
+        if !has_grok_creds() {
+            eprintln!("skipping responses live roundtrip: no grok creds");
+            return;
+        }
+        let port = free_port();
+        let mut child = Command::new(omni_bin_path())
+            .env("OMNI_PROVIDERS", "grok")
+            .args(["--no-auth", "--port", &port.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+
+        // Non-stream: Responses envelope with assistant output_text.
+        let out = Command::new("curl")
+            .args([
+                "-s",
+                "-X",
+                "POST",
+                "-H",
+                "content-type: application/json",
+                "-d",
+                r#"{"model":"grok:grok-3","input":"Reply with the single word PONG","max_output_tokens":16}"#,
+                &format!("http://127.0.0.1:{}/v1/responses", port),
+            ])
+            .output()
+            .unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout).expect("responses json");
+        assert_eq!(v["object"], "response", "live body: {v}");
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["output"][0]["type"], "message");
+        assert!(
+            !v["output"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .is_empty(),
+            "live response must carry assistant text: {v}"
+        );
+        assert!(v["usage"]["total_tokens"].as_u64().unwrap_or(0) > 0);
+
+        // Stream: Responses SSE events, no [DONE].
+        let out2 = Command::new("curl")
+            .args([
+                "-sN",
+                "-X",
+                "POST",
+                "-H",
+                "content-type: application/json",
+                "-d",
+                r#"{"model":"grok:grok-3","input":"Reply with the single word PONG","max_output_tokens":16,"stream":true}"#,
+                &format!("http://127.0.0.1:{}/v1/responses", port),
+            ])
+            .output()
+            .unwrap();
+        let body = String::from_utf8_lossy(&out2.stdout);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            body.contains("event: response.created"),
+            "live stream must open with response.created: {body}"
+        );
+        assert!(body.contains("event: response.output_text.delta"));
+        assert!(body.contains("event: response.completed"));
+        assert!(!body.contains("[DONE]"));
     }
 }

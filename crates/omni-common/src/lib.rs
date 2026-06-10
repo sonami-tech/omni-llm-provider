@@ -8,6 +8,7 @@ pub mod credentials;
 pub mod error;
 pub mod http;
 pub mod replacements;
+pub mod responses;
 pub mod session;
 pub mod stats;
 pub mod time_util;
@@ -20,4 +21,8 @@ pub use http::{
     sse_from_canonical_stream, to_canonical, unix_now_secs,
 };
 pub use replacements::{Replacements, ReplacementsError};
+pub use responses::{
+    ResponsesRequest, ResponsesResponse, responses_from_canonical, responses_to_canonical,
+    sse_from_canonical_stream_responses,
+};
 pub use stats::{Stats, StatsSnapshot, TokenUsage};

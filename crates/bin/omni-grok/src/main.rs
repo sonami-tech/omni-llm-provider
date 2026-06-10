@@ -262,6 +262,21 @@ fn map_provider_err(state: &AppState, model: &str, e: ProviderError) -> AppError
     }
 }
 
+/// Handler for POST /v1/responses (OpenAI Responses API protocol).
+///
+/// Contract (pinned by the responses tests below + omni-common::responses):
+/// unsupported input shapes map to BadRequest; non-stream returns the
+/// Responses envelope; stream:true returns Responses SSE (response.created
+/// ... response.completed, no [DONE]); requests/errors recorded in stats
+/// exactly like chat completions.
+#[allow(dead_code)] // TDD red phase: registered in build_router in the green phase
+async fn responses_handler(
+    State(_state): State<Arc<AppState>>,
+    Json(_body): Json<omni_common::ResponsesRequest>,
+) -> Result<axum::response::Response, AppError> {
+    todo!("TDD green phase: implement the Responses protocol handler")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,5 +659,172 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait(); // reap the child so no zombie is left behind
+    }
+
+    // ---- OpenAI Responses protocol (/v1/responses): TDD contract tests ----
+
+    #[tokio::test]
+    async fn responses_unsupported_input_is_bad_request() {
+        // WHY: v1 rejects non-message input items loudly as an OAI-shaped 400
+        // naming the offender, instead of silently mangling tool conversations.
+        let state = test_state();
+        let req: omni_common::ResponsesRequest = serde_json::from_str(
+            r#"{"model":"grok-3","input":[{"type":"function_call_output","call_id":"c1","output":"42"}]}"#,
+        )
+        .expect("responses request json");
+        let res = responses_handler(State(state), Json(req)).await;
+        match res {
+            Err(AppError::BadRequest(msg)) => assert!(
+                msg.contains("function_call_output"),
+                "400 must name the unsupported item type: {msg}"
+            ),
+            other => panic!("expected BadRequest for unsupported input, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_nonstream_upstream_error_maps_to_500() {
+        // WHY: proves the Responses handler delegates to the provider with the
+        // same error classification as chat completions: a dead upstream is a
+        // ServerError (5xx), never a parse-level 400.
+        let state = test_state();
+        let req: omni_common::ResponsesRequest =
+            serde_json::from_str(r#"{"model":"grok-3","input":"ping"}"#).unwrap();
+        let res = responses_handler(State(state), Json(req)).await;
+        match res {
+            Err(AppError::ServerError(msg)) => {
+                assert!(msg.contains("upstream") || msg.contains("network"))
+            }
+            other => panic!("expected upstream ServerError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_stream_returns_sse_with_failed_event_on_dead_upstream() {
+        // WHY: grok's send_stream defers the HTTP call into the stream body, so
+        // stream:true must yield an SSE response even for a dead upstream, whose
+        // terminal Responses event is response.failed. Pins hermetically that
+        // streaming is routed (never a 400) and that stream errors surface in
+        // Responses framing, not the Chat [DONE] convention.
+        let state = test_state();
+        let req: omni_common::ResponsesRequest =
+            serde_json::from_str(r#"{"model":"grok-3","input":"ping","stream":true}"#).unwrap();
+        let res = responses_handler(State(state), Json(req)).await;
+        let resp = match res {
+            Ok(r) => r,
+            Err(e) => panic!("stream must not be rejected; got error {e:?}"),
+        };
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("text/event-stream"),
+            "Responses stream must be SSE, got content-type {ct:?}"
+        );
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            body.contains("event: response.failed"),
+            "dead upstream must terminate the stream with response.failed: {body}"
+        );
+        assert!(
+            !body.contains("[DONE]"),
+            "Responses SSE has no [DONE] sentinel"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_route_registered_returns_400_not_404_for_bad_input() {
+        // WHY: the route must be wired into the PRODUCTION router. A
+        // parseable-but-unsupported body is rejected at parse level (hermetic,
+        // no upstream call); a 404 means /v1/responses is not registered.
+        use tower::ServiceExt;
+        let app = build_router(test_state(), Arc::new(std::collections::HashSet::new()));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"model":"grok-3","input":[{"type":"function_call_output","call_id":"c","output":"x"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "POST /v1/responses must exist and reject unsupported input with 400 (404 = not registered)"
+        );
+    }
+
+    #[test]
+    fn responses_live_subprocess_roundtrip_conditional() {
+        // WHY: end-to-end live proof over real HTTP that the standalone binary
+        // serves the Responses protocol: envelope for non-stream, Responses SSE
+        // events for stream. Skips cleanly offline.
+        if !has_grok_creds() {
+            eprintln!("skipping responses live subprocess test: no grok creds");
+            return;
+        }
+        let port = free_port();
+        let mut child = Command::new(bin_path())
+            .args(["--no-auth", "--port", &port.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn omni-grok");
+        assert!(wait_for_health(port, None, Duration::from_secs(6)));
+
+        let out = Command::new("curl")
+            .args([
+                "-s",
+                "-X",
+                "POST",
+                "-H",
+                "content-type: application/json",
+                "-d",
+                r#"{"model":"grok-3","input":"Reply with the single word PONG","max_output_tokens":16}"#,
+                &format!("http://127.0.0.1:{}/v1/responses", port),
+            ])
+            .output()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("responses json");
+        assert_eq!(v["object"], "response", "live body: {v}");
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["output"][0]["type"], "message");
+        assert!(
+            !v["output"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .is_empty()
+        );
+
+        let out2 = Command::new("curl")
+            .args([
+                "-sN",
+                "-X",
+                "POST",
+                "-H",
+                "content-type: application/json",
+                "-d",
+                r#"{"model":"grok-3","input":"Reply with the single word PONG","max_output_tokens":16,"stream":true}"#,
+                &format!("http://127.0.0.1:{}/v1/responses", port),
+            ])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out2.stdout);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(text.contains("event: response.created"));
+        assert!(text.contains("event: response.output_text.delta"));
+        assert!(text.contains("event: response.completed"));
+        assert!(!text.contains("[DONE]"));
     }
 }

@@ -301,6 +301,21 @@ fn record_and_map(state: &AppState, model: &str, e: ProviderError) -> AppError {
     map_provider_err(e)
 }
 
+/// Handler for POST /v1/responses (OpenAI Responses API protocol).
+///
+/// Contract (pinned by the responses tests below + omni-common::responses):
+/// unsupported input shapes map to BadRequest; non-stream returns the
+/// Responses envelope; stream:true returns Responses SSE (response.created
+/// ... response.completed, no [DONE]); requests/errors recorded in stats
+/// exactly like chat completions.
+#[allow(dead_code)] // TDD red phase: registered in build_router in the green phase
+async fn responses_handler(
+    State(_state): State<Arc<AppState>>,
+    Json(_body): Json<omni_common::ResponsesRequest>,
+) -> Result<axum::response::Response, AppError> {
+    todo!("TDD green phase: implement the Responses protocol handler")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,5 +878,131 @@ mod tests {
         assert!(text.contains("[DONE]"), "stream must terminate with [DONE]");
 
         kill_child(&mut child);
+    }
+
+    // ---- OpenAI Responses protocol (/v1/responses): TDD contract tests ----
+
+    #[tokio::test]
+    async fn responses_unsupported_input_is_bad_request() {
+        // WHY: v1 rejects non-message input items loudly as an OAI-shaped 400
+        // naming the offender, instead of silently mangling tool conversations.
+        let (state, _guard) = test_state(false);
+        let req: omni_common::ResponsesRequest = serde_json::from_str(
+            r#"{"model":"sonnet","input":[{"type":"function_call_output","call_id":"c1","output":"42"}]}"#,
+        )
+        .expect("responses request json");
+        let res = responses_handler(State(state), Json(req)).await;
+        match res {
+            Err(AppError::BadRequest(msg)) => assert!(
+                msg.contains("function_call_output"),
+                "400 must name the unsupported item type: {msg}"
+            ),
+            other => panic!("expected BadRequest for unsupported input, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_route_registered_returns_400_not_404_for_bad_input() {
+        // WHY: the route must be wired into the PRODUCTION router. A
+        // parseable-but-unsupported body is rejected at parse level (hermetic,
+        // no upstream call); a 404 means /v1/responses is not registered.
+        let (state, _guard) = test_state(false);
+        let app = build_router(state, Arc::new(HashSet::new()));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"model":"sonnet","input":[{"type":"function_call_output","call_id":"c","output":"x"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "POST /v1/responses must exist and reject unsupported input with 400 (404 = not registered)"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_records_request_in_stats() {
+        // WHY: the Responses surface must feed the same persistent stats as chat
+        // completions; an unrecorded protocol skews per-model accounting. Pinned
+        // contract: the inbound request is recorded FIRST (mirroring the chat
+        // handler's record-then-work order), so even a request later rejected
+        // for unsupported input counts as inbound traffic. Using the rejected
+        // path keeps this test hermetic (no upstream call ever happens).
+        let (state, _guard) = test_state(true);
+        let req: omni_common::ResponsesRequest = serde_json::from_str(
+            r#"{"model":"sonnet","input":[{"type":"function_call_output","call_id":"c","output":"x"}]}"#,
+        )
+        .expect("responses request json");
+        let _ = responses_handler(State(state.clone()), Json(req)).await;
+        let snap = state.stats.as_ref().expect("stats enabled").snapshot();
+        assert_eq!(
+            snap.total_requests, 1,
+            "an inbound Responses request must be recorded in stats (record-first order)"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_live_nonstream_and_stream_conditional() {
+        // WHY: live proof the Claude backend serves the Responses protocol:
+        // non-stream returns the envelope with assistant output_text; stream
+        // returns Responses SSE terminated by response.completed (no [DONE]).
+        // Skips cleanly offline.
+        if !has_claude_creds() {
+            eprintln!("skipping responses live test: no claude creds");
+            return;
+        }
+        let (state, _guard) = test_state(false);
+
+        // Non-stream.
+        let req: omni_common::ResponsesRequest = serde_json::from_str(
+            r#"{"model":"haiku","input":"Reply with the single word PONG","max_output_tokens":16}"#,
+        )
+        .unwrap();
+        let resp = responses_handler(State(state.clone()), Json(req))
+            .await
+            .expect("live non-stream responses call succeeds")
+            .into_response();
+        let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).expect("responses envelope json");
+        assert_eq!(v["object"], "response", "live body: {v}");
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["output"][0]["type"], "message");
+        assert!(
+            !v["output"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .is_empty()
+        );
+
+        // Stream.
+        let req2: omni_common::ResponsesRequest = serde_json::from_str(
+            r#"{"model":"haiku","input":"Reply with the single word PONG","max_output_tokens":16,"stream":true}"#,
+        )
+        .unwrap();
+        let resp2 = responses_handler(State(state), Json(req2))
+            .await
+            .expect("live stream responses call succeeds")
+            .into_response();
+        let ct = resp2
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(ct.contains("text/event-stream"), "got content-type {ct:?}");
+        let body2 = to_bytes(resp2.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8_lossy(&body2);
+        assert!(text.contains("event: response.created"));
+        assert!(text.contains("event: response.output_text.delta"));
+        assert!(text.contains("event: response.completed"));
+        assert!(!text.contains("[DONE]"));
     }
 }
