@@ -912,7 +912,9 @@ dependencies = [
 name = "omni-claude"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
+ "clap",
  "omni-common",
  "omni-core",
  "provider-claude",
@@ -920,6 +922,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -965,9 +968,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "clap",
  "omni-common",
  "omni-core",
- "provider-claude",
  "provider-grok",
  "reqwest",
  "serde",
