@@ -325,6 +325,12 @@ mod tests {
     }
 
     fn has_claude_creds() -> bool {
+        // Honor CLAUDE_CREDENTIALS_PATH (the same override ClaudeProvider reads) so
+        // this guard agrees with what the live send actually loads; otherwise a
+        // missing-file override would pass the guard and then fail the send.
+        if let Ok(p) = std::env::var("CLAUDE_CREDENTIALS_PATH") {
+            return std::path::Path::new(&p).exists();
+        }
         let home = std::env::var("HOME").unwrap_or_default();
         std::path::Path::new(&(home + "/.claude/.credentials.json")).exists()
     }

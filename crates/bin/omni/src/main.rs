@@ -572,8 +572,15 @@ mod tests {
 
     #[tokio::test]
     async fn smoke_routing_and_delegate_claude_stub() {
-        // Uses the claude provider (real path or live creds). Verifies resolve + to_canon + delegate + from_canon path.
-        // (Updated for ported full provider; no more internal stub marker.)
+        // Verifies the full path resolve + to_canonical + delegate + from_canonical
+        // against the real Claude upstream. Live-conditional: skips cleanly when no
+        // Claude credentials are present so the suite stays green offline (the
+        // routing + conversion logic without the live send is covered by the
+        // hermetic handler tests below).
+        if !has_claude_creds() {
+            eprintln!("skipping smoke_routing_and_delegate_claude_stub: no claude creds");
+            return;
+        }
         let claude = Arc::new(ClaudeProvider::new().expect("claude provider for wrapper test"));
         let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
         map.insert("claude".to_string(), claude);
@@ -668,11 +675,25 @@ mod tests {
     }
 
     fn has_claude_creds() -> bool {
+        // Honor the same override the provider uses (CLAUDE_CREDENTIALS_PATH), so
+        // this guard agrees with what ClaudeProvider::send actually reads. Without
+        // this, pointing the override at a missing file would pass the guard yet
+        // fail the live send.
+        if let Ok(p) = std::env::var("CLAUDE_CREDENTIALS_PATH") {
+            return std::path::Path::new(&p).exists();
+        }
         let home = std::env::var("HOME").unwrap_or_default();
         std::path::Path::new(&(home + "/.claude/.credentials.json")).exists()
     }
 
     fn has_grok_creds() -> bool {
+        // Mirror the Grok provider's fresh-load precedence and the race-safe guard
+        // used in provider-grok: when XAI_CREDENTIALS_PATH is set, treat creds as
+        // present only if that file exists (a test may point it at a dummy/missing
+        // path); otherwise fall back to XAI_API_KEY or the default file.
+        if let Ok(p) = std::env::var("XAI_CREDENTIALS_PATH") {
+            return std::path::Path::new(&p).exists();
+        }
         if std::env::var("XAI_API_KEY").is_ok() {
             return true;
         }
