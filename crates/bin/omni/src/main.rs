@@ -612,8 +612,9 @@ mod tests {
             return std::path::PathBuf::from(p);
         }
         // Otherwise build the binary on demand and locate the real artifact (honors
-        // CARGO_TARGET_DIR + profile). Cache so the build runs once per test process;
-        // see omni_common::test_support::build_workspace_bin for the full rationale.
+        // CARGO_TARGET_DIR; builds the dev profile). Cache so the build runs once per
+        // test process; see omni_common::test_support::build_workspace_bin for the
+        // full rationale.
         static BIN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
         BIN.get_or_init(|| omni_common::test_support::build_workspace_bin("omni"))
             .clone()

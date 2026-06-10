@@ -355,9 +355,10 @@ mod tests {
     /// harness, NOT the standalone binary, and unit tests (unlike integration
     /// tests) do not get a `CARGO_BIN_EXE_*` env var. Building here (and locating
     /// the real artifact via cargo's JSON output, which honors CARGO_TARGET_DIR and
-    /// profile) makes the subprocess suite self-contained and green offline
-    /// regardless of invocation order, and never spawns a stale binary. Cached so
-    /// the build runs once per test process. Kept in sync with omni::omni_bin_path.
+    /// builds the dev profile) makes the subprocess suite self-contained and green
+    /// offline regardless of invocation order, and never spawns a stale binary.
+    /// Cached so the build runs once per test process. Kept in sync with
+    /// omni::omni_bin_path.
     fn bin_path() -> std::path::PathBuf {
         // cargo normalizes '-' to '_' in the injected env var name.
         if let Ok(p) = std::env::var("CARGO_BIN_EXE_omni_grok") {

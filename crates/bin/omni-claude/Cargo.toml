@@ -26,3 +26,5 @@ anyhow = { workspace = true }
 [dev-dependencies]
 anyhow = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
+# Enable the build-and-locate helper used by the subprocess integration tests.
+omni-common = { path = "../../omni-common", features = ["test-support"] }

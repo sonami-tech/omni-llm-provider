@@ -438,8 +438,8 @@ mod tests {
     /// tests in a bin crate get no `CARGO_BIN_EXE_*` env var, so `cargo test -p
     /// omni-claude` from a clean tree would otherwise spawn a missing or stale
     /// binary. Builds and locates the real artifact via cargo's JSON output (honors
-    /// CARGO_TARGET_DIR + profile); cached so the build runs once per test process.
-    /// Kept in sync with omni::omni_bin_path / omni-grok::bin_path.
+    /// CARGO_TARGET_DIR; builds the dev profile); cached so the build runs once per
+    /// test process. Kept in sync with omni::omni_bin_path / omni-grok::bin_path.
     fn omni_claude_bin_path() -> PathBuf {
         if let Ok(p) = std::env::var("CARGO_BIN_EXE_omni_claude") {
             return p.into();

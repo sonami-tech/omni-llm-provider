@@ -11,6 +11,7 @@ pub mod replacements;
 pub mod responses;
 pub mod session;
 pub mod stats;
+#[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod time_util;
 

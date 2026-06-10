@@ -17,15 +17,22 @@ use std::process::Command;
 /// a *stale* binary from a prior build after a handler/route change.
 ///
 /// WHY parse `--message-format=json` instead of hardcoding `target/debug/<bin>`:
-/// the hardcoded guess is wrong whenever `CARGO_TARGET_DIR` is set (common in CI)
-/// or a non-`dev` profile is used (`--release`). Cargo reports the real executable
-/// path in its `compiler-artifact` messages, so we ask cargo where it put the
-/// binary rather than guess.
+/// the hardcoded guess is wrong whenever `CARGO_TARGET_DIR` is set (common in CI),
+/// so the test would spawn a missing or stale binary. Cargo reports the real
+/// executable path in its `compiler-artifact` messages, so we ask cargo where it
+/// put the binary rather than guess.
 ///
-/// The build runs at most once per `package` per test-binary process (cached via
-/// the returned path through a per-call `OnceLock` keyed implicitly by the caller's
-/// own `Once`). Callers typically wrap this so it runs once; cargo's own artifact
-/// lock makes concurrent invocations safe regardless.
+/// PROFILE: this always builds the default (dev) profile. It does NOT mirror a
+/// `cargo test --release` parent, because a unit test in a bin crate has no
+/// reliable way to learn the parent's profile. That is acceptable: the default
+/// `cargo test` is dev, and the release/integration-test path is already covered
+/// by the `CARGO_BIN_EXE_<pkg>` env var that cargo injects with the correct path
+/// (call sites check it first). If a release-profile subprocess test is ever
+/// needed, pass the profile explicitly rather than relying on this helper.
+///
+/// The build runs at most once per call; call sites cache the result in a
+/// `OnceLock` so it runs once per test-binary process. Cargo's own artifact lock
+/// makes any concurrent invocations safe regardless.
 pub fn build_workspace_bin(package: &str) -> PathBuf {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let output = Command::new(cargo)
@@ -38,8 +45,10 @@ pub fn build_workspace_bin(package: &str) -> PathBuf {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Scan compiler-artifact messages for the executable produced for `package`.
-    // We take the last matching executable so a re-link reports the current path.
+    // Scan compiler-artifact messages for the bin executable produced for `package`.
+    // Require BOTH target.kind == ["bin"] AND target.name == package so we never
+    // pick up a lib, build script, or example artifact; take the last match so a
+    // re-link reports the current path.
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut found: Option<PathBuf> = None;
     for line in stdout.lines() {
@@ -50,13 +59,16 @@ pub fn build_workspace_bin(package: &str) -> PathBuf {
         if msg.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
             continue;
         }
-        // Match the target name to the package's binary (target name == bin name).
-        let is_bin = msg
-            .get("target")
-            .and_then(|t| t.get("name"))
-            .and_then(|n| n.as_str())
-            == Some(package);
-        if !is_bin {
+        let target = match msg.get("target") {
+            Some(t) => t,
+            None => continue,
+        };
+        let name_matches = target.get("name").and_then(|n| n.as_str()) == Some(package);
+        let is_bin = target
+            .get("kind")
+            .and_then(|k| k.as_array())
+            .is_some_and(|kinds| kinds.iter().any(|k| k.as_str() == Some("bin")));
+        if !(name_matches && is_bin) {
             continue;
         }
         if let Some(exe) = msg.get("executable").and_then(|e| e.as_str()) {
@@ -65,6 +77,6 @@ pub fn build_workspace_bin(package: &str) -> PathBuf {
     }
 
     found.unwrap_or_else(|| {
-        panic!("cargo build -p {package} produced no executable artifact for target '{package}'")
+        panic!("cargo build -p {package} produced no bin executable artifact for target '{package}'")
     })
 }

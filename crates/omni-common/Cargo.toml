@@ -3,6 +3,12 @@ name = "omni-common"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Build-and-locate helper for the binary crates' subprocess integration tests.
+# Off by default so the test-only code is never compiled into production builds;
+# the binaries enable it via a dev-dependency on omni-common.
+test-support = []
+
 [dependencies]
 omni-core = { path = "../omni-core" }
 axum.workspace = true
