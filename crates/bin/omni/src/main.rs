@@ -1649,4 +1649,297 @@ rule = [
         assert!(body.contains("event: response.completed"));
         assert!(!body.contains("[DONE]"));
     }
+
+    #[test]
+    fn live_tool_call_loop_both_backends_conditional() {
+        // WHY: closes per-backend chat tool coverage on the AGGREGATOR. When a
+        // backend's creds are present, runs the full multi-turn tool loop through
+        // prefix routing for that backend: hop 1 declares a tool and the model
+        // emits a get_weather tool_call (finish_reason "tool_calls"); hop 2 feeds
+        // the tool RESULT back and the model answers using it (finish_reason
+        // "stop", content contains the fed-back "72"). The hop-2 "72" assertion
+        // proves the tool result actually round-tripped through the aggregator.
+        // Skips a backend's block when its creds are absent so the suite stays
+        // green offline. Starts both providers; passes XAI_API_KEY through if set
+        // (grok requires it at startup unless ~/.xai/.credentials.json exists).
+        if !has_grok_creds() && !has_claude_creds() {
+            eprintln!("skipping live tool-call loop both-backends: no grok or claude creds");
+            return;
+        }
+        let port = free_port();
+        let mut cmd = Command::new(omni_bin_path());
+        cmd.env("OMNI_PROVIDERS", "claude,grok")
+            .args(["--no-auth", "--port", &port.to_string()]);
+        if let Ok(k) = std::env::var("XAI_API_KEY") {
+            cmd.env("XAI_API_KEY", k);
+        }
+        let mut child = cmd
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+
+        // Per-backend prefix model; only exercised when that backend has creds.
+        let mut backends: Vec<&str> = Vec::new();
+        if has_grok_creds() {
+            backends.push("grok:grok-3");
+        }
+        if has_claude_creds() {
+            backends.push("claude:claude-3-5-haiku-20241022");
+        }
+        for model in backends {
+            // Hop 1: declare a tool; model must emit a get_weather tool_call.
+            let body1 = format!(
+                r#"{{"model":"{model}","messages":[{{"role":"user","content":"What is the weather in San Francisco? Use the get_weather tool."}}],"tools":[{{"type":"function","function":{{"name":"get_weather","description":"Get weather for a city","parameters":{{"type":"object","properties":{{"city":{{"type":"string"}}}},"required":["city"]}}}}}}],"tool_choice":"auto","max_tokens":256}}"#
+            );
+            let out = Command::new("curl")
+                .args([
+                    "-s",
+                    "-X",
+                    "POST",
+                    "-H",
+                    "content-type: application/json",
+                    "-d",
+                    &body1,
+                    &format!("http://127.0.0.1:{}/v1/chat/completions", port),
+                ])
+                .output()
+                .unwrap();
+            let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(serde_json::json!({}));
+            assert_eq!(
+                v["choices"][0]["finish_reason"], "tool_calls",
+                "{model} hop-1 must stop for tool_calls, got: {v}"
+            );
+            let tool_calls = v["choices"][0]["message"]["tool_calls"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                !tool_calls.is_empty(),
+                "{model} hop-1 must carry a non-empty tool_calls array: {v}"
+            );
+            assert_eq!(
+                tool_calls[0]["function"]["name"], "get_weather",
+                "{model} hop-1 tool call must name get_weather: {v}"
+            );
+            assert!(
+                !tool_calls[0]["function"]["arguments"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty(),
+                "{model} hop-1 tool call must carry arguments (city), got: {v}"
+            );
+
+            // Hop 2: feed the tool result back; model must answer using it.
+            let body2 = format!(
+                r#"{{"model":"{model}","messages":[{{"role":"user","content":"What is the weather in SF?"}},{{"role":"assistant","content":null,"tool_calls":[{{"id":"call_1","type":"function","function":{{"name":"get_weather","arguments":"{{\"city\":\"SF\"}}"}}}}]}},{{"role":"tool","tool_call_id":"call_1","content":"72F and sunny"}}],"tools":[{{"type":"function","function":{{"name":"get_weather","parameters":{{"type":"object","properties":{{"city":{{"type":"string"}}}}}}}}}}],"max_tokens":256}}"#
+            );
+            let out2 = Command::new("curl")
+                .args([
+                    "-s",
+                    "-X",
+                    "POST",
+                    "-H",
+                    "content-type: application/json",
+                    "-d",
+                    &body2,
+                    &format!("http://127.0.0.1:{}/v1/chat/completions", port),
+                ])
+                .output()
+                .unwrap();
+            let v2: Value = serde_json::from_slice(&out2.stdout).unwrap_or(serde_json::json!({}));
+            assert_eq!(
+                v2["choices"][0]["finish_reason"], "stop",
+                "{model} hop-2 must finish with stop after consuming the tool result, got: {v2}"
+            );
+            let content = v2["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("");
+            assert!(
+                !content.is_empty(),
+                "{model} hop-2 content must be present: {v2}"
+            );
+            assert!(
+                content.contains("72"),
+                "{model} hop-2 content must mention the fed-back temperature (proves the tool result round-tripped): {content}"
+            );
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn test_subprocess_omni_binary_responses_live_roundtrip_claude() {
+        // WHY: closes the CLAUDE gap in the live Responses coverage (the grok
+        // roundtrip test only covers grok). End-to-end over real HTTP through the
+        // aggregator's prefix routing: non-stream yields the Responses envelope
+        // (object "response", status completed, output[0] message with non-empty
+        // text); stream yields Responses SSE events (response.created /
+        // output_text.delta / completed) with no [DONE]. Live-conditional on
+        // claude creds (loaded from ~/.claude/.credentials.json; no env
+        // passthrough needed) so the suite stays green offline.
+        if !has_claude_creds() {
+            eprintln!("skipping responses live roundtrip (claude): no claude creds");
+            return;
+        }
+        let port = free_port();
+        let mut child = Command::new(omni_bin_path())
+            .env("OMNI_PROVIDERS", "claude")
+            .args(["--no-auth", "--port", &port.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+
+        // Non-stream: Responses envelope with assistant output_text.
+        let out = Command::new("curl")
+            .args([
+                "-s",
+                "-X",
+                "POST",
+                "-H",
+                "content-type: application/json",
+                "-d",
+                r#"{"model":"claude:claude-3-5-haiku-20241022","input":"Reply with the single word PONG","max_output_tokens":16}"#,
+                &format!("http://127.0.0.1:{}/v1/responses", port),
+            ])
+            .output()
+            .unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout).expect("responses json");
+        assert_eq!(v["object"], "response", "live body: {v}");
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["output"][0]["type"], "message");
+        assert!(
+            !v["output"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .is_empty(),
+            "live response must carry assistant text: {v}"
+        );
+
+        // Stream: Responses SSE events, no [DONE].
+        let out2 = Command::new("curl")
+            .args([
+                "-sN",
+                "-X",
+                "POST",
+                "-H",
+                "content-type: application/json",
+                "-d",
+                r#"{"model":"claude:claude-3-5-haiku-20241022","input":"Reply with the single word PONG","max_output_tokens":16,"stream":true}"#,
+                &format!("http://127.0.0.1:{}/v1/responses", port),
+            ])
+            .output()
+            .unwrap();
+        let body = String::from_utf8_lossy(&out2.stdout);
+        assert!(
+            body.contains("event: response.created"),
+            "live stream must open with response.created: {body}"
+        );
+        assert!(body.contains("event: response.output_text.delta"));
+        assert!(body.contains("event: response.completed"));
+        assert!(!body.contains("[DONE]"));
+
+        // Full tool loop (payload 3): feed function_call + output back; the model
+        // must complete using the fed-back result. The "72" assertion proves the
+        // tool result round-tripped through the Responses protocol on claude.
+        let out3 = Command::new("curl")
+            .args([
+                "-s",
+                "-X",
+                "POST",
+                "-H",
+                "content-type: application/json",
+                "-d",
+                r#"{"model":"claude:claude-3-5-haiku-20241022","input":[{"type":"message","role":"user","content":"Weather in SF?"},{"type":"function_call","call_id":"c1","name":"get_weather","arguments":"{\"city\":\"SF\"}"},{"type":"function_call_output","call_id":"c1","output":"72F and sunny"}],"tools":[{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}],"max_output_tokens":256}"#,
+                &format!("http://127.0.0.1:{}/v1/responses", port),
+            ])
+            .output()
+            .unwrap();
+        let v3: Value = serde_json::from_slice(&out3.stdout).unwrap_or(serde_json::json!({}));
+        assert_eq!(
+            v3["status"], "completed",
+            "responses tool loop must complete, got: {v3}"
+        );
+        let text3 = v3["output"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|it| it["type"] == "message")
+                    .and_then(|m| m["content"][0]["text"].as_str())
+            })
+            .unwrap_or("");
+        assert!(
+            text3.contains("72"),
+            "responses tool loop output must mention the fed-back temperature (proves the tool result round-tripped): {v3}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn test_subprocess_omni_binary_responses_tool_loop_live() {
+        // WHY: proves the Responses full-tool-loop on GROK through the aggregator
+        // (payload 3): feeding a function_call + function_call_output back makes
+        // the model complete using the fed-back result. The "72" assertion proves
+        // the tool result round-tripped through the Responses protocol.
+        // Live-conditional on grok creds; passes XAI_API_KEY through if set.
+        if !has_grok_creds() {
+            eprintln!("skipping responses tool loop live (grok): no grok creds");
+            return;
+        }
+        let port = free_port();
+        let mut cmd = Command::new(omni_bin_path());
+        cmd.env("OMNI_PROVIDERS", "grok")
+            .args(["--no-auth", "--port", &port.to_string()]);
+        if let Ok(k) = std::env::var("XAI_API_KEY") {
+            cmd.env("XAI_API_KEY", k);
+        }
+        let mut child = cmd
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+
+        let out = Command::new("curl")
+            .args([
+                "-s",
+                "-X",
+                "POST",
+                "-H",
+                "content-type: application/json",
+                "-d",
+                r#"{"model":"grok:grok-3","input":[{"type":"message","role":"user","content":"Weather in SF?"},{"type":"function_call","call_id":"c1","name":"get_weather","arguments":"{\"city\":\"SF\"}"},{"type":"function_call_output","call_id":"c1","output":"72F and sunny"}],"tools":[{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}],"max_output_tokens":256}"#,
+                &format!("http://127.0.0.1:{}/v1/responses", port),
+            ])
+            .output()
+            .unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(serde_json::json!({}));
+        assert_eq!(
+            v["status"], "completed",
+            "responses tool loop must complete, got: {v}"
+        );
+        let text = v["output"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|it| it["type"] == "message")
+                    .and_then(|m| m["content"][0]["text"].as_str())
+            })
+            .unwrap_or("");
+        assert!(
+            text.contains("72"),
+            "responses tool loop output must mention the fed-back temperature (proves the tool result round-tripped): {v}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }

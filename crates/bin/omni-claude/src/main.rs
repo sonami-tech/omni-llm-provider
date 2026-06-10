@@ -935,6 +935,106 @@ mod tests {
         kill_child(&mut child);
     }
 
+    #[test]
+    fn live_tool_call_loop_conditional() {
+        // WHY: codifies the multi-turn tool-calling loop end to end against real
+        // Claude. Hop 1: declaring a tool makes the model emit a tool_call
+        // (finish_reason "tool_calls", function name get_weather). Hop 2: feeding
+        // the tool RESULT back makes the model answer using it (finish_reason
+        // "stop", content mentions the fed-back temperature). The hop-2 "72"
+        // assertion is the key proof the tool result actually round-tripped and
+        // was consumed. Skips cleanly (eprintln+return) when creds are absent so
+        // the offline suite stays green and no Max quota is burned. Own random
+        // port; child is killed.
+        if !has_claude_creds() {
+            eprintln!(
+                "skipping live_tool_call_loop_conditional: no Claude credentials at ~/.claude/.credentials.json"
+            );
+            return;
+        }
+        let port = free_port();
+        let mut child = Command::new(omni_claude_bin_path())
+            .args(["--no-auth", "--port", &port.to_string()])
+            .env("OMNI_CLAUDE_STATS_DB", temp_stats_path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn omni-claude (live tools)");
+        if !wait_for_200_health(port, Duration::from_secs(8)) {
+            kill_child(&mut child);
+            panic!("omni-claude did not become healthy on {port}");
+        }
+
+        // Hop 1: declare a tool; model must emit a get_weather tool_call.
+        let out = Command::new("curl")
+            .args([
+                "-s",
+                "-X",
+                "POST",
+                "-H",
+                "content-type: application/json",
+                "-d",
+                r#"{"model":"claude-3-5-haiku-20241022","messages":[{"role":"user","content":"What is the weather in San Francisco? Use the get_weather tool."}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"tool_choice":"auto","max_tokens":256}"#,
+                &format!("http://127.0.0.1:{}/v1/chat/completions", port),
+            ])
+            .output()
+            .unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(serde_json::json!({}));
+        assert_eq!(
+            v["choices"][0]["finish_reason"], "tool_calls",
+            "hop-1 must stop for tool_calls, got: {v}"
+        );
+        let tool_calls = v["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !tool_calls.is_empty(),
+            "hop-1 must carry a non-empty tool_calls array: {v}"
+        );
+        assert_eq!(
+            tool_calls[0]["function"]["name"], "get_weather",
+            "hop-1 tool call must name get_weather: {v}"
+        );
+        assert!(
+            !tool_calls[0]["function"]["arguments"]
+                .as_str()
+                .unwrap_or("")
+                .is_empty(),
+            "hop-1 tool call must carry arguments (city), got: {v}"
+        );
+
+        // Hop 2: feed the tool result back; model must answer using it.
+        let out2 = Command::new("curl")
+            .args([
+                "-s",
+                "-X",
+                "POST",
+                "-H",
+                "content-type: application/json",
+                "-d",
+                r#"{"model":"claude-3-5-haiku-20241022","messages":[{"role":"user","content":"What is the weather in SF?"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"SF\"}"}}]},{"role":"tool","tool_call_id":"call_1","content":"72F and sunny"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],"max_tokens":256}"#,
+                &format!("http://127.0.0.1:{}/v1/chat/completions", port),
+            ])
+            .output()
+            .unwrap();
+        let v2: Value = serde_json::from_slice(&out2.stdout).unwrap_or(serde_json::json!({}));
+        assert_eq!(
+            v2["choices"][0]["finish_reason"], "stop",
+            "hop-2 must finish with stop after consuming the tool result, got: {v2}"
+        );
+        let content = v2["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("");
+        assert!(!content.is_empty(), "hop-2 content must be present: {v2}");
+        assert!(
+            content.contains("72"),
+            "hop-2 content must mention the fed-back temperature (proves the tool result round-tripped): {content}"
+        );
+
+        kill_child(&mut child);
+    }
+
     // ---- OpenAI Responses protocol (/v1/responses): TDD contract tests ----
 
     #[tokio::test]
