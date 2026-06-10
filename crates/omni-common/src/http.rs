@@ -549,6 +549,155 @@ mod tests {
         assert_eq!(to_canonical(&req).unwrap().max_tokens, Some(99));
     }
 
+    fn req_from_json(json: &str) -> ChatCompletionRequest {
+        serde_json::from_str(json).expect("chat request json")
+    }
+
+    #[test]
+    fn to_canonical_maps_tools_and_tool_choice_modes() {
+        // WHY: a client that declares tools must have them reach the provider;
+        // before this wiring to_canonical hardcoded tools:None and the model
+        // never saw the tools. Each tool_choice mode must map to its canonical
+        // equivalent, and "none" must KEEP the tools visible (not drop them).
+        let req = req_from_json(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"function","function":{"name":"get_weather","description":"d","parameters":{"type":"object"}}}],
+                "tool_choice":"auto"}"#,
+        );
+        let canon = to_canonical(&req).unwrap();
+        let tools = canon.tools.as_ref().expect("tools must reach canonical");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "get_weather");
+        assert!(matches!(canon.tool_choice, Some(CanonicalToolChoice::Auto)));
+
+        for (mode, want) in [
+            ("required", CanonicalToolChoice::Required),
+            ("none", CanonicalToolChoice::None),
+        ] {
+            let req = req_from_json(&format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],
+                    "tools":[{{"type":"function","function":{{"name":"f"}}}}],
+                    "tool_choice":"{mode}"}}"#,
+            ));
+            let canon = to_canonical(&req).unwrap();
+            assert!(
+                canon.tools.is_some(),
+                "tool_choice {mode} must keep tools visible"
+            );
+            assert_eq!(
+                std::mem::discriminant(canon.tool_choice.as_ref().unwrap()),
+                std::mem::discriminant(&want),
+                "tool_choice {mode} mapped wrong"
+            );
+        }
+    }
+
+    #[test]
+    fn to_canonical_maps_specific_tool_choice() {
+        // WHY: a forced function call ({type:function,function:{name}}) must map
+        // to Specific so the provider can require exactly that tool.
+        let req = req_from_json(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"function","function":{"name":"f"}}],
+                "tool_choice":{"type":"function","function":{"name":"f"}}}"#,
+        );
+        match to_canonical(&req).unwrap().tool_choice {
+            Some(CanonicalToolChoice::Specific { name }) => assert_eq!(name, "f"),
+            other => panic!("expected Specific, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_canonical_maps_assistant_tool_calls_to_blocks() {
+        // WHY: a multi-turn tool conversation feeds the assistant's prior
+        // tool_calls back in the next request; they must survive into canonical
+        // ToolUse blocks (keyed by id) rather than being dropped, or the upstream
+        // loses the call it is answering.
+        let req = req_from_json(
+            r#"{"model":"m","messages":[
+                {"role":"user","content":"weather?"},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"SF\"}"}}]}
+            ]}"#,
+        );
+        let canon = to_canonical(&req).unwrap();
+        match &canon.messages[1].content {
+            CanonicalContent::Blocks(blocks) => match &blocks[0] {
+                CanonicalBlock::ToolUse {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    assert_eq!(id, "call_1");
+                    assert_eq!(name, "get_weather");
+                    assert!(arguments.contains("SF"));
+                }
+                other => panic!("expected ToolUse, got {other:?}"),
+            },
+            other => panic!("assistant tool_calls must become Blocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_canonical_maps_tool_role_to_tool_result_block() {
+        // WHY: the tool result the client feeds back (role:"tool", keyed by
+        // tool_call_id) must become a ToolResult block linked to its call, or the
+        // model cannot tie the result to the request it made.
+        let req = req_from_json(
+            r#"{"model":"m","messages":[
+                {"role":"tool","tool_call_id":"call_1","content":"72F"}]}"#,
+        );
+        let canon = to_canonical(&req).unwrap();
+        match &canon.messages[0].content {
+            CanonicalContent::Blocks(blocks) => match &blocks[0] {
+                CanonicalBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    assert_eq!(tool_use_id, "call_1");
+                    assert_eq!(content, "72F");
+                    assert!(!is_error);
+                }
+                other => panic!("expected ToolResult, got {other:?}"),
+            },
+            other => panic!("tool role must become Blocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_canonical_rejects_malformed_tool_surfaces_by_name() {
+        // WHY: malformed tool input must fail LOUDLY (a 400 naming the offender)
+        // rather than being silently dropped, so a broken integration is
+        // debuggable instead of producing wrong answers.
+        // Non-function tool type.
+        let req = req_from_json(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"retrieval","function":{"name":"f"}}]}"#,
+        );
+        let err = to_canonical(&req).expect_err("non-function tool must reject");
+        assert!(err.contains("retrieval"), "error must name the type: {err}");
+
+        // tool message missing tool_call_id.
+        let req = req_from_json(
+            r#"{"model":"m","messages":[{"role":"tool","content":"42"}]}"#,
+        );
+        let err = to_canonical(&req).expect_err("tool msg without id must reject");
+        assert!(
+            err.contains("tool_call_id"),
+            "error must name the missing field: {err}"
+        );
+
+        // Unknown tool_choice mode.
+        let req = req_from_json(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"function","function":{"name":"f"}}],
+                "tool_choice":"bogus"}"#,
+        );
+        let err = to_canonical(&req).expect_err("unknown mode must reject");
+        assert!(err.contains("bogus"), "error must name the mode: {err}");
+    }
+
     #[test]
     fn from_canonical_text_response_shape() {
         // WHY: pins the OpenAI response envelope (object tag, echoed model,
