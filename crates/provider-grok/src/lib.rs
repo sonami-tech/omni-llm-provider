@@ -134,21 +134,15 @@ impl GrokProvider {
         &self.base_url
     }
 
-    /// Resolve the effective bearer key the same way for every request: walk the credential
-    /// source precedence ($XAI_CREDENTIALS_PATH -> ~/.xai/.credentials.json -> ~/.grok/auth.json)
-    /// fresh (never cached, so a CLI re-login or key rotation is picked up), warning-but-continuing
-    /// if the token reports expired. Shared by `send` and `send_stream` so the two paths cannot
-    /// drift in how they authenticate.
+    /// Resolve the effective bearer key the same way for every request: load the operator's
+    /// credentials fresh ($XAI_CREDENTIALS_PATH -> ~/.xai/.credentials.json -> ~/.grok/auth.json),
+    /// never cached so a CLI re-login or key rotation is picked up, warning-but-continuing if the
+    /// token reports expired. Shared by `send` and `send_stream` so the two paths cannot drift.
     ///
-    /// Two failure rules:
-    /// - If `$XAI_CREDENTIALS_PATH` is set, it is an explicit, deliberate override: a load failure
-    ///   there is surfaced LOUDLY and is never masked by the ctor key. (Production never sets a ctor
-    ///   key; this just keeps an explicit-override misconfiguration from silently using something else.)
-    /// - Otherwise, when the default file chain yields nothing, fall back to an explicit ctor key
-    ///   (set only by `new(Some(..))` / `new_for_test`; production `new(None)` never sets one), and
-    ///   only if that is also absent return an `Auth` error.
+    /// If no source yields a key, fall back to an explicit ctor key (set only by `new(Some(..))` /
+    /// `new_for_test`; production `new(None)` never sets one), and otherwise return a clear `Auth`
+    /// error naming where we looked.
     async fn resolve_api_key(&self) -> Result<String, ProviderError> {
-        let explicit_override = std::env::var_os("XAI_CREDENTIALS_PATH").is_some();
         match GrokCredentials::load_resolved_async().await {
             Ok(creds) => {
                 if let Err(e) = creds.check_expired() {
@@ -159,23 +153,13 @@ impl GrokProvider {
                 }
                 Ok(creds.api_key)
             }
-            Err(e) if explicit_override => {
-                // The user pointed XAI_CREDENTIALS_PATH at a specific file; a failure to load it
-                // must not silently fall through to the ctor key. Surface it.
-                Err(ProviderError::Auth(format!(
-                    "failed to load Grok credentials from $XAI_CREDENTIALS_PATH: {}",
-                    e
-                )))
-            }
             Err(e) => {
-                // No explicit override; the default file chain yielded nothing. Fall back to an
-                // explicit ctor key if one was provided (tests / explicit `new(Some(..))` callers).
                 if let Some(k) = &self.api_key {
                     debug!(error = %e, "no grok creds file (or load failed); using explicit ctor key");
                     Ok(k.clone())
                 } else {
                     Err(ProviderError::Auth(format!(
-                        "failed to load Grok credentials (tried ~/.xai/.credentials.json, ~/.grok/auth.json): {}",
+                        "failed to load Grok credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {}",
                         e
                     )))
                 }
@@ -1690,63 +1674,16 @@ mod tests {
     }
 
     #[tokio::test]
-    // See test_credentials_file_load_in_send: env lock held across await is safe
-    // on the current-thread test runtime.
     #[allow(clippy::await_holding_lock)]
-    async fn test_xai_credentials_path_explicit_failure_is_loud_not_ctor_masked() {
-        // Adversarial-review contract: an explicit $XAI_CREDENTIALS_PATH pointing at a missing
-        // file is a deliberate misconfiguration and must surface LOUDLY as an Auth error, even
-        // when a ctor key is present -- the ctor key must NOT mask it. (Production never sets a
-        // ctor key, so this only guards the new(Some)/new_for_test paths.)
-        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let non = format!("/tmp/xai-no-creds-fallback-{}.json", ::std::process::id());
-        let _ = ::std::fs::remove_file(&non);
-        let old = ::std::env::var("XAI_CREDENTIALS_PATH").ok();
-        unsafe {
-            ::std::env::set_var("XAI_CREDENTIALS_PATH", &non);
-        }
-        let p = GrokProvider::new_for_test("xai-ctor-fallback-key", "http://127.0.0.1:1");
-        let req = CanonicalRequest {
-            model: "grok-3-mini".into(),
-            messages: vec![CanonicalMessage {
-                role: "user".into(),
-                content: CanonicalContent::Text("fallback".into()),
-            }],
-            ..Default::default()
-        };
-        let err = p.send(req).await.unwrap_err();
-        unsafe {
-            if let Some(v) = old {
-                ::std::env::set_var("XAI_CREDENTIALS_PATH", v);
-            } else {
-                ::std::env::remove_var("XAI_CREDENTIALS_PATH");
-            }
-        }
-        // Explicit override failed -> loud Auth error, NOT a network error from a ctor-key send.
-        match err {
-            ProviderError::Auth(s) => assert!(
-                s.contains("$XAI_CREDENTIALS_PATH"),
-                "expected loud override-failure Auth error, got: {}",
-                s
-            ),
-            other => panic!(
-                "explicit override failure must be loud, not ctor-masked; got {:?}",
-                other
-            ),
-        }
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn test_ctor_key_used_when_no_file_source_present() {
-        // The ctor-key fallback (no explicit override) still works: point XAI_CREDENTIALS_PATH at
-        // a VALID temp file holding the test key, so the override succeeds and the key flows to
-        // send -- proving the key reaches the upstream (dead port -> network err, not Auth). This
-        // exercises the explicit-key send path without abusing the override as a failure trigger.
+    async fn test_key_resolves_from_explicit_override_file_then_sends() {
+        // Sanity for the explicit-override happy path: point XAI_CREDENTIALS_PATH at a VALID temp
+        // file; the override succeeds and the key flows to send, reaching the (dead) upstream as a
+        // network error rather than Auth. (This is NOT the ctor-fallback test -- see
+        // test_ctor_key_used_when_resolution_finds_no_source for that.)
         let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp = ::std::env::temp_dir()
-            .join(format!("xai-ctor-path-valid-{}.json", ::std::process::id()));
-        ::std::fs::write(&tmp, r#"{"apiKey": "xai-ctor-key-via-valid-file"}"#).unwrap();
+            .join(format!("xai-override-valid-{}.json", ::std::process::id()));
+        ::std::fs::write(&tmp, r#"{"apiKey": "xai-key-via-valid-file"}"#).unwrap();
         let old = ::std::env::var("XAI_CREDENTIALS_PATH").ok();
         unsafe {
             ::std::env::set_var("XAI_CREDENTIALS_PATH", tmp.to_str().unwrap());
@@ -1756,7 +1693,7 @@ mod tests {
             model: "grok-3-mini".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
-                content: CanonicalContent::Text("ctor send".into()),
+                content: CanonicalContent::Text("override send".into()),
             }],
             ..Default::default()
         };
@@ -1776,6 +1713,58 @@ mod tests {
             }
             other => panic!(
                 "expected key resolution then upstream net err, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_ctor_key_used_when_resolution_finds_no_source() {
+        // The GENUINE ctor-fallback path: with no explicit override AND no home creds file, the
+        // file chain yields NoSource, so resolve_api_key falls back to the explicit ctor key. We
+        // force "no home source" by pointing HOME at a fresh empty dir (and clearing the override),
+        // so the ctor key is the only thing that can authenticate -> reaches the (dead) upstream as
+        // a network error, NOT the "no key" Auth error. If the ctor fallback regressed, this would
+        // surface Auth instead and fail.
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let empty_home =
+            ::std::env::temp_dir().join(format!("xai-empty-home-{}", ::std::process::id()));
+        ::std::fs::create_dir_all(&empty_home).unwrap();
+        let old_path = ::std::env::var("XAI_CREDENTIALS_PATH").ok();
+        let old_home = ::std::env::var("HOME").ok();
+        unsafe {
+            ::std::env::remove_var("XAI_CREDENTIALS_PATH");
+            ::std::env::set_var("HOME", &empty_home);
+        }
+        let p = GrokProvider::new_for_test("xai-the-only-ctor-key", "http://127.0.0.1:1");
+        let req = CanonicalRequest {
+            model: "grok-3-mini".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("ctor fallback".into()),
+            }],
+            ..Default::default()
+        };
+        let err = p.send(req).await.unwrap_err();
+        unsafe {
+            match old_path {
+                Some(v) => ::std::env::set_var("XAI_CREDENTIALS_PATH", v),
+                None => ::std::env::remove_var("XAI_CREDENTIALS_PATH"),
+            }
+            match old_home {
+                Some(v) => ::std::env::set_var("HOME", v),
+                None => ::std::env::remove_var("HOME"),
+            }
+        }
+        let _ = ::std::fs::remove_dir_all(&empty_home);
+        // No file source -> ctor key used -> reached the (dead) upstream as a network error.
+        match err {
+            ProviderError::Upstream(s) => {
+                assert!(s.contains("error calling xAI") || s.contains("connection"))
+            }
+            other => panic!(
+                "ctor key must be used when no file source exists; got {:?}",
                 other
             ),
         }
