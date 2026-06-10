@@ -300,10 +300,16 @@ pub fn build_messages_request_from_canonical(
                 MessageContent::Blocks(out)
             }
         };
-        messages.push(Message {
-            role: m.role.clone(),
-            content,
-        });
+        // Anthropic has no "tool" role: a tool result is a `user` message
+        // carrying tool_result blocks. The canonical "tool" role (from the
+        // OpenAI-shaped surfaces) maps to "user" here; everything else passes
+        // through. See https://docs.claude.com/en/docs/build-with-claude/tool-use.
+        let role = if m.role == "tool" {
+            "user".to_string()
+        } else {
+            m.role.clone()
+        };
+        messages.push(Message { role, content });
     }
 
     let tools = match req.tools.as_ref() {
@@ -707,6 +713,76 @@ mod tests {
         assert!(
             matches!(anth.messages[0].content, MessageContent::Text(ref s) if s == "hello world")
         );
+    }
+
+    #[test]
+    fn canonical_tool_blocks_map_to_anthropic_with_user_role_for_results() {
+        // WHY: Anthropic has no "tool" role -- a tool result is a `user` message
+        // carrying tool_result blocks. A live request with role:"tool" returns a
+        // 400 "Unexpected role tool", so the canonical "tool" role MUST be
+        // remapped to "user" here. This also pins the block mapping: a ToolUse's
+        // string arguments become a parsed JSON `input` object, and a ToolResult
+        // becomes a tool_result block keyed by tool_use_id.
+        use omni_core::CanonicalBlock;
+        let req = CanonicalRequest {
+            model: "haiku".into(),
+            messages: vec![
+                CanonicalMessage {
+                    role: "assistant".into(),
+                    content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolUse {
+                        id: "toolu_1".into(),
+                        name: "get_weather".into(),
+                        arguments: r#"{"city":"SF"}"#.into(),
+                    }]),
+                },
+                CanonicalMessage {
+                    role: "tool".into(),
+                    content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
+                        tool_use_id: "toolu_1".into(),
+                        content: "72F".into(),
+                        is_error: false,
+                    }]),
+                },
+            ],
+            ..Default::default()
+        };
+        let profile = crate::fingerprint::default_profile();
+        let model_def = profile.resolve_model("haiku");
+        let anth = build_messages_request_from_canonical(&req, model_def, &empty_repl()).unwrap();
+
+        // Assistant ToolUse: role preserved, arguments parsed into a JSON object.
+        assert_eq!(anth.messages[0].role, "assistant");
+        match &anth.messages[0].content {
+            MessageContent::Blocks(blocks) => match &blocks[0] {
+                ContentBlock::ToolUse { id, name, input } => {
+                    assert_eq!(id, "toolu_1");
+                    assert_eq!(name, "get_weather");
+                    assert_eq!(input["city"], "SF");
+                }
+                other => panic!("expected ToolUse block, got {other:?}"),
+            },
+            other => panic!("expected Blocks, got {other:?}"),
+        }
+
+        // Tool result: role REMAPPED to "user" (the bug this test guards).
+        assert_eq!(
+            anth.messages[1].role, "user",
+            "a tool result must be sent as a Anthropic `user` message"
+        );
+        match &anth.messages[1].content {
+            MessageContent::Blocks(blocks) => match &blocks[0] {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
+                    assert_eq!(tool_use_id, "toolu_1");
+                    assert!(matches!(content, Some(ToolResultContent::Text(t)) if t == "72F"));
+                }
+                other => panic!("expected ToolResult block, got {other:?}"),
+            },
+            other => panic!("expected Blocks, got {other:?}"),
+        }
     }
 
     #[test]
