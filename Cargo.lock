@@ -926,6 +926,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "futures-core",
+ "futures-util",
  "serde",
  "serde_json",
  "thiserror",

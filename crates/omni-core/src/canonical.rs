@@ -52,7 +52,7 @@ pub struct CanonicalReasoning {
     pub budget_tokens: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct CanonicalUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -77,6 +77,47 @@ pub struct CanonicalToolCall {
     pub name: String,
     pub arguments: String,
 }
+
+/// One normalized event in a streaming response.
+///
+/// Both backends map their native wire events into this small vocabulary so the
+/// OpenAI-compatible SSE framing in the binaries is provider-agnostic:
+/// - Anthropic `content_block_delta` (text_delta) -> [`TextDelta`](Self::TextDelta)
+/// - Anthropic tool-use block start + `input_json_delta` -> [`ToolCallDelta`](Self::ToolCallDelta)
+/// - Anthropic `message_delta` usage / OpenAI `usage` chunk -> [`Usage`](Self::Usage)
+/// - Anthropic `message_delta.stop_reason` / OpenAI `finish_reason` -> [`Finish`](Self::Finish)
+///
+/// Streams should terminate with a single [`Finish`](Self::Finish) carrying the
+/// finish reason; a [`Usage`](Self::Usage) event (when the upstream provides one)
+/// should precede or accompany it so the framing layer can emit token counts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum CanonicalStreamEvent {
+    /// Incremental assistant text. Concatenate in order to reconstruct content.
+    TextDelta(String),
+    /// Incremental tool-call data. `index` identifies which tool call this delta
+    /// belongs to (parallel tool calls share the stream). On the first delta for
+    /// an index, `id` and `name` are set; subsequent deltas carry only
+    /// `arguments_delta` (a fragment of the JSON arguments string).
+    ToolCallDelta {
+        index: u32,
+        id: Option<String>,
+        name: Option<String>,
+        arguments_delta: String,
+    },
+    /// Token accounting, emitted when the upstream reports it (often once near the end).
+    Usage(CanonicalUsage),
+    /// Terminal event: the stream is complete. Carries the finish reason
+    /// ("stop", "tool_calls", "length", ...) when the upstream supplies one.
+    Finish { finish_reason: Option<String> },
+}
+
+/// A boxed, pinned stream of canonical stream events — the return type of
+/// [`crate::LlmProvider::send_stream`]. Boxed so the trait stays object-safe
+/// (`Arc<dyn LlmProvider>`), pinned + `Send` so it can cross `.await` points
+/// and be driven from an axum handler.
+pub type CanonicalStream = std::pin::Pin<
+    Box<dyn futures_core::Stream<Item = Result<CanonicalStreamEvent, crate::ProviderError>> + Send>,
+>;
 
 #[cfg(test)]
 mod tests {
@@ -186,6 +227,40 @@ mod tests {
         assert_eq!(rc.model, "test-model");
         assert!(rg.content.contains("grok"));
         assert!(rc.content.contains("claude-code"));
+    }
+
+    #[tokio::test]
+    async fn default_send_stream_adapts_send_into_event_sequence() {
+        use futures_util::StreamExt;
+        // WHY: the trait's default send_stream is the safety net that lets any
+        // provider participate in the streaming HTTP path before it has a native
+        // SSE impl. It must faithfully reduce a completed `send` into the
+        // canonical event vocabulary: text delta(s), then usage, then a terminal
+        // Finish carrying the response's finish_reason. A provider that only
+        // implements `send` still streams correctly because of this.
+        let p = MockProvider("grok");
+        let stream = p.send_stream(sample_req()).await.unwrap();
+        let events: Vec<CanonicalStreamEvent> =
+            stream.map(|r| r.unwrap()).collect::<Vec<_>>().await;
+
+        // First event is the buffered text, last is the terminal Finish.
+        match &events[0] {
+            CanonicalStreamEvent::TextDelta(t) => assert!(t.contains("mock-grok")),
+            other => panic!("expected leading TextDelta, got {other:?}"),
+        }
+        assert!(
+            matches!(events.last(), Some(CanonicalStreamEvent::Finish { finish_reason })
+                if finish_reason.as_deref() == Some("stop")),
+            "stream must terminate with Finish carrying the send()'s finish_reason; got {:?}",
+            events.last()
+        );
+        // Usage event present so the framing layer can emit token counts.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, CanonicalStreamEvent::Usage(_))),
+            "default stream must surface a Usage event"
+        );
     }
 
     #[test]
