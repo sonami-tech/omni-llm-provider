@@ -468,15 +468,7 @@ async fn models_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
 async fn chat_completions_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ChatCompletionRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    if body.stream {
-        // Light impl: streaming would require SSE framing + per-provider stream support on the trait.
-        // Delegate only does non-stream send today.
-        return Err(AppError::BadRequest(
-            "streaming not supported by light omni aggregator (use direct omni-grok or omni-claude for full streams)".into(),
-        ));
-    }
-
+) -> Result<axum::response::Response, AppError> {
     let enabled: Vec<String> = state.providers.keys().cloned().collect();
     let (prov_key, stripped_model) =
         resolve_provider_and_model(&body.model, &enabled).map_err(AppError::BadRequest)?;
@@ -490,26 +482,38 @@ async fn chat_completions_handler(
     let mut canon = to_canonical(&body);
     canon.model = stripped_model.clone();
 
-    // The actual delegation (thin by design).
-    let canon_resp: CanonicalResponse =
-        provider
-            .send(canon)
-            .await
-            .map_err(|e: ProviderError| match e {
-                ProviderError::Auth(msg) => AppError::Unauthorized(msg),
-                ProviderError::Upstream(msg) => AppError::ServerError(format!("upstream: {}", msg)),
-                ProviderError::Other(a) => AppError::ServerError(a.to_string()),
-            })?;
-
     let chat_id = format!("chatcmpl-{}", Uuid::new_v4());
-    let created = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let created = omni_common::unix_now_secs();
+
+    if body.stream {
+        // Streaming: delegate to the provider's native SSE stream and frame it as
+        // OpenAI chat.completion.chunk events (terminated by [DONE]) via the shared
+        // serializer. Prefix routing has already selected the provider above.
+        let stream = provider
+            .send_stream(canon)
+            .await
+            .map_err(map_provider_err)?;
+        // requested_model echoed is the *original* (with prefix if any) for client UX.
+        let sse = omni_common::sse_from_canonical_stream(stream, body.model, chat_id, created);
+        return Ok(sse.into_response());
+    }
+
+    // The actual delegation (thin by design).
+    let canon_resp: CanonicalResponse = provider.send(canon).await.map_err(map_provider_err)?;
 
     // requested_model echoed is the *original* (with prefix if client used one) for client UX.
     let oai = from_canonical(canon_resp, body.model, chat_id, created);
-    Ok(Json(oai))
+    Ok(Json(oai).into_response())
+}
+
+/// Map a provider error to the OAI-shaped AppError. Shared by the stream and
+/// non-stream completion paths so they classify errors identically.
+fn map_provider_err(e: ProviderError) -> AppError {
+    match e {
+        ProviderError::Auth(msg) => AppError::Unauthorized(msg),
+        ProviderError::Upstream(msg) => AppError::ServerError(format!("upstream: {}", msg)),
+        ProviderError::Other(a) => AppError::ServerError(a.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -771,13 +775,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_http_completions_stream_not_supported_error() {
-        let c = Arc::new(ClaudeProvider::new().expect("c"));
+    async fn test_http_completions_stream_is_routed_not_rejected() {
+        // WHY: streaming is now a first-class path. A stream:true request must be
+        // ROUTED to the provider's send_stream (and, when reachable, framed as an
+        // SSE response), never rejected with the old "streaming not supported"
+        // 400. We use the grok test provider pointed at a dead port: routing +
+        // stream-open is exercised; the dead upstream surfaces as a ServerError
+        // (NOT a BadRequest stream-rejection), proving the stream branch is live.
+        let g = Arc::new(GrokProvider::new_for_test("dummy", "http://127.0.0.1:1"));
         let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        map.insert("claude".into(), c);
+        map.insert("grok".into(), g);
         let state = Arc::new(AppState { providers: map });
         let req = ChatCompletionRequest {
-            model: "claude:foo".into(),
+            model: "grok:grok-3".into(),
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: Some("hi".into()),
@@ -790,14 +800,66 @@ mod tests {
             _extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
-        let err = match res {
-            Err(e) => e,
-            Ok(_) => panic!("expected err for stream"),
-        };
-        match err {
-            AppError::BadRequest(msg) => assert!(msg.contains("streaming not supported")),
-            _ => panic!("expected bad request for stream"),
+        match res {
+            // Dead upstream: stream-open failed -> mapped to a server error. The
+            // key assertion is that it is NOT the old BadRequest rejection.
+            Err(AppError::ServerError(_)) => {}
+            Err(AppError::BadRequest(msg)) => {
+                panic!("stream must not be rejected as bad request: {msg}")
+            }
+            Err(other) => panic!("unexpected error from stream route: {other:?}"),
+            Ok(resp) => {
+                // If a stream did open, it must be an SSE response.
+                let ct = resp
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                assert!(
+                    ct.contains("text/event-stream"),
+                    "streaming response must be SSE, got content-type {ct:?}"
+                );
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn test_http_completions_stream_returns_sse_when_backend_reachable() {
+        // WHY: pins that a successfully-opened stream is framed as an SSE response
+        // (text/event-stream), live-conditional on Grok creds so it stays green
+        // offline. The byte-level [DONE] framing is pinned in omni-common::http.
+        if !has_grok_creds() {
+            eprintln!("skipping SSE-reachable test: no grok creds");
+            return;
+        }
+        let g = Arc::new(GrokProvider::new(None).expect("grok provider with creds"));
+        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+        map.insert("grok".into(), g);
+        let state = Arc::new(AppState { providers: map });
+        let req = ChatCompletionRequest {
+            model: "grok:grok-3".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("Reply with the single word PONG".into()),
+            }],
+            stream: true,
+            max_tokens: Some(16),
+            max_completion_tokens: None,
+            temperature: Some(0.0),
+            top_p: None,
+            _extras: serde_json::Value::Null,
+        };
+        let res = chat_completions_handler(State(state), Json(req)).await;
+        let resp = res.expect("stream should open with creds").into_response();
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("text/event-stream"),
+            "live stream must be SSE, got {ct:?}"
+        );
     }
 
     #[tokio::test]
@@ -1375,6 +1437,47 @@ rule = [
             ids.iter()
                 .any(|id| id.starts_with("claude:") || id.starts_with("grok:"))
         );
+        let _ = child.kill();
+    }
+
+    #[test]
+    fn test_subprocess_omni_binary_streaming_sse_done_terminator() {
+        // WHY: full-stack proof that stream:true over real HTTP yields an SSE
+        // body terminated by `data: [DONE]` (the OpenAI streaming contract).
+        // Live-conditional on grok creds so the suite stays green offline; the
+        // hermetic framing is already pinned by omni-common::http unit tests.
+        if !has_grok_creds() {
+            eprintln!("skipping streaming subprocess test: no grok creds");
+            return;
+        }
+        let port = free_port();
+        let mut child = Command::new(omni_bin_path())
+            .env("OMNI_PROVIDERS", "grok")
+            .args(["--no-auth", "--port", &port.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+        let out = Command::new("curl")
+            .args([
+                "-sN",
+                "-X",
+                "POST",
+                "-H",
+                "content-type: application/json",
+                "-d",
+                r#"{"model":"grok:grok-3","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"Reply PONG"}]}"#,
+                &format!("http://127.0.0.1:{}/v1/chat/completions", port),
+            ])
+            .output()
+            .unwrap();
+        let body = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            body.contains("chat.completion.chunk"),
+            "expected SSE chunks, got: {body}"
+        );
+        assert!(body.contains("[DONE]"), "stream must terminate with [DONE]");
         let _ = child.kill();
     }
 }
