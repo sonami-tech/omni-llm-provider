@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Credentials must never be committed (loaded fresh from ~/.claude, ~/.xai, or env)
+.credentials.json
+*.credentials.json

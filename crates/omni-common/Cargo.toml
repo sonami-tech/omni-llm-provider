@@ -1,0 +1,17 @@
+[package]
+name = "omni-common"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+redb.workspace = true
+toml.workspace = true
+chrono.workspace = true
+dirs = "6"

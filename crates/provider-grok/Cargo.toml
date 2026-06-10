@@ -1,0 +1,19 @@
+[package]
+name = "provider-grok"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+omni-common = { path = "../omni-common" }
+omni-core = { path = "../omni-core" }
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+async-trait = "0.1"
+anyhow.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
