@@ -11,6 +11,7 @@ pub mod replacements;
 pub mod responses;
 pub mod session;
 pub mod stats;
+pub mod test_support;
 pub mod time_util;
 
 pub use auth::{ApiKeyId, auth_layer};

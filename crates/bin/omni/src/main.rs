@@ -605,34 +605,18 @@ mod tests {
     }
 
     fn omni_bin_path() -> std::path::PathBuf {
-        // Runtime lookup so compiles even if CARGO_BIN_EXE_* not set at compile for this bin test.
-        // Prefers cargo-injected (when present), falls back to workspace target/debug (for cargo test -p omni).
+        // Runtime lookup so this compiles even when CARGO_BIN_EXE_* is absent at
+        // compile time. Prefer the cargo-injected path when present (integration
+        // tests get it; unit tests in a bin crate do not).
         if let Ok(p) = std::env::var("CARGO_BIN_EXE_omni") {
             return std::path::PathBuf::from(p);
         }
-        // from crates/bin/omni -> workspace root
-        let mut root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        root.pop();
-        root.pop();
-        root.pop();
-        let bin = root.join("target").join("debug").join("omni");
-        // Build-on-demand: `cargo test -p omni` compiles only the unit-test harness,
-        // not the standalone binary, and unit tests get no CARGO_BIN_EXE_* env var.
-        // We build UNCONDITIONALLY (not just when the binary is missing) because the
-        // failure this guards against is a *stale* binary: a handler/route change
-        // recompiles the test harness but leaves an old target/debug/omni on disk,
-        // so the subprocess would run code that predates the change (e.g. a 404 on a
-        // newly added route). An incremental no-op build is ~0.15s, so always
-        // building is cheap insurance that the subprocess runs the current code.
-        // Kept in sync with omni-grok::bin_path().
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let status = Command::new(cargo)
-            .args(["build", "-p", "omni"])
-            .current_dir(&root)
-            .status()
-            .expect("invoke cargo build for omni bin");
-        assert!(status.success(), "cargo build -p omni failed");
-        bin
+        // Otherwise build the binary on demand and locate the real artifact (honors
+        // CARGO_TARGET_DIR + profile). Cache so the build runs once per test process;
+        // see omni_common::test_support::build_workspace_bin for the full rationale.
+        static BIN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        BIN.get_or_init(|| omni_common::test_support::build_workspace_bin("omni"))
+            .clone()
     }
 
     fn mk_app_with(

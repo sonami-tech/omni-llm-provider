@@ -350,33 +350,22 @@ mod tests {
             .port()
     }
 
-    /// Resolve the standalone `omni-grok` binary, building it on demand if it is
-    /// not already present. WHY build-on-demand: `cargo test -p omni-grok` only
-    /// compiles the unit-test harness, NOT the standalone binary, and unit tests
-    /// (unlike integration tests) do not get a `CARGO_BIN_EXE_*` env var. Without
-    /// this, a fresh `cargo test` with no prior `cargo build` would fail to spawn
-    /// the binary. Building once here makes the subprocess suite self-contained
-    /// and green offline regardless of invocation order.
+    /// Resolve the standalone `omni-grok` binary, building it on demand. WHY
+    /// build-on-demand: `cargo test -p omni-grok` only compiles the unit-test
+    /// harness, NOT the standalone binary, and unit tests (unlike integration
+    /// tests) do not get a `CARGO_BIN_EXE_*` env var. Building here (and locating
+    /// the real artifact via cargo's JSON output, which honors CARGO_TARGET_DIR and
+    /// profile) makes the subprocess suite self-contained and green offline
+    /// regardless of invocation order, and never spawns a stale binary. Cached so
+    /// the build runs once per test process. Kept in sync with omni::omni_bin_path.
     fn bin_path() -> std::path::PathBuf {
-        // crates/bin/omni-grok -> workspace root
-        let mut root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        root.pop();
-        root.pop();
-        root.pop();
-        let bin = root.join("target").join("debug").join("omni-grok");
-        // Build UNCONDITIONALLY (not only when missing): the real hazard is a *stale*
-        // binary, where a handler/route change recompiles this test harness but leaves
-        // an older target/debug/omni-grok on disk, so the subprocess runs pre-change
-        // code. An incremental no-op build is ~0.15s, cheap insurance the subprocess
-        // runs current code. Kept in sync with omni::omni_bin_path().
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let status = Command::new(cargo)
-            .args(["build", "-p", "omni-grok"])
-            .current_dir(&root)
-            .status()
-            .expect("invoke cargo build for omni-grok bin");
-        assert!(status.success(), "cargo build -p omni-grok failed");
-        bin
+        // cargo normalizes '-' to '_' in the injected env var name.
+        if let Ok(p) = std::env::var("CARGO_BIN_EXE_omni_grok") {
+            return std::path::PathBuf::from(p);
+        }
+        static BIN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        BIN.get_or_init(|| omni_common::test_support::build_workspace_bin("omni-grok"))
+            .clone()
     }
 
     /// Poll /health (optionally with an auth header) until it returns "ok".
