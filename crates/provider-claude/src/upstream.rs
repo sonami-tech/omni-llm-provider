@@ -752,14 +752,17 @@ use crate::fingerprint::{FingerprintProfile, RequestContext, build_headers, defa
 /// once after a fresh credentials.json re-read.
 const MAX_RETRIES: u32 = 2;
 
-const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages?beta=true";
-const ANTHROPIC_COUNT_TOKENS_URL: &str =
-    "https://api.anthropic.com/v1/messages/count_tokens?beta=true";
+const DEFAULT_ANTHROPIC_BASE: &str = "https://api.anthropic.com";
 
 #[derive(Clone)]
 pub struct UpstreamClient {
     http: Client,
     profile: &'static FingerprintProfile,
+    /// Upstream base URL (scheme + host[:port]), no trailing slash and no path.
+    /// Production uses [`DEFAULT_ANTHROPIC_BASE`]; tests point it at a local mock
+    /// server. The request paths (`/v1/messages?beta=true` etc.) are appended per
+    /// call, so the exact wire path is identical for production and tests.
+    base: String,
 }
 
 impl UpstreamClient {
@@ -768,6 +771,20 @@ impl UpstreamClient {
     }
 
     pub fn new_with_profile(profile: &'static FingerprintProfile) -> Result<Self, UpstreamError> {
+        Self::new_with_profile_and_base(profile, DEFAULT_ANTHROPIC_BASE)
+    }
+
+    /// Construct against an explicit base URL, reusing the production HTTP client
+    /// builder verbatim. The builder pins `http2_prior_knowledge`, so an
+    /// `http://` test base reaches a wiremock server over cleartext HTTP/2 (h2c),
+    /// which wiremock serves via hyper-util's protocol auto-detection. The
+    /// transport config is therefore the SAME one production uses, not a test
+    /// stand-in. `pub(crate)` so `ClaudeProvider::new_for_test_with_base` can
+    /// forward to it without widening the public surface further than needed.
+    pub(crate) fn new_with_profile_and_base(
+        profile: &'static FingerprintProfile,
+        base: impl Into<String>,
+    ) -> Result<Self, UpstreamError> {
         let http = Client::builder()
             .use_rustls_tls()
             .http2_prior_knowledge()
@@ -779,7 +796,24 @@ impl UpstreamClient {
             .pool_max_idle_per_host(8)
             .build()
             .map_err(UpstreamError::Transport)?;
-        Ok(Self { http, profile })
+        let base = base.into().trim_end_matches('/').to_string();
+        Ok(Self {
+            http,
+            profile,
+            base,
+        })
+    }
+
+    /// The `/v1/messages` URL for this client's base, preserving the `?beta=true`
+    /// query the production endpoint requires. Lives in one place so the
+    /// non-stream and streaming POST sites cannot drift.
+    fn messages_url(&self) -> String {
+        format!("{}/v1/messages?beta=true", self.base)
+    }
+
+    /// The `/v1/messages/count_tokens` URL for this client's base.
+    fn count_tokens_url(&self) -> String {
+        format!("{}/v1/messages/count_tokens?beta=true", self.base)
     }
 
     /// Send a non-streaming JSON body to /v1/messages with retry on 5xx and
@@ -877,7 +911,7 @@ impl UpstreamClient {
                 .map_err(|e| UpstreamError::Decode(format!("count_tokens serialize: {e}")))?;
             let result = self
                 .post_json_once(
-                    ANTHROPIC_COUNT_TOKENS_URL,
+                    &self.count_tokens_url(),
                     &creds_owned,
                     &ctx_owned,
                     body_bytes,
@@ -922,7 +956,7 @@ impl UpstreamClient {
         ctx: &RequestContext,
         body: Vec<u8>,
     ) -> Result<Value, UpstreamError> {
-        self.post_json_once(ANTHROPIC_MESSAGES_URL, creds, ctx, body)
+        self.post_json_once(&self.messages_url(), creds, ctx, body)
             .await
     }
 
@@ -1101,7 +1135,7 @@ impl UpstreamClient {
         let headers = build_headers(creds, ctx, self.profile);
         let resp = self
             .http
-            .post(ANTHROPIC_MESSAGES_URL)
+            .post(self.messages_url())
             .headers(headers)
             .body(body)
             .send()

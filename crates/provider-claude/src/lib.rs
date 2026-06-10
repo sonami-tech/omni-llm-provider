@@ -65,6 +65,10 @@ struct ClaudeStreamConverter {
     input_tokens: Option<u32>,
     output_tokens: Option<u32>,
     usage_emitted: bool,
+    /// Set once `finish_events` has emitted the terminal `Finish`. The
+    /// `send_stream` EOF guard checks this so a stream that already saw
+    /// `message_stop` does not get a SECOND `Finish` appended at end-of-byte-stream.
+    finished: bool,
 }
 
 impl ClaudeStreamConverter {
@@ -155,6 +159,7 @@ impl ClaudeStreamConverter {
         out.push(CanonicalStreamEvent::Finish {
             finish_reason: self.stop_reason.clone().or(Some("stop".into())),
         });
+        self.finished = true;
         out
     }
 }
@@ -190,6 +195,23 @@ impl ClaudeProvider {
 
     pub fn new_with_profile(profile: &'static FingerprintProfile) -> Result<Self, ProviderError> {
         let client = UpstreamClient::new_with_profile(profile).map_err(|e| {
+            ProviderError::Other(anyhow::Error::msg(format!("upstream client: {e}")))
+        })?;
+        Ok(Self { profile, client })
+    }
+
+    /// Construct a provider whose upstream client targets an explicit base URL
+    /// instead of `api.anthropic.com`. Used by hermetic tests (and, potentially,
+    /// router-level integration tests in the bin crates) to point the real
+    /// request-build -> HTTP -> response-parse path at a local mock server. The
+    /// HTTP client, headers, body finalization, and parsing are all the production
+    /// code; only the host changes. Mirrors `GrokProvider::new_for_test`'s public
+    /// base-URL seam so the two providers are testable the same way.
+    pub fn new_for_test_with_base(
+        profile: &'static FingerprintProfile,
+        base_url: impl Into<String>,
+    ) -> Result<Self, ProviderError> {
+        let client = UpstreamClient::new_with_profile_and_base(profile, base_url).map_err(|e| {
             ProviderError::Other(anyhow::Error::msg(format!("upstream client: {e}")))
         })?;
         Ok(Self { profile, client })
@@ -349,8 +371,11 @@ impl LlmProvider for ClaudeProvider {
                 }
             }
             // If the upstream ended without an explicit message_stop, still emit
-            // a terminal Finish so consumers always see stream completion.
-            if !conv.usage_emitted || conv.stop_reason.is_some() {
+            // a terminal Finish so consumers always see stream completion. A
+            // stream that DID see message_stop already emitted its Finish via
+            // `finish_events` (which sets `finished`), so this guard prevents a
+            // duplicate terminal chunk on the normal completed path.
+            if !conv.finished {
                 for tail in conv.finish_events() {
                     yield tail;
                 }
@@ -578,6 +603,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn claude_send_exercises_full_fingerprint_path() {
         // Live test: exercises the complete path end-to-end against the real
         // Anthropic upstream (canonical -> translate -> identity/cch finalize ->
@@ -588,6 +614,12 @@ mod tests {
         // on every run and never fails in a creds-less CI. The byte-exact wire
         // pins (fingerprint, cch, translate) are asserted by the offline unit tests
         // above; this test only proves the live wiring when creds exist.
+        //
+        // Holds CREDS_ENV_LOCK across the gate + send so it cannot race a hermetic
+        // wiremock test that points CLAUDE_CREDENTIALS_PATH at a temp creds file
+        // (which would otherwise change what `default_path()` resolves to mid-call).
+        // Mirrors the Grok live test's CRED_ENV_LOCK discipline.
+        let _guard = CREDS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         if !crate::credentials::Credentials::default_path().exists() {
             eprintln!(
                 "skipping claude_send_exercises_full_fingerprint_path: no Claude credentials at {}",
@@ -718,5 +750,268 @@ mod tests {
         assert_eq!(canon.usage.input_tokens, 7);
         assert_eq!(canon.usage.cache_creation, 1);
         assert_eq!(canon.usage.cache_read, 3);
+    }
+
+    // ── Hermetic wiremock round-trip tests ────────────────────────────────────
+    //
+    // These close the CI coverage gap left by the live test above: they prove the
+    // full request-build -> HTTP -> response-parse round-trip OFFLINE, against a
+    // local mock standing in for api.anthropic.com. The provider is pointed at the
+    // mock via the production base-URL seam (`new_for_test_with_base`); everything
+    // else (the rustls + http2_prior_knowledge client, the fingerprint headers, the
+    // body finalize, the typed response/stream decoders) is the real production
+    // path. wiremock serves cleartext HTTP/2, so the production transport config
+    // reaches it unchanged.
+    //
+    // Both the gate AND the env mutation are serialized by CREDS_ENV_LOCK so they
+    // cannot race the live test (which also takes it) or each other.
+
+    use std::sync::Mutex as StdMutex;
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Serializes every test that reads or mutates `CLAUDE_CREDENTIALS_PATH`
+    /// (the hermetic round-trip tests and the live `claude_send_*` test), so the
+    /// env override one test sets can never be observed by another mid-call.
+    static CREDS_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// RAII guard: writes a temp creds file, points `CLAUDE_CREDENTIALS_PATH` at
+    /// it, and restores the prior env value + removes the file on drop. The token
+    /// is a non-empty dummy (the only gate `from_bytes` enforces) with a far-future
+    /// `expiresAt` for realism. The caller must hold CREDS_ENV_LOCK for the guard's
+    /// whole lifetime so the env mutation is not observed by a concurrent test.
+    struct TempCreds {
+        path: std::path::PathBuf,
+        prev: Option<String>,
+    }
+
+    impl TempCreds {
+        fn dummy_token() -> &'static str {
+            "sk-ant-oat01-dummy"
+        }
+
+        fn install(tag: &str) -> Self {
+            // Far-future expiry (year ~2065) so any expiry-aware code sees a live
+            // token; the send path does not actually gate on it, but realism costs
+            // nothing here.
+            let body = format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"{}","expiresAt":3000000000000,"subscriptionType":"max"}}}}"#,
+                Self::dummy_token()
+            );
+            let path = std::env::temp_dir().join(format!(
+                "claude-creds-{}-{}.json",
+                tag,
+                std::process::id()
+            ));
+            std::fs::write(&path, body).expect("write temp claude creds");
+            let prev = std::env::var("CLAUDE_CREDENTIALS_PATH").ok();
+            // SAFETY (edition 2024): single-threaded mutation while holding
+            // CREDS_ENV_LOCK; no other thread reads the env concurrently.
+            unsafe {
+                std::env::set_var("CLAUDE_CREDENTIALS_PATH", &path);
+            }
+            Self { path, prev }
+        }
+    }
+
+    impl Drop for TempCreds {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("CLAUDE_CREDENTIALS_PATH", v),
+                    None => std::env::remove_var("CLAUDE_CREDENTIALS_PATH"),
+                }
+            }
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// The minimal-but-complete Anthropic non-stream response body. Includes every
+    /// field `MessagesResponse` requires (id/type/role/model/content/usage); the
+    /// caller overrides `content` + `stop_reason` for the tool-call variant.
+    fn anth_text_response_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": "msg_hermetic_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-6",
+            "content": [ {"type": "text", "text": "Hello"} ],
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": { "input_tokens": 10, "output_tokens": 2 }
+        })
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn claude_nonstream_success_roundtrip_via_wiremock() {
+        // WHY: proves a successful non-stream completion end to end offline — the
+        // request leaves with the right bearer + anthropic-version + path/query, and
+        // the real response decoder maps the Anthropic body to canonical (content,
+        // end_turn -> stop, usage). This is exactly what CI could not prove before:
+        // a green round-trip with no network and no real creds.
+        let _guard = CREDS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _creds = TempCreds::install("nonstream-ok");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(query_param("beta", "true"))
+            .and(header(
+                "authorization",
+                format!("Bearer {}", TempCreds::dummy_token()).as_str(),
+            ))
+            .and(header("anthropic-version", "2023-06-01"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anth_text_response_json()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let p = ClaudeProvider::new_for_test_with_base(default_profile(), server.uri())
+            .expect("test provider against mock base");
+        let resp = p
+            .send(sample_req("hi"))
+            .await
+            .expect("hermetic claude send must succeed");
+
+        assert_eq!(resp.content, "Hello");
+        assert_eq!(resp.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(resp.usage.input_tokens, 10);
+        assert_eq!(resp.usage.output_tokens, 2);
+        assert!(resp.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn claude_nonstream_tool_call_roundtrip_via_wiremock() {
+        // WHY: tool calls take a different decode branch (tool_use content block ->
+        // canonical tool_calls, stop_reason tool_use -> tool_calls). Pins that the
+        // wire round-trip surfaces the tool name, id, and JSON arguments intact.
+        let _guard = CREDS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _creds = TempCreds::install("nonstream-tool");
+
+        let body = serde_json::json!({
+            "id": "msg_hermetic_tool",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-6",
+            "content": [
+                {"type": "tool_use", "id": "toolu_abc", "name": "get_weather", "input": {"city": "SF"}}
+            ],
+            "stop_reason": "tool_use",
+            "stop_sequence": null,
+            "usage": { "input_tokens": 12, "output_tokens": 5 }
+        });
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(query_param("beta", "true"))
+            .and(header(
+                "authorization",
+                format!("Bearer {}", TempCreds::dummy_token()).as_str(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let p = ClaudeProvider::new_for_test_with_base(default_profile(), server.uri())
+            .expect("test provider against mock base");
+        let resp = p
+            .send(sample_req("weather?"))
+            .await
+            .expect("hermetic claude tool-call send must succeed");
+
+        assert_eq!(resp.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(resp.tool_calls.len(), 1);
+        let tc = &resp.tool_calls[0];
+        assert_eq!(tc.id, "toolu_abc");
+        assert_eq!(tc.name, "get_weather");
+        // Arguments are the serialized tool input object.
+        let args: serde_json::Value = serde_json::from_str(&tc.arguments).expect("args are json");
+        assert_eq!(args["city"], "SF");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn claude_streaming_roundtrip_via_wiremock_emits_single_finish() {
+        // WHY: proves the streaming round-trip offline AND pins the duplicate-Finish
+        // fix. The mock emits a normal completed Anthropic SSE sequence ending in
+        // message_stop; the converter emits its terminal Finish there, and the
+        // send_stream EOF guard must NOT append a second one. Asserting exactly one
+        // Finish is the regression test for that bug.
+        let _guard = CREDS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _creds = TempCreds::install("stream-ok");
+
+        // data: {json}\n\n frames; the decoder keys on the JSON `type` and ignores
+        // the `event:` line. message_start carries the nested `message` object with
+        // usage; message_delta carries stop_reason + output_tokens; message_stop
+        // closes. Frames are concatenated into one SSE body.
+        let sse_body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(query_param("beta", "true"))
+            .and(header(
+                "authorization",
+                format!("Bearer {}", TempCreds::dummy_token()).as_str(),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_body),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let p = ClaudeProvider::new_for_test_with_base(default_profile(), server.uri())
+            .expect("test provider against mock base");
+        let stream = p
+            .send_stream(sample_req("hi"))
+            .await
+            .expect("hermetic claude stream must open");
+        let events: Vec<CanonicalStreamEvent> =
+            stream.map(|r| r.expect("no stream error")).collect().await;
+
+        // Text delta first.
+        assert_eq!(events[0], CanonicalStreamEvent::TextDelta("Hello".into()));
+        // Usage carries the input tokens from message_start and output from message_delta.
+        assert_eq!(
+            events[1],
+            CanonicalStreamEvent::Usage(CanonicalUsage {
+                input_tokens: 10,
+                output_tokens: 3,
+                ..Default::default()
+            })
+        );
+        // Exactly ONE terminal Finish (the dup-Finish fix). end_turn -> stop.
+        assert_eq!(
+            events[2],
+            CanonicalStreamEvent::Finish {
+                finish_reason: Some("stop".into())
+            }
+        );
+        let finishes = events
+            .iter()
+            .filter(|e| matches!(e, CanonicalStreamEvent::Finish { .. }))
+            .count();
+        assert_eq!(finishes, 1, "exactly one terminal Finish, got {finishes}");
+        assert_eq!(events.len(), 3, "no extra events: {events:?}");
     }
 }
