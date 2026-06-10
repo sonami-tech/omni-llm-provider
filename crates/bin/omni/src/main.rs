@@ -1170,6 +1170,7 @@ rule = [
         let body = String::from_utf8_lossy(&out.stdout);
         assert!(body.contains("omni - light multi-backend"));
         let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
@@ -1190,6 +1191,7 @@ rule = [
         assert_eq!(v["object"], "list");
         assert!(v["data"].as_array().unwrap().len() >= 2); // at least defaults for enabled (default claude,grok)
         let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
@@ -1271,6 +1273,7 @@ rule = [
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&out3.stdout).trim(), "401");
         let _ = child.kill();
+        let _ = child.wait();
 
         // without keys (empty or --no-auth) -> 200 even no header
         let port2 = free_port();
@@ -1294,6 +1297,7 @@ rule = [
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&out4.stdout).trim(), "200");
         let _ = child2.kill();
+        let _ = child2.wait();
     }
 
     #[test]
@@ -1351,6 +1355,7 @@ rule = [
                 .contains("must use prefix")
         );
         let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
@@ -1406,6 +1411,7 @@ rule = [
             }
         }
         let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
@@ -1437,6 +1443,7 @@ rule = [
                 .any(|id| id.starts_with("claude:") || id.starts_with("grok:"))
         );
         let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
@@ -1478,5 +1485,6 @@ rule = [
         );
         assert!(body.contains("[DONE]"), "stream must terminate with [DONE]");
         let _ = child.kill();
+        let _ = child.wait();
     }
 }

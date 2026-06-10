@@ -1372,6 +1372,11 @@ mod tests {
     }
 
     #[tokio::test]
+    // Holds the env-serialization Mutex across the send().await on purpose: the
+    // XAI_CREDENTIALS_PATH env var must stay set while send() reads it fresh.
+    // Safe here because #[tokio::test] uses a current-thread runtime, so the task
+    // never migrates threads while the guard is held.
+    #[allow(clippy::await_holding_lock)]
     async fn test_credentials_file_load_in_send() {
         // prove send path does fresh file load: write dummy creds file, point env, use new(None) so no ctor fallback,
         // hit bad-port upstream -> must be network err (not Auth) proving load succeeded and key taken from file.
@@ -1416,6 +1421,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // See test_credentials_file_load_in_send: env lock held across await is safe
+    // on the current-thread test runtime.
+    #[allow(clippy::await_holding_lock)]
     async fn test_credentials_bad_file_no_key_gives_auth_error() {
         let _guard = CRED_ENV_LOCK.lock().expect("cred lock for env mutate");
         let non = format!("/tmp/xai-no-such-creds-{}.json", ::std::process::id());
@@ -1455,6 +1463,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // See test_credentials_file_load_in_send: env lock held across await is safe
+    // on the current-thread test runtime.
+    #[allow(clippy::await_holding_lock)]
     async fn test_xai_credentials_path_and_ctor_fallback() {
         // XAI_CREDENTIALS_PATH honored; when load fails, ctor key (simulating env) is fallback
         let _guard = CRED_ENV_LOCK.lock().expect("cred lock for env mutate");
@@ -1494,6 +1505,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // See test_credentials_file_load_in_send: env lock held across await is safe
+    // on the current-thread test runtime.
+    #[allow(clippy::await_holding_lock)]
     async fn test_send_401_on_bad_key_forced_via_creds_path() {
         // Always exercises 401 path from xAI (no secret needed): force non-existent creds file so load fails,
         // ctor supplies a deliberately invalid key, real base_url -> 401 upstream error.
@@ -1677,13 +1691,15 @@ mod tests {
         assert_eq!(canon.tool_calls[0].arguments, r#"{"a":2,"b":3}"#);
         assert_eq!(canon.finish_reason.as_deref(), Some("tool_calls"));
 
-        // streaming note (wire supports SSE deltas for content + incremental tool_call args; trait + provider send do not yet)
-        // deltas would look like: {"choices":[{"delta":{"content":"to","tool_calls":[...]}}]}
-        // stateful accumulation would be needed for full stream support (future).
-        assert!(
-            true,
-            "streaming deltas supported on wire but not yet in LlmProvider::send"
-        );
+        // Streaming is now implemented via LlmProvider::send_stream: the stream
+        // request builder flips stream:true and asks for usage, and the SSE parser
+        // maps content/tool_call deltas to canonical events (see the dedicated
+        // SSE parser test). Pin the builder flags here so the non-stream tool path
+        // above and the stream path stay distinct.
+        let stream_body = to_xai_chat_stream_request(&req, &empty_repl());
+        assert_eq!(stream_body["stream"], true);
+        assert_eq!(stream_body["stream_options"]["include_usage"], true);
+        assert_eq!(body["stream"], false);
     }
 
     #[test]
