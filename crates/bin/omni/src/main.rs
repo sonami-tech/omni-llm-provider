@@ -65,15 +65,11 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use serde::{Deserialize, Serialize};
 use tracing::info;
 use uuid::Uuid;
 
-use omni_common::{AppError, auth_layer};
-use omni_core::{
-    CanonicalContent, CanonicalMessage, CanonicalRequest, CanonicalResponse, CanonicalToolCall,
-    LlmProvider, ProviderError,
-};
+use omni_common::{AppError, ChatCompletionRequest, auth_layer, from_canonical, to_canonical};
+use omni_core::{CanonicalResponse, LlmProvider, ProviderError};
 
 // Re-export the concrete providers so main can construct them by name.
 use provider_claude::ClaudeProvider;
@@ -110,83 +106,6 @@ struct AppState {
     /// Map from provider key ("claude" | "grok") -> live LlmProvider.
     /// Thin indirection: the wrapper only selects and delegates .send().
     providers: HashMap<String, Arc<dyn LlmProvider>>,
-}
-
-/// Minimal OpenAI-compatible chat completion request (light subset).
-/// Only text messages + core sampling supported. Tools, stream, etc. accepted but
-/// largely ignored or errored for this light implementation.
-#[derive(Debug, Deserialize)]
-struct ChatCompletionRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    #[serde(default)]
-    stream: bool,
-    #[serde(default)]
-    max_tokens: Option<u32>,
-    #[serde(default, alias = "max_completion_tokens")]
-    max_completion_tokens: Option<u32>,
-    #[serde(default)]
-    temperature: Option<f32>,
-    #[serde(default)]
-    top_p: Option<f32>,
-    // user, tools, tool_choice, reasoning_effort etc. accepted by deserializer but unused here.
-    #[serde(flatten)]
-    _extras: serde_json::Value,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatMessage {
-    role: String,
-    #[serde(default)]
-    content: Option<String>,
-    // tool_calls etc. ignored in light version.
-}
-
-/// Minimal OpenAI-compatible chat completion response.
-#[derive(Debug, Serialize)]
-struct ChatCompletionResponse {
-    id: String,
-    object: &'static str,
-    created: u64,
-    model: String,
-    choices: Vec<ChatChoice>,
-    usage: ChatUsage,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatChoice {
-    index: u32,
-    message: AssistantMessage,
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct AssistantMessage {
-    role: &'static str,
-    content: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    tool_calls: Vec<ChatToolCall>,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatToolCall {
-    id: String,
-    #[serde(rename = "type")]
-    type_: &'static str,
-    function: ChatFunctionCall,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatFunctionCall {
-    name: String,
-    arguments: String,
-}
-
-#[derive(Debug, Serialize, Default)]
-struct ChatUsage {
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    total_tokens: u64,
 }
 
 #[tokio::main]
@@ -338,92 +257,6 @@ pub fn resolve_provider_and_model(
     )
 }
 
-/// Convert (light) OAI request to CanonicalRequest. Only basic text path.
-fn to_canonical(req: &ChatCompletionRequest) -> CanonicalRequest {
-    let messages: Vec<CanonicalMessage> = req
-        .messages
-        .iter()
-        .map(|m| CanonicalMessage {
-            role: m.role.clone(),
-            content: CanonicalContent::Text(m.content.clone().unwrap_or_default()),
-        })
-        .collect();
-
-    let max_tokens = req.max_completion_tokens.or(req.max_tokens);
-
-    CanonicalRequest {
-        model: req.model.clone(), // will be overwritten by caller with the *stripped* model
-        messages,
-        tools: None,
-        tool_choice: None,
-        max_tokens,
-        temperature: req.temperature,
-        top_p: req.top_p,
-        reasoning: None,
-        metadata: Default::default(),
-        provider_extras: None,
-    }
-}
-
-/// Convert CanonicalResponse (from any delegated provider) to OAI response shape.
-fn from_canonical(
-    canon: CanonicalResponse,
-    requested_model: String,
-    chat_id: String,
-    created: u64,
-) -> ChatCompletionResponse {
-    let tool_calls: Vec<ChatToolCall> = canon
-        .tool_calls
-        .into_iter()
-        .map(|tc: CanonicalToolCall| ChatToolCall {
-            id: tc.id,
-            type_: "function",
-            function: ChatFunctionCall {
-                name: tc.name,
-                arguments: tc.arguments,
-            },
-        })
-        .collect();
-
-    let has_tools = !tool_calls.is_empty();
-    let content = if canon.content.is_empty() && has_tools {
-        None
-    } else {
-        Some(canon.content)
-    };
-
-    let finish = canon.finish_reason.or_else(|| {
-        if has_tools {
-            Some("tool_calls".to_string())
-        } else {
-            Some("stop".to_string())
-        }
-    });
-
-    let total = canon.usage.input_tokens + canon.usage.output_tokens;
-
-    ChatCompletionResponse {
-        id: chat_id,
-        object: "chat.completion",
-        created,
-        model: requested_model,
-        choices: vec![ChatChoice {
-            index: 0,
-            message: AssistantMessage {
-                role: "assistant",
-                content,
-                tool_calls,
-            },
-            finish_reason: finish,
-        }],
-        usage: ChatUsage {
-            prompt_tokens: canon.usage.input_tokens,
-            completion_tokens: canon.usage.output_tokens,
-            total_tokens: total,
-        },
-    }
-}
-
 /// Handler: GET /health
 async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, "ok")
@@ -570,6 +403,7 @@ async fn responses_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omni_common::ChatMessage; // test constructors build requests literally
     use omni_core::LlmProvider; // for the smoke
 
     fn enabled_claude_grok() -> Vec<String> {
@@ -651,7 +485,7 @@ mod tests {
             max_completion_tokens: None,
             temperature: Some(0.7),
             top_p: None,
-            _extras: serde_json::Value::Null,
+            extras: serde_json::Value::Null,
         };
 
         let mut canon = to_canonical(&oai_req);
@@ -776,15 +610,29 @@ mod tests {
         if let Ok(p) = std::env::var("CARGO_BIN_EXE_omni") {
             return std::path::PathBuf::from(p);
         }
-        let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        // from crates/bin/omni -> root
-        p.pop();
-        p.pop();
-        p.pop();
-        p.push("target");
-        p.push("debug");
-        p.push("omni");
-        p
+        // from crates/bin/omni -> workspace root
+        let mut root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        root.pop();
+        root.pop();
+        root.pop();
+        let bin = root.join("target").join("debug").join("omni");
+        // Build-on-demand: `cargo test -p omni` compiles only the unit-test harness,
+        // not the standalone binary, and unit tests get no CARGO_BIN_EXE_* env var.
+        // We build UNCONDITIONALLY (not just when the binary is missing) because the
+        // failure this guards against is a *stale* binary: a handler/route change
+        // recompiles the test harness but leaves an old target/debug/omni on disk,
+        // so the subprocess would run code that predates the change (e.g. a 404 on a
+        // newly added route). An incremental no-op build is ~0.15s, so always
+        // building is cheap insurance that the subprocess runs the current code.
+        // Kept in sync with omni-grok::bin_path().
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let status = Command::new(cargo)
+            .args(["build", "-p", "omni"])
+            .current_dir(&root)
+            .status()
+            .expect("invoke cargo build for omni bin");
+        assert!(status.success(), "cargo build -p omni failed");
+        bin
     }
 
     fn mk_app_with(
@@ -868,7 +716,7 @@ mod tests {
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
-            _extras: serde_json::Value::Null,
+            extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
         match res {
@@ -918,7 +766,7 @@ mod tests {
             max_completion_tokens: None,
             temperature: Some(0.0),
             top_p: None,
-            _extras: serde_json::Value::Null,
+            extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
         let resp = res.expect("stream should open with creds").into_response();
@@ -950,7 +798,7 @@ mod tests {
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
-            _extras: serde_json::Value::Null,
+            extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
         let err = match res {
@@ -981,7 +829,7 @@ mod tests {
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
-            _extras: serde_json::Value::Null,
+            extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
         let m = match res {
@@ -1013,7 +861,7 @@ mod tests {
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
-            _extras: serde_json::Value::Null,
+            extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
         let m = match res {
@@ -1047,7 +895,7 @@ mod tests {
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
-            _extras: serde_json::Value::Null,
+            extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
         let err = match res {
@@ -1083,7 +931,7 @@ mod tests {
             max_completion_tokens: None,
             temperature: Some(0.0),
             top_p: None,
-            _extras: serde_json::Value::Null,
+            extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
         match res {
@@ -1212,7 +1060,7 @@ rule = [
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
-            _extras: serde_json::Value::Null,
+            extras: serde_json::Value::Null,
         };
         let _ = chat_completions_handler(State(state), Json(req)).await; // will err on net but cred code ran in provider
     }
