@@ -9,15 +9,15 @@ pub fn resolve_session_id(
     user: Option<&str>,
     api_key_id: Option<&str>,
 ) -> String {
-    if let Some(h) = header {
-        if !h.is_empty() {
-            return h.to_string();
-        }
+    if let Some(h) = header
+        && !h.is_empty()
+    {
+        return h.to_string();
     }
-    if let Some(u) = user {
-        if !u.is_empty() {
-            return format!("user:{}", u);
-        }
+    if let Some(u) = user
+        && !u.is_empty()
+    {
+        return format!("user:{}", u);
     }
     if let Some(k) = api_key_id {
         return format!("key:{}", k);

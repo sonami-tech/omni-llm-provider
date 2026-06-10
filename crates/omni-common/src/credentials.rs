@@ -162,7 +162,7 @@ mod tests {
             if let Some(v) = old {
                 std::env::set_var("XAI_CREDENTIALS_PATH", v);
             } else {
-                let _ = std::env::remove_var("XAI_CREDENTIALS_PATH");
+                std::env::remove_var("XAI_CREDENTIALS_PATH");
             }
         }
         assert_eq!(got, p);
@@ -242,7 +242,7 @@ mod tests {
             if let Some(v) = old {
                 std::env::set_var("XAI_CREDENTIALS_PATH", v);
             } else {
-                let _ = std::env::remove_var("XAI_CREDENTIALS_PATH");
+                std::env::remove_var("XAI_CREDENTIALS_PATH");
             }
         }
         let _ = std::fs::remove_file(&p);
