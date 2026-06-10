@@ -250,6 +250,18 @@ pub fn to_canonical(req: &ChatCompletionRequest) -> Result<CanonicalRequest, Str
 /// tool-bearing turns both map here; tool turns become `Blocks` so the call/
 /// result linkage survives into the canonical layer.
 fn chat_message_to_canonical(m: &ChatMessage) -> Result<CanonicalMessage, String> {
+    // tool_calls are only valid on the assistant role (OpenAI contract).
+    // Checked up front so a non-assistant message carrying tool_calls is
+    // rejected by name rather than having them silently dropped (e.g. a
+    // role:"tool" message must not also carry tool_calls).
+    let has_tool_calls = m.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty());
+    if has_tool_calls && m.role != "assistant" {
+        return Err(format!(
+            "tool_calls are only valid on an assistant message, not role \"{}\"",
+            m.role
+        ));
+    }
+
     // A `role:"tool"` message carries a tool result keyed by tool_call_id.
     if m.role == "tool" {
         let id = m
@@ -266,16 +278,8 @@ fn chat_message_to_canonical(m: &ChatMessage) -> Result<CanonicalMessage, String
         });
     }
 
-    // An assistant message may interleave text with tool calls. tool_calls are
-    // only valid on the assistant role (OpenAI contract); reject them elsewhere
-    // rather than forwarding a malformed history shape to a backend.
+    // An assistant message may interleave text with tool calls.
     if let Some(tool_calls) = m.tool_calls.as_ref().filter(|tc| !tc.is_empty()) {
-        if m.role != "assistant" {
-            return Err(format!(
-                "tool_calls are only valid on an assistant message, not role \"{}\"",
-                m.role
-            ));
-        }
         let mut blocks: Vec<CanonicalBlock> = Vec::new();
         if let Some(text) = m.content.as_ref().filter(|t| !t.is_empty()) {
             blocks.push(CanonicalBlock::Text(text.clone()));
@@ -743,6 +747,21 @@ mod tests {
         assert!(
             err.contains("assistant") || err.contains("tool_calls"),
             "error must explain tool_calls are assistant-only: {err}"
+        );
+
+        // A role:"tool" message carrying tool_calls must ALSO reject -- the
+        // tool-result branch is reached first, so the assistant-only check has
+        // to run BEFORE it or the tool_calls would be silently dropped.
+        let req = req_from_json(
+            r#"{"model":"m","messages":[
+                {"role":"tool","tool_call_id":"c1","content":"42","tool_calls":[
+                    {"id":"x","type":"function","function":{"name":"f","arguments":"{}"}}]}
+            ]}"#,
+        );
+        let err = to_canonical(&req).expect_err("tool_calls on tool role must reject");
+        assert!(
+            err.contains("assistant") || err.contains("tool_calls"),
+            "tool role with tool_calls must reject, not drop them: {err}"
         );
     }
 

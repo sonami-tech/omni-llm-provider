@@ -189,6 +189,7 @@ fn to_xai_chat_request(req: &CanonicalRequest, repl: &Replacements) -> Value {
                 // block rather than dropping siblings.
                 let mut text = String::new();
                 let mut tool_calls: Vec<Value> = Vec::new();
+                let mut tool_result_msgs: Vec<Value> = Vec::new();
                 for b in blocks {
                     match b {
                         CanonicalBlock::Text(t) => text.push_str(&repl.apply_prompt(t)),
@@ -208,7 +209,7 @@ fn to_xai_chat_request(req: &CanonicalRequest, repl: &Replacements) -> Value {
                             content,
                             ..
                         } => {
-                            messages.push(json!({
+                            tool_result_msgs.push(json!({
                                 "role": "tool",
                                 "tool_call_id": tool_use_id,
                                 "content": repl.apply_prompt(content)
@@ -216,10 +217,12 @@ fn to_xai_chat_request(req: &CanonicalRequest, repl: &Replacements) -> Value {
                         }
                     }
                 }
-                // Emit the role's own message only when it carries text or tool
-                // calls (a message of pure tool results adds nothing here). When
-                // there are tool_calls but no text, content is null per the
-                // OpenAI contract; omit an empty tool_calls array otherwise.
+                // Emit the role's own message FIRST (when it carries text or tool
+                // calls) so an assistant turn precedes the tool results that
+                // answer it, then the tool-result messages. A message of pure
+                // tool results adds no role message. When there are tool_calls
+                // but no text, content is null per the OpenAI contract; an empty
+                // tool_calls array is omitted.
                 if !text.is_empty() || !tool_calls.is_empty() {
                     let mut msg = serde_json::Map::new();
                     msg.insert("role".into(), json!(m.role));
@@ -236,6 +239,7 @@ fn to_xai_chat_request(req: &CanonicalRequest, repl: &Replacements) -> Value {
                     }
                     messages.push(Value::Object(msg));
                 }
+                messages.extend(tool_result_msgs);
             }
         }
     }
@@ -961,6 +965,47 @@ mod tests {
             .expect("tool result message must be present");
         assert_eq!(tool_msg["tool_call_id"], "c1");
         assert_eq!(tool_msg["content"], "R");
+    }
+
+    #[test]
+    fn mixed_block_single_message_emits_assistant_before_tool_result() {
+        // WHY: when ONE canonical message mixes Text/ToolUse with a ToolResult,
+        // the assistant message (text + tool_calls) must be emitted BEFORE the
+        // tool-result message, or the wire history is out of order (a result
+        // appearing before the call it answers). This pins the ordering inside a
+        // single block message.
+        let req = CanonicalRequest {
+            model: "grok-4.3".into(),
+            messages: vec![CanonicalMessage {
+                role: "assistant".into(),
+                content: CanonicalContent::Blocks(vec![
+                    CanonicalBlock::Text("calling".into()),
+                    CanonicalBlock::ToolUse {
+                        id: "c1".into(),
+                        name: "f".into(),
+                        arguments: "{}".into(),
+                    },
+                    CanonicalBlock::ToolResult {
+                        tool_use_id: "c1".into(),
+                        content: "R".into(),
+                        is_error: false,
+                    },
+                ]),
+            }],
+            ..Default::default()
+        };
+        let body = to_xai_chat_request(&req, &empty_repl());
+        let messages = body["messages"].as_array().unwrap();
+        let asst_idx = messages.iter().position(|m| m["role"] == "assistant");
+        let tool_idx = messages.iter().position(|m| m["role"] == "tool");
+        assert!(
+            asst_idx.is_some() && tool_idx.is_some(),
+            "both messages must be present: {messages:?}"
+        );
+        assert!(
+            asst_idx < tool_idx,
+            "assistant message must precede the tool result: {messages:?}"
+        );
     }
 
     #[test]
