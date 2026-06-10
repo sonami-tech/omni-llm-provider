@@ -11,15 +11,16 @@
 //! - When multiple enabled, bare models are rejected with clear error (forces prefix).
 //!
 //! ## Surfaces (unified OpenAI-compatible)
-//! - POST /v1/chat/completions  (basic non-stream text + sampling; tools/stream minimal)
+//! - POST /v1/chat/completions  (text + sampling; non-stream JSON and stream SSE)
 //! - GET  /v1/models , /models
 //! - GET  /health
 //! - GET  /
 //!
 //! ## How it uses shared crates (per requirements)
-//! - omni-common: auth_layer + AppError (for consistent OAI-shaped errors), nothing heavier.
+//! - omni-common: auth_layer + AppError (OAI-shaped errors) + the shared http
+//!   layer (to_canonical/from_canonical + the SSE stream framer).
 //! - omni-core: CanonicalRequest/Response + LlmProvider trait for the delegation contract.
-//! - Depends on provider-claude (light stub only) + provider-grok (full).
+//! - Depends on provider-claude (full fingerprint provider) + provider-grok (full).
 //!
 //! ## Routing implementation (pure, unit-testable)
 //! See `resolve_provider_and_model` below. Pure function; no side effects.
