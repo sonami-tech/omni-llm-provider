@@ -49,10 +49,12 @@
 //! with no network.
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use omni_common::{GrokCredentials, Replacements};
 use omni_core::{
-    CanonicalContent, CanonicalReasoning, CanonicalRequest, CanonicalResponse, CanonicalToolCall,
-    CanonicalToolChoice, CanonicalUsage, LlmProvider, ProviderError,
+    CanonicalContent, CanonicalReasoning, CanonicalRequest, CanonicalResponse, CanonicalStream,
+    CanonicalStreamEvent, CanonicalToolCall, CanonicalToolChoice, CanonicalUsage, LlmProvider,
+    ProviderError,
 };
 use reqwest::Client;
 use serde::Deserialize;
@@ -127,6 +129,35 @@ impl GrokProvider {
     /// Returns the configured upstream base (without trailing slash).
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Resolve the effective bearer key the same way for every request: load the credentials file
+    /// fresh (never cached, so key rotations are picked up), warning-but-continuing if it reports
+    /// expired, and falling back to the ctor/env key only when the file load fails. Returns an
+    /// `Auth` error when neither source yields a key. Shared by `send` and `send_stream` so the two
+    /// paths cannot drift in how they authenticate.
+    async fn resolve_api_key(&self) -> Result<String, ProviderError> {
+        match GrokCredentials::load_fresh_async(&GrokCredentials::default_path()).await {
+            Ok(creds) => {
+                if let Err(e) = creds.check_expired() {
+                    warn!(error = %e, "grok creds reported expired (continuing with file key)");
+                }
+                Ok(creds.api_key)
+            }
+            Err(e) => {
+                // Fallback to the key we were constructed with (explicit or XAI_API_KEY env)
+                // for backward compatibility with existing Grok users who only set the env var.
+                if let Some(k) = &self.api_key {
+                    debug!(error = %e, "no grok creds file (or load failed); falling back to ctor/env key");
+                    Ok(k.clone())
+                } else {
+                    Err(ProviderError::Auth(format!(
+                        "failed to load Grok credentials from file and no explicit/env key: {}",
+                        e
+                    )))
+                }
+            }
+        }
     }
 }
 
@@ -212,6 +243,18 @@ fn to_xai_chat_request(req: &CanonicalRequest, repl: &Replacements) -> Value {
     // Light hook demonstration for omni-common replacements on the *structured* prompt surface.
     // (Real rules for tool names etc. are typically applied by the frontend before producing CanonicalRequest,
     // or the provider ctor would be given a live Replacements instance instead of always empty().)
+    body
+}
+
+/// Map a CanonicalRequest to the JSON body for a *streaming* xAI /v1/chat/completions call.
+/// Reuses `to_xai_chat_request` (identical message/tool/sampling mapping + replacements hook) and
+/// then flips `stream` to true. `stream_options.include_usage` asks xAI to emit one final chunk
+/// carrying the `usage` object (otherwise streamed responses omit token accounting entirely), which
+/// the parser turns into a terminal `CanonicalStreamEvent::Usage`.
+fn to_xai_chat_stream_request(req: &CanonicalRequest, repl: &Replacements) -> Value {
+    let mut body = to_xai_chat_request(req, repl);
+    body["stream"] = json!(true);
+    body["stream_options"] = json!({ "include_usage": true });
     body
 }
 
@@ -352,6 +395,173 @@ fn from_xai_chat_response(raw: XaiChatCompletion, repl: &Replacements) -> Canoni
     }
 }
 
+// --- Streaming (SSE) wire shapes + parsing -------------------------------------------------
+//
+// xAI streams OpenAI-style Server-Sent Events: each event is a line `data: {json}` (one chat
+// completion *chunk*), and the stream terminates with the sentinel `data: [DONE]`. A chunk's
+// `choices[0].delta` carries incremental `content` and/or `tool_calls`; `finish_reason` becomes
+// non-null on the chunk that closes generation. With `stream_options.include_usage` xAI appends a
+// trailing chunk whose `choices` is empty but which carries the cumulative `usage`.
+//
+// JUDGMENT CALL (tool_call delta shape): xAI follows OpenAI's incremental tool-call convention.
+// The first chunk for a given tool call sets `index`, `id`, and `function.name`; subsequent chunks
+// for the same `index` carry only `function.arguments` fragments (and null id/name). We map each
+// raw tool-call delta straight onto `CanonicalStreamEvent::ToolCallDelta { index, id, name,
+// arguments_delta }` without accumulating, because the canonical contract documents exactly this
+// incremental shape (consumers concatenate by index). `index` is required by canonical; if a chunk
+// ever omits it we default to 0 (single tool call), which matches the common non-parallel case.
+
+#[derive(Debug, Deserialize)]
+struct XaiStreamChunk {
+    choices: Option<Vec<XaiStreamChoice>>,
+    usage: Option<XaiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XaiStreamChoice {
+    delta: Option<XaiStreamDelta>,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct XaiStreamDelta {
+    content: Option<String>,
+    tool_calls: Option<Vec<XaiStreamToolCall>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XaiStreamToolCall {
+    index: Option<u32>,
+    id: Option<String>,
+    function: Option<XaiStreamFunction>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct XaiStreamFunction {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+/// Parse the JSON payload of a single SSE `data:` frame (the `[DONE]` sentinel is handled by the
+/// caller, not here) into zero or more canonical stream events, in emission order.
+///
+/// One chunk can legitimately yield several events: a `content` text delta, one `ToolCallDelta`
+/// per entry in `tool_calls`, and/or a `Usage` event from the trailing include_usage chunk. A
+/// non-null `finish_reason` is *not* emitted here; the caller remembers it and emits a single
+/// terminal `Finish` at `[DONE]` (per the canonical contract: exactly one terminal Finish).
+///
+/// Returns a Vec rather than the single-event `Option` sketched in the task because a chunk is
+/// genuinely multi-event; an empty Vec means "nothing to surface from this frame" (e.g. a role-only
+/// opening delta). A malformed JSON frame yields a single `Err(Upstream(..))` so the stream fails
+/// loud instead of silently dropping data.
+fn parse_grok_sse_frame(data: &str) -> Vec<Result<CanonicalStreamEvent, ProviderError>> {
+    let chunk: XaiStreamChunk = match serde_json::from_str(data) {
+        Ok(c) => c,
+        Err(e) => {
+            return vec![Err(ProviderError::Upstream(format!(
+                "failed to decode xAI stream chunk: {e}: {data}"
+            )))];
+        }
+    };
+
+    let mut events: Vec<Result<CanonicalStreamEvent, ProviderError>> = Vec::new();
+
+    if let Some(choice) = chunk.choices.and_then(|mut c| c.drain(..).next()) {
+        if let Some(delta) = choice.delta {
+            if let Some(text) = delta.content
+                && !text.is_empty()
+            {
+                events.push(Ok(CanonicalStreamEvent::TextDelta(text)));
+            }
+            if let Some(tcs) = delta.tool_calls {
+                for tc in tcs {
+                    let func = tc.function.unwrap_or_default();
+                    events.push(Ok(CanonicalStreamEvent::ToolCallDelta {
+                        index: tc.index.unwrap_or(0),
+                        id: tc.id,
+                        name: func.name,
+                        arguments_delta: func.arguments.unwrap_or_default(),
+                    }));
+                }
+            }
+        }
+        // finish_reason is remembered by the driver and emitted once at [DONE]; not surfaced here.
+        let _ = choice.finish_reason;
+    }
+
+    if let Some(u) = chunk.usage {
+        events.push(Ok(CanonicalStreamEvent::Usage(CanonicalUsage {
+            input_tokens: u.prompt_tokens.unwrap_or(0),
+            output_tokens: u.completion_tokens.unwrap_or(0),
+            cache_read: u
+                .prompt_tokens_details
+                .and_then(|d| d.cached_tokens)
+                .unwrap_or(0),
+            cache_creation: 0,
+        })));
+    }
+
+    events
+}
+
+/// Extract the `finish_reason` from a single SSE `data:` frame, if present and non-null.
+/// The driver records the last one seen and emits it in the terminal `Finish` at `[DONE]`.
+fn finish_reason_from_frame(data: &str) -> Option<String> {
+    let chunk: XaiStreamChunk = serde_json::from_str(data).ok()?;
+    chunk
+        .choices
+        .and_then(|mut c| c.drain(..).next())
+        .and_then(|ch| ch.finish_reason)
+}
+
+/// Incremental SSE line buffer. Bytes arrive from `reqwest::bytes_stream()` in arbitrary chunks; a
+/// single `data: {json}` line (and the JSON inside it) can be split across two byte chunks, so we
+/// accumulate into a `String` and only hand back *complete* lines (those terminated by `\n`). Any
+/// trailing partial line stays buffered for the next byte chunk.
+#[derive(Default)]
+struct SseBuffer {
+    buf: String,
+}
+
+impl SseBuffer {
+    /// Feed a UTF-8 string slice of freshly received bytes; returns each complete line (newline
+    /// stripped, including the trailing `\r` from CRLF framing) now available. A line not yet
+    /// terminated by `\n` is retained internally until more bytes arrive.
+    fn push(&mut self, s: &str) -> Vec<String> {
+        self.buf.push_str(s);
+        let mut lines = Vec::new();
+        while let Some(nl) = self.buf.find('\n') {
+            let line: String = self.buf.drain(..=nl).collect();
+            // Strip the trailing \n and any \r (SSE uses CRLF or LF).
+            lines.push(line.trim_end_matches(['\r', '\n']).to_string());
+        }
+        lines
+    }
+}
+
+/// Classify a single complete SSE line. Returns `None` for blank lines, comments (`:` prefix), and
+/// non-`data:` fields (e.g. `event:`), which carry nothing the canonical stream needs.
+enum SseLine {
+    Done,
+    Data(String),
+    Ignore,
+}
+
+fn classify_sse_line(line: &str) -> SseLine {
+    let trimmed = line.trim_end();
+    if trimmed.is_empty() || trimmed.starts_with(':') {
+        return SseLine::Ignore;
+    }
+    if let Some(payload) = trimmed.strip_prefix("data:") {
+        let payload = payload.trim();
+        if payload == "[DONE]" {
+            return SseLine::Done;
+        }
+        return SseLine::Data(payload.to_string());
+    }
+    SseLine::Ignore
+}
+
 #[async_trait]
 impl LlmProvider for GrokProvider {
     fn id(&self) -> &'static str {
@@ -378,28 +588,7 @@ impl LlmProvider for GrokProvider {
 
         // Fresh credentials load (the "Grok gate" technique, copied from CCP).
         // See docs/grok-gate.md and omni-common::credentials::GrokCredentials.
-        let effective_key =
-            match GrokCredentials::load_fresh_async(&GrokCredentials::default_path()).await {
-                Ok(creds) => {
-                    if let Err(e) = creds.check_expired() {
-                        warn!(error = %e, "grok creds reported expired (continuing with file key)");
-                    }
-                    creds.api_key
-                }
-                Err(e) => {
-                    // Fallback to the key we were constructed with (explicit or XAI_API_KEY env)
-                    // for backward compatibility with existing Grok users who only set the env var.
-                    if let Some(k) = &self.api_key {
-                        debug!(error = %e, "no grok creds file (or load failed); falling back to ctor/env key");
-                        k.clone()
-                    } else {
-                        return Err(ProviderError::Auth(format!(
-                            "failed to load Grok credentials from file and no explicit/env key: {}",
-                            e
-                        )));
-                    }
-                }
-            };
+        let effective_key = self.resolve_api_key().await?;
 
         let http_resp = self
             .client
@@ -443,6 +632,115 @@ impl LlmProvider for GrokProvider {
         // For now the canonical shape is the contract.
 
         Ok(canon)
+    }
+
+    /// Native SSE streaming against xAI /v1/chat/completions.
+    ///
+    /// Overrides the trait default (which buffers a whole `send`) so callers get incremental
+    /// deltas as xAI emits them. The HTTP request is issued *inside* the returned stream (via
+    /// `async_stream::stream!`) so the call site gets the stream immediately and any upstream
+    /// failure surfaces as the first `Err` item rather than from the `send_stream` call itself.
+    async fn send_stream(&self, req: CanonicalRequest) -> Result<CanonicalStream, ProviderError> {
+        debug!(
+            provider = "grok",
+            model = %req.model,
+            n_msgs = req.messages.len(),
+            n_tools = req.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+            has_reasoning = req.reasoning.is_some(),
+            "streaming to xAI"
+        );
+
+        // Same prompt-scope replacements seam as send() (Replacements::empty() hook).
+        let repl = Replacements::empty();
+        let body = to_xai_chat_stream_request(&req, &repl);
+        let url = format!("{}/chat/completions", self.base_url);
+
+        // Resolve the key fresh exactly like send() (shared helper; never cached).
+        let effective_key = self.resolve_api_key().await?;
+        let client = self.client.clone();
+
+        let stream = async_stream::stream! {
+            let send_result = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", effective_key))
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
+                .json(&body)
+                .send()
+                .await;
+
+            let http_resp = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    yield Err(ProviderError::Upstream(format!("network error calling xAI: {}", e)));
+                    return;
+                }
+            };
+
+            let status = http_resp.status();
+            if !status.is_success() {
+                // Read the error body first, same as the non-stream path.
+                let err_body = http_resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<no body>".to_string());
+                error!(%status, body = %err_body, "xAI upstream stream error");
+                yield Err(ProviderError::Upstream(format!("xAI {}: {}", status, err_body)));
+                return;
+            }
+
+            // Consume the raw byte stream, reframing into SSE lines (a JSON object may span
+            // multiple byte chunks; SseBuffer holds partial lines across chunk boundaries) and
+            // mapping each `data:` frame to canonical events. The last non-null finish_reason is
+            // remembered and emitted once as the terminal Finish at `data: [DONE]`.
+            let mut bytes = http_resp.bytes_stream();
+            let mut sse = SseBuffer::default();
+            let mut finish_reason: Option<String> = None;
+            let mut done = false;
+
+            while let Some(chunk) = bytes.next().await {
+                let chunk = match chunk {
+                    Ok(b) => b,
+                    Err(e) => {
+                        yield Err(ProviderError::Upstream(format!("xAI stream read error: {}", e)));
+                        return;
+                    }
+                };
+                // xAI SSE payloads are UTF-8; tolerate any split multi-byte sequence by lossy decode
+                // (frame boundaries are at `\n`, so SseBuffer only releases complete lines anyway).
+                let text = String::from_utf8_lossy(&chunk);
+                for line in sse.push(&text) {
+                    match classify_sse_line(&line) {
+                        SseLine::Ignore => {}
+                        SseLine::Done => {
+                            done = true;
+                            break;
+                        }
+                        SseLine::Data(payload) => {
+                            if let Some(fr) = finish_reason_from_frame(&payload) {
+                                finish_reason = Some(fr);
+                            }
+                            for ev in parse_grok_sse_frame(&payload) {
+                                let is_err = ev.is_err();
+                                yield ev;
+                                if is_err {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                if done {
+                    break;
+                }
+            }
+
+            // Terminal Finish (exactly one), carrying the remembered finish_reason. Emitted even if
+            // the upstream closed without an explicit `[DONE]` so consumers always see a terminator.
+            yield Ok(CanonicalStreamEvent::Finish { finish_reason });
+        };
+
+        Ok(Box::pin(stream))
     }
 }
 
@@ -1458,5 +1756,240 @@ mod tests {
         assert_eq!(canon.usage.input_tokens, 0);
         assert_eq!(canon.usage.output_tokens, 0);
         assert!(canon.finish_reason.is_none());
+    }
+
+    // ============================================================
+    // STREAMING (native SSE) tests
+    // ============================================================
+
+    #[test]
+    fn test_stream_builder_sets_stream_and_usage_flag() {
+        // WHY: the streaming path depends on two wire facts. (1) `stream: true` is what makes xAI
+        // emit SSE instead of one JSON body; the non-stream builder MUST stay `false` (the existing
+        // non-stream assertions and callers rely on that). (2) `stream_options.include_usage: true`
+        // is the ONLY way xAI appends a final chunk carrying `usage` for a streamed response; without
+        // it the parser would never see a Usage event and token accounting for streams would be lost.
+        let req = CanonicalRequest {
+            model: "grok-4.3".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            ..Default::default()
+        };
+        let stream_body = to_xai_chat_stream_request(&req, &empty_repl());
+        assert_eq!(stream_body["stream"], true);
+        assert_eq!(stream_body["stream_options"]["include_usage"], true);
+
+        // The non-stream builder is unchanged: still stream: false, no stream_options.
+        let plain_body = to_xai_chat_request(&req, &empty_repl());
+        assert_eq!(plain_body["stream"], false);
+        assert!(plain_body.get("stream_options").is_none());
+    }
+
+    /// Drive the *production* SSE logic over a sequence of raw byte chunks exactly the way
+    /// `send_stream` does: `SseBuffer` reframes bytes into complete lines (holding partial frames
+    /// across chunk boundaries), `classify_sse_line` finds `data:`/`[DONE]`, `finish_reason_from_frame`
+    /// remembers the reason, `parse_grok_sse_frame` produces events, and a single terminal `Finish`
+    /// is appended at `[DONE]`. This is the identical pipeline the HTTP path runs, just fed from
+    /// in-memory chunks so it needs no network or creds.
+    fn drive_sse(chunks: &[&[u8]]) -> Vec<Result<CanonicalStreamEvent, ProviderError>> {
+        let mut sse = SseBuffer::default();
+        let mut out = Vec::new();
+        let mut finish_reason: Option<String> = None;
+        let mut done = false;
+        for chunk in chunks {
+            let text = String::from_utf8_lossy(chunk);
+            for line in sse.push(&text) {
+                match classify_sse_line(&line) {
+                    SseLine::Ignore => {}
+                    SseLine::Done => {
+                        done = true;
+                        break;
+                    }
+                    SseLine::Data(payload) => {
+                        if let Some(fr) = finish_reason_from_frame(&payload) {
+                            finish_reason = Some(fr);
+                        }
+                        out.extend(parse_grok_sse_frame(&payload));
+                    }
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        out.push(Ok(CanonicalStreamEvent::Finish { finish_reason }));
+        out
+    }
+
+    #[test]
+    fn test_sse_parser_buffers_split_frames_and_orders_events() {
+        // WHY: this is the load-bearing guarantee the HTTP streaming path depends on. reqwest's
+        // bytes_stream() yields bytes in arbitrary splits, so a single `data: {json}` frame (and the
+        // JSON inside it) WILL sometimes arrive across two network reads. If the parser did not buffer
+        // partial lines, that JSON would fail to decode and we would either drop a delta or fail the
+        // stream. We also pin event ORDER (text deltas in arrival order, then the tool-call delta,
+        // then the trailing usage chunk, then exactly one terminal Finish with the right reason)
+        // because downstream framing concatenates text by arrival and tool args by index; reordering
+        // or a missing/duplicated Finish would corrupt the reconstructed assistant turn.
+
+        // A complete content frame...
+        let c0: &[u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n";
+        // ...then a SECOND content frame deliberately CUT in half across two chunks to prove buffering.
+        let c1a: &[u8] = b"data: {\"choices\":[{\"delta\":{\"con";
+        let c1b: &[u8] = b"tent\":\" world\"}}]}\n\n";
+        // A tool-call delta frame (first delta for index 0 carries id + name + an args fragment).
+        let c2: &[u8] = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\"}}]}}]}\n\n";
+        // The closing content/finish frame (finish_reason non-null; remembered, not emitted yet).
+        let c3: &[u8] =
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n";
+        // The include_usage trailer (empty choices, carries usage) then the [DONE] sentinel.
+        let c4: &[u8] = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\ndata: [DONE]\n\n";
+
+        let events = drive_sse(&[c0, c1a, c1b, c2, c3, c4]);
+        let events: Vec<CanonicalStreamEvent> = events
+            .into_iter()
+            .map(|r| r.expect("no parse errors expected for well-formed frames"))
+            .collect();
+
+        assert_eq!(
+            events,
+            vec![
+                CanonicalStreamEvent::TextDelta("Hello".into()),
+                // proves the split " world" frame was reassembled, not lost.
+                CanonicalStreamEvent::TextDelta(" world".into()),
+                CanonicalStreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_abc".into()),
+                    name: Some("get_weather".into()),
+                    arguments_delta: "{\"city\":".into(),
+                },
+                CanonicalStreamEvent::Usage(CanonicalUsage {
+                    input_tokens: 11,
+                    output_tokens: 7,
+                    cache_read: 0,
+                    cache_creation: 0,
+                }),
+                // exactly one terminal Finish, carrying the reason seen on the finish frame.
+                CanonicalStreamEvent::Finish {
+                    finish_reason: Some("tool_calls".into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sse_parser_malformed_frame_yields_upstream_error() {
+        // WHY: a corrupt frame must fail loud (Err) so the stream surfaces the problem rather than
+        // silently swallowing data the consumer is counting on. The driver stops the stream on the
+        // first error (mirrors send_stream returning after yielding the Err).
+        let bad: &[u8] = b"data: {not json}\n\n";
+        let events = drive_sse(&[bad]);
+        match &events[0] {
+            Err(ProviderError::Upstream(s)) => {
+                assert!(s.contains("decode xAI stream chunk"), "got: {s}")
+            }
+            other => panic!("expected Upstream error for malformed frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_stream_upstream_error_is_first_item() {
+        // WHY: send_stream issues the HTTP call inside the stream, so a connection failure must
+        // surface as the FIRST yielded Err (not a panic, not an empty stream). Uses an impossible
+        // port as the "mock" upstream (same pattern as test_send_mocked_upstream_error). No creds: the
+        // ctor key is the fallback, so we never hit the Auth branch.
+        let p = GrokProvider::new_for_test("xai-dummy", "http://127.0.0.1:1");
+        let req = CanonicalRequest {
+            model: "grok-4.3".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            ..Default::default()
+        };
+        let mut stream = p
+            .send_stream(req)
+            .await
+            .expect("send_stream returns the stream eagerly");
+        let first = stream
+            .next()
+            .await
+            .expect("stream must yield at least one item");
+        match first {
+            Err(ProviderError::Upstream(s)) => {
+                assert!(
+                    s.contains("network error calling xAI") || s.contains("connection"),
+                    "got: {s}"
+                )
+            }
+            other => panic!("expected leading Upstream error for bad port, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_stream_real_if_creds_present() {
+        // Guarded live test: only runs when creds are available (XAI_API_KEY env or
+        // ~/.xai/.credentials.json). Otherwise skips so the offline suite stays green. Mirrors the
+        // existing guarded-live pattern (test_send_real_if_key_present).
+        if !has_grok_creds() {
+            eprintln!(
+                "skipping real grok stream test (no XAI_API_KEY and no ~/.xai/.credentials.json)"
+            );
+            return;
+        }
+        let p = GrokProvider::new(std::env::var("XAI_API_KEY").ok())
+            .expect("ctor for live stream test");
+        let req = CanonicalRequest {
+            model: "grok-3-mini".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("Reply with the single word: PONG".into()),
+            }],
+            max_tokens: Some(8),
+            ..Default::default()
+        };
+        let mut stream = p.send_stream(req).await.expect("live stream open");
+        let mut text = String::new();
+        let mut saw_finish = false;
+        while let Some(ev) = stream.next().await {
+            match ev.expect("live stream event") {
+                CanonicalStreamEvent::TextDelta(t) => text.push_str(&t),
+                CanonicalStreamEvent::Finish { .. } => saw_finish = true,
+                _ => {}
+            }
+        }
+        assert!(saw_finish, "live stream must terminate with a Finish");
+        assert!(
+            !text.trim().is_empty(),
+            "live stream must produce some text"
+        );
+    }
+
+    /// True when real, human-provisioned xAI credentials are reachable for a live test: either the
+    /// `XAI_API_KEY` env var, or a credentials file at the canonical `~/.xai/.credentials.json` home
+    /// path. We deliberately read the *home* path directly rather than `GrokCredentials::default_path()`
+    /// because that honors `$XAI_CREDENTIALS_PATH`, which the credential tests in this module set to a
+    /// throwaway dummy-key file under the `CRED_ENV_LOCK`; keying the live guard off it would race those
+    /// tests and trigger a real (failing) network call with a junk key. Requiring `XAI_CREDENTIALS_PATH`
+    /// to be unset before trusting the file makes this fully race-immune and keeps the offline suite green.
+    fn has_grok_creds() -> bool {
+        if std::env::var("XAI_API_KEY")
+            .map(|k| !k.trim().is_empty())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if std::env::var_os("XAI_CREDENTIALS_PATH").is_some() {
+            return false;
+        }
+        match std::env::var_os("HOME") {
+            Some(home) => ::std::path::Path::new(&home)
+                .join(".xai")
+                .join(".credentials.json")
+                .exists(),
+            None => false,
+        }
     }
 }
