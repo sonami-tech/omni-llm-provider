@@ -1,4 +1,4 @@
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 use std::net::SocketAddr;
 use tracing::{info, warn};
 
@@ -16,7 +16,10 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
-        .route("/", get(|| async { "omni-claude - OpenAI compat + native Anthropic for Claude Max" }));
+        .route(
+            "/",
+            get(|| async { "omni-claude - OpenAI compat + native Anthropic for Claude Max" }),
+        );
 
     let addr: SocketAddr = "127.0.0.1:18321".parse().unwrap();
     info!("omni-claude listening on http://{}", addr);
@@ -36,7 +39,10 @@ mod tests {
     fn make_req(text: &str) -> CanonicalRequest {
         CanonicalRequest {
             model: "claude".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text(text.into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text(text.into()),
+            }],
             ..Default::default()
         }
     }
@@ -64,14 +70,24 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     }
 
     fn omni_claude_bin_path() -> std::path::PathBuf {
-        if let Ok(p) = std::env::var("CARGO_BIN_EXE_omni_claude") { return p.into(); }
+        if let Ok(p) = std::env::var("CARGO_BIN_EXE_omni_claude") {
+            return p.into();
+        }
         let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.pop(); p.pop(); p.pop();
-        p.push("target"); p.push("debug"); p.push("omni-claude");
+        p.pop();
+        p.pop();
+        p.pop();
+        p.push("target");
+        p.push("debug");
+        p.push("omni-claude");
         p
     }
 
@@ -79,8 +95,13 @@ mod tests {
         let start = Instant::now();
         let u = format!("http://127.0.0.1:{}/health", port);
         while start.elapsed() < to {
-            if let Ok(o) = Command::new("curl").args(["-s", "--max-time", "1", &u]).output() {
-                if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "ok" { return true; }
+            if let Ok(o) = Command::new("curl")
+                .args(["-s", "--max-time", "1", &u])
+                .output()
+            {
+                if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "ok" {
+                    return true;
+                }
             }
             thread::sleep(Duration::from_millis(100));
         }
@@ -100,15 +121,24 @@ mod tests {
         // focused bin uses hardcoded port (no --port in current main); use known + kill after
         const PORT: u16 = 18321;
         let mut ch = Command::new(omni_claude_bin_path())
-            .stdout(Stdio::null()).stderr(Stdio::null())
-            .spawn().expect("spawn omni-claude");
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn omni-claude");
         // give it a moment; use fixed port for wait/curl
         thread::sleep(Duration::from_millis(500));
         let _ = wait_health(PORT, Duration::from_secs(5));
         // health already verified by wait; root / may vary in stub binary, check health surface explicitly
-        let out = Command::new("curl").args(["-sS", &format!("http://127.0.0.1:{}/health", PORT)]).output().unwrap();
+        let out = Command::new("curl")
+            .args(["-sS", &format!("http://127.0.0.1:{}/health", PORT)])
+            .output()
+            .unwrap();
         let body = String::from_utf8_lossy(&out.stdout);
-        assert!(body.trim() == "ok" || out.status.success(), "health after wait: {}", body);
+        assert!(
+            body.trim() == "ok" || out.status.success(),
+            "health after wait: {}",
+            body
+        );
         let _ = ch.kill();
     }
 }

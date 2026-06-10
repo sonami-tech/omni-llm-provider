@@ -14,45 +14,45 @@ pub struct ApiKeyId(pub String);
 
 /// Auth middleware. If `valid_keys` is empty, all requests pass through.
 pub async fn auth_layer(
-	valid_keys: Arc<HashSet<String>>,
-	mut req: Request<Body>,
-	next: Next,
+    valid_keys: Arc<HashSet<String>>,
+    mut req: Request<Body>,
+    next: Next,
 ) -> Response {
-	if valid_keys.is_empty() {
-		return next.run(req).await;
-	}
+    if valid_keys.is_empty() {
+        return next.run(req).await;
+    }
 
-	let key = req
-		.headers()
-		.get("authorization")
-		.and_then(|v| v.to_str().ok())
-		.and_then(|v| v.strip_prefix("Bearer "))
-		.map(str::trim);
+    let key = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim);
 
-	match key {
-		Some(k) if valid_keys.contains(k) => {
-			let id = key_id(k);
-			req.extensions_mut().insert(ApiKeyId(id));
-			next.run(req).await
-		}
-		Some(_) => AppError::Unauthorized("Invalid API key".into()).into_response(),
-		None => AppError::Unauthorized(
-			"Missing API key. Include 'Authorization: Bearer <key>' header.".into(),
-		)
-		.into_response(),
-	}
+    match key {
+        Some(k) if valid_keys.contains(k) => {
+            let id = key_id(k);
+            req.extensions_mut().insert(ApiKeyId(id));
+            next.run(req).await
+        }
+        Some(_) => AppError::Unauthorized("Invalid API key".into()).into_response(),
+        None => AppError::Unauthorized(
+            "Missing API key. Include 'Authorization: Bearer <key>' header.".into(),
+        )
+        .into_response(),
+    }
 }
 
 /// Generate a short identifier for a key (first 4 + last 4, or just last 4 for short keys).
 fn key_id(key: &str) -> String {
-	let chars: Vec<char> = key.chars().collect();
-	if chars.len() < 12 {
-		let suffix: String = chars.iter().rev().take(4).rev().collect();
-		return format!("...{}", suffix);
-	}
-	let prefix: String = chars.iter().take(4).collect();
-	let suffix: String = chars.iter().rev().take(4).rev().collect();
-	format!("{}...{}", prefix, suffix)
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() < 12 {
+        let suffix: String = chars.iter().rev().take(4).rev().collect();
+        return format!("...{}", suffix);
+    }
+    let prefix: String = chars.iter().take(4).collect();
+    let suffix: String = chars.iter().rev().take(4).rev().collect();
+    format!("{}...{}", prefix, suffix)
 }
 
 #[cfg(test)]
@@ -111,7 +111,9 @@ mod tests {
         let resp = AppError::Unauthorized("Invalid API key".into()).into_response();
         let (status, body) = {
             let status = resp.status();
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
             (status, String::from_utf8(bytes.to_vec()).unwrap())
         };
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -123,10 +125,13 @@ mod tests {
     async fn auth_middleware_missing_key_yields_401_with_guidance() {
         let resp = AppError::Unauthorized(
             "Missing API key. Include 'Authorization: Bearer <key>' header.".into(),
-        ).into_response();
+        )
+        .into_response();
         let (status, body) = {
             let status = resp.status();
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
             (status, String::from_utf8(bytes.to_vec()).unwrap())
         };
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -156,7 +161,9 @@ mod tests {
         let resp = AppError::Unauthorized("Invalid API key".into()).into_response();
         let (status, body) = {
             let status = resp.status();
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
             (status, String::from_utf8(bytes.to_vec()).unwrap())
         };
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -169,10 +176,13 @@ mod tests {
     async fn missing_yields_401_with_guidance() {
         let resp = AppError::Unauthorized(
             "Missing API key. Include 'Authorization: Bearer <key>' header.".into(),
-        ).into_response();
+        )
+        .into_response();
         let (status, body) = {
             let status = resp.status();
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
             (status, String::from_utf8(bytes.to_vec()).unwrap())
         };
         assert_eq!(status, StatusCode::UNAUTHORIZED);

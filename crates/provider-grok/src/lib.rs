@@ -51,12 +51,12 @@
 use async_trait::async_trait;
 use omni_common::{GrokCredentials, Replacements};
 use omni_core::{
-    CanonicalContent, CanonicalReasoning, CanonicalRequest, CanonicalResponse,
-    CanonicalToolCall, CanonicalToolChoice, CanonicalUsage, LlmProvider, ProviderError,
+    CanonicalContent, CanonicalReasoning, CanonicalRequest, CanonicalResponse, CanonicalToolCall,
+    CanonicalToolChoice, CanonicalUsage, LlmProvider, ProviderError,
 };
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::env;
 use tracing::{debug, error, warn};
 
@@ -93,7 +93,12 @@ impl GrokProvider {
             .user_agent("omni-grok/0.1 (+https://github.com/omni-llm-provider; rust-reqwest)")
             .timeout(std::time::Duration::from_secs(300))
             .build()
-            .map_err(|e| ProviderError::Other(anyhow::Error::msg(format!("failed to build http client: {}", e))))?;
+            .map_err(|e| {
+                ProviderError::Other(anyhow::Error::msg(format!(
+                    "failed to build http client: {}",
+                    e
+                )))
+            })?;
 
         Ok(Self {
             client,
@@ -185,7 +190,10 @@ fn to_xai_chat_request(req: &CanonicalRequest, repl: &Replacements) -> Value {
     }
 
     // Map canonical reasoning -> xAI chat.completions form (top level for this surface)
-    if let Some(CanonicalReasoning { effort: Some(eff), .. }) = &req.reasoning {
+    if let Some(CanonicalReasoning {
+        effort: Some(eff), ..
+    }) = &req.reasoning
+    {
         if !eff.is_empty() {
             body["reasoning_effort"] = json!(eff);
         }
@@ -291,39 +299,43 @@ struct XaiCompletionDetails {
 fn from_xai_chat_response(raw: XaiChatCompletion, repl: &Replacements) -> CanonicalResponse {
     let model = raw.model.unwrap_or_else(|| "unknown".to_string());
 
-    let (content, tool_calls, finish_reason) = if let Some(ch) = raw.choices.and_then(|mut c| c.drain(..).next()) {
-        let msg = ch.message.unwrap_or_default();
-        let raw_content = msg.content.unwrap_or_default();
-        let content = repl.apply_response(&raw_content);
+    let (content, tool_calls, finish_reason) =
+        if let Some(ch) = raw.choices.and_then(|mut c| c.drain(..).next()) {
+            let msg = ch.message.unwrap_or_default();
+            let raw_content = msg.content.unwrap_or_default();
+            let content = repl.apply_response(&raw_content);
 
-        let tcs: Vec<CanonicalToolCall> = msg
-            .tool_calls
-            .unwrap_or_default()
-            .into_iter()
-            .enumerate()
-            .map(|(i, tc)| {
-                let func = tc.function.unwrap_or_default();
-                let raw_name = func.name.unwrap_or_default();
-                let raw_args = func.arguments.unwrap_or_default();
-                CanonicalToolCall {
-                    // xAI (OpenAI-compat) normally supplies stable ids like "call_xxx"; synthesize if absent.
-                    id: tc.id.unwrap_or_else(|| format!("call_{}_{}", i, raw_name)),
-                    name: repl.apply_response(&raw_name),
-                    arguments: repl.apply_response(&raw_args),
-                }
-            })
-            .collect();
+            let tcs: Vec<CanonicalToolCall> = msg
+                .tool_calls
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+                .map(|(i, tc)| {
+                    let func = tc.function.unwrap_or_default();
+                    let raw_name = func.name.unwrap_or_default();
+                    let raw_args = func.arguments.unwrap_or_default();
+                    CanonicalToolCall {
+                        // xAI (OpenAI-compat) normally supplies stable ids like "call_xxx"; synthesize if absent.
+                        id: tc.id.unwrap_or_else(|| format!("call_{}_{}", i, raw_name)),
+                        name: repl.apply_response(&raw_name),
+                        arguments: repl.apply_response(&raw_args),
+                    }
+                })
+                .collect();
 
-        (content, tcs, ch.finish_reason)
-    } else {
-        (String::new(), vec![], None)
-    };
+            (content, tcs, ch.finish_reason)
+        } else {
+            (String::new(), vec![], None)
+        };
 
     let usage = if let Some(u) = raw.usage {
         CanonicalUsage {
             input_tokens: u.prompt_tokens.unwrap_or(0),
             output_tokens: u.completion_tokens.unwrap_or(0),
-            cache_read: u.prompt_tokens_details.and_then(|d| d.cached_tokens).unwrap_or(0),
+            cache_read: u
+                .prompt_tokens_details
+                .and_then(|d| d.cached_tokens)
+                .unwrap_or(0),
             cache_creation: 0,
         }
     } else {
@@ -366,26 +378,28 @@ impl LlmProvider for GrokProvider {
 
         // Fresh credentials load (the "Grok gate" technique, copied from CCP).
         // See docs/grok-gate.md and omni-common::credentials::GrokCredentials.
-        let effective_key = match GrokCredentials::load_fresh_async(&GrokCredentials::default_path()).await {
-            Ok(creds) => {
-                if let Err(e) = creds.check_expired() {
-                    warn!(error = %e, "grok creds reported expired (continuing with file key)");
+        let effective_key =
+            match GrokCredentials::load_fresh_async(&GrokCredentials::default_path()).await {
+                Ok(creds) => {
+                    if let Err(e) = creds.check_expired() {
+                        warn!(error = %e, "grok creds reported expired (continuing with file key)");
+                    }
+                    creds.api_key
                 }
-                creds.api_key
-            }
-            Err(e) => {
-                // Fallback to the key we were constructed with (explicit or XAI_API_KEY env)
-                // for backward compatibility with existing Grok users who only set the env var.
-                if let Some(k) = &self.api_key {
-                    debug!(error = %e, "no grok creds file (or load failed); falling back to ctor/env key");
-                    k.clone()
-                } else {
-                    return Err(ProviderError::Auth(
-                        format!("failed to load Grok credentials from file and no explicit/env key: {}", e),
-                    ));
+                Err(e) => {
+                    // Fallback to the key we were constructed with (explicit or XAI_API_KEY env)
+                    // for backward compatibility with existing Grok users who only set the env var.
+                    if let Some(k) = &self.api_key {
+                        debug!(error = %e, "no grok creds file (or load failed); falling back to ctor/env key");
+                        k.clone()
+                    } else {
+                        return Err(ProviderError::Auth(format!(
+                            "failed to load Grok credentials from file and no explicit/env key: {}",
+                            e
+                        )));
+                    }
                 }
-            }
-        };
+            };
 
         let http_resp = self
             .client
@@ -399,15 +413,20 @@ impl LlmProvider for GrokProvider {
 
         let status = http_resp.status();
         if !status.is_success() {
-            let err_body = http_resp.text().await.unwrap_or_else(|_| "<no body>".to_string());
+            let err_body = http_resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "<no body>".to_string());
             error!(%status, body = %err_body, "xAI upstream error");
-            return Err(ProviderError::Upstream(format!("xAI {}: {}", status, err_body)));
+            return Err(ProviderError::Upstream(format!(
+                "xAI {}: {}",
+                status, err_body
+            )));
         }
 
-        let raw: XaiChatCompletion = http_resp
-            .json()
-            .await
-            .map_err(|e| ProviderError::Upstream(format!("failed to decode xAI response: {}", e)))?;
+        let raw: XaiChatCompletion = http_resp.json().await.map_err(|e| {
+            ProviderError::Upstream(format!("failed to decode xAI response: {}", e))
+        })?;
 
         debug!(
             model = %raw.model.as_deref().unwrap_or("unknown"),
@@ -435,7 +454,9 @@ pub fn provider_id() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omni_core::{CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalTool, CanonicalToolChoice};
+    use omni_core::{
+        CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalTool, CanonicalToolChoice,
+    };
     use serde_json::json;
 
     fn empty_repl() -> Replacements {
@@ -451,15 +472,24 @@ mod tests {
         let req = CanonicalRequest {
             model: "grok-4.3".into(),
             messages: vec![
-                CanonicalMessage { role: "system".into(), content: CanonicalContent::Text("You are Grok.".into()) },
-                CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("Hi".into()) },
+                CanonicalMessage {
+                    role: "system".into(),
+                    content: CanonicalContent::Text("You are Grok.".into()),
+                },
+                CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Text("Hi".into()),
+                },
             ],
             tools: None,
             tool_choice: None,
             max_tokens: Some(128),
             temperature: Some(0.5),
             top_p: None,
-            reasoning: Some(CanonicalReasoning { effort: Some("high".into()), budget_tokens: None }),
+            reasoning: Some(CanonicalReasoning {
+                effort: Some("high".into()),
+                budget_tokens: None,
+            }),
             metadata: Default::default(),
             provider_extras: Some(json!({"service_tier": "priority"})),
         };
@@ -479,13 +509,18 @@ mod tests {
     fn test_to_xai_tools_and_choice() {
         let req = CanonicalRequest {
             model: "grok-4.3".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("use tool".into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("use tool".into()),
+            }],
             tools: Some(vec![CanonicalTool {
                 name: "get_weather".into(),
                 description: Some("Get weather".into()),
                 parameters: json!({"type":"object","properties":{}}),
             }]),
-            tool_choice: Some(CanonicalToolChoice::Specific { name: "get_weather".into() }),
+            tool_choice: Some(CanonicalToolChoice::Specific {
+                name: "get_weather".into(),
+            }),
             max_tokens: None,
             temperature: None,
             top_p: None,
@@ -517,7 +552,10 @@ mod tests {
             usage: Some(XaiUsage {
                 prompt_tokens: Some(10),
                 completion_tokens: Some(5),
-                prompt_tokens_details: Some(XaiPromptDetails { cached_tokens: Some(3), ..Default::default() }),
+                prompt_tokens_details: Some(XaiPromptDetails {
+                    cached_tokens: Some(3),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -578,7 +616,8 @@ mod tests {
         // new(None) now succeeds (the "same technique as CCP": fresh file load with env override
         // happens inside send(), not at construction time). This lets the binary start without
         // the key and pick it up (or pick up a rotated key) on the first request.
-        let p = GrokProvider::new(None).expect("new without key must succeed after credential extraction");
+        let p = GrokProvider::new(None)
+            .expect("new without key must succeed after credential extraction");
         assert_eq!(p.id(), "grok");
 
         let p2 = GrokProvider::new_for_test("xai-test-123", "https://api.x.ai/v1");
@@ -588,10 +627,16 @@ mod tests {
 
     #[test]
     fn test_replacements_hook_in_request() {
-        let repl = Replacements::parse(r#"rule = [ { scope = "prompt", search = "secret", replace = "REDACTED" } ]"#).unwrap();
+        let repl = Replacements::parse(
+            r#"rule = [ { scope = "prompt", search = "secret", replace = "REDACTED" } ]"#,
+        )
+        .unwrap();
         let req = CanonicalRequest {
             model: "grok-4.3".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("tell secret".into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("tell secret".into()),
+            }],
             ..Default::default()
         };
         let body = to_xai_chat_request(&req, &repl);
@@ -605,15 +650,23 @@ mod tests {
     fn test_to_xai_with_tools_and_extras_and_reasoning() {
         let req = CanonicalRequest {
             model: "grok-4".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("search".into()) }],
-            tools: Some(vec![
-                CanonicalTool { name: "web".into(), description: Some("web".into()), parameters: serde_json::json!({"type":"object"}) },
-            ]),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("search".into()),
+            }],
+            tools: Some(vec![CanonicalTool {
+                name: "web".into(),
+                description: Some("web".into()),
+                parameters: serde_json::json!({"type":"object"}),
+            }]),
             tool_choice: Some(CanonicalToolChoice::Auto),
             max_tokens: Some(256),
             temperature: None,
             top_p: Some(0.9),
-            reasoning: Some(CanonicalReasoning { effort: Some("medium".into()), budget_tokens: Some(100) }),
+            reasoning: Some(CanonicalReasoning {
+                effort: Some("medium".into()),
+                budget_tokens: Some(100),
+            }),
             metadata: Default::default(),
             provider_extras: Some(serde_json::json!({"service_tier": "standard"})),
         };
@@ -623,7 +676,11 @@ mod tests {
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["max_completion_tokens"], 256);
         let top_p = body["top_p"].as_f64().unwrap();
-        assert!((top_p - 0.9).abs() < 1e-6, "top_p float json approx: {}", top_p);
+        assert!(
+            (top_p - 0.9).abs() < 1e-6,
+            "top_p float json approx: {}",
+            top_p
+        );
         assert_eq!(body["reasoning_effort"], "medium");
         assert_eq!(body["service_tier"], "standard");
     }
@@ -645,8 +702,14 @@ mod tests {
             usage: Some(XaiUsage {
                 prompt_tokens: Some(2),
                 completion_tokens: Some(1),
-                prompt_tokens_details: Some(XaiPromptDetails { text_tokens: Some(2), ..Default::default() }),
-                completion_tokens_details: Some(XaiCompletionDetails { reasoning_tokens: Some(10), ..Default::default() }),
+                prompt_tokens_details: Some(XaiPromptDetails {
+                    text_tokens: Some(2),
+                    ..Default::default()
+                }),
+                completion_tokens_details: Some(XaiCompletionDetails {
+                    reasoning_tokens: Some(10),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -663,12 +726,17 @@ mod tests {
         let p = GrokProvider::new_for_test("xai-dummy", "http://127.0.0.1:1");
         let req = CanonicalRequest {
             model: "grok-4.3".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("hi".into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
             ..Default::default()
         };
         let err = p.send(req).await.unwrap_err();
         match err {
-            ProviderError::Upstream(s) => assert!(s.contains("error calling xAI") || s.contains("connection")),
+            ProviderError::Upstream(s) => {
+                assert!(s.contains("error calling xAI") || s.contains("connection"))
+            }
             _ => panic!("expected Upstream error for mocked bad port"),
         }
     }
@@ -680,21 +748,31 @@ mod tests {
         let key = match std::env::var("XAI_API_KEY") {
             Ok(k) if !k.trim().is_empty() => k,
             _ => {
-                eprintln!("skipping real grok send test (no XAI_API_KEY set; using mocked behavior)");
+                eprintln!(
+                    "skipping real grok send test (no XAI_API_KEY set; using mocked behavior)"
+                );
                 return;
             }
         };
         let p = GrokProvider::new(Some(key)).expect("ctor with explicit key");
         let req = CanonicalRequest {
-            model: "grok-3-mini".into(),  // use a generally available lightweight model for the real probe
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("Reply with the single word: PONG".into()) }],
+            model: "grok-3-mini".into(), // use a generally available lightweight model for the real probe
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("Reply with the single word: PONG".into()),
+            }],
             max_tokens: Some(8),
             ..Default::default()
         };
-        let resp = p.send(req).await.expect("live xAI call must succeed with valid key");
+        let resp = p
+            .send(req)
+            .await
+            .expect("live xAI call must succeed with valid key");
         assert!(!resp.content.trim().is_empty());
         // model may be resolved/echoed by upstream
-        assert!(resp.usage.input_tokens > 0 || resp.usage.output_tokens > 0 || !resp.content.is_empty());
+        assert!(
+            resp.usage.input_tokens > 0 || resp.usage.output_tokens > 0 || !resp.content.is_empty()
+        );
     }
 
     // ============================================================
@@ -711,25 +789,35 @@ mod tests {
         // cover all supported sampling + reasoning + max in one + combos
         let base = CanonicalRequest {
             model: "grok-4.3".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("hi".into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
             ..Default::default()
         };
 
         // temp only
-        let mut r = base.clone(); r.temperature = Some(0.2); r.max_tokens = Some(64);
+        let mut r = base.clone();
+        r.temperature = Some(0.2);
+        r.max_tokens = Some(64);
         let b = to_xai_chat_request(&r, &empty_repl());
         let t = b["temperature"].as_f64().unwrap();
         assert!((t - 0.2).abs() < 1e-6, "temp float json: {}", t);
         assert_eq!(b["max_completion_tokens"], 64);
 
         // top_p only
-        let mut r = base.clone(); r.top_p = Some(0.95);
+        let mut r = base.clone();
+        r.top_p = Some(0.95);
         let b = to_xai_chat_request(&r, &empty_repl());
         let tp = b["top_p"].as_f64().unwrap();
         assert!((tp - 0.95).abs() < 1e-6, "top_p float json approx: {}", tp);
 
         // reasoning only (no sampling)
-        let mut r = base.clone(); r.reasoning = Some(CanonicalReasoning { effort: Some("low".into()), budget_tokens: Some(50) });
+        let mut r = base.clone();
+        r.reasoning = Some(CanonicalReasoning {
+            effort: Some("low".into()),
+            budget_tokens: Some(50),
+        });
         let b = to_xai_chat_request(&r, &empty_repl());
         assert_eq!(b["reasoning_effort"], "low");
 
@@ -738,7 +826,10 @@ mod tests {
         r.temperature = Some(1.0);
         r.top_p = Some(1.0);
         r.max_tokens = Some(10);
-        r.reasoning = Some(CanonicalReasoning { effort: Some("high".into()), budget_tokens: None });
+        r.reasoning = Some(CanonicalReasoning {
+            effort: Some("high".into()),
+            budget_tokens: None,
+        });
         r.provider_extras = Some(json!({"service_tier": "priority"}));
         let b = to_xai_chat_request(&r, &empty_repl());
         assert_eq!(b["temperature"], 1.0);
@@ -752,7 +843,10 @@ mod tests {
         // these come via provider_extras passthrough (canonical has limited native sampling)
         let req = CanonicalRequest {
             model: "grok-4".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("x".into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("x".into()),
+            }],
             provider_extras: Some(json!({
                 "parallel_tool_calls": true,
                 "response_format": {"type": "json_object"},
@@ -777,7 +871,10 @@ mod tests {
         // deliberate: we target chat/completions (messages+stream), not /responses (input+reasoning.effort)
         let req = CanonicalRequest {
             model: "grok-4.3".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("hi".into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
             ..Default::default()
         };
         let body = to_xai_chat_request(&req, &empty_repl());
@@ -791,7 +888,10 @@ mod tests {
         // built-in via extras (overwrites or provides the tools array); function tools via canonical
         let req = CanonicalRequest {
             model: "grok-4".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("search web".into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("search web".into()),
+            }],
             tools: Some(vec![CanonicalTool {
                 name: "get_weather".into(),
                 description: Some("weather fn".into()),
@@ -817,8 +917,15 @@ mod tests {
     fn test_to_xai_tool_choice_required() {
         let req = CanonicalRequest {
             model: "grok-beta".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("do it".into()) }],
-            tools: Some(vec![CanonicalTool { name: "calc".into(), description: None, parameters: json!({}) }]),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("do it".into()),
+            }],
+            tools: Some(vec![CanonicalTool {
+                name: "calc".into(),
+                description: None,
+                parameters: json!({}),
+            }]),
             tool_choice: Some(CanonicalToolChoice::Required),
             ..Default::default()
         };
@@ -832,11 +939,15 @@ mod tests {
             r#"rule = [
                 { scope = "prompt", search = "SECRET", replace = "REDACTED" },
                 { scope = "prompt", search = "weather tool", replace = "wx tool" }
-            ]"#
-        ).unwrap();
+            ]"#,
+        )
+        .unwrap();
         let req = CanonicalRequest {
             model: "grok-4".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("tell SECRET".into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("tell SECRET".into()),
+            }],
             tools: Some(vec![CanonicalTool {
                 name: "get_wx".into(),
                 description: Some("the weather tool here".into()),
@@ -847,7 +958,10 @@ mod tests {
         let body = to_xai_chat_request(&req, &repl);
         assert_eq!(body["messages"][0]["content"], "tell REDACTED");
         // desc gets prompt apply (name currently does not per mapper)
-        assert_eq!(body["tools"][0]["function"]["description"], "the wx tool here");
+        assert_eq!(
+            body["tools"][0]["function"]["description"],
+            "the wx tool here"
+        );
     }
 
     #[test]
@@ -935,7 +1049,10 @@ mod tests {
 
     #[test]
     fn test_from_xai_tool_args_repl_and_output_files_tolerated() {
-        let repl = Replacements::parse(r#"rule = [ { scope = "response", search = "sf", replace = "SAN_FRANCISCO" } ]"#).unwrap();
+        let repl = Replacements::parse(
+            r#"rule = [ { scope = "response", search = "sf", replace = "SAN_FRANCISCO" } ]"#,
+        )
+        .unwrap();
         let raw_json = json!({
             "model": "grok",
             "choices": [{
@@ -951,7 +1068,10 @@ mod tests {
         let canon = from_xai_chat_response(raw, &repl);
         assert_eq!(canon.tool_calls.len(), 1);
         assert_eq!(canon.tool_calls[0].name, "geo"); // name rule not matching
-        assert_eq!(canon.tool_calls[0].arguments, "{\"city\":\"SAN_FRANCISCO\"}"); // args get response repl
+        assert_eq!(
+            canon.tool_calls[0].arguments,
+            "{\"city\":\"SAN_FRANCISCO\"}"
+        ); // args get response repl
         assert_eq!(canon.finish_reason.as_deref(), Some("tool_calls"));
     }
 
@@ -960,23 +1080,42 @@ mod tests {
         // prove send path does fresh file load: write dummy creds file, point env, use new(None) so no ctor fallback,
         // hit bad-port upstream -> must be network err (not Auth) proving load succeeded and key taken from file.
         let _guard = CRED_ENV_LOCK.lock().expect("cred lock for env mutate");
-        let tmp = ::std::env::temp_dir().join(format!("xai-creds-grok-test-{}.json", ::std::process::id()));
+        let tmp = ::std::env::temp_dir()
+            .join(format!("xai-creds-grok-test-{}.json", ::std::process::id()));
         ::std::fs::write(&tmp, r#"{"apiKey": "xai-from-file-dummy-for-load-test"}"#).unwrap();
         let old = ::std::env::var("XAI_CREDENTIALS_PATH").ok();
-        unsafe { ::std::env::set_var("XAI_CREDENTIALS_PATH", tmp.to_str().unwrap()); }
-        let p = GrokProvider::new(None).expect("new(None) succeeds").with_base_url("http://127.0.0.1:1");
+        unsafe {
+            ::std::env::set_var("XAI_CREDENTIALS_PATH", tmp.to_str().unwrap());
+        }
+        let p = GrokProvider::new(None)
+            .expect("new(None) succeeds")
+            .with_base_url("http://127.0.0.1:1");
         let req = CanonicalRequest {
             model: "grok-3-mini".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("cred file test".into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("cred file test".into()),
+            }],
             ..Default::default()
         };
         let err = p.send(req).await.unwrap_err();
         unsafe {
-            if let Some(v) = old { ::std::env::set_var("XAI_CREDENTIALS_PATH", v); } else { ::std::env::remove_var("XAI_CREDENTIALS_PATH"); }
+            if let Some(v) = old {
+                ::std::env::set_var("XAI_CREDENTIALS_PATH", v);
+            } else {
+                ::std::env::remove_var("XAI_CREDENTIALS_PATH");
+            }
         }
         match err {
-            ProviderError::Upstream(s) => assert!(s.contains("error calling xAI") || s.contains("connection"), "expected net err after file load: {}", s),
-            other => panic!("expected Upstream after successful file load, got {:?}", other),
+            ProviderError::Upstream(s) => assert!(
+                s.contains("error calling xAI") || s.contains("connection"),
+                "expected net err after file load: {}",
+                s
+            ),
+            other => panic!(
+                "expected Upstream after successful file load, got {:?}",
+                other
+            ),
         }
     }
 
@@ -986,20 +1125,36 @@ mod tests {
         let non = format!("/tmp/xai-no-such-creds-{}.json", ::std::process::id());
         let _ = ::std::fs::remove_file(&non);
         let old = ::std::env::var("XAI_CREDENTIALS_PATH").ok();
-        unsafe { ::std::env::set_var("XAI_CREDENTIALS_PATH", &non); }
-        let p = GrokProvider::new(None).expect("ctor ok");  // no ctor key
+        unsafe {
+            ::std::env::set_var("XAI_CREDENTIALS_PATH", &non);
+        }
+        let p = GrokProvider::new(None).expect("ctor ok"); // no ctor key
         let req = CanonicalRequest {
             model: "grok-3-mini".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("x".into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("x".into()),
+            }],
             ..Default::default()
         };
         let err = p.send(req).await.unwrap_err();
         unsafe {
-            if let Some(v) = old { ::std::env::set_var("XAI_CREDENTIALS_PATH", v); } else { ::std::env::remove_var("XAI_CREDENTIALS_PATH"); }
+            if let Some(v) = old {
+                ::std::env::set_var("XAI_CREDENTIALS_PATH", v);
+            } else {
+                ::std::env::remove_var("XAI_CREDENTIALS_PATH");
+            }
         }
         match err {
-            ProviderError::Auth(s) => assert!(s.contains("failed to load Grok credentials from file and no explicit/env key"), "got: {}", s),
-            other => panic!("expected Auth for missing creds + no fallback, got {:?}", other),
+            ProviderError::Auth(s) => assert!(
+                s.contains("failed to load Grok credentials from file and no explicit/env key"),
+                "got: {}",
+                s
+            ),
+            other => panic!(
+                "expected Auth for missing creds + no fallback, got {:?}",
+                other
+            ),
         }
     }
 
@@ -1010,21 +1165,35 @@ mod tests {
         let non = format!("/tmp/xai-no-creds-fallback-{}.json", ::std::process::id());
         let _ = ::std::fs::remove_file(&non);
         let old = ::std::env::var("XAI_CREDENTIALS_PATH").ok();
-        unsafe { ::std::env::set_var("XAI_CREDENTIALS_PATH", &non); }
+        unsafe {
+            ::std::env::set_var("XAI_CREDENTIALS_PATH", &non);
+        }
         let p = GrokProvider::new_for_test("xai-ctor-fallback-key", "http://127.0.0.1:1");
         let req = CanonicalRequest {
             model: "grok-3-mini".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("fallback".into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("fallback".into()),
+            }],
             ..Default::default()
         };
         let err = p.send(req).await.unwrap_err();
         unsafe {
-            if let Some(v) = old { ::std::env::set_var("XAI_CREDENTIALS_PATH", v); } else { ::std::env::remove_var("XAI_CREDENTIALS_PATH"); }
+            if let Some(v) = old {
+                ::std::env::set_var("XAI_CREDENTIALS_PATH", v);
+            } else {
+                ::std::env::remove_var("XAI_CREDENTIALS_PATH");
+            }
         }
         // load failed -> used ctor key -> still network err (not the "no key" Auth)
         match err {
-            ProviderError::Upstream(s) => assert!(s.contains("error calling xAI") || s.contains("connection")),
-            other => panic!("expected fallback to ctor key then upstream, got {:?}", other),
+            ProviderError::Upstream(s) => {
+                assert!(s.contains("error calling xAI") || s.contains("connection"))
+            }
+            other => panic!(
+                "expected fallback to ctor key then upstream, got {:?}",
+                other
+            ),
         }
     }
 
@@ -1036,21 +1205,40 @@ mod tests {
         let non = format!("/tmp/xai-badkey-401-{}.json", ::std::process::id());
         let _ = ::std::fs::remove_file(&non);
         let old = ::std::env::var("XAI_CREDENTIALS_PATH").ok();
-        unsafe { ::std::env::set_var("XAI_CREDENTIALS_PATH", &non); }
-        let p = GrokProvider::new_for_test("xai-DEFINITELY-INVALID-KEY-FOR-TEST-401-XYZ", "https://api.x.ai/v1");
+        unsafe {
+            ::std::env::set_var("XAI_CREDENTIALS_PATH", &non);
+        }
+        let p = GrokProvider::new_for_test(
+            "xai-DEFINITELY-INVALID-KEY-FOR-TEST-401-XYZ",
+            "https://api.x.ai/v1",
+        );
         let req = CanonicalRequest {
             model: "grok-3-mini".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("auth test".into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("auth test".into()),
+            }],
             max_tokens: Some(4),
             ..Default::default()
         };
         let err = p.send(req).await.unwrap_err();
         unsafe {
-            if let Some(v) = old { ::std::env::set_var("XAI_CREDENTIALS_PATH", v); } else { ::std::env::remove_var("XAI_CREDENTIALS_PATH"); }
+            if let Some(v) = old {
+                ::std::env::set_var("XAI_CREDENTIALS_PATH", v);
+            } else {
+                ::std::env::remove_var("XAI_CREDENTIALS_PATH");
+            }
         }
         match err {
             ProviderError::Upstream(s) => {
-                assert!(s.contains("401") || s.contains("xAI 401") || s.to_lowercase().contains("invalid") || s.to_lowercase().contains("auth"), "bad key 401: {}", s);
+                assert!(
+                    s.contains("401")
+                        || s.contains("xAI 401")
+                        || s.to_lowercase().contains("invalid")
+                        || s.to_lowercase().contains("auth"),
+                    "bad key 401: {}",
+                    s
+                );
             }
             other => panic!("expected 401 Upstream for bad key, got {:?}", other),
         }
@@ -1062,7 +1250,9 @@ mod tests {
         let key = match ::std::env::var("XAI_API_KEY") {
             Ok(k) if !k.trim().is_empty() => k,
             _ => {
-                eprintln!("skipping 400 error case (no XAI_API_KEY); 401 path covered unconditionally");
+                eprintln!(
+                    "skipping 400 error case (no XAI_API_KEY); 401 path covered unconditionally"
+                );
                 return;
             }
         };
@@ -1070,7 +1260,10 @@ mod tests {
         let p_ok = GrokProvider::new(Some(key.clone())).expect("ctor");
         let req_ok = CanonicalRequest {
             model: "grok-3-mini".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("PING".into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("PING".into()),
+            }],
             max_tokens: Some(5),
             ..Default::default()
         };
@@ -1081,14 +1274,21 @@ mod tests {
         let p_bad = GrokProvider::new(Some(key)).expect("ctor2");
         let req_bad = CanonicalRequest {
             model: "this-model-does-not-exist-xyz-999".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("hi".into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
             max_tokens: Some(1),
             ..Default::default()
         };
         let err = p_bad.send(req_bad).await.unwrap_err();
         match err {
             ProviderError::Upstream(s) => {
-                assert!(s.contains("400") || s.contains("404") || s.contains("model"), "expected 4xx model error: {}", s);
+                assert!(
+                    s.contains("400") || s.contains("404") || s.contains("model"),
+                    "expected 4xx model error: {}",
+                    s
+                );
             }
             other => panic!("expected upstream 4xx, got {:?}", other),
         }
@@ -1114,8 +1314,14 @@ mod tests {
             .build()
             .expect("build req");
         let headers = built.headers();
-        assert_eq!(headers.get("authorization").unwrap().to_str().unwrap(), "Bearer xai-header-test-KEY-987");
-        assert_eq!(headers.get("content-type").unwrap().to_str().unwrap(), "application/json");
+        assert_eq!(
+            headers.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer xai-header-test-KEY-987"
+        );
+        assert_eq!(
+            headers.get("content-type").unwrap().to_str().unwrap(),
+            "application/json"
+        );
         // body would be sent as the json
         assert!(built.body().is_some());
     }
@@ -1125,13 +1331,18 @@ mod tests {
         // full roundtrip mapper for a tool-using turn (to body shape + from response shape)
         let req = CanonicalRequest {
             model: "grok-4".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("call tool please".into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("call tool please".into()),
+            }],
             tools: Some(vec![CanonicalTool {
                 name: "adder".into(),
                 description: Some("add two nums".into()),
                 parameters: json!({"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}}}),
             }]),
-            tool_choice: Some(CanonicalToolChoice::Specific { name: "adder".into() }),
+            tool_choice: Some(CanonicalToolChoice::Specific {
+                name: "adder".into(),
+            }),
             ..Default::default()
         };
         let body = to_xai_chat_request(&req, &empty_repl());
@@ -1157,7 +1368,11 @@ mod tests {
                 finish_reason: Some("tool_calls".into()),
                 ..Default::default()
             }]),
-            usage: Some(XaiUsage { prompt_tokens: Some(8), completion_tokens: Some(2), ..Default::default() }),
+            usage: Some(XaiUsage {
+                prompt_tokens: Some(8),
+                completion_tokens: Some(2),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let canon = from_xai_chat_response(raw, &empty_repl());
@@ -1169,7 +1384,10 @@ mod tests {
         // streaming note (wire supports SSE deltas for content + incremental tool_call args; trait + provider send do not yet)
         // deltas would look like: {"choices":[{"delta":{"content":"to","tool_calls":[...]}}]}
         // stateful accumulation would be needed for full stream support (future).
-        assert!(true, "streaming deltas supported on wire but not yet in LlmProvider::send");
+        assert!(
+            true,
+            "streaming deltas supported on wire but not yet in LlmProvider::send"
+        );
     }
 
     #[test]
@@ -1179,8 +1397,9 @@ mod tests {
             r#"rule = [
                 { scope = "response", search = "adder", replace = "sum" },
                 { scope = "response", search = "2", replace = "TWO" }
-            ]"#
-        ).unwrap();
+            ]"#,
+        )
+        .unwrap();
         let raw = XaiChatCompletion {
             model: Some("grok".into()),
             choices: Some(vec![XaiChoice {
@@ -1205,7 +1424,7 @@ mod tests {
         let canon = from_xai_chat_response(raw, &repl);
         assert_eq!(canon.content, "result ready");
         assert_eq!(canon.tool_calls[0].name, "sum");
-        assert_eq!(canon.tool_calls[0].arguments, r#"{"x":TWO,"y":TWO}"#);  // both instances replaced
+        assert_eq!(canon.tool_calls[0].arguments, r#"{"x":TWO,"y":TWO}"#); // both instances replaced
     }
 
     #[test]
@@ -1213,8 +1432,13 @@ mod tests {
         // Explicit unit for "check_expired" in the creds requirements list.
         // Intent: send() always calls it after fresh load (warn+continue on err); for xAI API keys it is always Ok (no-op today, future-proofs for any oauth-style tokens exactly as in CCP).
         // Construction works because GrokCredentials pub fields (see its tests); exercised indirectly by all file-load send tests.
-        let c = GrokCredentials { api_key: "xai-foo-bar-123".into() };
-        assert!(c.check_expired().is_ok(), "grok creds check_expired must be non-fatal noop for standard keys");
+        let c = GrokCredentials {
+            api_key: "xai-foo-bar-123".into(),
+        };
+        assert!(
+            c.check_expired().is_ok(),
+            "grok creds check_expired must be non-fatal noop for standard keys"
+        );
     }
 
     #[test]

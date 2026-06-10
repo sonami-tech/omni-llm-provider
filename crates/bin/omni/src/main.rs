@@ -56,19 +56,19 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use axum::{
+    Router,
     extract::{Json, State},
     http::StatusCode,
     middleware,
     response::IntoResponse,
     routing::{get, post},
-    Router,
 };
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use uuid::Uuid;
 
-use omni_common::{auth_layer, AppError};
+use omni_common::{AppError, auth_layer};
 use omni_core::{
     CanonicalContent, CanonicalMessage, CanonicalRequest, CanonicalResponse, CanonicalToolCall,
     LlmProvider, ProviderError,
@@ -81,10 +81,18 @@ use provider_grok::GrokProvider;
 /// CLI for the light omni aggregator.
 /// Env vars: OMNI_PROVIDERS, OMNI_PORT, OMNI_NO_AUTH (clap env support).
 #[derive(Parser, Debug)]
-#[command(name = "omni", about = "Light Omni LLM aggregator (claude + grok backends)")]
+#[command(
+    name = "omni",
+    about = "Light Omni LLM aggregator (claude + grok backends)"
+)]
 struct Cli {
     /// Comma-separated list of providers to enable (claude,grok). Prefix routing uses these names.
-    #[arg(long, env = "OMNI_PROVIDERS", default_value = "claude,grok", value_delimiter = ',')]
+    #[arg(
+        long,
+        env = "OMNI_PROVIDERS",
+        default_value = "claude,grok",
+        value_delimiter = ','
+    )]
     providers: Vec<String>,
 
     /// Listen port.
@@ -200,7 +208,9 @@ async fn main() -> anyhow::Result<()> {
                 info!("initializing claude provider");
                 // new() returns Result because of optional creds/profile load for the real gate logic.
                 // In production bin this would be .expect or proper error handling.
-                Arc::new(ClaudeProvider::new().expect("claude provider init (valid ~/.claude/.credentials.json or explicit profile)"))
+                Arc::new(ClaudeProvider::new().expect(
+                    "claude provider init (valid ~/.claude/.credentials.json or explicit profile)",
+                ))
             }
             "grok" => {
                 info!("initializing grok provider (requires XAI_API_KEY if not using test ctor)");
@@ -253,7 +263,9 @@ async fn main() -> anyhow::Result<()> {
     info!("  providers: {}", enabled.join(","));
     info!("  try: curl http://{}/health", addr);
     info!("  models:  curl http://{}/v1/models", addr);
-    info!("  completions example: model=grok:grok-4 or claude:claude-3-5-sonnet-20241022 (or bare if single provider)");
+    info!(
+        "  completions example: model=grok:grok-4 or claude:claude-3-5-sonnet-20241022 (or bare if single provider)"
+    );
 
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app)
         .await
@@ -352,7 +364,12 @@ fn to_canonical(req: &ChatCompletionRequest) -> CanonicalRequest {
 }
 
 /// Convert CanonicalResponse (from any delegated provider) to OAI response shape.
-fn from_canonical(canon: CanonicalResponse, requested_model: String, chat_id: String, created: u64) -> ChatCompletionResponse {
+fn from_canonical(
+    canon: CanonicalResponse,
+    requested_model: String,
+    chat_id: String,
+    created: u64,
+) -> ChatCompletionResponse {
     let tool_calls: Vec<ChatToolCall> = canon
         .tool_calls
         .into_iter()
@@ -474,14 +491,15 @@ async fn chat_completions_handler(
     canon.model = stripped_model.clone();
 
     // The actual delegation (thin by design).
-    let canon_resp: CanonicalResponse = provider
-        .send(canon)
-        .await
-        .map_err(|e: ProviderError| match e {
-            ProviderError::Auth(msg) => AppError::Unauthorized(msg),
-            ProviderError::Upstream(msg) => AppError::ServerError(format!("upstream: {}", msg)),
-            ProviderError::Other(a) => AppError::ServerError(a.to_string()),
-        })?;
+    let canon_resp: CanonicalResponse =
+        provider
+            .send(canon)
+            .await
+            .map_err(|e: ProviderError| match e {
+                ProviderError::Auth(msg) => AppError::Unauthorized(msg),
+                ProviderError::Upstream(msg) => AppError::ServerError(format!("upstream: {}", msg)),
+                ProviderError::Other(a) => AppError::ServerError(a.to_string()),
+            })?;
 
     let chat_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created = std::time::SystemTime::now()
@@ -515,7 +533,9 @@ mod tests {
 
     #[test]
     fn test_resolve_prefix_claude() {
-        let (k, m) = resolve_provider_and_model("CLAUDE:claude-3-5-sonnet-20241022", &enabled_claude_grok()).unwrap();
+        let (k, m) =
+            resolve_provider_and_model("CLAUDE:claude-3-5-sonnet-20241022", &enabled_claude_grok())
+                .unwrap();
         assert_eq!(k, "claude");
         assert_eq!(m, "claude-3-5-sonnet-20241022");
     }
@@ -582,9 +602,18 @@ mod tests {
         // real response (live creds) or auth/upstream error would have failed .unwrap; content from canonical
         assert!(!canon_resp.content.is_empty() || !canon_resp.tool_calls.is_empty());
 
-        let oai_resp = from_canonical(canon_resp, oai_req.model, "chatcmpl-test".into(), 1234567890);
+        let oai_resp = from_canonical(
+            canon_resp,
+            oai_req.model,
+            "chatcmpl-test".into(),
+            1234567890,
+        );
         assert_eq!(oai_resp.model, "claude:sonnet");
-        let has_content = oai_resp.choices[0].message.content.as_deref().map_or(false, |c| !c.is_empty());
+        let has_content = oai_resp.choices[0]
+            .message
+            .content
+            .as_deref()
+            .map_or(false, |c| !c.is_empty());
         let has_tools = !oai_resp.choices[0].message.tool_calls.is_empty();
         assert!(has_content || has_tools);
         let _ = oai_resp.usage.prompt_tokens; // u64 always >=0 by type; shape covered by other asserts + CCP mirror
@@ -616,14 +645,14 @@ mod tests {
     // --- comprehensive http/integration tests added per task (using direct handler calls for router surfaces
     // + subprocess+curl for full binary http stack incl auth mw, random port, live creds conditional) ---
 
+    use axum::http::StatusCode;
+    use omni_core::CanonicalResponse;
+    use serde_json::Value;
     use std::collections::HashSet;
     use std::process::{Command, Stdio};
     use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
-    use axum::http::StatusCode;
-    use serde_json::Value;
-    use omni_core::CanonicalResponse;
 
     fn free_port() -> u16 {
         std::net::TcpListener::bind("127.0.0.1:0")
@@ -639,7 +668,9 @@ mod tests {
     }
 
     fn has_grok_creds() -> bool {
-        if std::env::var("XAI_API_KEY").is_ok() { return true; }
+        if std::env::var("XAI_API_KEY").is_ok() {
+            return true;
+        }
         let home = std::env::var("HOME").unwrap_or_default();
         std::path::Path::new(&(home + "/.xai/.credentials.json")).exists()
     }
@@ -648,10 +679,15 @@ mod tests {
         let start = Instant::now();
         let url = format!("http://127.0.0.1:{}/health", port);
         while start.elapsed() < timeout {
-            if let Ok(out) = Command::new("curl").args(["-s", "--max-time", "1", &url]).output() {
+            if let Ok(out) = Command::new("curl")
+                .args(["-s", "--max-time", "1", &url])
+                .output()
+            {
                 if out.status.success() {
                     let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if body == "ok" { return true; }
+                    if body == "ok" {
+                        return true;
+                    }
                 }
             }
             thread::sleep(Duration::from_millis(120));
@@ -667,7 +703,9 @@ mod tests {
         }
         let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         // from crates/bin/omni -> root
-        p.pop(); p.pop(); p.pop();
+        p.pop();
+        p.pop();
+        p.pop();
         p.push("target");
         p.push("debug");
         p.push("omni");
@@ -684,7 +722,10 @@ mod tests {
         axum::Router::new()
             .route("/health", axum::routing::get(health_handler))
             .route("/", axum::routing::get(root_handler))
-            .route("/v1/chat/completions", axum::routing::post(chat_completions_handler))
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(chat_completions_handler),
+            )
             .route("/v1/models", axum::routing::get(models_handler))
             .route("/models", axum::routing::get(models_handler))
             .with_state(state)
@@ -737,7 +778,10 @@ mod tests {
         let state = Arc::new(AppState { providers: map });
         let req = ChatCompletionRequest {
             model: "claude:foo".into(),
-            messages: vec![ChatMessage { role: "user".into(), content: Some("hi".into()) }],
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+            }],
             stream: true,
             max_tokens: None,
             max_completion_tokens: None,
@@ -746,7 +790,10 @@ mod tests {
             _extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
-        let err = match res { Err(e) => e, Ok(_) => panic!("expected err for stream") };
+        let err = match res {
+            Err(e) => e,
+            Ok(_) => panic!("expected err for stream"),
+        };
         match err {
             AppError::BadRequest(msg) => assert!(msg.contains("streaming not supported")),
             _ => panic!("expected bad request for stream"),
@@ -761,13 +808,22 @@ mod tests {
         let state = Arc::new(AppState { providers: map });
         let req = ChatCompletionRequest {
             model: "codex:bar".into(),
-            messages: vec![ChatMessage { role: "user".into(), content: Some("hi".into()) }],
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+            }],
             stream: false,
-            max_tokens: None, max_completion_tokens: None, temperature: None, top_p: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
             _extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
-        let err = match res { Err(e) => e, Ok(_) => panic!("expected err for unknown prov") };
+        let err = match res {
+            Err(e) => e,
+            Ok(_) => panic!("expected err for unknown prov"),
+        };
         match err {
             AppError::BadRequest(msg) => assert!(msg.contains("not enabled")),
             _ => panic!("expected badrequest for unknown prov"),
@@ -783,12 +839,22 @@ mod tests {
         let state = Arc::new(AppState { providers: map });
         let req = ChatCompletionRequest {
             model: "grok:bar".into(),
-            messages: vec![ChatMessage { role: "user".into(), content: Some("hi".into()) }],
-            stream: false, max_tokens: None, max_completion_tokens: None, temperature: None, top_p: None,
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+            }],
+            stream: false,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
             _extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
-        let m = match res { Err(e) => e, Ok(_) => panic!("want badreq") };
+        let m = match res {
+            Err(e) => e,
+            Ok(_) => panic!("want badreq"),
+        };
         match m {
             AppError::BadRequest(mm) => assert!(mm.contains("not enabled")),
             _ => panic!("want badreq"),
@@ -805,12 +871,22 @@ mod tests {
         let state = Arc::new(AppState { providers: map });
         let req = ChatCompletionRequest {
             model: "bare-model".into(),
-            messages: vec![ChatMessage { role: "user".into(), content: Some("hi".into()) }],
-            stream: false, max_tokens: None, max_completion_tokens: None, temperature: None, top_p: None,
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+            }],
+            stream: false,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
             _extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
-        let m = match res { Err(e) => e, Ok(_) => panic!("want prefix error") };
+        let m = match res {
+            Err(e) => e,
+            Ok(_) => panic!("want prefix error"),
+        };
         match m {
             AppError::BadRequest(mm) => assert!(mm.contains("must use prefix")),
             _ => panic!("want prefix error"),
@@ -820,21 +896,39 @@ mod tests {
     #[tokio::test]
     async fn test_http_completions_routes_via_prefix_to_grok_test_provider() {
         // grok test ctor points to bad port -> upstream err mapped to 5xx server err (delegation exercised)
-        let g = Arc::new(GrokProvider::new_for_test("dummy-key", "http://127.0.0.1:1"));
+        let g = Arc::new(GrokProvider::new_for_test(
+            "dummy-key",
+            "http://127.0.0.1:1",
+        ));
         let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
         map.insert("grok".into(), g);
         let state = Arc::new(AppState { providers: map });
         let req = ChatCompletionRequest {
             model: "grok:grok-3".into(),
-            messages: vec![ChatMessage { role: "user".into(), content: Some("ping".into()) }],
-            stream: false, max_tokens: None, max_completion_tokens: None, temperature: None, top_p: None,
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("ping".into()),
+            }],
+            stream: false,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
             _extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
-        let err = match res { Err(e) => e, Ok(_) => panic!("expected err from grok test") };
+        let err = match res {
+            Err(e) => e,
+            Ok(_) => panic!("expected err from grok test"),
+        };
         match err {
-            AppError::ServerError(msg) => assert!(msg.contains("upstream") || msg.contains("network")),
-            _ => panic!("expected server/upstream error from grok test dispatch, got {:?}", err),
+            AppError::ServerError(msg) => {
+                assert!(msg.contains("upstream") || msg.contains("network"))
+            }
+            _ => panic!(
+                "expected server/upstream error from grok test dispatch, got {:?}",
+                err
+            ),
         }
     }
 
@@ -847,8 +941,15 @@ mod tests {
         let state = Arc::new(AppState { providers: map });
         let req = ChatCompletionRequest {
             model: "claude:claude-3-5-sonnet-20241022".into(),
-            messages: vec![ChatMessage { role: "user".into(), content: Some("Reply with the word PONG only.".into()) }],
-            stream: false, max_tokens: Some(16), max_completion_tokens: None, temperature: Some(0.0), top_p: None,
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("Reply with the word PONG only.".into()),
+            }],
+            stream: false,
+            max_tokens: Some(16),
+            max_completion_tokens: None,
+            temperature: Some(0.0),
+            top_p: None,
             _extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
@@ -872,13 +973,21 @@ mod tests {
             content: "hello from backend".into(),
             tool_calls: vec![],
             finish_reason: Some("stop".into()),
-            usage: omni_core::CanonicalUsage { input_tokens: 5, output_tokens: 2, cache_read: 0, cache_creation: 0 },
+            usage: omni_core::CanonicalUsage {
+                input_tokens: 5,
+                output_tokens: 2,
+                cache_read: 0,
+                cache_creation: 0,
+            },
         };
         let oai = from_canonical(canon, "grok:grok-3".into(), "chatcmpl-xyz".into(), 123);
         assert_eq!(oai.id, "chatcmpl-xyz");
         assert_eq!(oai.object, "chat.completion");
         assert_eq!(oai.model, "grok:grok-3");
-        assert_eq!(oai.choices[0].message.content.as_deref(), Some("hello from backend"));
+        assert_eq!(
+            oai.choices[0].message.content.as_deref(),
+            Some("hello from backend")
+        );
         assert_eq!(oai.usage.prompt_tokens, 5);
         assert_eq!(oai.usage.completion_tokens, 2);
     }
@@ -911,7 +1020,10 @@ rule = [
     async fn test_replacements_applied_in_provider_paths_for_both_backends() {
         // Exercises that both backends go through omni-common Replacements hook (empty in current, but config parse proves e2e seam)
         // (prompt apply inside to_* , response apply inside from_* )
-        let _r = omni_common::Replacements::parse(r#"rule = [{scope="both", search="ping", replace="pong"}]"#).unwrap();
+        let _r = omni_common::Replacements::parse(
+            r#"rule = [{scope="both", search="ping", replace="pong"}]"#,
+        )
+        .unwrap();
         // grok path (test ctor, no net)
         let pg = GrokProvider::new_for_test("k", "http://127.0.0.1:9");
         assert_eq!(pg.id(), "grok");
@@ -919,7 +1031,13 @@ rule = [
         let pc = ClaudeProvider::new().expect("claude");
         assert_eq!(pc.id(), "claude-code");
         // unified via core
-        let _ = omni_core::CanonicalResponse { model: "m".into(), content: "c".into(), tool_calls: vec![], finish_reason: None, usage: Default::default() };
+        let _ = omni_core::CanonicalResponse {
+            model: "m".into(),
+            content: "c".into(),
+            tool_calls: vec![],
+            finish_reason: None,
+            usage: Default::default(),
+        };
     }
 
     #[tokio::test]
@@ -933,9 +1051,11 @@ rule = [
         let enabled: Vec<String> = map.keys().cloned().collect();
         assert_eq!(enabled.len(), 2);
         let (kg, mg) = resolve_provider_and_model("grok:x", &enabled).unwrap();
-        assert_eq!(kg, "grok"); assert_eq!(mg, "x");
+        assert_eq!(kg, "grok");
+        assert_eq!(mg, "x");
         let (kc, mc) = resolve_provider_and_model("claude:y", &enabled).unwrap();
-        assert_eq!(kc, "claude"); assert_eq!(mc, "y");
+        assert_eq!(kc, "claude");
+        assert_eq!(mc, "y");
         // bare fails
         assert!(resolve_provider_and_model("bare", &enabled).is_err());
     }
@@ -950,8 +1070,15 @@ rule = [
         let state = Arc::new(AppState { providers: map });
         let req = ChatCompletionRequest {
             model: "grok:grok-3".into(),
-            messages: vec![ChatMessage { role: "user".into(), content: Some("c".into()) }],
-            stream: false, max_tokens: None, max_completion_tokens: None, temperature: None, top_p: None,
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("c".into()),
+            }],
+            stream: false,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
             _extras: serde_json::Value::Null,
         };
         let _ = chat_completions_handler(State(state), Json(req)).await; // will err on net but cred code ran in provider
@@ -968,9 +1095,16 @@ rule = [
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn omni bin for health test");
-        assert!(wait_for_200_health(port, Duration::from_secs(6)), "omni did not become healthy on {}", port);
+        assert!(
+            wait_for_200_health(port, Duration::from_secs(6)),
+            "omni did not become healthy on {}",
+            port
+        );
         // root
-        let out = Command::new("curl").args(["-s", &format!("http://127.0.0.1:{}/", port)]).output().unwrap();
+        let out = Command::new("curl")
+            .args(["-s", &format!("http://127.0.0.1:{}/", port)])
+            .output()
+            .unwrap();
         let body = String::from_utf8_lossy(&out.stdout);
         assert!(body.contains("omni - light multi-backend"));
         let _ = child.kill();
@@ -981,9 +1115,15 @@ rule = [
         let port = free_port();
         let mut child = Command::new(omni_bin_path())
             .args(["--no-auth", "--port", &port.to_string()])
-            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
         assert!(wait_for_200_health(port, Duration::from_secs(6)));
-        let out = Command::new("curl").args(["-s", &format!("http://127.0.0.1:{}/v1/models", port)]).output().unwrap();
+        let out = Command::new("curl")
+            .args(["-s", &format!("http://127.0.0.1:{}/v1/models", port)])
+            .output()
+            .unwrap();
         let v: Value = serde_json::from_slice(&out.stdout).expect("models json");
         assert_eq!(v["object"], "list");
         assert!(v["data"].as_array().unwrap().len() >= 2); // at least defaults for enabled (default claude,grok)
@@ -998,25 +1138,75 @@ rule = [
         let mut child = Command::new(omni_bin_path())
             .env("OMNI_API_KEYS", "secret123,other")
             .args(["--port", &port.to_string()])
-            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
         // wait using proper header (keys case requires it for any surface incl health)
         let start = Instant::now();
         let mut ready = false;
         while start.elapsed() < Duration::from_secs(6) {
-            if let Ok(out) = Command::new("curl").args(["-s", "--max-time", "1", "-H", "Authorization: Bearer secret123", &format!("http://127.0.0.1:{}/health", port)]).output() {
-                if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "ok" { ready = true; break; }
+            if let Ok(out) = Command::new("curl")
+                .args([
+                    "-s",
+                    "--max-time",
+                    "1",
+                    "-H",
+                    "Authorization: Bearer secret123",
+                    &format!("http://127.0.0.1:{}/health", port),
+                ])
+                .output()
+            {
+                if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "ok" {
+                    ready = true;
+                    break;
+                }
             }
             thread::sleep(Duration::from_millis(120));
         }
         assert!(ready, "protected server did not become ready");
         // no header -> 401
-        let out1 = Command::new("curl").args(["-s", "-o", "/dev/null", "-w", "%{http_code}", &format!("http://127.0.0.1:{}/health", port)]).output().unwrap();
+        let out1 = Command::new("curl")
+            .args([
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                &format!("http://127.0.0.1:{}/health", port),
+            ])
+            .output()
+            .unwrap();
         assert_eq!(String::from_utf8_lossy(&out1.stdout).trim(), "401");
         // with good key -> 200
-        let out2 = Command::new("curl").args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "-H", "Authorization: Bearer secret123", &format!("http://127.0.0.1:{}/health", port)]).output().unwrap();
+        let out2 = Command::new("curl")
+            .args([
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "-H",
+                "Authorization: Bearer secret123",
+                &format!("http://127.0.0.1:{}/health", port),
+            ])
+            .output()
+            .unwrap();
         assert_eq!(String::from_utf8_lossy(&out2.stdout).trim(), "200");
         // bad key -> 401
-        let out3 = Command::new("curl").args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "-H", "Authorization: Bearer wrong", &format!("http://127.0.0.1:{}/health", port)]).output().unwrap();
+        let out3 = Command::new("curl")
+            .args([
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "-H",
+                "Authorization: Bearer wrong",
+                &format!("http://127.0.0.1:{}/health", port),
+            ])
+            .output()
+            .unwrap();
         assert_eq!(String::from_utf8_lossy(&out3.stdout).trim(), "401");
         let _ = child.kill();
 
@@ -1024,9 +1214,22 @@ rule = [
         let port2 = free_port();
         let mut child2 = Command::new(omni_bin_path())
             .args(["--no-auth", "--port", &port2.to_string()])
-            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn2");
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn2");
         assert!(wait_for_200_health(port2, Duration::from_secs(6)));
-        let out4 = Command::new("curl").args(["-s", "-o", "/dev/null", "-w", "%{http_code}", &format!("http://127.0.0.1:{}/health", port2)]).output().unwrap();
+        let out4 = Command::new("curl")
+            .args([
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                &format!("http://127.0.0.1:{}/health", port2),
+            ])
+            .output()
+            .unwrap();
         assert_eq!(String::from_utf8_lossy(&out4.stdout).trim(), "200");
         let _ = child2.kill();
     }
@@ -1037,21 +1240,54 @@ rule = [
         let port = free_port();
         let mut child = Command::new(omni_bin_path())
             .args(["--no-auth", "--port", &port.to_string()])
-            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
         assert!(wait_for_200_health(port, Duration::from_secs(6)));
         // unknown prefix
         let out = Command::new("curl")
-            .args(["-s", "-X", "POST", "-H", "content-type: application/json", "-d", r#"{"model":"nope:xx","messages":[{"role":"user","content":"hi"}]}"#, &format!("http://127.0.0.1:{}/v1/chat/completions", port)])
-            .output().unwrap();
+            .args([
+                "-s",
+                "-X",
+                "POST",
+                "-H",
+                "content-type: application/json",
+                "-d",
+                r#"{"model":"nope:xx","messages":[{"role":"user","content":"hi"}]}"#,
+                &format!("http://127.0.0.1:{}/v1/chat/completions", port),
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "curl invocation failed");
         let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(serde_json::json!({}));
-        assert!(out.status.success() || true); // curl ok
-        assert!(v["error"]["message"].as_str().unwrap_or("").contains("not enabled"));
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not enabled")
+        );
         // bare in multi
         let out2 = Command::new("curl")
-            .args(["-s", "-X", "POST", "-H", "content-type: application/json", "-d", r#"{"model":"bare","messages":[{"role":"user","content":"hi"}]}"#, &format!("http://127.0.0.1:{}/v1/chat/completions", port)])
-            .output().unwrap();
+            .args([
+                "-s",
+                "-X",
+                "POST",
+                "-H",
+                "content-type: application/json",
+                "-d",
+                r#"{"model":"bare","messages":[{"role":"user","content":"hi"}]}"#,
+                &format!("http://127.0.0.1:{}/v1/chat/completions", port),
+            ])
+            .output()
+            .unwrap();
         let v2: Value = serde_json::from_slice(&out2.stdout).unwrap_or(serde_json::json!({}));
-        assert!(v2["error"]["message"].as_str().unwrap_or("").contains("must use prefix"));
+        assert!(
+            v2["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("must use prefix")
+        );
         let _ = child.kill();
     }
 
@@ -1061,7 +1297,10 @@ rule = [
         let port = free_port();
         let mut child = Command::new(omni_bin_path())
             .args(["--no-auth", "--port", &port.to_string()])
-            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
         assert!(wait_for_200_health(port, Duration::from_secs(6)));
         if has_grok_creds() {
             let out = Command::new("curl")
@@ -1069,11 +1308,24 @@ rule = [
                 .output().unwrap();
             let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(serde_json::json!({}));
             // accept 200 with real or if rate limit etc, just that it reached delegation not routing err
-            if let Some(code) = out.status.code() { if code == 0 { /*curl ok*/ } }
+            if let Some(code) = out.status.code() {
+                if code == 0 { /*curl ok*/ }
+            }
             let err_msg = v["error"]["message"].as_str().unwrap_or("");
-            assert!(!err_msg.contains("not enabled") && !err_msg.contains("must use prefix"), "routing should have succeeded for grok: prefix: {}", err_msg);
+            assert!(
+                !err_msg.contains("not enabled") && !err_msg.contains("must use prefix"),
+                "routing should have succeeded for grok: prefix: {}",
+                err_msg
+            );
             if v.get("choices").is_some() {
-                assert!(v["choices"][0]["message"]["content"].as_str().unwrap_or("").len() > 0 || v["choices"][0]["message"].get("tool_calls").is_some());
+                assert!(
+                    v["choices"][0]["message"]["content"]
+                        .as_str()
+                        .unwrap_or("")
+                        .len()
+                        > 0
+                        || v["choices"][0]["message"].get("tool_calls").is_some()
+                );
             }
         }
         if has_claude_creds() {
@@ -1082,7 +1334,11 @@ rule = [
                 .output().unwrap();
             let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(serde_json::json!({}));
             let err_msg = v["error"]["message"].as_str().unwrap_or("");
-            assert!(!err_msg.contains("not enabled"), "claude route: {}", err_msg);
+            assert!(
+                !err_msg.contains("not enabled"),
+                "claude route: {}",
+                err_msg
+            );
             if v.get("choices").is_some() {
                 let c = v["choices"][0]["message"]["content"].as_str().unwrap_or("");
                 assert!(c.len() > 0);
@@ -1098,13 +1354,27 @@ rule = [
         let mut child = Command::new(omni_bin_path())
             .env("OMNI_PROVIDERS", "claude,grok")
             .args(["--no-auth", "--port", &port.to_string()])
-            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
         assert!(wait_for_200_health(port, Duration::from_secs(6)));
         // models should list for both
-        let out = Command::new("curl").args(["-s", &format!("http://127.0.0.1:{}/models", port)]).output().unwrap();
+        let out = Command::new("curl")
+            .args(["-s", &format!("http://127.0.0.1:{}/models", port)])
+            .output()
+            .unwrap();
         let v: Value = serde_json::from_slice(&out.stdout).expect("json");
-        let ids: Vec<String> = v["data"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str().map(|s|s.to_string())).collect();
-        assert!(ids.iter().any(|id| id.starts_with("claude:") || id.starts_with("grok:")));
+        let ids: Vec<String> = v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
+            .collect();
+        assert!(
+            ids.iter()
+                .any(|id| id.starts_with("claude:") || id.starts_with("grok:"))
+        );
         let _ = child.kill();
     }
 }

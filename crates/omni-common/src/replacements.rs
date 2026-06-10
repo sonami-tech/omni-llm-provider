@@ -45,7 +45,11 @@ pub enum ReplacementsError {
 
 impl Replacements {
     pub fn empty() -> Self {
-        Self { prompt_rules: vec![], response_rules: vec![], file_rule_count: 0 }
+        Self {
+            prompt_rules: vec![],
+            response_rules: vec![],
+            file_rule_count: 0,
+        }
     }
 
     pub fn load(path: &Path) -> Result<Self, ReplacementsError> {
@@ -54,43 +58,75 @@ impl Replacements {
     }
 
     pub fn parse(toml_str: &str) -> Result<Self, ReplacementsError> {
-        if toml_str.trim().is_empty() { return Ok(Self::empty()); }
-        let file: RulesFile = toml::from_str(toml_str).map_err(|e| ReplacementsError::Parse(e.to_string()))?;
+        if toml_str.trim().is_empty() {
+            return Ok(Self::empty());
+        }
+        let file: RulesFile =
+            toml::from_str(toml_str).map_err(|e| ReplacementsError::Parse(e.to_string()))?;
 
         let mut prompt_rules = Vec::new();
         let mut response_rules = Vec::new();
         for r in &file.rule {
-            let rule = Rule { search: r.search.clone(), replace: r.replace.clone() };
+            let rule = Rule {
+                search: r.search.clone(),
+                replace: r.replace.clone(),
+            };
             match r.scope {
                 Scope::Prompt => prompt_rules.push(rule),
                 Scope::Response => response_rules.push(rule),
-                Scope::Both => { prompt_rules.push(rule.clone()); response_rules.push(rule); }
+                Scope::Both => {
+                    prompt_rules.push(rule.clone());
+                    response_rules.push(rule);
+                }
             }
         }
 
         for (scope_name, rules) in [("prompt", &prompt_rules), ("response", &response_rules)] {
             for (i, a) in rules.iter().enumerate() {
-                for b in &rules[i+1..] {
+                for b in &rules[i + 1..] {
                     if a.search == b.search {
-                        return Err(ReplacementsError::Parse(format!("duplicate {} rule for {:?}", scope_name, a.search)));
+                        return Err(ReplacementsError::Parse(format!(
+                            "duplicate {} rule for {:?}",
+                            scope_name, a.search
+                        )));
                     }
                 }
             }
         }
 
-        Ok(Replacements { prompt_rules, response_rules, file_rule_count: file.rule.len() })
+        Ok(Replacements {
+            prompt_rules,
+            response_rules,
+            file_rule_count: file.rule.len(),
+        })
     }
 
-    pub fn is_empty(&self) -> bool { self.prompt_rules.is_empty() && self.response_rules.is_empty() }
-    pub fn count(&self) -> usize { self.file_rule_count }
-    pub fn apply_prompt(&self, text: &str) -> String { apply_rules(text, &self.prompt_rules) }
-    pub fn apply_response(&self, text: &str) -> String { apply_rules(text, &self.response_rules) }
-    pub fn max_response_search_len(&self) -> usize { self.response_rules.iter().map(|r| r.search.len()).max().unwrap_or(0) }
+    pub fn is_empty(&self) -> bool {
+        self.prompt_rules.is_empty() && self.response_rules.is_empty()
+    }
+    pub fn count(&self) -> usize {
+        self.file_rule_count
+    }
+    pub fn apply_prompt(&self, text: &str) -> String {
+        apply_rules(text, &self.prompt_rules)
+    }
+    pub fn apply_response(&self, text: &str) -> String {
+        apply_rules(text, &self.response_rules)
+    }
+    pub fn max_response_search_len(&self) -> usize {
+        self.response_rules
+            .iter()
+            .map(|r| r.search.len())
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 fn apply_rules(text: &str, rules: &[Rule]) -> String {
     let mut out = text.to_string();
-    for r in rules { out = out.replace(&r.search, &r.replace); }
+    for r in rules {
+        out = out.replace(&r.search, &r.replace);
+    }
     out
 }
 
@@ -119,38 +155,31 @@ mod tests {
 
     #[test]
     fn reject_invalid_scope() {
-        let result = parse(
-            r#"rule = [ { scope = "invalid", search = "foo", replace = "bar" } ]"#,
-        );
+        let result = parse(r#"rule = [ { scope = "invalid", search = "foo", replace = "bar" } ]"#);
         assert!(result.is_err());
     }
 
     #[test]
     fn prompt_rules_dont_apply_to_response() {
-        let r = parse(
-            r#"rule = [ { scope = "prompt", search = "secret", replace = "REDACTED" } ]"#,
-        )
-        .unwrap();
+        let r =
+            parse(r#"rule = [ { scope = "prompt", search = "secret", replace = "REDACTED" } ]"#)
+                .unwrap();
         assert_eq!(r.apply_prompt("my secret"), "my REDACTED");
         assert_eq!(r.apply_response("my secret"), "my secret");
     }
 
     #[test]
     fn response_rules_dont_apply_to_prompt() {
-        let r = parse(
-            r#"rule = [ { scope = "response", search = "hello", replace = "goodbye" } ]"#,
-        )
-        .unwrap();
+        let r =
+            parse(r#"rule = [ { scope = "response", search = "hello", replace = "goodbye" } ]"#)
+                .unwrap();
         assert_eq!(r.apply_prompt("hello world"), "hello world");
         assert_eq!(r.apply_response("hello world"), "goodbye world");
     }
 
     #[test]
     fn both_scope_applies_everywhere() {
-        let r = parse(
-            r#"rule = [ { scope = "both", search = "old", replace = "new" } ]"#,
-        )
-        .unwrap();
+        let r = parse(r#"rule = [ { scope = "both", search = "old", replace = "new" } ]"#).unwrap();
         assert_eq!(r.apply_prompt("old value"), "new value");
         assert_eq!(r.apply_response("old value"), "new value");
     }
@@ -169,10 +198,8 @@ mod tests {
 
     #[test]
     fn empty_replacement_is_deletion() {
-        let r = parse(
-            r#"rule = [ { scope = "response", search = "remove me", replace = "" } ]"#,
-        )
-        .unwrap();
+        let r = parse(r#"rule = [ { scope = "response", search = "remove me", replace = "" } ]"#)
+            .unwrap();
         assert_eq!(r.apply_response("please remove me now"), "please  now");
     }
 
@@ -232,16 +259,17 @@ mod tests {
     // chunk boundaries (tool arg json partials) must be handled by max lookback sizing.
     #[test]
     fn mirrors_ccp_streaming_repl_buffer_for_partial_tool_args() {
-        let r = parse(
-            r#"rule = [ { scope = "response", search = "foo", replace = "bar" } ]"#,
-        )
-        .unwrap();
+        let r =
+            parse(r#"rule = [ { scope = "response", search = "foo", replace = "bar" } ]"#).unwrap();
         // partial json arg fragment that would arrive in separate SSE chunks; apply on
         // concat simulates post-buffer result.
         let partial1 = r#"{"function":{"name":"x","arguments":"{\"k\":\"foo"#;
         let partial2 = r#"\"}}}"#;
         let full = format!("{}{}", partial1, partial2);
-        assert_eq!(r.apply_response(&full), format!("{}{}", partial1.replace("foo", "bar"), partial2));
+        assert_eq!(
+            r.apply_response(&full),
+            format!("{}{}", partial1.replace("foo", "bar"), partial2)
+        );
         assert!(r.max_response_search_len() > 0);
     }
 
@@ -249,10 +277,8 @@ mod tests {
     // Mirrors CCP apply_response_to_args_string fallback.
     #[test]
     fn response_rules_apply_to_tool_arg_json_partials() {
-        let r = parse(
-            r#"rule = [ { scope = "response", search = "foo", replace = "bar" } ]"#,
-        )
-        .unwrap();
+        let r =
+            parse(r#"rule = [ { scope = "response", search = "foo", replace = "bar" } ]"#).unwrap();
         let partial = r#"{"k":"foo"#; // unterminated json
         assert_eq!(r.apply_response(partial), r#"{"k":"bar"#);
         let args = r#"{"a": "foo", "b": "xfoo y"}"#;
@@ -264,10 +290,8 @@ mod tests {
     // callers (per CCP) restrict to nl fields only. Test documents the raw apply behavior.
     #[test]
     fn prompt_rules_hit_schema_title_desc_text() {
-        let r = parse(
-            r#"rule = [ { scope = "prompt", search = "string", replace = "text" } ]"#,
-        )
-        .unwrap();
+        let r = parse(r#"rule = [ { scope = "prompt", search = "string", replace = "text" } ]"#)
+            .unwrap();
         let schema_text = r#"{"type":"object","properties":{"p":{"type":"string","description":"a string path","title":"string title"}}}"#;
         let replaced = r.apply_prompt(schema_text);
         // raw replace hits the type value too (intent: real schema applicator in translate must limit)
@@ -298,14 +322,15 @@ mod tests {
     // response rules are active. Mirrors CCP role_opener_keeps_empty_content_under_response_rules.
     #[test]
     fn role_opener_empty_content_is_preserved_under_rules() {
-        let r = parse(
-            r#"rule = [ { scope = "response", search = "foo", replace = "bar" } ]"#,
-        )
-        .unwrap();
+        let r =
+            parse(r#"rule = [ { scope = "response", search = "foo", replace = "bar" } ]"#).unwrap();
         let opener = r#"{"role":"assistant","content":""}"#;
         assert_eq!(r.apply_response(opener), opener); // no match, preserved exactly
         let with_match = r#"{"role":"assistant","content":"foo"}"#;
-        assert_eq!(r.apply_response(with_match), r#"{"role":"assistant","content":"bar"}"#);
+        assert_eq!(
+            r.apply_response(with_match),
+            r#"{"role":"assistant","content":"bar"}"#
+        );
     }
 
     // Duplicate rejection variants: prompt dups, response dups (via both), and cross
@@ -366,16 +391,18 @@ mod tests {
     // max_response_search_len for buffer; apply on concat is canonical. Mirrors CCP.
     #[test]
     fn streaming_buffer_full_partial_tool_json() {
-        let r = parse(
-            r#"rule = [ { scope = "response", search = "TOOLARG", replace = "REPLACED" } ]"#,
-        )
-        .unwrap();
+        let r =
+            parse(r#"rule = [ { scope = "response", search = "TOOLARG", replace = "REPLACED" } ]"#)
+                .unwrap();
         let full = r#"{"tool_calls":[{"function":{"arguments":"{\"x\":\"TOOLARG\"}"}}]}"#;
         assert_eq!(r.apply_response(full), full.replace("TOOLARG", "REPLACED"));
         let partial1 = r#"{"tool_calls":[{"function":{"arguments":"{\"x\":\"TOO"#;
         let partial2 = r#"LARG\"}"}}]}"#;
         let concat = format!("{}{}", partial1, partial2);
-        assert_eq!(r.apply_response(&concat), concat.replace("TOOLARG", "REPLACED"));
+        assert_eq!(
+            r.apply_response(&concat),
+            concat.replace("TOOLARG", "REPLACED")
+        );
         assert!(r.max_response_search_len() >= 7);
     }
 
@@ -404,7 +431,10 @@ mod tests {
     #[test]
     fn role_opener_empty_and_duplicate_rejection_more() {
         let r = parse(r#"rule = [ { scope = "response", search = "x", replace = "y" } ]"#).unwrap();
-        assert_eq!(r.apply_response(r#"{"role":"assistant","content":""}"#), r#"{"role":"assistant","content":""}"#);
+        assert_eq!(
+            r.apply_response(r#"{"role":"assistant","content":""}"#),
+            r#"{"role":"assistant","content":""}"#
+        );
         // dup via both + response
         let bad = parse(
             r#"rule = [
@@ -424,7 +454,8 @@ mod tests {
         let r_ok = parse(r#"rule = [ { scope = "both", search = "", replace = "X" } ]"#);
         assert!(r_ok.is_ok());
         // empty search as deletion? but "" replace would be insert? use non-empty search delete
-        let r_del = parse(r#"rule = [ { scope = "response", search = "DELME", replace = "" } ]"#).unwrap();
+        let r_del =
+            parse(r#"rule = [ { scope = "response", search = "DELME", replace = "" } ]"#).unwrap();
         assert_eq!(r_del.apply_response("keep DELME here"), "keep  here");
         // colons already; noop no rules
         let r0 = Replacements::empty();
@@ -452,10 +483,12 @@ mod tests {
     // Noop on no-match, both/prompt isolation, duplicate variants prompt only.
     #[test]
     fn noop_no_match_both_isolation_and_dup_variants() {
-        let r = parse(r#"rule = [ { scope = "prompt", search = "NOHIT", replace = "X" } ]"#).unwrap();
+        let r =
+            parse(r#"rule = [ { scope = "prompt", search = "NOHIT", replace = "X" } ]"#).unwrap();
         assert_eq!(r.apply_prompt("nothing here"), "nothing here");
         assert_eq!(r.apply_response("nothing here"), "nothing here");
-        let rboth = parse(r#"rule = [ { scope = "both", search = "hit", replace = "HIT" } ]"#).unwrap();
+        let rboth =
+            parse(r#"rule = [ { scope = "both", search = "hit", replace = "HIT" } ]"#).unwrap();
         assert_eq!(rboth.apply_prompt("hit me"), "HIT me");
         assert_eq!(rboth.apply_response("hit me"), "HIT me");
         // prompt dup direct

@@ -1,4 +1,4 @@
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 use std::net::SocketAddr;
 use tracing::{info, warn};
 
@@ -15,7 +15,10 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
-        .route("/", get(|| async { "omni-grok - OpenAI compatible for xAI Grok models" }));
+        .route(
+            "/",
+            get(|| async { "omni-grok - OpenAI compatible for xAI Grok models" }),
+        );
 
     let addr: SocketAddr = "127.0.0.1:18322".parse().unwrap();
     info!("omni-grok listening on http://{}", addr);
@@ -31,21 +34,29 @@ mod tests {
     // via prefix/config string, exercising unified LlmProvider surface + canonical.
     // These run inside the bin crate (which pulls providers via normal + dev-dep) so they
     // cross the "wrapper" boundary without altering production main or requiring a real omni bin.
-    use omni_core::{CanonicalContent, CanonicalMessage, CanonicalRequest, LlmProvider, ProviderError};
+    use omni_core::{
+        CanonicalContent, CanonicalMessage, CanonicalRequest, LlmProvider, ProviderError,
+    };
     use provider_claude::ClaudeProvider;
     use provider_grok::GrokProvider;
 
     fn make_simple_req(model: &str, text: &str) -> CanonicalRequest {
         CanonicalRequest {
             model: model.into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text(text.into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text(text.into()),
+            }],
             ..Default::default()
         }
     }
 
     // Simulated router (the kind a future thin omni bin would have).
     // Selects backend by "prefix" (e.g. "claude:sonnet" or config "grok") then delegates.
-    async fn dispatch(which: &str, req: CanonicalRequest) -> Result<omni_core::CanonicalResponse, ProviderError> {
+    async fn dispatch(
+        which: &str,
+        req: CanonicalRequest,
+    ) -> Result<omni_core::CanonicalResponse, ProviderError> {
         if which.starts_with("grok") || which == "grok" {
             // mocked upstream via bad port (real key path covered in provider-grok unit)
             let p = GrokProvider::new_for_test("xai-dummy", "http://127.0.0.1:1");
@@ -55,7 +66,10 @@ mod tests {
             let p = ClaudeProvider::new().expect("claude profile for wrapper test dispatch");
             return p.send(req).await;
         }
-        Err(ProviderError::Other(anyhow::anyhow!("no provider for {}", which)))
+        Err(ProviderError::Other(anyhow::anyhow!(
+            "no provider for {}",
+            which
+        )))
     }
 
     #[tokio::test]
@@ -72,7 +86,9 @@ mod tests {
         }
 
         // claude path (ported) -> succeeds (may use live creds in env), unified canonical response shape
-        let rc = dispatch("claude", req_c.clone()).await.expect("claude route via port");
+        let rc = dispatch("claude", req_c.clone())
+            .await
+            .expect("claude route via port");
         assert_eq!(rc.model, "claude-haiku");
         assert!(!rc.content.is_empty()); // ported send produces real or demo content; stub-specific string no longer applies
 
@@ -100,7 +116,9 @@ mod tests {
 
     #[tokio::test]
     async fn wrapper_unknown_provider_is_error() {
-        let err = dispatch("codex", make_simple_req("x", "y")).await.unwrap_err();
+        let err = dispatch("codex", make_simple_req("x", "y"))
+            .await
+            .unwrap_err();
         match err {
             ProviderError::Other(_) => {}
             _ => panic!("expected Other for unknown backend"),
@@ -114,14 +132,24 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     }
 
     fn omni_grok_bin_path() -> std::path::PathBuf {
-        if let Ok(p) = std::env::var("CARGO_BIN_EXE_omni_grok") { return p.into(); }
+        if let Ok(p) = std::env::var("CARGO_BIN_EXE_omni_grok") {
+            return p.into();
+        }
         let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.pop(); p.pop(); p.pop();
-        p.push("target"); p.push("debug"); p.push("omni-grok");
+        p.pop();
+        p.pop();
+        p.pop();
+        p.push("target");
+        p.push("debug");
+        p.push("omni-grok");
         p
     }
 
@@ -129,8 +157,13 @@ mod tests {
         let start = Instant::now();
         let u = format!("http://127.0.0.1:{}/health", port);
         while start.elapsed() < to {
-            if let Ok(o) = Command::new("curl").args(["-s", "--max-time", "1", &u]).output() {
-                if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "ok" { return true; }
+            if let Ok(o) = Command::new("curl")
+                .args(["-s", "--max-time", "1", &u])
+                .output()
+            {
+                if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "ok" {
+                    return true;
+                }
             }
             thread::sleep(Duration::from_millis(100));
         }
@@ -151,14 +184,23 @@ mod tests {
         // focused uses hardcoded port (no cli port support yet); use known 18322 + kill
         const PORT: u16 = 18322;
         let mut ch = Command::new(omni_grok_bin_path())
-            .stdout(Stdio::null()).stderr(Stdio::null())
-            .spawn().expect("spawn omni-grok");
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn omni-grok");
         thread::sleep(Duration::from_millis(500));
         let _ = wait_health(PORT, Duration::from_secs(5));
         // health verified by wait; use /health for body check (root may be minimal in stub)
-        let out = Command::new("curl").args(["-sS", &format!("http://127.0.0.1:{}/health", PORT)]).output().unwrap();
+        let out = Command::new("curl")
+            .args(["-sS", &format!("http://127.0.0.1:{}/health", PORT)])
+            .output()
+            .unwrap();
         let body = String::from_utf8_lossy(&out.stdout);
-        assert!(body.trim() == "ok" || out.status.success(), "health body: {}", body);
+        assert!(
+            body.trim() == "ok" || out.status.success(),
+            "health body: {}",
+            body
+        );
         let _ = ch.kill();
     }
 
@@ -167,7 +209,10 @@ mod tests {
         // spawn + call proves binary surface + shared crates in context
         const PORT: u16 = 18322;
         let mut ch = Command::new(omni_grok_bin_path())
-            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
         thread::sleep(Duration::from_millis(300));
         let _ = wait_health(PORT, Duration::from_secs(4));
         let _ = ch.kill();

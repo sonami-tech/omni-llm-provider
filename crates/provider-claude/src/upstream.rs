@@ -24,14 +24,20 @@ pub mod errors {
         #[error("credentials.json missing accessToken")]
         CredentialsMissingToken,
 
-        #[error("OAuth token expired (per credentials.json expiresAt). Run `claude` once to refresh.")]
+        #[error(
+            "OAuth token expired (per credentials.json expiresAt). Run `claude` once to refresh."
+        )]
         TokenExpired,
 
         #[error("HTTP transport: {0}")]
         Transport(#[from] reqwest::Error),
 
         #[error("Anthropic returned HTTP {status}: {body}")]
-        Anthropic { status: u16, body: String, parsed: Option<AnthropicErrorBody> },
+        Anthropic {
+            status: u16,
+            body: String,
+            parsed: Option<AnthropicErrorBody>,
+        },
 
         #[error("response decode: {0}")]
         Decode(String),
@@ -92,16 +98,10 @@ mod error_tests {
     #[test]
     fn surface_status_maps_auth_to_401() {
         assert_eq!(UpstreamError::TokenExpired.surface_status(), 401);
+        assert_eq!(UpstreamError::CredentialsMissingToken.surface_status(), 401);
         assert_eq!(
-            UpstreamError::CredentialsMissingToken.surface_status(),
-            401
-        );
-        assert_eq!(
-            UpstreamError::CredentialsRead(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "no"
-            ))
-            .surface_status(),
+            UpstreamError::CredentialsRead(std::io::Error::new(std::io::ErrorKind::NotFound, "no"))
+                .surface_status(),
             500
         );
     }
@@ -282,17 +282,17 @@ pub mod stream {
             }
             "content_block_start" => {
                 let idx = any.index.unwrap_or(0);
-                let block_val = any
-                    .content_block
-                    .ok_or_else(|| UpstreamError::Decode("content_block_start missing content_block".into()))?;
+                let block_val = any.content_block.ok_or_else(|| {
+                    UpstreamError::Decode("content_block_start missing content_block".into())
+                })?;
                 let block = parse_block_start(&block_val);
                 StreamEvent::ContentBlockStart { index: idx, block }
             }
             "content_block_delta" => {
                 let idx = any.index.unwrap_or(0);
-                let delta_val = any
-                    .delta
-                    .ok_or_else(|| UpstreamError::Decode("content_block_delta missing delta".into()))?;
+                let delta_val = any.delta.ok_or_else(|| {
+                    UpstreamError::Decode("content_block_delta missing delta".into())
+                })?;
                 StreamEvent::ContentBlockDelta {
                     index: idx,
                     delta: parse_block_delta(&delta_val),
@@ -307,8 +307,12 @@ pub mod stream {
                     .as_ref()
                     .map(|d| {
                         (
-                            d.get("stop_reason").and_then(|v| v.as_str()).map(str::to_string),
-                            d.get("stop_sequence").and_then(|v| v.as_str()).map(str::to_string),
+                            d.get("stop_reason")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
+                            d.get("stop_sequence")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
                         )
                     })
                     .unwrap_or((None, None));
@@ -339,8 +343,16 @@ pub mod stream {
         match kind {
             "text" => BlockStart::Text,
             "tool_use" => BlockStart::ToolUse {
-                id: v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                name: v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                id: v
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                name: v
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
             },
             "thinking" => BlockStart::Thinking,
             other => BlockStart::Other(other.to_string()),
@@ -351,7 +363,10 @@ pub mod stream {
         let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
         match kind {
             "text_delta" => BlockDelta::Text(
-                v.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                v.get("text")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
             ),
             "input_json_delta" => BlockDelta::InputJson(
                 v.get("partial_json")
@@ -360,10 +375,16 @@ pub mod stream {
                     .to_string(),
             ),
             "thinking_delta" => BlockDelta::Thinking(
-                v.get("thinking").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                v.get("thinking")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
             ),
             "signature_delta" => BlockDelta::ThinkingSignature(
-                v.get("signature").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                v.get("signature")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
             ),
             _ => BlockDelta::Other,
         }
@@ -606,7 +627,11 @@ pub mod stream {
         let data: Value = serde_json::from_str(&joined)
             .map_err(|e| UpstreamError::Decode(format!("sse data not json: {e}")))?;
         let event = event_name
-            .or_else(|| data.get("type").and_then(|t| t.as_str()).map(str::to_string))
+            .or_else(|| {
+                data.get("type")
+                    .and_then(|t| t.as_str())
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| "message".to_string());
         Ok(Some(RawFrame { event, data }))
     }
@@ -699,14 +724,16 @@ pub mod stream {
             let text = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n";
             let bytes = text.as_bytes().to_vec();
             // simulate via the block parser (take_event would split)
-            let frame = parse_raw_frame(&bytes[0..bytes.len()-2]).unwrap().unwrap();
+            let frame = parse_raw_frame(&bytes[0..bytes.len() - 2])
+                .unwrap()
+                .unwrap();
             assert_eq!(frame.event, "content_block_delta");
             assert_eq!(frame.data["delta"]["text"], "hi");
         }
     }
 }
 
-pub use stream::{EventStream, RawEventStream, RawFrame, StreamEvent, BlockStart, BlockDelta};
+pub use stream::{BlockDelta, BlockStart, EventStream, RawEventStream, RawFrame, StreamEvent};
 
 use std::pin::Pin;
 use std::time::Duration;
@@ -849,7 +876,12 @@ impl UpstreamClient {
             let body_bytes = serde_json::to_vec(body)
                 .map_err(|e| UpstreamError::Decode(format!("count_tokens serialize: {e}")))?;
             let result = self
-                .post_json_once(ANTHROPIC_COUNT_TOKENS_URL, &creds_owned, &ctx_owned, body_bytes)
+                .post_json_once(
+                    ANTHROPIC_COUNT_TOKENS_URL,
+                    &creds_owned,
+                    &ctx_owned,
+                    body_bytes,
+                )
                 .await;
             match result {
                 Ok(v) => return Ok(v),
@@ -879,7 +911,9 @@ impl UpstreamClient {
                 }
             }
         }
-        Err(UpstreamError::Decode("count_tokens retry loop exhausted".into()))
+        Err(UpstreamError::Decode(
+            "count_tokens retry loop exhausted".into(),
+        ))
     }
 
     async fn send_messages_json_once(
@@ -888,7 +922,8 @@ impl UpstreamClient {
         ctx: &RequestContext,
         body: Vec<u8>,
     ) -> Result<Value, UpstreamError> {
-        self.post_json_once(ANTHROPIC_MESSAGES_URL, creds, ctx, body).await
+        self.post_json_once(ANTHROPIC_MESSAGES_URL, creds, ctx, body)
+            .await
     }
 
     /// POST a finalized body to a JSON endpoint and parse the 2xx body, or map a

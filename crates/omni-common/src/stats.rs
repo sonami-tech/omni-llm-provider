@@ -24,52 +24,52 @@ const MAX_SAMPLES: usize = 1000;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TokenUsage {
-	pub input_tokens: u64,
-	pub output_tokens: u64,
-	pub cache_read_input_tokens: u64,
-	pub cache_creation_input_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct TokenStats {
-	input_tokens: u64,
-	output_tokens: u64,
-	cache_read_input_tokens: u64,
-	cache_creation_input_tokens: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_input_tokens: u64,
+    cache_creation_input_tokens: u64,
 }
 
 #[derive(Serialize, Clone)]
 pub struct ErrorRecord {
-	pub timestamp: String,
-	pub model: String,
-	pub message: String,
+    pub timestamp: String,
+    pub model: String,
+    pub message: String,
 }
 
 #[derive(Serialize)]
 pub struct StatsSnapshot {
-	pub uptime_seconds: u64,
-	pub total_requests: u64,
-	pub active_requests: u64,
-	pub errors: u64,
-	pub total_input_tokens: u64,
-	pub total_output_tokens: u64,
-	pub total_cache_read_input_tokens: u64,
-	pub total_cache_creation_input_tokens: u64,
-	pub last_request_at: Option<String>,
-	pub models: HashMap<String, ModelStats>,
-	pub api_keys: HashMap<String, u64>,
-	pub recent_errors: Vec<ErrorRecord>,
+    pub uptime_seconds: u64,
+    pub total_requests: u64,
+    pub active_requests: u64,
+    pub errors: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cache_read_input_tokens: u64,
+    pub total_cache_creation_input_tokens: u64,
+    pub last_request_at: Option<String>,
+    pub models: HashMap<String, ModelStats>,
+    pub api_keys: HashMap<String, u64>,
+    pub recent_errors: Vec<ErrorRecord>,
 }
 
 #[derive(Serialize)]
 pub struct ModelStats {
-	pub requests: u64,
-	pub avg_ttft_ms: f64,
-	pub avg_duration_ms: f64,
-	pub input_tokens: u64,
-	pub output_tokens: u64,
-	pub cache_read_input_tokens: u64,
-	pub cache_creation_input_tokens: u64,
+    pub requests: u64,
+    pub avg_ttft_ms: f64,
+    pub avg_duration_ms: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
 }
 
 pub struct Stats {
@@ -83,18 +83,36 @@ impl Stats {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
         let db = Database::create(path)?;
         // original table creation would go here
-        Ok(Stats { db, _active: AtomicU64::new(0), _start: Instant::now() })
+        Ok(Stats {
+            db,
+            _active: AtomicU64::new(0),
+            _start: Instant::now(),
+        })
     }
 
-    pub fn record_request(&self, _model: &str, _key: Option<&str>) { /* full impl */ }
-    pub fn record_response(&self, _model: &str, _usage: TokenUsage, _ttft: Option<f64>, _dur: f64) { /* */ }
-    pub fn record_error(&self, _model: &str, _msg: &str) { /* */ }
+    pub fn record_request(&self, _model: &str, _key: Option<&str>) { /* full impl */
+    }
+    pub fn record_response(&self, _model: &str, _usage: TokenUsage, _ttft: Option<f64>, _dur: f64) { /* */
+    }
+    pub fn record_error(&self, _model: &str, _msg: &str) { /* */
+    }
     // snapshot, guards etc. stubbed for compile in this pass; the redb + per-model tracking is the reusable concept.
 }
 
-pub struct ActiveRequestGuard<'a> { _s: &'a Stats }
-impl<'a> ActiveRequestGuard<'a> { pub fn new(s: &'a Stats) -> Self { s._active.fetch_add(1, Ordering::Relaxed); Self { _s: s } } }
-impl Drop for ActiveRequestGuard<'_> { fn drop(&mut self) { self._s._active.fetch_sub(1, Ordering::Relaxed); } }
+pub struct ActiveRequestGuard<'a> {
+    _s: &'a Stats,
+}
+impl<'a> ActiveRequestGuard<'a> {
+    pub fn new(s: &'a Stats) -> Self {
+        s._active.fetch_add(1, Ordering::Relaxed);
+        Self { _s: s }
+    }
+}
+impl Drop for ActiveRequestGuard<'_> {
+    fn drop(&mut self) {
+        self._s._active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -109,7 +127,12 @@ mod tests {
     fn token_usage_defaults_and_fields() {
         let u = TokenUsage::default();
         assert_eq!(u.input_tokens, 0);
-        let u2 = TokenUsage { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 2, cache_creation_input_tokens: 1 };
+        let u2 = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_input_tokens: 2,
+            cache_creation_input_tokens: 1,
+        };
         assert_eq!(u2.input_tokens, 10);
     }
 
@@ -118,7 +141,16 @@ mod tests {
         let path = temp_db_path();
         let stats = Stats::open(&path).expect("open temp stats db");
         stats.record_request("claude-haiku", Some("...key"));
-        stats.record_response("claude-haiku", TokenUsage { input_tokens: 7, output_tokens: 3, ..Default::default() }, Some(123.4), 456.7);
+        stats.record_response(
+            "claude-haiku",
+            TokenUsage {
+                input_tokens: 7,
+                output_tokens: 3,
+                ..Default::default()
+            },
+            Some(123.4),
+            456.7,
+        );
         stats.record_error("grok", "rate limit");
         // guard
         {
@@ -170,7 +202,15 @@ mod tests {
         );
         models.insert(
             "grok-3".into(),
-            ModelStats { requests: 2, avg_ttft_ms: 0.0, avg_duration_ms: 10.0, input_tokens: 20, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+            ModelStats {
+                requests: 2,
+                avg_ttft_ms: 0.0,
+                avg_duration_ms: 10.0,
+                input_tokens: 20,
+                output_tokens: 5,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
         );
         let snap = StatsSnapshot {
             uptime_seconds: 100,
@@ -254,8 +294,14 @@ mod tests {
     #[test]
     fn uptime_monotonic_across_snapshots() {
         // construct two snapshots simulating time progression (real Stats uses _start)
-        let s0 = StatsSnapshot { uptime_seconds: 5, ..make_empty_snap() };
-        let s1 = StatsSnapshot { uptime_seconds: 7, ..make_empty_snap() };
+        let s0 = StatsSnapshot {
+            uptime_seconds: 5,
+            ..make_empty_snap()
+        };
+        let s1 = StatsSnapshot {
+            uptime_seconds: 7,
+            ..make_empty_snap()
+        };
         assert!(s1.uptime_seconds >= s0.uptime_seconds);
     }
 
@@ -265,10 +311,25 @@ mod tests {
     fn record_on_all_paths_affects_snapshot_fields() {
         // simulate effects of record_request (total+models+keys), record_response (tokens), record_error
         let mut models = std::collections::HashMap::new();
-        models.insert("m".into(), ModelStats { requests: 1, avg_ttft_ms: 0.0, avg_duration_ms: 0.0, input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 });
+        models.insert(
+            "m".into(),
+            ModelStats {
+                requests: 1,
+                avg_ttft_ms: 0.0,
+                avg_duration_ms: 0.0,
+                input_tokens: 10,
+                output_tokens: 2,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        );
         let mut keys = std::collections::HashMap::new();
         keys.insert("k1".into(), 1);
-        let errs = vec![ErrorRecord { timestamp: "now".into(), model: "m".into(), message: "boom".into() }];
+        let errs = vec![ErrorRecord {
+            timestamp: "now".into(),
+            model: "m".into(),
+            message: "boom".into(),
+        }];
         let snap = StatsSnapshot {
             uptime_seconds: 1,
             total_requests: 1,
@@ -332,8 +393,30 @@ mod tests {
     #[test]
     fn per_key_and_model_accumulation_in_snapshot() {
         let mut models = std::collections::HashMap::new();
-        models.insert("m1".into(), ModelStats { requests: 10, avg_ttft_ms: 5.0, avg_duration_ms: 100.0, input_tokens: 200, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 });
-        models.insert("m2".into(), ModelStats { requests: 3, avg_ttft_ms: 0.0, avg_duration_ms: 0.0, input_tokens: 30, output_tokens: 15, cache_read_input_tokens: 5, cache_creation_input_tokens: 0 });
+        models.insert(
+            "m1".into(),
+            ModelStats {
+                requests: 10,
+                avg_ttft_ms: 5.0,
+                avg_duration_ms: 100.0,
+                input_tokens: 200,
+                output_tokens: 100,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        );
+        models.insert(
+            "m2".into(),
+            ModelStats {
+                requests: 3,
+                avg_ttft_ms: 0.0,
+                avg_duration_ms: 0.0,
+                input_tokens: 30,
+                output_tokens: 15,
+                cache_read_input_tokens: 5,
+                cache_creation_input_tokens: 0,
+            },
+        );
         let mut keys = std::collections::HashMap::new();
         keys.insert("keyA".into(), 8);
         keys.insert("keyB".into(), 5);
@@ -363,7 +446,11 @@ mod tests {
     fn snapshot_serde_and_recent_errors_cap() {
         let mut errs = vec![];
         for i in 0..50 {
-            errs.push(ErrorRecord { timestamp: format!("t{i}"), model: "m".into(), message: format!("e{i}") });
+            errs.push(ErrorRecord {
+                timestamp: format!("t{i}"),
+                model: "m".into(),
+                message: format!("e{i}"),
+            });
         }
         let snap = StatsSnapshot {
             uptime_seconds: 99,
@@ -394,8 +481,14 @@ mod tests {
     fn uptime_monotonic_and_record_paths_exercised() {
         let path = temp_db_path();
         let stats = Stats::open(&path).expect("open");
-        let s0 = StatsSnapshot { uptime_seconds: 10, ..make_empty_snap() };
-        let s1 = StatsSnapshot { uptime_seconds: 20, ..make_empty_snap() };
+        let s0 = StatsSnapshot {
+            uptime_seconds: 10,
+            ..make_empty_snap()
+        };
+        let s1 = StatsSnapshot {
+            uptime_seconds: 20,
+            ..make_empty_snap()
+        };
         assert!(s1.uptime_seconds > s0.uptime_seconds);
         // exercise all record paths (no panic even in stub)
         stats.record_request("mod", Some("k"));
@@ -411,7 +504,18 @@ mod tests {
     #[test]
     fn snapshot_models_with_data_and_api_keys_and_active() {
         let mut m = std::collections::HashMap::new();
-        m.insert("haiku".into(), ModelStats { requests: 1, avg_ttft_ms: 10.0, avg_duration_ms: 20.0, input_tokens: 5, output_tokens: 3, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 });
+        m.insert(
+            "haiku".into(),
+            ModelStats {
+                requests: 1,
+                avg_ttft_ms: 10.0,
+                avg_duration_ms: 20.0,
+                input_tokens: 5,
+                output_tokens: 3,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        );
         let mut k = std::collections::HashMap::new();
         k.insert("sk-abc".into(), 1);
         let snap = StatsSnapshot {

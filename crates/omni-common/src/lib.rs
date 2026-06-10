@@ -12,7 +12,7 @@ pub mod stats;
 pub mod time_util;
 
 pub use auth::{ApiKeyId, auth_layer};
-pub use replacements::{Replacements, ReplacementsError};
-pub use stats::{Stats, TokenUsage, StatsSnapshot};
-pub use error::AppError;
 pub use credentials::GrokCredentials;
+pub use error::AppError;
+pub use replacements::{Replacements, ReplacementsError};
+pub use stats::{Stats, StatsSnapshot, TokenUsage};

@@ -103,8 +103,14 @@ mod tests {
     // whitespace header used as-is (non-empty); empty user + key.
     #[test]
     fn whitespace_header_used_as_is_and_empty_user_key() {
-        assert_eq!(resolve_session_id(Some("   "), Some("user"), Some("k")), "   ");
-        assert_eq!(resolve_session_id(Some(""), Some("   "), Some("k1")), "user:   ");
+        assert_eq!(
+            resolve_session_id(Some("   "), Some("user"), Some("k")),
+            "   "
+        );
+        assert_eq!(
+            resolve_session_id(Some(""), Some("   "), Some("k1")),
+            "user:   "
+        );
         assert_eq!(resolve_session_id(Some(""), Some(""), Some("k1")), "key:k1");
     }
 

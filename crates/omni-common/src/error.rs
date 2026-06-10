@@ -63,10 +63,26 @@ mod tests {
     #[tokio::test]
     async fn error_into_response_shapes() {
         let cases = vec![
-            (AppError::Unauthorized("u".into()), StatusCode::UNAUTHORIZED, "authentication_error"),
-            (AppError::BadRequest("b".into()), StatusCode::BAD_REQUEST, "invalid_request_error"),
-            (AppError::NotFound("n".into()), StatusCode::NOT_FOUND, "invalid_request_error"),
-            (AppError::ServerError("s".into()), StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+            (
+                AppError::Unauthorized("u".into()),
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+            ),
+            (
+                AppError::BadRequest("b".into()),
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+            ),
+            (
+                AppError::NotFound("n".into()),
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+            ),
+            (
+                AppError::ServerError("s".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+            ),
         ];
         for (err, want_status, want_type) in cases {
             let resp = err.into_response();
@@ -113,10 +129,30 @@ mod tests {
     #[tokio::test]
     async fn all_variants_map_to_oai_shape_exact() {
         let cases = vec![
-            (AppError::Unauthorized("u msg".into()), StatusCode::UNAUTHORIZED, "authentication_error", "u msg"),
-            (AppError::BadRequest("b msg".into()), StatusCode::BAD_REQUEST, "invalid_request_error", "b msg"),
-            (AppError::NotFound("n msg".into()), StatusCode::NOT_FOUND, "invalid_request_error", "n msg"),
-            (AppError::ServerError("s msg".into()), StatusCode::INTERNAL_SERVER_ERROR, "server_error", "s msg"),
+            (
+                AppError::Unauthorized("u msg".into()),
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "u msg",
+            ),
+            (
+                AppError::BadRequest("b msg".into()),
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "b msg",
+            ),
+            (
+                AppError::NotFound("n msg".into()),
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                "n msg",
+            ),
+            (
+                AppError::ServerError("s msg".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "s msg",
+            ),
         ];
         for (err, want_status, want_type, want_msg) in cases {
             let resp = err.into_response();

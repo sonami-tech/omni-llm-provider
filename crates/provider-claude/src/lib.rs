@@ -29,16 +29,14 @@ pub mod translate;
 pub mod upstream;
 
 pub use fingerprint::{
-    default_profile, resolve_profile, FingerprintProfile, RequestContext, RequestKind,
-    CLAUDE_CODE_SYSTEM_PREAMBLE,
+    CLAUDE_CODE_SYSTEM_PREAMBLE, FingerprintProfile, RequestContext, RequestKind, default_profile,
+    resolve_profile,
 };
 pub use upstream::{UpstreamClient, UpstreamError};
 
 use async_trait::async_trait;
 use omni_common::Replacements;
-use omni_core::{
-    CanonicalRequest, CanonicalResponse, LlmProvider, ProviderError,
-};
+use omni_core::{CanonicalRequest, CanonicalResponse, LlmProvider, ProviderError};
 use tracing::debug;
 
 /// The Claude provider. Holds the fingerprint profile (for the invariant)
@@ -60,8 +58,9 @@ impl ClaudeProvider {
     }
 
     pub fn new_with_profile(profile: &'static FingerprintProfile) -> Result<Self, ProviderError> {
-        let client = UpstreamClient::new_with_profile(profile)
-            .map_err(|e| ProviderError::Other(anyhow::Error::msg(format!("upstream client: {e}"))))?;
+        let client = UpstreamClient::new_with_profile(profile).map_err(|e| {
+            ProviderError::Other(anyhow::Error::msg(format!("upstream client: {e}")))
+        })?;
         Ok(Self { profile, client })
     }
 
@@ -136,15 +135,17 @@ impl LlmProvider for ClaudeProvider {
         .map_err(|e| ProviderError::Other(anyhow::Error::msg(e)))?;
 
         // 3. Serialize for finalize (cch lives in the billing text inside system).
-        let body_val = serde_json::to_value(&anth_req)
-            .map_err(|e| ProviderError::Other(anyhow::Error::msg(format!("anth serialize: {e}"))))?;
+        let body_val = serde_json::to_value(&anth_req).map_err(|e| {
+            ProviderError::Other(anyhow::Error::msg(format!("anth serialize: {e}")))
+        })?;
 
         let ctx = RequestContext::new_reply().with_model(anth_req.model.clone());
 
         // Fresh creds read (the design: never cached in this process).
-        let creds = credentials::Credentials::load_fresh_async(&credentials::Credentials::default_path())
-            .await
-            .map_err(map_upstream_err)?;
+        let creds =
+            credentials::Credentials::load_fresh_async(&credentials::Credentials::default_path())
+                .await
+                .map_err(map_upstream_err)?;
 
         // 4. Send (this does finalize_body_json which patches the 5-hex cch,
         //    builds the full header set with per-profile betas / stainless / ua,
@@ -217,7 +218,9 @@ mod tests {
         match sys {
             translate::SystemField::Blocks(blocks) => {
                 assert!(blocks.len() >= 2);
-                assert!(crate::fingerprint::is_claude_code_billing_header(&blocks[0].text));
+                assert!(crate::fingerprint::is_claude_code_billing_header(
+                    &blocks[0].text
+                ));
                 assert_eq!(blocks[1].text, CLAUDE_CODE_SYSTEM_PREAMBLE);
             }
             _ => panic!("blocks form required for identity"),
@@ -250,7 +253,10 @@ mod tests {
     fn sample_req(text: &str) -> CanonicalRequest {
         CanonicalRequest {
             model: "claude-sonnet-4-5".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text(text.into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text(text.into()),
+            }],
             ..Default::default()
         }
     }
@@ -259,7 +265,9 @@ mod tests {
     fn claude_additional_ctors_and_shared_repl() {
         let p = ClaudeProvider::new().expect("ctor");
         assert_eq!(p.id(), "claude-code");
-        let repl = Replacements::parse(r#"rule = [ { scope = "prompt", search = "x", replace = "y" } ]"#).unwrap();
+        let repl =
+            Replacements::parse(r#"rule = [ { scope = "prompt", search = "x", replace = "y" } ]"#)
+                .unwrap();
         assert_eq!(repl.apply_prompt("x"), "y");
     }
 
@@ -270,8 +278,15 @@ mod tests {
         // upstream headers (betas, stainless, ua, session) + body -> real Anth call -> from_anth -> canonical.
         // This is the "live but deterministic shape" test for the port (the unit pins for exact bytes live in fingerprint + translate).
         let p = ClaudeProvider::new().expect("ctor");
-        let resp = p.send(sample_req("port test")).await.expect("claude provider send must succeed with creds");
-        assert!(resp.model.contains("sonnet"), "resolved sonnet alias should yield sonnet-family model, got {}", resp.model);
+        let resp = p
+            .send(sample_req("port test"))
+            .await
+            .expect("claude provider send must succeed with creds");
+        assert!(
+            resp.model.contains("sonnet"),
+            "resolved sonnet alias should yield sonnet-family model, got {}",
+            resp.model
+        );
         assert!(!resp.content.is_empty() || resp.tool_calls.is_empty()); // basic shape
     }
 
@@ -283,7 +298,8 @@ mod tests {
 
     #[test]
     fn new_for_test_allows_other_profiles() {
-        let p154 = ClaudeProvider::new_for_test(crate::fingerprint::resolve_profile("2.1.154").unwrap());
+        let p154 =
+            ClaudeProvider::new_for_test(crate::fingerprint::resolve_profile("2.1.154").unwrap());
         assert_eq!(p154.profile().name, "cc-2.1.154-sdk-cli");
         assert_eq!(p154.profile().default_model, "sonnet");
     }
@@ -299,13 +315,17 @@ mod tests {
             _ => panic!(),
         };
         assert!(sys.len() >= 2);
-        assert!(crate::fingerprint::is_claude_code_billing_header(&sys[0].text));
+        assert!(crate::fingerprint::is_claude_code_billing_header(
+            &sys[0].text
+        ));
         assert_eq!(sys[1].text, CLAUDE_CODE_SYSTEM_PREAMBLE);
     }
 
     #[test]
     fn prompt_repl_before_identity_gate_for_billing() {
-        let repl = Replacements::parse(r#"rule = [ { scope = "prompt", search = "Q", replace = "Z" } ]"#).unwrap();
+        let repl =
+            Replacements::parse(r#"rule = [ { scope = "prompt", search = "Q", replace = "Z" } ]"#)
+                .unwrap();
         let mut req = sample_req("ask Q");
         // force model that hits haiku path etc
         req.model = "haiku".into();
@@ -328,17 +348,26 @@ mod tests {
         let p = ClaudeProvider::new().unwrap();
         let prof = p.profile();
         // canonical
-        assert_eq!(prof.resolve_model("claude-sonnet-4-6").canonical, "claude-sonnet-4-6");
+        assert_eq!(
+            prof.resolve_model("claude-sonnet-4-6").canonical,
+            "claude-sonnet-4-6"
+        );
         // alias
         assert_eq!(prof.resolve_model("sonnet").canonical, "claude-sonnet-4-6");
         // substring
-        assert_eq!(prof.resolve_model("foo-sonnet-bar").canonical, "claude-sonnet-4-6");
+        assert_eq!(
+            prof.resolve_model("foo-sonnet-bar").canonical,
+            "claude-sonnet-4-6"
+        );
         // cli
         assert_eq!(prof.resolve_model("opus").canonical, "claude-opus-4-8");
         // default
         assert_eq!(prof.resolve_model("weird").canonical, "claude-opus-4-8");
         // haiku dated
-        assert_eq!(prof.resolve_model("claude-haiku-4-5-20251001").canonical, "claude-haiku-4-5-20251001");
+        assert_eq!(
+            prof.resolve_model("claude-haiku-4-5-20251001").canonical,
+            "claude-haiku-4-5-20251001"
+        );
     }
 
     #[test]
@@ -373,4 +402,3 @@ mod tests {
         assert_eq!(canon.usage.cache_read, 3);
     }
 }
-

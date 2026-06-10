@@ -30,8 +30,8 @@ use uuid::Uuid;
 
 use crate::credentials::Credentials;
 use crate::models::{
-    CATALOG_CC_2_1_142, CATALOG_CC_2_1_150, CATALOG_CC_2_1_154, CATALOG_CC_2_1_158, ModelDef, ModelInfo, models_list_from_catalog,
-    resolve_model_in_catalog,
+    CATALOG_CC_2_1_142, CATALOG_CC_2_1_150, CATALOG_CC_2_1_154, CATALOG_CC_2_1_158, ModelDef,
+    ModelInfo, models_list_from_catalog, resolve_model_in_catalog,
 };
 
 /// Static identity CCP claims on the wire. These values must move together
@@ -924,9 +924,9 @@ pub fn resolve_profile(selector: &str) -> Option<&'static FingerprintProfile> {
         selector
     };
 
-    FINGERPRINT_PROFILES.iter().find(|profile| {
-        profile.name == selector || profile.aliases.contains(&selector)
-    })
+    FINGERPRINT_PROFILES
+        .iter()
+        .find(|profile| profile.name == selector || profile.aliases.contains(&selector))
 }
 
 pub fn valid_profile_selectors() -> String {
@@ -1450,8 +1450,8 @@ mod tests {
         let profile = default_profile(); // 2.1.165
         let creds = fixture_creds();
         let cases = [
-            ("opus", BETA_CC_2_1_165_DEFAULT, true),    // default has context-1m
-            ("sonnet", BETA_CC_2_1_165_SONNET, false),  // sonnet must NOT
+            ("opus", BETA_CC_2_1_165_DEFAULT, true), // default has context-1m
+            ("sonnet", BETA_CC_2_1_165_SONNET, false), // sonnet must NOT
             ("haiku", BETA_CC_2_1_165_HAIKU, false),
         ];
         for (alias, expected_beta, has_context_1m) in cases {
@@ -1527,13 +1527,19 @@ mod tests {
         // and User-Agent are version-coupled and a prime silent-drift vector on
         // a rebaseline (carry-forward leaves a stale value that still 200s).
         assert_eq!(
-            h.get("x-stainless-package-version").unwrap().to_str().unwrap(),
+            h.get("x-stainless-package-version")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             profile.stainless_package_version,
             "x-stainless-package-version drifted from profile field on {}",
             profile.name
         );
         assert_eq!(
-            h.get("x-stainless-runtime-version").unwrap().to_str().unwrap(),
+            h.get("x-stainless-runtime-version")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             profile.stainless_runtime_version,
             "x-stainless-runtime-version drifted from profile field on {}",
             profile.name
@@ -1797,7 +1803,10 @@ mod tests {
         let marker = "cc_entrypoint=sdk-cli; cch=";
         let idx = json.find(marker).expect("snapshot body missing cch marker");
         let got = &json[idx + marker.len()..idx + marker.len() + 5];
-        assert_eq!(got, "32282", "default-profile snapshot cch changed (re-derive literal)");
+        assert_eq!(
+            got, "32282",
+            "default-profile snapshot cch changed (re-derive literal)"
+        );
     }
 
     #[test]
@@ -2004,15 +2013,21 @@ mod tests {
         let vectors = [
             (
                 "claude-haiku-4-5",
-                include_str!("../../../../claude-code-provider/tools/fingerprint/vectors/vector-2.1.162-claude-haiku-4-5.json"),
+                include_str!(
+                    "../../../../claude-code-provider/tools/fingerprint/vectors/vector-2.1.162-claude-haiku-4-5.json"
+                ),
             ),
             (
                 "claude-sonnet-4-6",
-                include_str!("../../../../claude-code-provider/tools/fingerprint/vectors/vector-2.1.162-claude-sonnet-4-6.json"),
+                include_str!(
+                    "../../../../claude-code-provider/tools/fingerprint/vectors/vector-2.1.162-claude-sonnet-4-6.json"
+                ),
             ),
             (
                 "claude-opus-4-8",
-                include_str!("../../../../claude-code-provider/tools/fingerprint/vectors/vector-2.1.162-claude-opus-4-8.json"),
+                include_str!(
+                    "../../../../claude-code-provider/tools/fingerprint/vectors/vector-2.1.162-claude-opus-4-8.json"
+                ),
             ),
         ];
         for (model, body) in vectors {
@@ -2027,9 +2042,15 @@ mod tests {
                 &format!("{marker}00000;"),
                 1,
             );
-            assert_ne!(placeholder_body, body, "{model}: cch substitution was a no-op");
+            assert_ne!(
+                placeholder_body, body,
+                "{model}: cch substitution was a no-op"
+            );
             assert_eq!(
-                format!("{:05x}", claude_code_cch_checksum(placeholder_body.as_bytes())),
+                format!(
+                    "{:05x}",
+                    claude_code_cch_checksum(placeholder_body.as_bytes())
+                ),
                 embedded,
                 "cch != real Claude Code 2.1.162 cch for the {model} capture vector"
             );
@@ -2044,15 +2065,21 @@ mod tests {
         let vectors = [
             (
                 "claude-haiku-4-5",
-                include_str!("../../../../claude-code-provider/tools/fingerprint/vectors/vector-2.1.165-claude-haiku-4-5.json"),
+                include_str!(
+                    "../../../../claude-code-provider/tools/fingerprint/vectors/vector-2.1.165-claude-haiku-4-5.json"
+                ),
             ),
             (
                 "claude-sonnet-4-6",
-                include_str!("../../../../claude-code-provider/tools/fingerprint/vectors/vector-2.1.165-claude-sonnet-4-6.json"),
+                include_str!(
+                    "../../../../claude-code-provider/tools/fingerprint/vectors/vector-2.1.165-claude-sonnet-4-6.json"
+                ),
             ),
             (
                 "claude-opus-4-8",
-                include_str!("../../../../claude-code-provider/tools/fingerprint/vectors/vector-2.1.165-claude-opus-4-8.json"),
+                include_str!(
+                    "../../../../claude-code-provider/tools/fingerprint/vectors/vector-2.1.165-claude-opus-4-8.json"
+                ),
             ),
         ];
         for (model, body) in vectors {
@@ -2067,9 +2094,15 @@ mod tests {
                 &format!("{marker}00000;"),
                 1,
             );
-            assert_ne!(placeholder_body, body, "{model}: cch substitution was a no-op");
+            assert_ne!(
+                placeholder_body, body,
+                "{model}: cch substitution was a no-op"
+            );
             assert_eq!(
-                format!("{:05x}", claude_code_cch_checksum(placeholder_body.as_bytes())),
+                format!(
+                    "{:05x}",
+                    claude_code_cch_checksum(placeholder_body.as_bytes())
+                ),
                 embedded,
                 "cch != real Claude Code 2.1.165 cch for the {model} capture vector"
             );

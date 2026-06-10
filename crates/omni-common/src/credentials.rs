@@ -1,6 +1,6 @@
 //! Grok / xAI credentials loading, modeled exactly after the Claude Code Provider technique.
 //!
-//! Locked design (same as CCP): never cache. Always re-read per request. 
+//! Locked design (same as CCP): never cache. Always re-read per request.
 //! This picks up any background refresh or key rotation the user may have performed
 //! (e.g. via xAI console or a login helper that writes the file).
 //!
@@ -142,7 +142,10 @@ mod tests {
         write_temp_creds(&p, r#"{"foo": "bar"}"#);
         let res = GrokCredentials::load_fresh(&p);
         let _ = std::fs::remove_file(&p);
-        assert!(matches!(res.unwrap_err(), GrokCredentialsError::MissingToken));
+        assert!(matches!(
+            res.unwrap_err(),
+            GrokCredentialsError::MissingToken
+        ));
     }
 
     #[test]
@@ -156,7 +159,11 @@ mod tests {
         let got = GrokCredentials::default_path();
         // restore
         unsafe {
-            if let Some(v) = old { std::env::set_var("XAI_CREDENTIALS_PATH", v); } else { let _ = std::env::remove_var("XAI_CREDENTIALS_PATH"); }
+            if let Some(v) = old {
+                std::env::set_var("XAI_CREDENTIALS_PATH", v);
+            } else {
+                let _ = std::env::remove_var("XAI_CREDENTIALS_PATH");
+            }
         }
         assert_eq!(got, p);
     }
@@ -172,7 +179,9 @@ mod tests {
 
     #[test]
     fn check_expired_is_noop_for_api_keys() {
-        let c = GrokCredentials { api_key: "xai-foo".into() };
+        let c = GrokCredentials {
+            api_key: "xai-foo".into(),
+        };
         assert!(c.check_expired().is_ok());
     }
 
@@ -212,7 +221,10 @@ mod tests {
         write_temp_creds(&p, r#"{"other": "stuff"}"#);
         let res = GrokCredentials::load_fresh(&p);
         let _ = std::fs::remove_file(&p);
-        assert!(matches!(res.unwrap_err(), GrokCredentialsError::MissingToken));
+        assert!(matches!(
+            res.unwrap_err(),
+            GrokCredentialsError::MissingToken
+        ));
     }
 
     // Env override XAI_CREDENTIALS_PATH (already tested; re-exercise with async load too).
@@ -221,11 +233,17 @@ mod tests {
         let p = temp_credentials_path();
         write_temp_creds(&p, r#"{"apiKey": "env-override-key"}"#);
         let old = std::env::var("XAI_CREDENTIALS_PATH").ok();
-        unsafe { std::env::set_var("XAI_CREDENTIALS_PATH", p.to_str().unwrap()); }
+        unsafe {
+            std::env::set_var("XAI_CREDENTIALS_PATH", p.to_str().unwrap());
+        }
         let got = GrokCredentials::default_path();
         let c = GrokCredentials::load_fresh(&got).unwrap();
         unsafe {
-            if let Some(v) = old { std::env::set_var("XAI_CREDENTIALS_PATH", v); } else { let _ = std::env::remove_var("XAI_CREDENTIALS_PATH"); }
+            if let Some(v) = old {
+                std::env::set_var("XAI_CREDENTIALS_PATH", v);
+            } else {
+                let _ = std::env::remove_var("XAI_CREDENTIALS_PATH");
+            }
         }
         let _ = std::fs::remove_file(&p);
         assert_eq!(c.api_key, "env-override-key");
@@ -249,6 +267,9 @@ mod tests {
         write_temp_creds(&p, r#"{"apiKey": "   "} "#);
         let res = GrokCredentials::load_fresh(&p);
         let _ = std::fs::remove_file(&p);
-        assert!(matches!(res.unwrap_err(), GrokCredentialsError::MissingToken));
+        assert!(matches!(
+            res.unwrap_err(),
+            GrokCredentialsError::MissingToken
+        ));
     }
 }

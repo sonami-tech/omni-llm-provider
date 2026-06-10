@@ -18,8 +18,8 @@ use serde_json::Value;
 
 use omni_common::Replacements;
 use omni_core::{
-    CanonicalContent, CanonicalReasoning, CanonicalRequest, CanonicalResponse,
-    CanonicalTool, CanonicalToolCall, CanonicalToolChoice, CanonicalUsage,
+    CanonicalContent, CanonicalReasoning, CanonicalRequest, CanonicalResponse, CanonicalTool,
+    CanonicalToolCall, CanonicalToolChoice, CanonicalUsage,
 };
 
 use crate::fingerprint::FingerprintProfile;
@@ -287,20 +287,25 @@ pub fn build_messages_request_from_canonical(
     }
 
     let tool_choice = if tools.is_some() {
-        translate_tool_choice(&req.tool_choice, None)  // parallel handled elsewhere for now
+        translate_tool_choice(&req.tool_choice, None) // parallel handled elsewhere for now
     } else {
         None
     };
 
-    let mut max_tokens = req.max_tokens.unwrap_or_else(|| default_max_tokens(model_def));
+    let mut max_tokens = req
+        .max_tokens
+        .unwrap_or_else(|| default_max_tokens(model_def));
 
     let thinking = derive_thinking_from_canonical(req.reasoning.as_ref(), model_def);
 
     if let Some(t) = thinking.as_ref()
         && let Some(budget) = t.budget_tokens
-            && max_tokens <= budget {
-                max_tokens = budget.saturating_add(1024).min(default_max_tokens(model_def));
-            }
+        && max_tokens <= budget
+    {
+        max_tokens = budget
+            .saturating_add(1024)
+            .min(default_max_tokens(model_def));
+    }
 
     let thinking_active = thinking
         .as_ref()
@@ -312,11 +317,7 @@ pub fn build_messages_request_from_canonical(
     } else {
         req.temperature
     };
-    let top_p = if thinking_active {
-        None
-    } else {
-        req.top_p
-    };
+    let top_p = if thinking_active { None } else { req.top_p };
     let top_k = if thinking_active { None } else { None };
     let stop_sequences = if thinking_active { None } else { None };
 
@@ -354,7 +355,10 @@ fn derive_thinking_from_canonical(
     model_def: &ModelDef,
 ) -> Option<Thinking> {
     match reasoning {
-        Some(CanonicalReasoning { effort: Some(e), budget_tokens }) if !e.is_empty() => {
+        Some(CanonicalReasoning {
+            effort: Some(e),
+            budget_tokens,
+        }) if !e.is_empty() => {
             let budget = budget_tokens.or_else(|| Some(budget_for_effort(e, model_def)));
             Some(Thinking {
                 kind: "enabled".into(),
@@ -376,7 +380,10 @@ fn budget_for_effort(effort: &str, _model_def: &ModelDef) -> u32 {
 }
 
 fn tool_choice_requires_tool(choice: &Option<CanonicalToolChoice>) -> bool {
-    matches!(choice, Some(CanonicalToolChoice::Required) | Some(CanonicalToolChoice::Specific { .. }))
+    matches!(
+        choice,
+        Some(CanonicalToolChoice::Required) | Some(CanonicalToolChoice::Specific { .. })
+    )
 }
 
 fn translate_tools(tools: &[CanonicalTool], repl: &Replacements) -> Result<Vec<Tool>, String> {
@@ -401,8 +408,12 @@ fn translate_tool_choice(
 ) -> Option<ToolChoice> {
     match choice {
         None => None,
-        Some(CanonicalToolChoice::Auto) => Some(ToolChoice::Auto { disable_parallel_tool_use: None }),
-        Some(CanonicalToolChoice::Required) => Some(ToolChoice::Any { disable_parallel_tool_use: None }),
+        Some(CanonicalToolChoice::Auto) => Some(ToolChoice::Auto {
+            disable_parallel_tool_use: None,
+        }),
+        Some(CanonicalToolChoice::Required) => Some(ToolChoice::Any {
+            disable_parallel_tool_use: None,
+        }),
         Some(CanonicalToolChoice::Specific { name }) => Some(ToolChoice::Tool {
             name: name.clone(),
             disable_parallel_tool_use: None,
@@ -494,7 +505,11 @@ fn first_user_text_for_billing(req: &MessagesRequest) -> Option<&str> {
 
 // Apply inbound replacements (response scope) to assistant text + tool surfaces.
 #[allow(dead_code)]
-fn apply_response_replacements(text: &str, tool_calls: &mut [CanonicalToolCall], repl: &Replacements) -> String {
+fn apply_response_replacements(
+    text: &str,
+    tool_calls: &mut [CanonicalToolCall],
+    repl: &Replacements,
+) -> String {
     let t = repl.apply_response(text);
     for tc in tool_calls.iter_mut() {
         tc.name = repl.apply_response(&tc.name);
@@ -592,8 +607,8 @@ pub fn prepare_anthropic_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omni_core::CanonicalMessage;
     use crate::CLAUDE_CODE_SYSTEM_PREAMBLE;
+    use omni_core::CanonicalMessage;
 
     fn empty_repl() -> Replacements {
         Replacements::empty()
@@ -613,7 +628,9 @@ mod tests {
         let model_def = profile.resolve_model("haiku");
         let anth = build_messages_request_from_canonical(&req, model_def, &empty_repl()).unwrap();
         assert_eq!(anth.model, "claude-haiku-4-5-20251001");
-        assert!(matches!(anth.messages[0].content, MessageContent::Text(ref s) if s == "hello world"));
+        assert!(
+            matches!(anth.messages[0].content, MessageContent::Text(ref s) if s == "hello world")
+        );
     }
 
     #[test]
@@ -644,7 +661,9 @@ mod tests {
             _ => panic!("expected blocks"),
         };
         assert!(blocks.len() >= 2);
-        assert!(crate::fingerprint::is_claude_code_billing_header(&blocks[0].text));
+        assert!(crate::fingerprint::is_claude_code_billing_header(
+            &blocks[0].text
+        ));
         assert_eq!(blocks[1].text, CLAUDE_CODE_SYSTEM_PREAMBLE);
     }
 
@@ -655,10 +674,16 @@ mod tests {
             kind: "message".into(),
             role: "assistant".into(),
             model: "claude-haiku-4-5-20251001".into(),
-            content: vec![ResponseContentBlock::Text { text: "hi there".into() }],
+            content: vec![ResponseContentBlock::Text {
+                text: "hi there".into(),
+            }],
             stop_reason: Some("end_turn".into()),
             stop_sequence: None,
-            usage: Usage { input_tokens: 5, output_tokens: 2, ..Default::default() },
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 2,
+                ..Default::default()
+            },
         };
         let canon = build_canonical_response(&resp, "haiku", &empty_repl());
         assert_eq!(canon.model, "haiku");
@@ -669,10 +694,16 @@ mod tests {
 
     #[test]
     fn prepare_applies_repl_and_identity() {
-        let repl = Replacements::parse(r#"rule = [ { scope = "prompt", search = "SECRET", replace = "REDACTED" } ]"#).unwrap();
+        let repl = Replacements::parse(
+            r#"rule = [ { scope = "prompt", search = "SECRET", replace = "REDACTED" } ]"#,
+        )
+        .unwrap();
         let canon = CanonicalRequest {
             model: "sonnet".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("tell SECRET".into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("tell SECRET".into()),
+            }],
             ..Default::default()
         };
         let profile = crate::fingerprint::default_profile();
@@ -725,7 +756,10 @@ mod tests {
         let mut req = MessagesRequest {
             model: "haiku".into(),
             max_tokens: 1,
-            messages: vec![Message { role: "user".into(), content: MessageContent::Text("x".into()) }],
+            messages: vec![Message {
+                role: "user".into(),
+                content: MessageContent::Text("x".into()),
+            }],
             system: None,
             tools: None,
             tool_choice: None,
@@ -745,8 +779,14 @@ mod tests {
             _ => panic!(),
         };
         assert!(blocks.len() >= 2);
-        assert!(crate::fingerprint::is_claude_code_billing_header(&blocks[0].text), "billing must be [0]");
-        assert_eq!(blocks[1].text, CLAUDE_CODE_SYSTEM_PREAMBLE, "preamble must be exact at [1]");
+        assert!(
+            crate::fingerprint::is_claude_code_billing_header(&blocks[0].text),
+            "billing must be [0]"
+        );
+        assert_eq!(
+            blocks[1].text, CLAUDE_CODE_SYSTEM_PREAMBLE,
+            "preamble must be exact at [1]"
+        );
     }
 
     #[test]
@@ -754,10 +794,16 @@ mod tests {
         // Prompt-before-identity gate: repls (tool/prompt scope) run on texts
         // BEFORE billing_header_text is called, so suffix (and thus cch body)
         // is derived from post-repl bytes. Critical for gate fingerprint.
-        let repl = Replacements::parse(r#"rule = [ { scope = "prompt", search = "FOO", replace = "BAR" } ]"#).unwrap();
+        let repl = Replacements::parse(
+            r#"rule = [ { scope = "prompt", search = "FOO", replace = "BAR" } ]"#,
+        )
+        .unwrap();
         let canon = CanonicalRequest {
             model: "haiku".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("say FOO".into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("say FOO".into()),
+            }],
             ..Default::default()
         };
         let profile = crate::fingerprint::default_profile();
@@ -778,7 +824,10 @@ mod tests {
         // must be minimal + our injected.
         let mut canon = CanonicalRequest {
             model: "sonnet".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("hi".into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
             ..Default::default()
         };
         canon.provider_extras = Some(serde_json::json!({"foo":"bar"}));
@@ -801,8 +850,14 @@ mod tests {
             role: "assistant".into(),
             model: "claude-haiku-4-5-20251001".into(),
             content: vec![
-                ResponseContentBlock::ToolUse { id: "t1".into(), name: "do".into(), input: serde_json::json!({"x":1}) },
-                ResponseContentBlock::Text { text: "done".into() },
+                ResponseContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "do".into(),
+                    input: serde_json::json!({"x":1}),
+                },
+                ResponseContentBlock::Text {
+                    text: "done".into(),
+                },
             ],
             stop_reason: Some("tool_use".into()),
             stop_sequence: None,
@@ -825,14 +880,27 @@ mod tests {
 
     #[test]
     fn response_repl_applies_to_text_and_tool_surfaces() {
-        let repl = Replacements::parse(r#"rule = [ { scope = "response", search = "HIDE", replace = "SHOWN" } ]"#).unwrap();
+        let repl = Replacements::parse(
+            r#"rule = [ { scope = "response", search = "HIDE", replace = "SHOWN" } ]"#,
+        )
+        .unwrap();
         let resp = MessagesResponse {
-            id: "m".into(), kind: "message".into(), role: "assistant".into(),
+            id: "m".into(),
+            kind: "message".into(),
+            role: "assistant".into(),
             model: "haiku".into(),
-            content: vec![ ResponseContentBlock::ToolUse { id: "t".into(), name: "callHIDE".into(), input: serde_json::json!({}) } ],
+            content: vec![ResponseContentBlock::ToolUse {
+                id: "t".into(),
+                name: "callHIDE".into(),
+                input: serde_json::json!({}),
+            }],
             stop_reason: Some("tool_use".into()),
             stop_sequence: None,
-            usage: Usage { input_tokens: 1, output_tokens: 1, ..Default::default() },
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..Default::default()
+            },
         };
         let canon = build_canonical_response(&resp, "haiku", &repl);
         assert_eq!(canon.tool_calls[0].name, "callSHOWN");
@@ -845,7 +913,10 @@ mod tests {
         // by the LlmProvider send.
         let canon = CanonicalRequest {
             model: "haiku".into(),
-            messages: vec![CanonicalMessage { role: "user".into(), content: CanonicalContent::Text("p".into()) }],
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("p".into()),
+            }],
             ..Default::default()
         };
         let profile = crate::fingerprint::default_profile();
@@ -855,8 +926,14 @@ mod tests {
         prepend_claude_code_identity(&mut built, profile, true);
         let prepped = prepare_anthropic_request(&canon, profile, &repl, true).unwrap();
         // compare key identity + model
-        let bsys = match built.system { Some(SystemField::Blocks(b)) => b, _ => panic!() };
-        let psys = match prepped.system { Some(SystemField::Blocks(b)) => b, _ => panic!() };
+        let bsys = match built.system {
+            Some(SystemField::Blocks(b)) => b,
+            _ => panic!(),
+        };
+        let psys = match prepped.system {
+            Some(SystemField::Blocks(b)) => b,
+            _ => panic!(),
+        };
         assert_eq!(bsys[0].text, psys[0].text);
         assert_eq!(bsys[1].text, psys[1].text);
         assert_eq!(built.model, prepped.model);

@@ -149,7 +149,10 @@ pub fn resolve_model_in_catalog(
 }
 
 fn match_by_substring(input: &str, models: &'static [ModelDef]) -> Option<&'static ModelDef> {
-    models.iter().find(|&m| input.contains(m.cli_name)).map(|v| v as _)
+    models
+        .iter()
+        .find(|&m| input.contains(m.cli_name))
+        .map(|v| v as _)
 }
 
 fn default_model_def(
@@ -202,7 +205,11 @@ pub(crate) fn catalog_contains_unique_names(models: &'static [ModelDef]) -> bool
             if other.aliases.contains(&model.cli_name) || model.aliases.contains(&other.cli_name) {
                 return false;
             }
-            if model.aliases.iter().any(|alias| other.aliases.contains(alias)) {
+            if model
+                .aliases
+                .iter()
+                .any(|alias| other.aliases.contains(alias))
+            {
                 return false;
             }
         }
@@ -249,8 +256,8 @@ pub struct ModelInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fingerprint::default_profile;
     use crate::fingerprint::FingerprintProfile;
+    use crate::fingerprint::default_profile;
     fn profile() -> &'static FingerprintProfile {
         default_profile()
     }
@@ -303,11 +310,15 @@ mod tests {
     #[test]
     fn resolve_date_suffixed_via_substring() {
         assert_eq!(
-            profile().resolve_model("claude-opus-4-8-20260101").canonical,
+            profile()
+                .resolve_model("claude-opus-4-8-20260101")
+                .canonical,
             "claude-opus-4-8"
         );
         assert_eq!(
-            profile().resolve_model("claude-opus-4-6-20260101").canonical,
+            profile()
+                .resolve_model("claude-opus-4-6-20260101")
+                .canonical,
             "claude-opus-4-8"
         );
         assert_eq!(
@@ -335,7 +346,10 @@ mod tests {
     #[test]
     fn resolve_unknown_falls_back_to_default() {
         // 2.1.158+ default_model is "opus" (captured); older profiles used "sonnet".
-        assert_eq!(profile().resolve_model("gpt-4").canonical, "claude-opus-4-8");
+        assert_eq!(
+            profile().resolve_model("gpt-4").canonical,
+            "claude-opus-4-8"
+        );
         assert_eq!(
             profile().resolve_model("unknown").canonical,
             "claude-opus-4-8"
@@ -378,7 +392,10 @@ mod tests {
     #[test]
     fn resolve_canonical_exact() {
         assert_eq!(profile().resolve_model("claude-opus-4-8").cli_name, "opus");
-        assert_eq!(profile().resolve_model("claude-sonnet-4-6").cli_name, "sonnet");
+        assert_eq!(
+            profile().resolve_model("claude-sonnet-4-6").cli_name,
+            "sonnet"
+        );
     }
 
     #[test]
