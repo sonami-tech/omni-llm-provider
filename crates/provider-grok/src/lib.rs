@@ -137,11 +137,18 @@ impl GrokProvider {
     /// Resolve the effective bearer key the same way for every request: walk the credential
     /// source precedence ($XAI_CREDENTIALS_PATH -> ~/.xai/.credentials.json -> ~/.grok/auth.json)
     /// fresh (never cached, so a CLI re-login or key rotation is picked up), warning-but-continuing
-    /// if the token reports expired, and falling back to an explicit ctor key (set only by
-    /// `new(Some(..))` / `new_for_test`) when no source yields a key. Returns an `Auth` error when
-    /// neither the files nor a ctor key yield one. Shared by `send` and `send_stream` so the two
-    /// paths cannot drift in how they authenticate.
+    /// if the token reports expired. Shared by `send` and `send_stream` so the two paths cannot
+    /// drift in how they authenticate.
+    ///
+    /// Two failure rules:
+    /// - If `$XAI_CREDENTIALS_PATH` is set, it is an explicit, deliberate override: a load failure
+    ///   there is surfaced LOUDLY and is never masked by the ctor key. (Production never sets a ctor
+    ///   key; this just keeps an explicit-override misconfiguration from silently using something else.)
+    /// - Otherwise, when the default file chain yields nothing, fall back to an explicit ctor key
+    ///   (set only by `new(Some(..))` / `new_for_test`; production `new(None)` never sets one), and
+    ///   only if that is also absent return an `Auth` error.
     async fn resolve_api_key(&self) -> Result<String, ProviderError> {
+        let explicit_override = std::env::var_os("XAI_CREDENTIALS_PATH").is_some();
         match GrokCredentials::load_resolved_async().await {
             Ok(creds) => {
                 if let Err(e) = creds.check_expired() {
@@ -152,16 +159,23 @@ impl GrokProvider {
                 }
                 Ok(creds.api_key)
             }
+            Err(e) if explicit_override => {
+                // The user pointed XAI_CREDENTIALS_PATH at a specific file; a failure to load it
+                // must not silently fall through to the ctor key. Surface it.
+                Err(ProviderError::Auth(format!(
+                    "failed to load Grok credentials from $XAI_CREDENTIALS_PATH: {}",
+                    e
+                )))
+            }
             Err(e) => {
-                // Fallback to an explicit key the provider was constructed with. Production
-                // (`new(None)`) never sets this, so the files are the only credential source;
-                // it is populated solely by tests and explicit `new(Some(..))` callers.
+                // No explicit override; the default file chain yielded nothing. Fall back to an
+                // explicit ctor key if one was provided (tests / explicit `new(Some(..))` callers).
                 if let Some(k) = &self.api_key {
                     debug!(error = %e, "no grok creds file (or load failed); using explicit ctor key");
                     Ok(k.clone())
                 } else {
                     Err(ProviderError::Auth(format!(
-                        "failed to load Grok credentials (tried $XAI_CREDENTIALS_PATH, ~/.xai/.credentials.json, ~/.grok/auth.json): {}",
+                        "failed to load Grok credentials (tried ~/.xai/.credentials.json, ~/.grok/auth.json): {}",
                         e
                     )))
                 }
@@ -1239,21 +1253,23 @@ mod tests {
     }
 
     #[tokio::test]
+    // Holds CRED_ENV_LOCK across the send().await on purpose: send() -> resolve_api_key()
+    // re-reads XAI_CREDENTIALS_PATH, so the lock must stay held through the network call to
+    // keep a concurrent credential test from mutating that env mid-send (which could swap in a
+    // dummy key). Safe: #[tokio::test] is a current-thread runtime, so the task never migrates
+    // threads while the std Mutex guard is held.
+    #[allow(clippy::await_holding_lock)]
     async fn test_send_real_if_key_present() {
-        // "real if creds, but mocked" -- when ~/.xai/.credentials.json is present, exercises the full
-        // send path against live xAI (uses the real file key, real net); otherwise returns early
-        // (mocked/no-op for CI without secrets).
-        // Snapshot the key UNDER CRED_ENV_LOCK so this live test cannot read while a credential test
-        // is mutating XAI_CREDENTIALS_PATH (live_grok_key returns None whenever that env is set, so a
-        // concurrent mutation could otherwise blank the key). We take the lock only to copy the key
-        // into a local, then drop it before the network await (no lock held across .await).
+        // "real if creds, but mocked" -- when real Grok creds are reachable (a static file or the
+        // Grok CLI login), exercises the full send path against live xAI (real key, real net);
+        // otherwise returns early (mocked/no-op for CI without secrets).
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let key = {
-            let _guard = CRED_ENV_LOCK.lock().expect("cred lock for live read");
             match live_grok_key() {
                 Some(k) => k,
                 None => {
                     eprintln!(
-                        "skipping real grok send test (no ~/.xai/.credentials.json; using mocked behavior)"
+                        "skipping real grok send test (no Grok creds; using mocked behavior)"
                     );
                     return;
                 }
@@ -1589,7 +1605,7 @@ mod tests {
     async fn test_credentials_file_load_in_send() {
         // prove send path does fresh file load: write dummy creds file, point env, use new(None) so no ctor fallback,
         // hit bad-port upstream -> must be network err (not Auth) proving load succeeded and key taken from file.
-        let _guard = CRED_ENV_LOCK.lock().expect("cred lock for env mutate");
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp = ::std::env::temp_dir()
             .join(format!("xai-creds-grok-test-{}.json", ::std::process::id()));
         ::std::fs::write(&tmp, r#"{"apiKey": "xai-from-file-dummy-for-load-test"}"#).unwrap();
@@ -1634,7 +1650,7 @@ mod tests {
     // on the current-thread test runtime.
     #[allow(clippy::await_holding_lock)]
     async fn test_credentials_bad_file_no_key_gives_auth_error() {
-        let _guard = CRED_ENV_LOCK.lock().expect("cred lock for env mutate");
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let non = format!("/tmp/xai-no-such-creds-{}.json", ::std::process::id());
         let _ = ::std::fs::remove_file(&non);
         let old = ::std::env::var("XAI_CREDENTIALS_PATH").ok();
@@ -1677,9 +1693,12 @@ mod tests {
     // See test_credentials_file_load_in_send: env lock held across await is safe
     // on the current-thread test runtime.
     #[allow(clippy::await_holding_lock)]
-    async fn test_xai_credentials_path_and_ctor_fallback() {
-        // XAI_CREDENTIALS_PATH honored; when load fails, ctor key (simulating env) is fallback
-        let _guard = CRED_ENV_LOCK.lock().expect("cred lock for env mutate");
+    async fn test_xai_credentials_path_explicit_failure_is_loud_not_ctor_masked() {
+        // Adversarial-review contract: an explicit $XAI_CREDENTIALS_PATH pointing at a missing
+        // file is a deliberate misconfiguration and must surface LOUDLY as an Auth error, even
+        // when a ctor key is present -- the ctor key must NOT mask it. (Production never sets a
+        // ctor key, so this only guards the new(Some)/new_for_test paths.)
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let non = format!("/tmp/xai-no-creds-fallback-{}.json", ::std::process::id());
         let _ = ::std::fs::remove_file(&non);
         let old = ::std::env::var("XAI_CREDENTIALS_PATH").ok();
@@ -1703,13 +1722,60 @@ mod tests {
                 ::std::env::remove_var("XAI_CREDENTIALS_PATH");
             }
         }
-        // load failed -> used ctor key -> still network err (not the "no key" Auth)
+        // Explicit override failed -> loud Auth error, NOT a network error from a ctor-key send.
+        match err {
+            ProviderError::Auth(s) => assert!(
+                s.contains("$XAI_CREDENTIALS_PATH"),
+                "expected loud override-failure Auth error, got: {}",
+                s
+            ),
+            other => panic!(
+                "explicit override failure must be loud, not ctor-masked; got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_ctor_key_used_when_no_file_source_present() {
+        // The ctor-key fallback (no explicit override) still works: point XAI_CREDENTIALS_PATH at
+        // a VALID temp file holding the test key, so the override succeeds and the key flows to
+        // send -- proving the key reaches the upstream (dead port -> network err, not Auth). This
+        // exercises the explicit-key send path without abusing the override as a failure trigger.
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = ::std::env::temp_dir()
+            .join(format!("xai-ctor-path-valid-{}.json", ::std::process::id()));
+        ::std::fs::write(&tmp, r#"{"apiKey": "xai-ctor-key-via-valid-file"}"#).unwrap();
+        let old = ::std::env::var("XAI_CREDENTIALS_PATH").ok();
+        unsafe {
+            ::std::env::set_var("XAI_CREDENTIALS_PATH", tmp.to_str().unwrap());
+        }
+        let p = GrokProvider::new_for_test("ignored-ctor-key", "http://127.0.0.1:1");
+        let req = CanonicalRequest {
+            model: "grok-3-mini".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("ctor send".into()),
+            }],
+            ..Default::default()
+        };
+        let err = p.send(req).await.unwrap_err();
+        unsafe {
+            if let Some(v) = old {
+                ::std::env::set_var("XAI_CREDENTIALS_PATH", v);
+            } else {
+                ::std::env::remove_var("XAI_CREDENTIALS_PATH");
+            }
+        }
+        let _ = ::std::fs::remove_file(&tmp);
+        // Key resolved from the file -> reached the (dead) upstream -> network err, not Auth.
         match err {
             ProviderError::Upstream(s) => {
                 assert!(s.contains("error calling xAI") || s.contains("connection"))
             }
             other => panic!(
-                "expected fallback to ctor key then upstream, got {:?}",
+                "expected key resolution then upstream net err, got {:?}",
                 other
             ),
         }
@@ -1720,19 +1786,23 @@ mod tests {
     // on the current-thread test runtime.
     #[allow(clippy::await_holding_lock)]
     async fn test_send_401_on_bad_key_forced_via_creds_path() {
-        // Always exercises 401 path from xAI (no secret needed): force non-existent creds file so load fails,
-        // ctor supplies a deliberately invalid key, real base_url -> 401 upstream error.
-        let _guard = CRED_ENV_LOCK.lock().expect("cred lock for env mutate");
-        let non = format!("/tmp/xai-badkey-401-{}.json", ::std::process::id());
-        let _ = ::std::fs::remove_file(&non);
+        // Always exercises 401 path from xAI (no secret needed): a deliberately invalid key is
+        // placed in a VALID creds file the loader reads, real base_url -> 401 upstream error.
+        // (Using a valid file -- not a missing one -- so the key actually resolves and reaches
+        // xAI under the new "explicit override failure is loud" contract.)
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp =
+            ::std::env::temp_dir().join(format!("xai-badkey-401-{}.json", ::std::process::id()));
+        ::std::fs::write(
+            &tmp,
+            r#"{"apiKey": "xai-DEFINITELY-INVALID-KEY-FOR-TEST-401-XYZ"}"#,
+        )
+        .unwrap();
         let old = ::std::env::var("XAI_CREDENTIALS_PATH").ok();
         unsafe {
-            ::std::env::set_var("XAI_CREDENTIALS_PATH", &non);
+            ::std::env::set_var("XAI_CREDENTIALS_PATH", tmp.to_str().unwrap());
         }
-        let p = GrokProvider::new_for_test(
-            "xai-DEFINITELY-INVALID-KEY-FOR-TEST-401-XYZ",
-            "https://api.x.ai/v1",
-        );
+        let p = GrokProvider::new_for_test("ignored-ctor-key", "https://api.x.ai/v1");
         let req = CanonicalRequest {
             model: "grok-3-mini".into(),
             messages: vec![CanonicalMessage {
@@ -1750,6 +1820,7 @@ mod tests {
                 ::std::env::remove_var("XAI_CREDENTIALS_PATH");
             }
         }
+        let _ = ::std::fs::remove_file(&tmp);
         match err {
             ProviderError::Upstream(s) => {
                 assert!(
@@ -1766,20 +1837,21 @@ mod tests {
     }
 
     #[tokio::test]
+    // Holds CRED_ENV_LOCK across the send().await calls (see test_send_real_if_key_present):
+    // send() re-reads XAI_CREDENTIALS_PATH, so the lock must stay held through the network calls
+    // to keep a concurrent credential test from swapping the env mid-send. Safe on the
+    // current-thread test runtime.
+    #[allow(clippy::await_holding_lock)]
     async fn test_send_400_and_real_error_cases_conditional() {
-        // When real key present, exercise a 4xx error path (bad model) in addition to success path.
-        // Snapshot the key UNDER CRED_ENV_LOCK (see test_send_real_if_key_present) so this live
-        // test cannot read a transiently-blanked env while a credential test mutates it.
-        let key = {
-            let _guard = CRED_ENV_LOCK.lock().expect("cred lock for live read");
-            match live_grok_key() {
-                Some(k) => k,
-                None => {
-                    eprintln!(
-                        "skipping 400 error case (no ~/.xai/.credentials.json); 401 path covered unconditionally"
-                    );
-                    return;
-                }
+        // When real creds present, exercise a 4xx error path (bad model) in addition to success path.
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let key = match live_grok_key() {
+            Some(k) => k,
+            None => {
+                eprintln!(
+                    "skipping 400 error case (no Grok creds); 401 path covered unconditionally"
+                );
+                return;
             }
         };
         // success part (similar to existing)
@@ -2003,7 +2075,7 @@ mod tests {
         // upstream (here a dead port, so it fails with a NETWORK error, proving the
         // key was resolved from the file, not an Auth error that would mean the file
         // was ignored / the key dropped).
-        let _guard = CRED_ENV_LOCK.lock().expect("cred lock for env mutate");
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let creds = ::std::env::temp_dir().join(format!(
             "xai-creds-present-{}-filekeytest.json",
             ::std::process::id()
@@ -2243,20 +2315,21 @@ mod tests {
     }
 
     #[tokio::test]
+    // Holds CRED_ENV_LOCK across the streaming send().await (see test_send_real_if_key_present):
+    // send_stream() re-reads XAI_CREDENTIALS_PATH via resolve_api_key, so the lock must stay held
+    // through the network call to keep a concurrent credential test from swapping the env mid-send.
+    // Safe on the current-thread test runtime.
+    #[allow(clippy::await_holding_lock)]
     async fn test_send_stream_real_if_creds_present() {
-        // Guarded live test: only runs when ~/.xai/.credentials.json is present. Otherwise skips so
-        // the offline suite stays green. Mirrors the existing guarded-live pattern
-        // (test_send_real_if_key_present).
-        // Snapshot the key UNDER CRED_ENV_LOCK (see the note in test_send_real_if_key_present) so this
-        // live test cannot race the env-mutating credential tests. Lock dropped before the network await.
-        let key = {
-            let _guard = CRED_ENV_LOCK.lock().expect("cred lock for live read");
-            match live_grok_key() {
-                Some(k) => k,
-                None => {
-                    eprintln!("skipping real grok stream test (no ~/.xai/.credentials.json)");
-                    return;
-                }
+        // Guarded live test: only runs when real Grok creds are reachable (static file or Grok CLI
+        // login). Otherwise skips so the offline suite stays green. Mirrors the existing guarded-live
+        // pattern (test_send_real_if_key_present).
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let key = match live_grok_key() {
+            Some(k) => k,
+            None => {
+                eprintln!("skipping real grok stream test (no Grok creds)");
+                return;
             }
         };
         let p = GrokProvider::new(Some(key)).expect("ctor for live stream test");
@@ -2286,35 +2359,30 @@ mod tests {
         );
     }
 
-    /// True when real, human-provisioned xAI credentials are reachable for a live test: a credentials
-    /// file at the canonical `~/.xai/.credentials.json` home path. We deliberately read the *home* path
-    /// directly rather than `GrokCredentials::default_path()` because that honors `$XAI_CREDENTIALS_PATH`,
-    /// which the credential tests in this module set to a throwaway dummy-key file under the
-    /// `CRED_ENV_LOCK`; keying the live guard off it would race those tests and trigger a real (failing)
-    /// network call with a junk key. Requiring `XAI_CREDENTIALS_PATH` to be unset before trusting the
-    /// file makes this fully race-immune and keeps the offline suite green.
-    /// Read a real xAI key from the canonical `~/.xai/.credentials.json` home file for live tests,
-    /// returning None when it is absent/unreadable or when `$XAI_CREDENTIALS_PATH` is set (which means
-    /// a credential test is pointing the loader at a throwaway dummy file, so the home file must not be
-    /// trusted for a live network call). Live tests use this to obtain the key explicitly instead of
-    /// relying on the loader's env-honoring `default_path()`, keeping them race-immune against the
-    /// env-mutating credential tests.
+    /// Read a real xAI key for a live test from the SAME home sources production auto-detects:
+    /// `~/.xai/.credentials.json` (static key) then `~/.grok/auth.json` (the Grok CLI's OIDC login).
+    /// This is what makes the provider-crate live tests exercise the "grok CLI Just Works" path, not
+    /// only a static file. Returns None when neither home file yields a key, or when
+    /// `$XAI_CREDENTIALS_PATH` is set -- which means a credential test is pointing the loader at a
+    /// throwaway dummy file, so the home files must not be trusted for a live network call. Reusing
+    /// the production parser (`GrokCredentials::load_fresh`) keeps this in lockstep with real parsing.
+    /// Requiring `XAI_CREDENTIALS_PATH` to be unset makes it race-immune against the env-mutating
+    /// credential tests and keeps the offline suite green.
     fn live_grok_key() -> Option<String> {
         if std::env::var_os("XAI_CREDENTIALS_PATH").is_some() {
             return None;
         }
         let home = std::env::var_os("HOME")?;
-        let path = ::std::path::Path::new(&home)
-            .join(".xai")
-            .join(".credentials.json");
-        let bytes = std::fs::read(&path).ok()?;
-        let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-        let key = v
-            .get("apiKey")
-            .or_else(|| v.get("xaiApiKey"))
-            .and_then(|k| k.as_str())?
-            .trim()
-            .to_string();
-        if key.is_empty() { None } else { Some(key) }
+        let home = ::std::path::Path::new(&home);
+        let candidates = [
+            home.join(".xai").join(".credentials.json"),
+            home.join(".grok").join("auth.json"),
+        ];
+        for path in candidates {
+            if let Ok(creds) = GrokCredentials::load_fresh(&path) {
+                return Some(creds.api_key);
+            }
+        }
+        None
     }
 }

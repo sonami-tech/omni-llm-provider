@@ -118,19 +118,32 @@ impl GrokCredentials {
         // 2. Static-key default file (deliberate console key beats the CLI login).
         if let Some(home) = dirs::home_dir() {
             let static_path = home.join(".xai").join(".credentials.json");
-            if tokio::fs::try_exists(&static_path).await.unwrap_or(false) {
+            if Self::probe_exists(&static_path).await? {
                 return Self::load_fresh_async(&static_path).await;
             }
         }
 
         // 3. The Grok CLI's OIDC login file (auto-detect).
         if let Some(cli_path) = Self::grok_cli_path()
-            && tokio::fs::try_exists(&cli_path).await.unwrap_or(false)
+            && Self::probe_exists(&cli_path).await?
         {
             return Self::load_fresh_async(&cli_path).await;
         }
 
         Err(GrokCredentialsError::NoSource)
+    }
+
+    /// Probe whether a source file exists, distinguishing "absent" (skip to the next source)
+    /// from a genuine probe error such as a permissions or path-component failure. A bare
+    /// `try_exists(..).unwrap_or(false)` would turn an EACCES on a present file into "absent"
+    /// and silently fall through to a lower-precedence source, selecting the wrong credential.
+    /// We only treat `NotFound` as absent; any other error propagates loudly.
+    async fn probe_exists(path: &Path) -> Result<bool, GrokCredentialsError> {
+        match tokio::fs::try_exists(path).await {
+            Ok(exists) => Ok(exists),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(GrokCredentialsError::Read(e)),
+        }
     }
 
     /// Read and parse a specific credentials file synchronously. Never cached.
@@ -148,8 +161,10 @@ impl GrokCredentials {
     }
 
     /// Parse either credential shape from raw bytes. Tries the Grok CLI OIDC shape first
-    /// (it is unambiguous: a top-level entry carrying a `key` + `auth_mode:"oidc"`), then
-    /// the simple static-key shape. This lets `$XAI_CREDENTIALS_PATH` point at either file.
+    /// (a top-level entry KEYED by `https://auth.x.ai::<id>` carrying `key` + `auth_mode:"oidc"`),
+    /// then the simple static-key shape. The key-prefix gate makes the two shapes unambiguous,
+    /// so `$XAI_CREDENTIALS_PATH` may point at either file and a static-key file that happens to
+    /// contain an unrelated nested `oidc`-shaped object is NOT mistaken for a CLI login.
     fn from_bytes(bytes: &[u8]) -> Result<Self, GrokCredentialsError> {
         let value: serde_json::Value = serde_json::from_slice(bytes)?;
 
@@ -170,12 +185,21 @@ impl GrokCredentials {
         })
     }
 
-    /// Recognize the Grok CLI's `~/.grok/auth.json` shape: a JSON object whose values are
-    /// per-client entries. We accept any value that carries a non-empty `key` and an
-    /// `auth_mode` of "oidc" (the CLI's login mode), reading the JWT and its expiry.
+    /// The top-level map-key prefix that identifies a Grok CLI OIDC entry. The CLI keys each
+    /// entry by `<issuer>::<client-id>`, e.g. `https://auth.x.ai::b1a0...`. We gate on this
+    /// prefix so only the genuine CLI shape is treated as an OIDC credential.
+    const GROK_CLI_KEY_PREFIX: &'static str = "https://auth.x.ai";
+
+    /// Recognize the Grok CLI's `~/.grok/auth.json` shape: a JSON object whose entries are keyed
+    /// by `https://auth.x.ai::<client-id>` and whose value carries a non-empty `key` (the JWT) and
+    /// `auth_mode:"oidc"`. We require the key prefix AND the oidc marker AND a key, so a static-key
+    /// file cannot be misread as a CLI login. Reads the JWT and its expiry.
     fn try_grok_cli(value: &serde_json::Value) -> Option<GrokCredentials> {
         let obj = value.as_object()?;
-        for entry_val in obj.values() {
+        for (map_key, entry_val) in obj {
+            if !map_key.starts_with(Self::GROK_CLI_KEY_PREFIX) {
+                continue;
+            }
             let entry: GrokCliEntry = match serde_json::from_value(entry_val.clone()) {
                 Ok(e) => e,
                 Err(_) => continue,
@@ -275,7 +299,7 @@ mod tests {
 
     #[test]
     fn default_path_respects_env_override_xai_credentials_path() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let p = temp_credentials_path();
         let old = std::env::var("XAI_CREDENTIALS_PATH").ok();
         // SAFETY: test-only mutation of process env for override verification; serialized by ENV_LOCK.
@@ -357,7 +381,7 @@ mod tests {
     // Env override XAI_CREDENTIALS_PATH (already tested; re-exercise with async load too).
     #[test]
     fn env_override_xai_credentials_path() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let p = temp_credentials_path();
         write_temp_creds(&p, r#"{"apiKey": "env-override-key"}"#);
         let old = std::env::var("XAI_CREDENTIALS_PATH").ok();
@@ -468,6 +492,43 @@ mod tests {
     }
 
     #[test]
+    fn static_key_file_with_incidental_oidc_sibling_resolves_to_static_key() {
+        // WHY (adversarial-review regression): try_grok_cli must gate on the top-level
+        // `https://auth.x.ai::` map-key prefix. A deliberately-written static-key file that
+        // happens to carry an unrelated nested object shaped like an OIDC entry must resolve
+        // to the real apiKey, NOT the stray JWT -- otherwise the wrong token is sent.
+        let p = temp_credentials_path();
+        write_temp_creds(
+            &p,
+            r#"{ "apiKey": "xai-the-real-console-key",
+                 "profile": { "key": "jwt-WRONG", "auth_mode": "oidc",
+                              "expires_at": "2999-01-01T00:00:00Z" } }"#,
+        );
+        let c = GrokCredentials::load_fresh(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(c.api_key, "xai-the-real-console-key");
+        assert!(c.expires_at_ms.is_none(), "static key carries no expiry");
+    }
+
+    #[test]
+    fn oidc_entry_without_auth_x_ai_key_prefix_is_ignored() {
+        // WHY: the oidc marker alone is not enough; the entry must be keyed by the CLI's
+        // issuer prefix. A wrongly-keyed oidc-shaped entry is not a CLI login, so (lacking a
+        // static apiKey too) the load yields MissingToken rather than a bogus credential.
+        let p = temp_credentials_path();
+        write_temp_creds(
+            &p,
+            r#"{ "https://evil.example::x": { "key": "jwt-evil", "auth_mode": "oidc" } }"#,
+        );
+        let res = GrokCredentials::load_fresh(&p);
+        let _ = std::fs::remove_file(&p);
+        assert!(matches!(
+            res.unwrap_err(),
+            GrokCredentialsError::MissingToken
+        ));
+    }
+
+    #[test]
     fn from_bytes_accepts_either_shape_via_explicit_path() {
         // WHY: $XAI_CREDENTIALS_PATH may point at EITHER file shape. Prove load_fresh parses
         // both, so the explicit override is not locked to one format.
@@ -509,7 +570,7 @@ mod tests {
     async fn resolved_honors_explicit_env_override_first() {
         // WHY: $XAI_CREDENTIALS_PATH is the highest-precedence source. When set, it is the only
         // source consulted, so an OIDC file there resolves even if it is the explicit path.
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let p = temp_credentials_path();
         write_temp_creds(&p, &grok_cli_json("jwt-via-env", "2999-01-01T00:00:00Z"));
         let old = std::env::var("XAI_CREDENTIALS_PATH").ok();
@@ -536,7 +597,7 @@ mod tests {
         // WHY: an explicit override is deliberate. If it points at a missing/broken file we must
         // surface that loudly (a Read error) rather than silently falling through to the home
         // files, which would mask a misconfiguration.
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let missing = temp_credentials_path();
         let _ = std::fs::remove_file(&missing);
         let old = std::env::var("XAI_CREDENTIALS_PATH").ok();
