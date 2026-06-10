@@ -250,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health_handler))
         .route("/", get(root_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
+        .route("/v1/responses", post(responses_handler))
         .route("/v1/models", get(models_handler))
         .route("/models", get(models_handler))
         .with_state(Arc::new(state))
@@ -523,12 +524,47 @@ fn map_provider_err(e: ProviderError) -> AppError {
 /// same prefix routing as chat completions; unsupported input shapes map to
 /// BadRequest; non-stream returns the Responses envelope; stream:true returns
 /// Responses SSE events (response.created ... response.completed, no [DONE]).
-#[allow(dead_code)] // TDD red phase: registered in the router in the green phase
 async fn responses_handler(
-    State(_state): State<Arc<AppState>>,
-    Json(_body): Json<omni_common::ResponsesRequest>,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<omni_common::ResponsesRequest>,
 ) -> Result<axum::response::Response, AppError> {
-    todo!("TDD green phase: implement the Responses protocol handler")
+    let enabled: Vec<String> = state.providers.keys().cloned().collect();
+    let (prov_key, stripped_model) =
+        resolve_provider_and_model(&body.model, &enabled).map_err(AppError::BadRequest)?;
+
+    let provider = state
+        .providers
+        .get(&prov_key)
+        .ok_or_else(|| AppError::ServerError("provider disappeared".into()))?;
+
+    // Convert the Responses request to canonical, then swap in the stripped model
+    // so the delegated provider sees the real backend model name. Unsupported
+    // input shapes are rejected loudly as a 400 naming the offender.
+    let mut canon = omni_common::responses_to_canonical(&body).map_err(AppError::BadRequest)?;
+    canon.model = stripped_model;
+
+    let response_id = format!("resp_{}", Uuid::new_v4());
+    let created_at = omni_common::unix_now_secs();
+
+    if body.stream {
+        let stream = provider
+            .send_stream(canon)
+            .await
+            .map_err(map_provider_err)?;
+        // Echo the original (prefixed) model for client UX.
+        let sse = omni_common::sse_from_canonical_stream_responses(
+            stream,
+            body.model,
+            response_id,
+            created_at,
+        );
+        return Ok(sse.into_response());
+    }
+
+    let canon_resp: CanonicalResponse = provider.send(canon).await.map_err(map_provider_err)?;
+    let resp =
+        omni_common::responses_from_canonical(canon_resp, body.model, response_id, created_at);
+    Ok(Json(resp).into_response())
 }
 
 #[cfg(test)]

@@ -56,7 +56,8 @@ use uuid::Uuid;
 
 use omni_common::{
     AppError, ChatCompletionRequest, Stats, TokenUsage, auth_layer, from_canonical,
-    sse_from_canonical_stream, to_canonical, unix_now_secs,
+    responses_from_canonical, responses_to_canonical, sse_from_canonical_stream,
+    sse_from_canonical_stream_responses, to_canonical, unix_now_secs,
 };
 use omni_core::{LlmProvider, ProviderError};
 use provider_claude::ClaudeProvider;
@@ -183,6 +184,7 @@ fn build_router(state: Arc<AppState>, auth_keys: Arc<HashSet<String>>) -> Router
         .route("/health", get(health_handler))
         .route("/", get(root_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
+        .route("/v1/responses", post(responses_handler))
         .route("/v1/models", get(models_handler))
         .route("/models", get(models_handler))
         .route("/stats", get(stats_handler))
@@ -308,12 +310,56 @@ fn record_and_map(state: &AppState, model: &str, e: ProviderError) -> AppError {
 /// Responses envelope; stream:true returns Responses SSE (response.created
 /// ... response.completed, no [DONE]); requests/errors recorded in stats
 /// exactly like chat completions.
-#[allow(dead_code)] // TDD red phase: registered in build_router in the green phase
 async fn responses_handler(
-    State(_state): State<Arc<AppState>>,
-    Json(_body): Json<omni_common::ResponsesRequest>,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<omni_common::ResponsesRequest>,
 ) -> Result<axum::response::Response, AppError> {
-    todo!("TDD green phase: implement the Responses protocol handler")
+    let model = body.model.clone();
+    let stream = body.stream;
+
+    // Record the inbound request FIRST (mirroring the chat handler's record-then
+    // -work order) so even a request later rejected for unsupported input counts
+    // as inbound traffic; an unrecorded protocol would skew per-model accounting.
+    if let Some(s) = &state.stats {
+        s.record_request(&model, None);
+    }
+
+    // Unsupported input shapes are rejected loudly as a 400 naming the offender.
+    let canon = responses_to_canonical(&body).map_err(AppError::BadRequest)?;
+
+    let response_id = format!("resp_{}", Uuid::new_v4());
+    let created_at = unix_now_secs();
+
+    if stream {
+        let stream = state
+            .provider
+            .send_stream(canon)
+            .await
+            .map_err(|e| record_and_map(&state, &model, e))?;
+        let sse = sse_from_canonical_stream_responses(stream, model, response_id, created_at);
+        return Ok(sse.into_response());
+    }
+
+    let started = Instant::now();
+    let canon_resp = state
+        .provider
+        .send(canon)
+        .await
+        .map_err(|e| record_and_map(&state, &model, e))?;
+
+    if let Some(s) = &state.stats {
+        let usage = TokenUsage {
+            input_tokens: canon_resp.usage.input_tokens,
+            output_tokens: canon_resp.usage.output_tokens,
+            cache_read_input_tokens: canon_resp.usage.cache_read,
+            cache_creation_input_tokens: canon_resp.usage.cache_creation,
+        };
+        let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
+        s.record_response(&model, usage, None, dur_ms);
+    }
+
+    let resp = responses_from_canonical(canon_resp, model, response_id, created_at);
+    Ok(Json(resp).into_response())
 }
 
 #[cfg(test)]

@@ -24,7 +24,10 @@ use axum::response::sse::{Event, Sse};
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 
-use omni_core::{CanonicalRequest, CanonicalResponse, CanonicalStream};
+use omni_core::{
+    CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest, CanonicalResponse,
+    CanonicalStream, CanonicalStreamEvent, CanonicalTool, CanonicalToolChoice,
+};
 
 /// The boxed SSE event stream produced by the Responses framer. Boxed so the
 /// signature stays stable while the implementation evolves (and so the TDD
@@ -204,9 +207,121 @@ pub struct ResponsesUsage {
 ///   "none" -> drop tools and tool_choice entirely
 /// - unsupported shapes (non-message item types, non-text parts, non-function
 ///   tools, message items without a role) -> Err naming the offender
-#[allow(unused_variables)] // TDD red phase: parameters used once implemented
 pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest, String> {
-    todo!("TDD green phase: implement Responses -> canonical conversion")
+    let mut messages: Vec<CanonicalMessage> = Vec::new();
+
+    // `instructions` is the Responses system prompt: a leading system message.
+    if let Some(instructions) = req.instructions.as_ref() {
+        messages.push(CanonicalMessage {
+            role: "system".into(),
+            content: CanonicalContent::Text(instructions.clone()),
+        });
+    }
+
+    match &req.input {
+        ResponsesInput::Text(text) => {
+            messages.push(CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text(text.clone()),
+            });
+        }
+        ResponsesInput::Items(items) => {
+            for item in items {
+                // Non-message item types (function_call_output, ...) need richer
+                // canonical content than v1 has; reject by name rather than mangle.
+                if let Some(kind) = item.kind.as_deref()
+                    && kind != "message"
+                {
+                    return Err(format!("unsupported input item type: {kind}"));
+                }
+                let role = item
+                    .role
+                    .as_deref()
+                    .ok_or_else(|| "message input item missing role".to_string())?;
+                let role = if role == "developer" { "system" } else { role };
+                let text = match item.content.as_ref() {
+                    Some(ResponsesInputContent::Text(t)) => t.clone(),
+                    Some(ResponsesInputContent::Parts(parts)) => {
+                        let mut fragments = Vec::with_capacity(parts.len());
+                        for part in parts {
+                            if part.kind != "input_text" && part.kind != "output_text" {
+                                return Err(format!(
+                                    "unsupported content part type: {}",
+                                    part.kind
+                                ));
+                            }
+                            fragments.push(part.text.clone().unwrap_or_default());
+                        }
+                        fragments.join("\n")
+                    }
+                    None => String::new(),
+                };
+                messages.push(CanonicalMessage {
+                    role: role.to_string(),
+                    content: CanonicalContent::Text(text),
+                });
+            }
+        }
+    }
+
+    // Flattened function tools -> canonical tools (non-function tools rejected).
+    let tools = match req.tools.as_ref() {
+        Some(ts) if !ts.is_empty() => {
+            let mut out = Vec::with_capacity(ts.len());
+            for t in ts {
+                if t.kind != "function" {
+                    return Err(format!("unsupported tool type: {}", t.kind));
+                }
+                out.push(CanonicalTool {
+                    name: t.name.clone().unwrap_or_default(),
+                    description: t.description.clone(),
+                    parameters: t
+                        .parameters
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({})),
+                });
+            }
+            Some(out)
+        }
+        _ => None,
+    };
+
+    // tool_choice: "auto"->Auto, "required"->Required, {function,name}->Specific,
+    // "none"-> drop tools + tool_choice entirely (canonical has no None variant).
+    let mut tools = tools;
+    let tool_choice = match req.tool_choice.as_ref() {
+        Some(ResponsesToolChoice::Mode(mode)) => match mode.as_str() {
+            "auto" => Some(CanonicalToolChoice::Auto),
+            "required" => Some(CanonicalToolChoice::Required),
+            "none" => {
+                tools = None;
+                None
+            }
+            other => return Err(format!("unsupported tool_choice mode: {other}")),
+        },
+        Some(ResponsesToolChoice::Function { name, .. }) => {
+            Some(CanonicalToolChoice::Specific { name: name.clone() })
+        }
+        None => None,
+    };
+
+    let reasoning = req.reasoning.as_ref().map(|r| CanonicalReasoning {
+        effort: r.effort.clone(),
+        budget_tokens: None,
+    });
+
+    Ok(CanonicalRequest {
+        model: req.model.clone(),
+        messages,
+        tools,
+        tool_choice,
+        max_tokens: req.max_output_tokens,
+        temperature: req.temperature,
+        top_p: req.top_p,
+        reasoning,
+        metadata: Default::default(),
+        provider_extras: None,
+    })
 }
 
 /// Convert a `CanonicalResponse` into the Responses envelope.
@@ -216,14 +331,67 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
 /// call (call_id = canonical id, ids prefixed "msg_"/"fc_"); finish_reason
 /// "length" -> status "incomplete" with incomplete_details.reason
 /// "max_output_tokens", everything else -> "completed"; usage totals filled.
-#[allow(unused_variables)] // TDD red phase: parameters used once implemented
 pub fn responses_from_canonical(
     canon: CanonicalResponse,
     requested_model: String,
     response_id: String,
     created_at: u64,
 ) -> ResponsesResponse {
-    todo!("TDD green phase: implement canonical -> Responses framing")
+    let length_finish = canon.finish_reason.as_deref() == Some("length");
+    let (status, incomplete_details) = if length_finish {
+        (
+            "incomplete".to_string(),
+            Some(IncompleteDetails {
+                reason: "max_output_tokens".into(),
+            }),
+        )
+    } else {
+        ("completed".to_string(), None)
+    };
+
+    let mut output: Vec<ResponsesOutputItem> = Vec::new();
+
+    // A message item is emitted only when there is assistant text; a tool-only
+    // turn carries no empty message (mirrors Chat's null-content contract).
+    if !canon.content.is_empty() {
+        output.push(ResponsesOutputItem::Message {
+            id: format!("msg_{response_id}"),
+            status: status.clone(),
+            role: "assistant",
+            content: vec![ResponsesOutputContent {
+                kind: "output_text",
+                text: canon.content,
+                annotations: Vec::new(),
+            }],
+        });
+    }
+
+    for tc in canon.tool_calls {
+        output.push(ResponsesOutputItem::FunctionCall {
+            id: format!("fc_{}", tc.id),
+            call_id: tc.id,
+            name: tc.name,
+            arguments: tc.arguments,
+            status: status.clone(),
+        });
+    }
+
+    let total = canon.usage.input_tokens + canon.usage.output_tokens;
+
+    ResponsesResponse {
+        id: response_id,
+        object: "response",
+        created_at,
+        status,
+        model: requested_model,
+        output,
+        incomplete_details,
+        usage: ResponsesUsage {
+            input_tokens: canon.usage.input_tokens,
+            output_tokens: canon.usage.output_tokens,
+            total_tokens: total,
+        },
+    }
 }
 
 /// Frame a canonical event stream as Responses SSE.
@@ -237,14 +405,220 @@ pub fn responses_from_canonical(
 /// `response.completed` (carrying the aggregated output + usage + status
 /// "completed"), or `response.incomplete` on a "length" finish, or
 /// `response.failed` on a stream error. NO `data: [DONE]` sentinel.
-#[allow(unused_variables)] // TDD red phase: parameters used once implemented
 pub fn sse_from_canonical_stream_responses(
     stream: CanonicalStream,
     requested_model: String,
     response_id: String,
     created_at: u64,
 ) -> Sse<ResponsesSseStream> {
-    todo!("TDD green phase: implement Responses SSE framing")
+    let body = responses_sse_events(stream, requested_model, response_id, created_at);
+    Sse::new(Box::pin(body) as ResponsesSseStream)
+}
+
+/// One SSE frame: `event:`-named with the JSON `type` and a stamped
+/// `sequence_number`. Centralizes the naming so the event name and the payload
+/// `type` can never drift apart (SDK clients match on both).
+fn responses_event(seq: &mut u64, name: &str, mut payload: serde_json::Value) -> Event {
+    payload["type"] = serde_json::Value::String(name.to_string());
+    payload["sequence_number"] = serde_json::json!(*seq);
+    *seq += 1;
+    Event::default().event(name).data(payload.to_string())
+}
+
+/// Stream-wide constants shared by every Responses SSE event (the response id,
+/// the creation timestamp, and the echoed model). Built once per stream and
+/// threaded by reference so the envelope/event helpers stay small.
+struct StreamMeta {
+    response_id: String,
+    created_at: u64,
+    model: String,
+}
+
+/// Build the terminal response envelope embedded in `response.completed` /
+/// `response.incomplete` / `response.failed`, carrying the aggregated output
+/// and usage so a streaming client ends with the same shape as non-streaming.
+fn responses_stream_envelope(
+    meta: &StreamMeta,
+    status: &str,
+    text: &str,
+    tool_calls: &[(String, String, String)], // (call_id, name, arguments)
+    usage: &CanonicalUsageAccum,
+    incomplete_reason: Option<&str>,
+) -> serde_json::Value {
+    let mut output: Vec<serde_json::Value> = Vec::new();
+    if !text.is_empty() {
+        output.push(serde_json::json!({
+            "type": "message",
+            "id": format!("msg_{}", meta.response_id),
+            "status": status,
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }));
+    }
+    for (call_id, name, arguments) in tool_calls {
+        output.push(serde_json::json!({
+            "type": "function_call",
+            "id": format!("fc_{call_id}"),
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+            "status": status,
+        }));
+    }
+    let mut envelope = serde_json::json!({
+        "id": meta.response_id,
+        "object": "response",
+        "created_at": meta.created_at,
+        "status": status,
+        "model": meta.model,
+        "output": output,
+        "usage": {
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "total_tokens": usage.input_tokens + usage.output_tokens,
+        },
+    });
+    if let Some(reason) = incomplete_reason {
+        envelope["incomplete_details"] = serde_json::json!({ "reason": reason });
+    }
+    envelope
+}
+
+#[derive(Default)]
+struct CanonicalUsageAccum {
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+fn responses_sse_events(
+    mut stream: CanonicalStream,
+    requested_model: String,
+    response_id: String,
+    created_at: u64,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    use futures_util::StreamExt;
+    let meta = StreamMeta {
+        response_id,
+        created_at,
+        model: requested_model,
+    };
+    async_stream::stream! {
+        let mut seq: u64 = 0;
+
+        // response.created opens the stream (status in_progress, empty output).
+        let created_env = serde_json::json!({
+            "id": meta.response_id,
+            "object": "response",
+            "created_at": meta.created_at,
+            "status": "in_progress",
+            "model": meta.model,
+            "output": [],
+        });
+        yield Ok(responses_event(&mut seq, "response.created", serde_json::json!({
+            "response": created_env,
+        })));
+
+        // Aggregated state for the terminal envelope.
+        let mut text = String::new();
+        let mut message_added = false;
+        // Tool calls in arrival order, indexed by their canonical stream index.
+        let mut tool_calls: Vec<(u32, String, String, String)> = Vec::new(); // (index, call_id, name, args)
+        let mut usage = CanonicalUsageAccum::default();
+        let mut finish_reason: Option<String> = None;
+        let mut errored = false;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(CanonicalStreamEvent::TextDelta(delta)) => {
+                    if !message_added {
+                        message_added = true;
+                        let item = serde_json::json!({
+                            "type": "message",
+                            "id": format!("msg_{}", meta.response_id),
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        });
+                        yield Ok(responses_event(&mut seq, "response.output_item.added", serde_json::json!({
+                            "item": item,
+                        })));
+                    }
+                    text.push_str(&delta);
+                    yield Ok(responses_event(&mut seq, "response.output_text.delta", serde_json::json!({
+                        "delta": delta,
+                    })));
+                }
+                Ok(CanonicalStreamEvent::ToolCallDelta { index, id, name, arguments_delta }) => {
+                    // First delta for an index opens the function_call item.
+                    if !tool_calls.iter().any(|(i, ..)| *i == index) {
+                        let call_id = id.clone().unwrap_or_else(|| format!("call_{index}"));
+                        let call_name = name.clone().unwrap_or_default();
+                        tool_calls.push((index, call_id.clone(), call_name.clone(), String::new()));
+                        let item = serde_json::json!({
+                            "type": "function_call",
+                            "id": format!("fc_{call_id}"),
+                            "call_id": call_id,
+                            "name": call_name,
+                            "arguments": "",
+                            "status": "in_progress",
+                        });
+                        yield Ok(responses_event(&mut seq, "response.output_item.added", serde_json::json!({
+                            "item": item,
+                        })));
+                    }
+                    if !arguments_delta.is_empty() {
+                        if let Some(slot) = tool_calls.iter_mut().find(|(i, ..)| *i == index) {
+                            slot.3.push_str(&arguments_delta);
+                        }
+                        yield Ok(responses_event(&mut seq, "response.function_call_arguments.delta", serde_json::json!({
+                            "delta": arguments_delta,
+                        })));
+                    }
+                }
+                Ok(CanonicalStreamEvent::Usage(u)) => {
+                    usage.input_tokens = u.input_tokens;
+                    usage.output_tokens = u.output_tokens;
+                }
+                Ok(CanonicalStreamEvent::Finish { finish_reason: fr }) => {
+                    finish_reason = fr;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "canonical stream error mid-flight (responses)");
+                    errored = true;
+                    break;
+                }
+            }
+        }
+
+        let calls: Vec<(String, String, String)> = tool_calls
+            .into_iter()
+            .map(|(_, call_id, name, args)| (call_id, name, args))
+            .collect();
+
+        if errored {
+            let env = responses_stream_envelope(
+                &meta, "failed", &text, &calls, &usage, None,
+            );
+            yield Ok(responses_event(&mut seq, "response.failed", serde_json::json!({
+                "response": env,
+            })));
+        } else if finish_reason.as_deref() == Some("length") {
+            let env = responses_stream_envelope(
+                &meta, "incomplete", &text, &calls, &usage, Some("max_output_tokens"),
+            );
+            yield Ok(responses_event(&mut seq, "response.incomplete", serde_json::json!({
+                "response": env,
+            })));
+        } else {
+            let env = responses_stream_envelope(
+                &meta, "completed", &text, &calls, &usage, None,
+            );
+            yield Ok(responses_event(&mut seq, "response.completed", serde_json::json!({
+                "response": env,
+            })));
+        }
+        // NB: no [DONE] sentinel — that is Chat Completions framing only.
+    }
 }
 
 #[cfg(test)]
