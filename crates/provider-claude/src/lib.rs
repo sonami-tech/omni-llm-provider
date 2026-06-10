@@ -273,10 +273,22 @@ mod tests {
 
     #[tokio::test]
     async fn claude_send_exercises_full_fingerprint_path() {
-        // If creds present (as in this env), exercises the complete path:
-        // canonical -> translate build -> identity prepend -> finalize cch (profile) ->
-        // upstream headers (betas, stainless, ua, session) + body -> real Anth call -> from_anth -> canonical.
-        // This is the "live but deterministic shape" test for the port (the unit pins for exact bytes live in fingerprint + translate).
+        // Live test: exercises the complete path end-to-end against the real
+        // Anthropic upstream (canonical -> translate -> identity/cch finalize ->
+        // headers + body -> real call -> from_anth -> canonical).
+        //
+        // Guarded so `cargo test` stays hermetic and green offline: skips cleanly
+        // when no Claude OAuth credentials are present, so it never burns Max quota
+        // on every run and never fails in a creds-less CI. The byte-exact wire
+        // pins (fingerprint, cch, translate) are asserted by the offline unit tests
+        // above; this test only proves the live wiring when creds exist.
+        if !crate::credentials::Credentials::default_path().exists() {
+            eprintln!(
+                "skipping claude_send_exercises_full_fingerprint_path: no Claude credentials at {}",
+                crate::credentials::Credentials::default_path().display()
+            );
+            return;
+        }
         let p = ClaudeProvider::new().expect("ctor");
         let resp = p
             .send(sample_req("port test"))
