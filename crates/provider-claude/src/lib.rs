@@ -35,9 +35,140 @@ pub use fingerprint::{
 pub use upstream::{UpstreamClient, UpstreamError};
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use omni_common::Replacements;
-use omni_core::{CanonicalRequest, CanonicalResponse, LlmProvider, ProviderError};
+use omni_core::{
+    CanonicalRequest, CanonicalResponse, CanonicalStream, CanonicalStreamEvent, CanonicalUsage,
+    LlmProvider, ProviderError,
+};
 use tracing::debug;
+
+use crate::upstream::stream::{BlockDelta, BlockStart, StreamEvent};
+
+/// Stateful converter from Anthropic typed [`StreamEvent`]s to the
+/// provider-agnostic [`CanonicalStreamEvent`] vocabulary.
+///
+/// Anthropic addresses content by `content_block` index and signals tool calls
+/// via a `content_block_start` (carrying id + name) followed by
+/// `input_json_delta` fragments. The canonical `ToolCallDelta` instead carries a
+/// stable per-tool `index` plus id/name on its first delta. This converter maps
+/// Anthropic block indexes to dense canonical tool indexes and remembers the
+/// stop reason / token usage so it can emit a terminal `Finish` (and a `Usage`)
+/// when the message stops. Mirrors the event handling in the working reference's
+/// to_oai_stream converter, retargeted to canonical events.
+#[derive(Default)]
+struct ClaudeStreamConverter {
+    /// Anthropic content_block index -> canonical tool-call index (tool-use blocks only).
+    tool_block_to_index: std::collections::HashMap<u32, u32>,
+    next_tool_index: u32,
+    stop_reason: Option<String>,
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+    usage_emitted: bool,
+}
+
+impl ClaudeStreamConverter {
+    fn on_event(&mut self, event: StreamEvent) -> Vec<CanonicalStreamEvent> {
+        match event {
+            StreamEvent::MessageStart {
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                if input_tokens.is_some() {
+                    self.input_tokens = input_tokens;
+                }
+                if output_tokens.is_some() {
+                    self.output_tokens = output_tokens;
+                }
+                vec![]
+            }
+            StreamEvent::ContentBlockStart {
+                index,
+                block: BlockStart::ToolUse { id, name },
+            } => {
+                let tool_index = self.next_tool_index;
+                self.next_tool_index += 1;
+                self.tool_block_to_index.insert(index, tool_index);
+                vec![CanonicalStreamEvent::ToolCallDelta {
+                    index: tool_index,
+                    id: Some(id),
+                    name: Some(name),
+                    arguments_delta: String::new(),
+                }]
+            }
+            // Text / Thinking / Other block starts carry no canonical payload.
+            StreamEvent::ContentBlockStart { .. } => vec![],
+            StreamEvent::ContentBlockDelta { index, delta } => match delta {
+                BlockDelta::Text(s) => vec![CanonicalStreamEvent::TextDelta(s)],
+                BlockDelta::InputJson(s) => {
+                    // Arguments fragment for the tool call opened at this block.
+                    match self.tool_block_to_index.get(&index) {
+                        Some(&tool_index) => vec![CanonicalStreamEvent::ToolCallDelta {
+                            index: tool_index,
+                            id: None,
+                            name: None,
+                            arguments_delta: s,
+                        }],
+                        None => vec![],
+                    }
+                }
+                // Thinking deltas are not surfaced in the canonical text stream today.
+                _ => vec![],
+            },
+            StreamEvent::MessageDelta {
+                stop_reason,
+                output_tokens,
+                ..
+            } => {
+                if let Some(r) = stop_reason {
+                    self.stop_reason = Some(map_stop_reason(&r));
+                }
+                if output_tokens.is_some() {
+                    self.output_tokens = output_tokens;
+                }
+                vec![]
+            }
+            StreamEvent::MessageStop => self.finish_events(),
+            StreamEvent::Error { kind, message } => {
+                // Surface as a terminal error so the consumer stops cleanly.
+                vec![CanonicalStreamEvent::Finish {
+                    finish_reason: Some(format!("error: {kind}: {message}")),
+                }]
+            }
+            // Ping / ContentBlockStop / Unknown carry nothing canonical.
+            _ => vec![],
+        }
+    }
+
+    /// Emit the trailing Usage (once) + terminal Finish for message_stop / EOF.
+    fn finish_events(&mut self) -> Vec<CanonicalStreamEvent> {
+        let mut out = Vec::new();
+        if !self.usage_emitted && (self.input_tokens.is_some() || self.output_tokens.is_some()) {
+            self.usage_emitted = true;
+            out.push(CanonicalStreamEvent::Usage(CanonicalUsage {
+                input_tokens: self.input_tokens.unwrap_or(0) as u64,
+                output_tokens: self.output_tokens.unwrap_or(0) as u64,
+                ..Default::default()
+            }));
+        }
+        out.push(CanonicalStreamEvent::Finish {
+            finish_reason: self.stop_reason.clone().or(Some("stop".into())),
+        });
+        out
+    }
+}
+
+/// Map Anthropic stop_reason to the OpenAI-style finish_reason vocabulary so the
+/// canonical stream matches the non-stream path's mapping.
+fn map_stop_reason(anth: &str) -> String {
+    match anth {
+        "end_turn" | "stop_sequence" => "stop".into(),
+        "max_tokens" => "length".into(),
+        "tool_use" => "tool_calls".into(),
+        other => other.into(),
+    }
+}
 
 /// The Claude provider. Holds the fingerprint profile (for the invariant)
 /// and a reusable upstream client.
@@ -167,6 +298,67 @@ impl LlmProvider for ClaudeProvider {
 
         Ok(canon)
     }
+
+    async fn send_stream(&self, req: CanonicalRequest) -> Result<CanonicalStream, ProviderError> {
+        debug!(
+            provider = "claude-code",
+            model = %req.model,
+            n_msgs = req.messages.len(),
+            "streaming via claude (fingerprint profile {})",
+            self.profile.name
+        );
+
+        // Same outbound build as send(): replacements -> exact wire request ->
+        // identity injection. Streaming only flips the `stream` flag, so the
+        // fingerprint body (betas, cch, preamble, wire defaults) is identical to
+        // the non-stream path. Build, serialize, then set stream=true on the
+        // JSON value (the typed builder set Some(false)).
+        let repl = Replacements::empty();
+        let anth_req = translate::prepare_anthropic_request(&req, self.profile, &repl, true)
+            .map_err(|e| ProviderError::Other(anyhow::Error::msg(e)))?;
+        let mut body_val = serde_json::to_value(&anth_req).map_err(|e| {
+            ProviderError::Other(anyhow::Error::msg(format!("anth serialize: {e}")))
+        })?;
+        body_val["stream"] = serde_json::Value::Bool(true);
+
+        let ctx = RequestContext::new_reply().with_model(anth_req.model.clone());
+
+        let creds =
+            credentials::Credentials::load_fresh_async(&credentials::Credentials::default_path())
+                .await
+                .map_err(map_upstream_err)?;
+
+        // Open the upstream SSE stream (full retry / 401-refresh semantics live
+        // in send_messages_stream). Yields typed Anthropic StreamEvents.
+        let upstream = self
+            .client
+            .send_messages_stream(&creds, &ctx, &body_val)
+            .await
+            .map_err(map_upstream_err)?;
+
+        // Map each Anthropic event to zero-or-more canonical events, flattening
+        // into a single ordered canonical stream. The converter is stateful, so
+        // it lives inside the async stream closure.
+        let canonical = async_stream::try_stream! {
+            let mut conv = ClaudeStreamConverter::default();
+            futures_util::pin_mut!(upstream);
+            while let Some(item) = upstream.next().await {
+                let event = item.map_err(map_upstream_err)?;
+                for canon_event in conv.on_event(event) {
+                    yield canon_event;
+                }
+            }
+            // If the upstream ended without an explicit message_stop, still emit
+            // a terminal Finish so consumers always see stream completion.
+            if !conv.usage_emitted || conv.stop_reason.is_some() {
+                for tail in conv.finish_events() {
+                    yield tail;
+                }
+            }
+        };
+
+        Ok(Box::pin(canonical))
+    }
 }
 
 // Free fn for any legacy direct use (matches provider-grok).
@@ -259,6 +451,120 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn stream_converter_maps_anthropic_events_to_canonical_sequence() {
+        // WHY: send_stream's correctness reduces to this converter. The HTTP path
+        // just feeds it upstream StreamEvents. This pins the contract the binary
+        // SSE framing (F8) depends on: text deltas pass through in order; a
+        // tool-use block start opens a ToolCallDelta (id+name) and its
+        // input_json deltas append arguments under the SAME canonical index;
+        // usage + a mapped finish_reason terminate the stream exactly once.
+        use crate::upstream::stream::{BlockDelta, BlockStart, StreamEvent};
+        let mut conv = ClaudeStreamConverter::default();
+        let mut out: Vec<CanonicalStreamEvent> = Vec::new();
+
+        out.extend(conv.on_event(StreamEvent::MessageStart {
+            id: "msg_1".into(),
+            model: "claude-haiku-4-5-20251001".into(),
+            input_tokens: Some(11),
+            output_tokens: Some(0),
+        }));
+        out.extend(conv.on_event(StreamEvent::ContentBlockStart {
+            index: 0,
+            block: BlockStart::Text,
+        }));
+        out.extend(conv.on_event(StreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: BlockDelta::Text("Hello".into()),
+        }));
+        out.extend(conv.on_event(StreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: BlockDelta::Text(" world".into()),
+        }));
+        // Tool-use block at Anthropic index 1 -> canonical tool index 0.
+        out.extend(conv.on_event(StreamEvent::ContentBlockStart {
+            index: 1,
+            block: BlockStart::ToolUse {
+                id: "toolu_9".into(),
+                name: "get_weather".into(),
+            },
+        }));
+        out.extend(conv.on_event(StreamEvent::ContentBlockDelta {
+            index: 1,
+            delta: BlockDelta::InputJson("{\"city\":".into()),
+        }));
+        out.extend(conv.on_event(StreamEvent::ContentBlockDelta {
+            index: 1,
+            delta: BlockDelta::InputJson("\"SF\"}".into()),
+        }));
+        out.extend(conv.on_event(StreamEvent::MessageDelta {
+            stop_reason: Some("tool_use".into()),
+            stop_sequence: None,
+            output_tokens: Some(7),
+        }));
+        out.extend(conv.on_event(StreamEvent::MessageStop));
+
+        // Text deltas, in order.
+        assert_eq!(out[0], CanonicalStreamEvent::TextDelta("Hello".into()));
+        assert_eq!(out[1], CanonicalStreamEvent::TextDelta(" world".into()));
+        // Tool-call open carries id+name at canonical index 0.
+        assert_eq!(
+            out[2],
+            CanonicalStreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("toolu_9".into()),
+                name: Some("get_weather".into()),
+                arguments_delta: String::new(),
+            }
+        );
+        // Argument fragments append under the SAME index, id/name now None.
+        assert_eq!(
+            out[3],
+            CanonicalStreamEvent::ToolCallDelta {
+                index: 0,
+                id: None,
+                name: None,
+                arguments_delta: "{\"city\":".into(),
+            }
+        );
+        assert_eq!(
+            out[4],
+            CanonicalStreamEvent::ToolCallDelta {
+                index: 0,
+                id: None,
+                name: None,
+                arguments_delta: "\"SF\"}".into(),
+            }
+        );
+        // Usage then terminal Finish with mapped reason (tool_use -> tool_calls).
+        assert_eq!(
+            out[5],
+            CanonicalStreamEvent::Usage(CanonicalUsage {
+                input_tokens: 11,
+                output_tokens: 7,
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            out[6],
+            CanonicalStreamEvent::Finish {
+                finish_reason: Some("tool_calls".into())
+            }
+        );
+        assert_eq!(out.len(), 7, "no extra events emitted");
+    }
+
+    #[test]
+    fn stream_converter_maps_stop_reasons_to_oai_vocabulary() {
+        // WHY: the canonical finish_reason must match the non-stream path's
+        // mapping so OAI clients see consistent values regardless of stream mode.
+        assert_eq!(map_stop_reason("end_turn"), "stop");
+        assert_eq!(map_stop_reason("max_tokens"), "length");
+        assert_eq!(map_stop_reason("tool_use"), "tool_calls");
+        assert_eq!(map_stop_reason("stop_sequence"), "stop");
+        assert_eq!(map_stop_reason("weird_future"), "weird_future");
     }
 
     #[test]
