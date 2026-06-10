@@ -140,7 +140,7 @@ mod tests {
                     "mock-{}: {}",
                     self.0,
                     req.messages
-                        .get(0)
+                        .first()
                         .map(|m| match &m.content {
                             CanonicalContent::Text(t) => t.as_str(),
                         })
@@ -315,9 +315,7 @@ mod tests {
                 },
                 CanonicalMessage {
                     role: "user".into(),
-                    content: CanonicalContent::Text(
-                        sim_apply_prompt("tell secret about foo-tool").into(),
-                    ),
+                    content: CanonicalContent::Text(sim_apply_prompt("tell secret about foo-tool")),
                 },
             ],
             tools: Some(vec![CanonicalTool {
@@ -417,10 +415,10 @@ mod tests {
     fn canonical_response_with_tools_and_usage_serde() {
         let resp = CanonicalResponse {
             model: "claude-sonnet".into(),
-            content: sim_apply_response("result after secret".into()),
+            content: sim_apply_response("result after secret"),
             tool_calls: vec![CanonicalToolCall {
                 id: "call_1".into(),
-                name: sim_apply_response("rawname".into()),
+                name: sim_apply_response("rawname"),
                 arguments: "{\"a\":1}".into(),
             }],
             finish_reason: Some("tool_calls".into()),
@@ -454,8 +452,8 @@ mod tests {
                 req.model.clone()
             };
             let applied = sim_apply_prompt(
-                &req.messages
-                    .get(0)
+                req.messages
+                    .first()
                     .and_then(|m| m.content.as_text())
                     .unwrap_or(""),
             );
@@ -568,7 +566,7 @@ mod tests {
         assert!(!rg.content.is_empty());
         assert!(!rc.content.is_empty());
         // tools caused claude mock to return a tool_call (grok did not in this impl); both valid CanonicalResponse
-        assert!(rg.usage.input_tokens > 0 || rc.tool_calls.len() > 0);
+        assert!(rg.usage.input_tokens > 0 || !rc.tool_calls.is_empty());
         // WHY: guarantees frontends get consistent canonical regardless of which enabled provider the router selected.
     }
 
@@ -579,10 +577,10 @@ mod tests {
             model: "test".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
-                content: CanonicalContent::Text(sim_apply_prompt("call foo-tool secret").into()),
+                content: CanonicalContent::Text(sim_apply_prompt("call foo-tool secret")),
             }],
             tools: Some(vec![CanonicalTool {
-                name: sim_apply_prompt("foo-tool".into()),
+                name: sim_apply_prompt("foo-tool"),
                 description: None,
                 parameters: serde_json::json!({}),
             }]),
@@ -644,12 +642,14 @@ mod tests {
     #[test]
     fn canonical_metadata_extras_and_none_cases_serde() {
         // hit skip_serializing_if and empty cases
-        let mut req = CanonicalRequest::default();
-        req.model = "m".into();
-        req.messages = vec![CanonicalMessage {
-            role: "user".into(),
-            content: CanonicalContent::Text("x".into()),
-        }];
+        let mut req = CanonicalRequest {
+            model: "m".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("x".into()),
+            }],
+            ..Default::default()
+        };
         // provider_extras None -> omitted in json
         let j = serde_json::to_string(&req).unwrap();
         assert!(!j.contains("provider_extras"));
@@ -738,14 +738,16 @@ mod tests {
 
     #[test]
     fn provider_extras_and_metadata_full_serde() {
-        let mut req = CanonicalRequest::default();
-        req.model = "m".into();
-        req.messages = vec![CanonicalMessage {
-            role: "user".into(),
-            content: CanonicalContent::Text("t".into()),
-        }];
-        req.provider_extras = Some(serde_json::json!({"a":1, "b":{"c":true}}));
-        req.metadata = [("x".into(), "y".into()), ("trace".into(), "id".into())].into();
+        let req = CanonicalRequest {
+            model: "m".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("t".into()),
+            }],
+            provider_extras: Some(serde_json::json!({"a":1, "b":{"c":true}})),
+            metadata: [("x".into(), "y".into()), ("trace".into(), "id".into())].into(),
+            ..Default::default()
+        };
         let j = serde_json::to_string(&req).unwrap();
         let back: CanonicalRequest = serde_json::from_str(&j).unwrap();
         assert!(back.provider_extras.is_some());
@@ -936,12 +938,14 @@ mod tests {
 
     #[test]
     fn canonical_request_all_optionals_none_and_some() {
-        let mut r = CanonicalRequest::default();
-        r.model = "m".into();
-        r.messages = vec![CanonicalMessage {
-            role: "user".into(),
-            content: CanonicalContent::Text("x".into()),
-        }];
+        let mut r = CanonicalRequest {
+            model: "m".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("x".into()),
+            }],
+            ..Default::default()
+        };
         let j = serde_json::to_string(&r).unwrap();
         let b: CanonicalRequest = serde_json::from_str(&j).unwrap();
         assert!(b.tools.is_none());

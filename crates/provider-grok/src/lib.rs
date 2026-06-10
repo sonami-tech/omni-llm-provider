@@ -59,7 +59,6 @@ use omni_core::{
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::env;
 use tracing::{debug, error, warn};
 
 const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
@@ -224,19 +223,18 @@ fn to_xai_chat_request(req: &CanonicalRequest, repl: &Replacements) -> Value {
     if let Some(CanonicalReasoning {
         effort: Some(eff), ..
     }) = &req.reasoning
+        && !eff.is_empty()
     {
-        if !eff.is_empty() {
-            body["reasoning_effort"] = json!(eff);
-        }
+        body["reasoning_effort"] = json!(eff);
     }
 
     // Passthrough any xAI-specific (search_parameters, service_tier, response_format, parallel_tool_calls, etc.)
     // Extras win on collision (caller responsibility).
-    if let Some(extras) = &req.provider_extras {
-        if let Some(obj) = extras.as_object() {
-            for (k, v) in obj {
-                body[k] = v.clone();
-            }
+    if let Some(extras) = &req.provider_extras
+        && let Some(obj) = extras.as_object()
+    {
+        for (k, v) in obj {
+            body[k] = v.clone();
         }
     }
 

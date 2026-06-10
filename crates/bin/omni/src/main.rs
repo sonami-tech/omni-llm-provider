@@ -618,7 +618,7 @@ mod tests {
             .message
             .content
             .as_deref()
-            .map_or(false, |c| !c.is_empty());
+            .is_some_and(|c| !c.is_empty());
         let has_tools = !oai_resp.choices[0].message.tool_calls.is_empty();
         assert!(has_content || has_tools);
         let _ = oai_resp.usage.prompt_tokens; // u64 always >=0 by type; shape covered by other asserts + CCP mirror
@@ -687,12 +687,11 @@ mod tests {
             if let Ok(out) = Command::new("curl")
                 .args(["-s", "--max-time", "1", &url])
                 .output()
+                && out.status.success()
             {
-                if out.status.success() {
-                    let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if body == "ok" {
-                        return true;
-                    }
+                let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if body == "ok" {
+                    return true;
                 }
             }
             thread::sleep(Duration::from_millis(120));
@@ -1219,11 +1218,11 @@ rule = [
                     &format!("http://127.0.0.1:{}/health", port),
                 ])
                 .output()
+                && out.status.success()
+                && String::from_utf8_lossy(&out.stdout).trim() == "ok"
             {
-                if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "ok" {
-                    ready = true;
-                    break;
-                }
+                ready = true;
+                break;
             }
             thread::sleep(Duration::from_millis(120));
         }
@@ -1371,9 +1370,9 @@ rule = [
                 .output().unwrap();
             let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(serde_json::json!({}));
             // accept 200 with real or if rate limit etc, just that it reached delegation not routing err
-            if let Some(code) = out.status.code() {
-                if code == 0 { /*curl ok*/ }
-            }
+            if let Some(code) = out.status.code()
+                && code == 0
+            { /*curl ok*/ }
             let err_msg = v["error"]["message"].as_str().unwrap_or("");
             assert!(
                 !err_msg.contains("not enabled") && !err_msg.contains("must use prefix"),
@@ -1382,11 +1381,10 @@ rule = [
             );
             if v.get("choices").is_some() {
                 assert!(
-                    v["choices"][0]["message"]["content"]
+                    !v["choices"][0]["message"]["content"]
                         .as_str()
                         .unwrap_or("")
-                        .len()
-                        > 0
+                        .is_empty()
                         || v["choices"][0]["message"].get("tool_calls").is_some()
                 );
             }
@@ -1404,7 +1402,7 @@ rule = [
             );
             if v.get("choices").is_some() {
                 let c = v["choices"][0]["message"]["content"].as_str().unwrap_or("");
-                assert!(c.len() > 0);
+                assert!(!c.is_empty());
             }
         }
         let _ = child.kill();
