@@ -22,13 +22,15 @@
 //!   contract). provider_grok: the one real backend.
 //!
 //! ## Credentials
-//! `GrokProvider::new(None)` requires creds at startup (XAI_API_KEY env or a
-//! credentials file at $XAI_CREDENTIALS_PATH / ~/.xai/.credentials.json). Creds
-//! are re-loaded fresh per request inside the provider, never cached or printed
-//! here.
+//! `GrokProvider::new(None)` reads no credentials at startup; the key is read fresh per
+//! request from files (no env-var key), never cached or printed here. Source precedence:
+//! $XAI_CREDENTIALS_PATH -> ~/.xai/.credentials.json (static {"apiKey":"xai-..."}) ->
+//! ~/.grok/auth.json (the Grok CLI's OIDC login, auto-detected). A logged-in `grok` CLI
+//! therefore Just Works. A missing/invalid source surfaces as an auth error on the first
+//! request, mirroring the Claude provider's file-only model.
 //!
 //! Build: cargo build -p omni-grok
-//! Run:   XAI_API_KEY=... cargo run -p omni-grok -- --port 18402
+//! Run:   cargo run -p omni-grok -- --port 18402   (with a Grok CLI login or creds file)
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -93,11 +95,11 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    // Provider init requires creds at startup (fails fast). Map the failure to a
-    // clear, actionable message; never print the creds themselves.
-    let provider: Arc<dyn LlmProvider> = Arc::new(GrokProvider::new(None).context(
-        "failed to init grok provider: set XAI_API_KEY or provide ~/.xai/.credentials.json",
-    )?);
+    // Provider construction reads no credentials (those are read fresh per request
+    // inside the provider, from $XAI_CREDENTIALS_PATH / ~/.xai/.credentials.json).
+    // Map any client-build failure to a clear message; never print creds.
+    let provider: Arc<dyn LlmProvider> =
+        Arc::new(GrokProvider::new(None).context("failed to init grok provider")?);
     info!("grok provider initialized");
 
     // Stats DB lives at a local temp/data path the app owns. A failure to open
@@ -330,11 +332,6 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    // A clearly-labeled dummy key that lets GrokProvider::new(None) succeed at
-    // startup WITHOUT real creds. It never reaches the upstream in the hermetic
-    // tests (those endpoints do not call xAI), so no real network/auth happens.
-    const TEST_DUMMY_KEY: &str = "xai-dummy-test-key";
-
     // ---- shared subprocess test helpers (every test uses its OWN free port) ----
 
     /// Bind 127.0.0.1:0 to get a free ephemeral port, then drop the listener so
@@ -401,27 +398,22 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    /// True when real xAI creds are reachable for the live-conditional test.
-    /// Race-safe: when XAI_CREDENTIALS_PATH is set (some other test points it at
-    /// a throwaway dummy file) we treat creds as ABSENT, and we read the home
-    /// path directly rather than the env-overridable default. Mirrors the guard
-    /// in provider-grok so the offline suite stays green and never fires a real
-    /// network call with a junk key.
+    /// True when real xAI creds are reachable for the live-conditional test: either the static-key
+    /// file `~/.xai/.credentials.json` OR the Grok CLI's own login file `~/.grok/auth.json` (which
+    /// the provider auto-detects). Race-safe: when XAI_CREDENTIALS_PATH is set (some other test
+    /// points it at a throwaway dummy file) we treat creds as ABSENT, and we read the home paths
+    /// directly rather than the env-overridable default. Mirrors the provider's source precedence so
+    /// the offline suite stays green and never fires a real network call with a junk key.
     fn has_grok_creds() -> bool {
-        if std::env::var("XAI_API_KEY")
-            .map(|k| !k.trim().is_empty())
-            .unwrap_or(false)
-        {
-            return true;
-        }
         if std::env::var_os("XAI_CREDENTIALS_PATH").is_some() {
             return false;
         }
         match std::env::var_os("HOME") {
-            Some(home) => std::path::Path::new(&home)
-                .join(".xai")
-                .join(".credentials.json")
-                .exists(),
+            Some(home) => {
+                let home = std::path::Path::new(&home);
+                home.join(".xai").join(".credentials.json").exists()
+                    || home.join(".grok").join("auth.json").exists()
+            }
             None => false,
         }
     }
@@ -534,13 +526,13 @@ mod tests {
 
     // ---- subprocess + curl tests (full HTTP stack, RANDOM free port, kill child) ----
 
-    /// Spawn the binary on its OWN free port with the dummy key so the provider
-    /// starts without real creds. The caller MUST kill the returned child.
+    /// Spawn the binary on its OWN free port. The provider constructs without
+    /// reading any credentials (creds are read fresh per request from the file),
+    /// and these hermetic endpoints (health/models/stats, auth gate) never reach
+    /// xAI, so no credential is provided. The caller MUST kill the returned child.
     fn spawn_hermetic(port: u16, extra_env: &[(&str, &str)], no_auth: bool) -> std::process::Child {
         let mut cmd = Command::new(bin_path());
-        cmd.env("XAI_API_KEY", TEST_DUMMY_KEY)
-            .arg("--port")
-            .arg(port.to_string());
+        cmd.arg("--port").arg(port.to_string());
         if no_auth {
             cmd.arg("--no-auth");
         }
@@ -628,23 +620,18 @@ mod tests {
     fn live_conditional_real_completion_nonstream_and_stream() {
         // WHY: when real creds are present, prove a genuine non-stream AND stream
         // completion round-trips through the binary. Skips cleanly (and loudly)
-        // when creds are absent so the offline suite stays green. NOTE: we do NOT
-        // inject the dummy key here, because real creds must be used; the guard is
+        // when creds are absent so the offline suite stays green. The guard is
         // race-safe (see has_grok_creds).
         if !has_grok_creds() {
-            eprintln!(
-                "skipping live grok completion test (no XAI_API_KEY and no ~/.xai/.credentials.json)"
-            );
+            eprintln!("skipping live grok completion test (no ~/.xai/.credentials.json)");
             return;
         }
         let port = free_port();
-        // Pass through the real env key if set; otherwise the provider loads the
-        // credentials file fresh. Do not override with the dummy.
+        // The spawned binary inherits HOME and loads the real key fresh from
+        // ~/.xai/.credentials.json (has_grok_creds confirmed it is present and that
+        // XAI_CREDENTIALS_PATH is unset).
         let mut cmd = Command::new(bin_path());
         cmd.arg("--no-auth").arg("--port").arg(port.to_string());
-        if let Ok(k) = std::env::var("XAI_API_KEY") {
-            cmd.env("XAI_API_KEY", k);
-        }
         let mut child = cmd
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -709,20 +696,15 @@ mod tests {
         // "stop", content mentions the fed-back temperature). The hop-2 "72"
         // assertion is the key proof the tool result actually round-tripped and
         // was consumed. Skips cleanly (and loudly) when creds are absent so the
-        // offline suite stays green; uses real creds (no dummy key injected),
-        // passing through XAI_API_KEY if set.
+        // offline suite stays green; the spawned binary loads the real key fresh
+        // from ~/.xai/.credentials.json (inherited via HOME).
         if !has_grok_creds() {
-            eprintln!(
-                "skipping live grok tool-call loop test (no XAI_API_KEY and no ~/.xai/.credentials.json)"
-            );
+            eprintln!("skipping live grok tool-call loop test (no ~/.xai/.credentials.json)");
             return;
         }
         let port = free_port();
         let mut cmd = Command::new(bin_path());
         cmd.arg("--no-auth").arg("--port").arg(port.to_string());
-        if let Ok(k) = std::env::var("XAI_API_KEY") {
-            cmd.env("XAI_API_KEY", k);
-        }
         let mut child = cmd
             .stdout(Stdio::null())
             .stderr(Stdio::null())

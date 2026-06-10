@@ -42,8 +42,10 @@
 //!   no OMNI_API_KEYS) means "allow all" (passthrough), matching original CCP behavior.
 //! - No stats/replacements loaded at this layer (cross-cutting; providers demonstrate
 //!   the hook; real bins can inject Arc<Replacements> etc. into provider ctors later).
-//! - Startup: claude stub always succeeds. grok requires XAI_API_KEY (or explicit)
-//!   when "grok" is in the enabled list — fails fast, as intended.
+//! - Startup: both providers construct without reading credentials; the grok key is
+//!   read fresh per request from files ($XAI_CREDENTIALS_PATH -> ~/.xai/.credentials.json
+//!   -> ~/.grok/auth.json, the Grok CLI's OIDC login). A missing source surfaces as an
+//!   auth error on the first grok request.
 //!
 //! Build: cargo build -p omni
 //! Run (claude only, no keys needed): OMNI_PROVIDERS=claude cargo run -p omni -- --no-auth --port 18323
@@ -133,9 +135,10 @@ async fn main() -> anyhow::Result<()> {
                 ))
             }
             "grok" => {
-                info!("initializing grok provider (requires XAI_API_KEY if not using test ctor)");
-                let p = GrokProvider::new(None)
-                    .context("failed to init grok provider (set XAI_API_KEY or remove grok from OMNI_PROVIDERS)")?;
+                info!(
+                    "initializing grok provider (key read per request from ~/.xai/.credentials.json)"
+                );
+                let p = GrokProvider::new(None).context("failed to init grok provider")?;
                 Arc::new(p)
             }
             other => {
@@ -526,8 +529,7 @@ mod tests {
         // Here we prove:
         // 1. Routing logic selects "grok" for "grok:..." prefix (even in multi-provider mode).
         // 2. The GrokProvider type satisfies LlmProvider (compile-time), so the dyn map + delegation
-        //    code paths in main are valid for it. (No runtime construction here to avoid XAI_API_KEY
-        //    requirement.)
+        //    code paths in main are valid for it. (Routing only; no runtime construction or network.)
         let enabled: Vec<String> = vec!["claude".into(), "grok".into()];
         let (key, stripped) = resolve_provider_and_model("grok:grok-4.3", &enabled).unwrap();
         assert_eq!(key, "grok");
@@ -575,18 +577,17 @@ mod tests {
     }
 
     fn has_grok_creds() -> bool {
-        // Mirror the Grok provider's fresh-load precedence and the race-safe guard
-        // used in provider-grok: when XAI_CREDENTIALS_PATH is set, treat creds as
-        // present only if that file exists (a test may point it at a dummy/missing
-        // path); otherwise fall back to XAI_API_KEY or the default file.
+        // Mirror the Grok provider's fresh-load source precedence: when XAI_CREDENTIALS_PATH
+        // is set, treat creds as present only if that file exists (a test may point it at a
+        // dummy/missing path); otherwise creds are present if EITHER the static-key file
+        // ~/.xai/.credentials.json OR the Grok CLI login ~/.grok/auth.json exists. Files are
+        // the only credential source (no env key), matching the provider.
         if let Ok(p) = std::env::var("XAI_CREDENTIALS_PATH") {
             return std::path::Path::new(&p).exists();
         }
-        if std::env::var("XAI_API_KEY").is_ok() {
-            return true;
-        }
         let home = std::env::var("HOME").unwrap_or_default();
-        std::path::Path::new(&(home + "/.xai/.credentials.json")).exists()
+        std::path::Path::new(&format!("{home}/.xai/.credentials.json")).exists()
+            || std::path::Path::new(&format!("{home}/.grok/auth.json")).exists()
     }
 
     fn wait_for_200_health(port: u16, timeout: Duration) -> bool {
@@ -1660,8 +1661,8 @@ rule = [
         // "stop", content contains the fed-back "72"). The hop-2 "72" assertion
         // proves the tool result actually round-tripped through the aggregator.
         // Skips a backend's block when its creds are absent so the suite stays
-        // green offline. Starts both providers; passes XAI_API_KEY through if set
-        // (grok requires it at startup unless ~/.xai/.credentials.json exists).
+        // green offline. Starts both providers; each reads its key fresh per request
+        // from its credentials file (grok: ~/.xai/.credentials.json, inherited via HOME).
         if !has_grok_creds() && !has_claude_creds() {
             eprintln!("skipping live tool-call loop both-backends: no grok or claude creds");
             return;
@@ -1670,9 +1671,6 @@ rule = [
         let mut cmd = Command::new(omni_bin_path());
         cmd.env("OMNI_PROVIDERS", "claude,grok")
             .args(["--no-auth", "--port", &port.to_string()]);
-        if let Ok(k) = std::env::var("XAI_API_KEY") {
-            cmd.env("XAI_API_KEY", k);
-        }
         let mut child = cmd
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1888,7 +1886,8 @@ rule = [
         // (payload 3): feeding a function_call + function_call_output back makes
         // the model complete using the fed-back result. The "72" assertion proves
         // the tool result round-tripped through the Responses protocol.
-        // Live-conditional on grok creds; passes XAI_API_KEY through if set.
+        // Live-conditional on grok creds; the spawned binary reads its key fresh from
+        // ~/.xai/.credentials.json (inherited via HOME).
         if !has_grok_creds() {
             eprintln!("skipping responses tool loop live (grok): no grok creds");
             return;
@@ -1897,9 +1896,6 @@ rule = [
         let mut cmd = Command::new(omni_bin_path());
         cmd.env("OMNI_PROVIDERS", "grok")
             .args(["--no-auth", "--port", &port.to_string()]);
-        if let Ok(k) = std::env::var("XAI_API_KEY") {
-            cmd.env("XAI_API_KEY", k);
-        }
         let mut child = cmd
             .stdout(Stdio::null())
             .stderr(Stdio::null())

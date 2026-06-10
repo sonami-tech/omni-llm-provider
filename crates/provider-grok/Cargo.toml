@@ -19,3 +19,4 @@ async-stream.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+chrono.workspace = true
