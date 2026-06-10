@@ -65,9 +65,10 @@ struct ClaudeStreamConverter {
     input_tokens: Option<u32>,
     output_tokens: Option<u32>,
     usage_emitted: bool,
-    /// Set once `finish_events` has emitted the terminal `Finish`. The
-    /// `send_stream` EOF guard checks this so a stream that already saw
-    /// `message_stop` does not get a SECOND `Finish` appended at end-of-byte-stream.
+    /// Set once a terminal `Finish` has been emitted by ANY path (`finish_events`
+    /// for `message_stop`, or the `Error` arm). The `send_stream` EOF guard checks
+    /// this so a stream that already produced its terminal `Finish` does not get a
+    /// SECOND one appended at end-of-byte-stream.
     finished: bool,
 }
 
@@ -135,7 +136,11 @@ impl ClaudeStreamConverter {
             }
             StreamEvent::MessageStop => self.finish_events(),
             StreamEvent::Error { kind, message } => {
-                // Surface as a terminal error so the consumer stops cleanly.
+                // Surface as a terminal error so the consumer stops cleanly. This
+                // IS a terminal Finish, so mark `finished` to stop the send_stream
+                // EOF guard from appending a second (success) Finish if the
+                // upstream then closes the byte stream.
+                self.finished = true;
                 vec![CanonicalStreamEvent::Finish {
                     finish_reason: Some(format!("error: {kind}: {message}")),
                 }]
@@ -579,6 +584,32 @@ mod tests {
             }
         );
         assert_eq!(out.len(), 7, "no extra events emitted");
+    }
+
+    #[test]
+    fn stream_converter_error_event_marks_finished_for_single_finish() {
+        // WHY: an Anthropic `error` SSE frame emits a terminal Finish directly
+        // (not via finish_events). If `finished` were not set here, a subsequent
+        // end-of-byte-stream would make send_stream's EOF guard append a SECOND,
+        // contradictory success Finish. This pins that the error path is also a
+        // single-Finish terminal, matching the message_stop path.
+        use crate::upstream::stream::StreamEvent;
+        let mut conv = ClaudeStreamConverter::default();
+        let out = conv.on_event(StreamEvent::Error {
+            kind: "overloaded_error".into(),
+            message: "upstream busy".into(),
+        });
+        assert_eq!(out.len(), 1);
+        assert!(
+            matches!(out[0], CanonicalStreamEvent::Finish { .. }),
+            "error event yields a terminal Finish"
+        );
+        assert!(
+            conv.finished,
+            "error path must mark finished so the EOF guard does not double-Finish"
+        );
+        // The EOF guard would now be a no-op: finish_events is only re-run when
+        // !finished, so no second Finish is appended.
     }
 
     #[test]
