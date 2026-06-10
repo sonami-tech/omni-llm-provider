@@ -364,15 +364,18 @@ mod tests {
         root.pop();
         root.pop();
         let bin = root.join("target").join("debug").join("omni-grok");
-        if !bin.exists() {
-            let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-            let status = Command::new(cargo)
-                .args(["build", "-p", "omni-grok"])
-                .current_dir(&root)
-                .status()
-                .expect("invoke cargo build for omni-grok bin");
-            assert!(status.success(), "cargo build -p omni-grok failed");
-        }
+        // Build UNCONDITIONALLY (not only when missing): the real hazard is a *stale*
+        // binary, where a handler/route change recompiles this test harness but leaves
+        // an older target/debug/omni-grok on disk, so the subprocess runs pre-change
+        // code. An incremental no-op build is ~0.15s, cheap insurance the subprocess
+        // runs current code. Kept in sync with omni::omni_bin_path().
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let status = Command::new(cargo)
+            .args(["build", "-p", "omni-grok"])
+            .current_dir(&root)
+            .status()
+            .expect("invoke cargo build for omni-grok bin");
+        assert!(status.success(), "cargo build -p omni-grok failed");
         bin
     }
 
