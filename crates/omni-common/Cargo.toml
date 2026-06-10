@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+omni-core = { path = "../omni-core" }
 axum.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -14,4 +15,6 @@ uuid.workspace = true
 redb.workspace = true
 toml.workspace = true
 chrono.workspace = true
+futures-util.workspace = true
+async-stream.workspace = true
 dirs = "6"
