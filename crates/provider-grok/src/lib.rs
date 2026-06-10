@@ -2348,6 +2348,255 @@ mod tests {
         );
     }
 
+    // ── Hermetic wiremock round-trip tests ────────────────────────────────────
+    //
+    // These close the CI coverage gap left by the live tests above: they prove the
+    // full request-build -> HTTP -> response-parse round-trip OFFLINE against a
+    // local mock standing in for api.x.ai. The provider is pointed at the mock via
+    // the existing public `new_for_test(key, base_url)` seam; the request building,
+    // body shape, response decoder, and SSE pipeline are all production code.
+    //
+    // CREDS ISOLATION (load-bearing): `resolve_api_key` reads the creds FILE chain
+    // FIRST ($XAI_CREDENTIALS_PATH -> ~/.xai -> ~/.grok), and ~/.grok/auth.json
+    // exists on dev boxes, so without isolation the provider would send the REAL
+    // OIDC bearer and the `Bearer xai-dummy` matcher would 404. Each test takes
+    // CRED_ENV_LOCK and points XAI_CREDENTIALS_PATH at a temp `{"apiKey":"xai-dummy"}`
+    // static-key file (the explicit-override branch), so the dummy key is what flows.
+
+    /// RAII guard: writes a temp `{"apiKey": "xai-dummy"}` file, sets
+    /// `XAI_CREDENTIALS_PATH` to it, and restores the prior env + removes the file
+    /// on drop. Caller must hold CRED_ENV_LOCK for the guard's whole lifetime.
+    struct DummyXaiCreds {
+        path: ::std::path::PathBuf,
+        prev: Option<String>,
+    }
+
+    impl DummyXaiCreds {
+        const KEY: &'static str = "xai-dummy";
+
+        fn install(tag: &str) -> Self {
+            let path = ::std::env::temp_dir().join(format!(
+                "xai-hermetic-{}-{}.json",
+                tag,
+                ::std::process::id()
+            ));
+            ::std::fs::write(&path, format!(r#"{{"apiKey": "{}"}}"#, Self::KEY))
+                .expect("write temp xai creds");
+            let prev = ::std::env::var("XAI_CREDENTIALS_PATH").ok();
+            unsafe {
+                ::std::env::set_var("XAI_CREDENTIALS_PATH", &path);
+            }
+            Self { path, prev }
+        }
+    }
+
+    impl Drop for DummyXaiCreds {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => ::std::env::set_var("XAI_CREDENTIALS_PATH", v),
+                    None => ::std::env::remove_var("XAI_CREDENTIALS_PATH"),
+                }
+            }
+            let _ = ::std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn grok_nonstream_success_roundtrip_via_wiremock() {
+        // WHY: proves a successful non-stream completion end to end offline — the
+        // request leaves with `Authorization: Bearer xai-dummy`, the right method
+        // and path, and a body carrying the model + messages; and the real decoder
+        // maps the xAI response to canonical content/finish_reason/usage. CI could
+        // not prove a green Grok round-trip before this.
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _creds = DummyXaiCreds::install("nonstream-ok");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header(
+                "authorization",
+                format!("Bearer {}", DummyXaiCreds::KEY).as_str(),
+            ))
+            .and(body_partial_json(json!({"model": "grok-3-mini"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-hermetic",
+                "object": "chat.completion",
+                "model": "grok-3-mini",
+                "choices": [ {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "Hello back" },
+                    "finish_reason": "stop"
+                } ],
+                "usage": { "prompt_tokens": 9, "completion_tokens": 2, "total_tokens": 11 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let p = GrokProvider::new_for_test(DummyXaiCreds::KEY, server.uri());
+        let req = CanonicalRequest {
+            model: "grok-3-mini".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            ..Default::default()
+        };
+        let resp = p.send(req).await.expect("hermetic grok send must succeed");
+
+        assert_eq!(resp.content, "Hello back");
+        assert_eq!(resp.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(resp.usage.input_tokens, 9);
+        assert_eq!(resp.usage.output_tokens, 2);
+        assert!(resp.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn grok_nonstream_tool_call_roundtrip_via_wiremock() {
+        // WHY: tool calls take the tool_calls decode branch (synthesize/keep id,
+        // map name + arguments, finish_reason tool_calls). Pins the wire round-trip
+        // surfaces the tool name, id, and arguments intact.
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _creds = DummyXaiCreds::install("nonstream-tool");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header(
+                "authorization",
+                format!("Bearer {}", DummyXaiCreds::KEY).as_str(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-tool",
+                "object": "chat.completion",
+                "model": "grok-3-mini",
+                "choices": [ {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [ {
+                            "id": "call_xyz",
+                            "type": "function",
+                            "function": { "name": "get_weather", "arguments": "{\"city\":\"SF\"}" }
+                        } ]
+                    },
+                    "finish_reason": "tool_calls"
+                } ],
+                "usage": { "prompt_tokens": 14, "completion_tokens": 6, "total_tokens": 20 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let p = GrokProvider::new_for_test(DummyXaiCreds::KEY, server.uri());
+        let req = CanonicalRequest {
+            model: "grok-3-mini".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("weather?".into()),
+            }],
+            ..Default::default()
+        };
+        let resp = p
+            .send(req)
+            .await
+            .expect("hermetic grok tool-call send must succeed");
+
+        assert_eq!(resp.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(resp.tool_calls.len(), 1);
+        let tc = &resp.tool_calls[0];
+        assert_eq!(tc.id, "call_xyz");
+        assert_eq!(tc.name, "get_weather");
+        let args: serde_json::Value = serde_json::from_str(&tc.arguments).expect("args are json");
+        assert_eq!(args["city"], "SF");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn grok_streaming_roundtrip_via_wiremock() {
+        // WHY: proves the streaming round-trip offline through the real HTTP path:
+        // the SSE body is reframed by SseBuffer, parsed by parse_grok_sse_frame, and
+        // terminated by exactly one Finish at `[DONE]`. Pins ordered TextDelta ->
+        // ToolCallDelta -> Usage -> single terminal Finish over the wire (the
+        // in-memory drive_sse test covers the parser; this covers the transport).
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _creds = DummyXaiCreds::install("stream-ok");
+
+        // OpenAI-style SSE chunks, terminated by `data: [DONE]`.
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_s\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"SF\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header(
+                "authorization",
+                format!("Bearer {}", DummyXaiCreds::KEY).as_str(),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_body),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let p = GrokProvider::new_for_test(DummyXaiCreds::KEY, server.uri());
+        let req = CanonicalRequest {
+            model: "grok-3-mini".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            ..Default::default()
+        };
+        let stream = p.send_stream(req).await.expect("hermetic grok stream open");
+        let events: Vec<CanonicalStreamEvent> =
+            stream.map(|r| r.expect("no stream error")).collect().await;
+
+        assert_eq!(
+            events,
+            vec![
+                CanonicalStreamEvent::TextDelta("Hello".into()),
+                CanonicalStreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_s".into()),
+                    name: Some("get_weather".into()),
+                    arguments_delta: "{\"city\":\"SF\"}".into(),
+                },
+                CanonicalStreamEvent::Usage(CanonicalUsage {
+                    input_tokens: 11,
+                    output_tokens: 7,
+                    cache_read: 0,
+                    cache_creation: 0,
+                }),
+                CanonicalStreamEvent::Finish {
+                    finish_reason: Some("tool_calls".into()),
+                },
+            ]
+        );
+    }
+
     /// Read a real xAI key for a live test from the SAME home sources production auto-detects:
     /// `~/.xai/.credentials.json` (static key) then `~/.grok/auth.json` (the Grok CLI's OIDC login).
     /// This is what makes the provider-crate live tests exercise the "grok CLI Just Works" path, not
