@@ -292,9 +292,13 @@ pub fn build_messages_request_from_canonical(
         None
     };
 
-    let mut max_tokens = req
-        .max_tokens
-        .unwrap_or_else(|| default_max_tokens(model_def));
+    // Leave max_tokens at the sentinel 0 when the client supplied neither an
+    // explicit value nor (below) a thinking budget. apply_profile_wire_defaults
+    // then fills the captured Claude Code wire value (64k/32k per model), which
+    // is what real Claude Code bodies carry. Using the catalog default here
+    // instead would deviate from the fingerprint baseline. See
+    // apply_profile_wire_defaults + FingerprintProfile::wire_defaults_for_model.
+    let mut max_tokens = req.max_tokens.unwrap_or(0);
 
     let thinking = derive_thinking_from_canonical(req.reasoning.as_ref(), model_def);
 
@@ -302,6 +306,9 @@ pub fn build_messages_request_from_canonical(
         && let Some(budget) = t.budget_tokens
         && max_tokens <= budget
     {
+        // Thinking is active: max_tokens must exceed the budget. This is a
+        // different request shape than a default reply, so we compute a concrete
+        // value here (non-zero, so the wire-default gate below leaves it alone).
         max_tokens = budget
             .saturating_add(1024)
             .min(default_max_tokens(model_def));
@@ -312,14 +319,18 @@ pub fn build_messages_request_from_canonical(
         .map(|t| t.kind == "enabled")
         .unwrap_or(false);
 
+    // When thinking is active Anthropic requires temperature=1.0 and forbids
+    // top_p/top_k/stop_sequences. Otherwise pass client sampling through; the
+    // wire-default temperature (when the client omitted one) is applied later in
+    // apply_profile_wire_defaults so it can key off the resolved outbound model.
     let temperature = if thinking_active {
         Some(1.0)
     } else {
         req.temperature
     };
     let top_p = if thinking_active { None } else { req.top_p };
-    let top_k = if thinking_active { None } else { None };
-    let stop_sequences = if thinking_active { None } else { None };
+    let top_k = None;
+    let stop_sequences = None;
 
     // metadata / user passthrough limited for canonical v1
     let metadata = None;
@@ -528,7 +539,7 @@ pub fn build_canonical_response(
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<CanonicalToolCall> = Vec::new();
 
-    for (_i, block) in resp.content.iter().enumerate() {
+    for block in resp.content.iter() {
         match block {
             ResponseContentBlock::Text { text } => {
                 text_parts.push(text.clone());
@@ -599,9 +610,44 @@ pub fn prepare_anthropic_request(
 ) -> Result<MessagesRequest, String> {
     let model_def = profile.resolve_model(&canon.model);
     let mut anth = build_messages_request_from_canonical(canon, model_def, repl)?;
+
+    // Emit the outbound model exactly as Claude Code would: an explicit version
+    // pin is forwarded verbatim, otherwise the profile canonical. This is part
+    // of the wire fingerprint (per-model betas key off this value upstream).
+    anth.model = profile.outbound_model(&canon.model, model_def);
+
+    // Apply the captured Claude Code wire defaults (max_tokens / temperature /
+    // output_config.effort) for any field the client did not specify, so a
+    // default-shaped request matches the real Claude Code body byte-for-byte on
+    // these fields rather than deviating. Must run BEFORE identity injection so
+    // the billing suffix is computed over the final body shape.
+    apply_profile_wire_defaults(&mut anth, profile);
+
     // Important: identity uses the (post-repl) first user text for the suffix.
     prepend_claude_code_identity(&mut anth, profile, inject_identity);
     Ok(anth)
+}
+
+/// Fill the fingerprint wire defaults for any field the client left unset, so a
+/// default request reproduces the real Claude Code 2.1.x body. Gated on
+/// "client did not supply": max_tokens sentinel 0, temperature None,
+/// output_config None. Mirrors the reference implementation's
+/// `apply_profile_wire_defaults` (see the working claude-code-provider).
+pub fn apply_profile_wire_defaults(req: &mut MessagesRequest, profile: &FingerprintProfile) {
+    let defaults = profile.wire_defaults_for_model(&req.model);
+    if req.max_tokens == 0 {
+        req.max_tokens = defaults.max_tokens;
+    }
+    if req.temperature.is_none() {
+        req.temperature = defaults.temperature;
+    }
+    if req.output_config.is_none()
+        && let Some(effort) = defaults.output_effort
+    {
+        req.output_config = Some(OutputConfig {
+            effort: effort.to_string(),
+        });
+    }
 }
 
 #[cfg(test)]
@@ -818,6 +864,105 @@ mod tests {
     }
 
     #[test]
+    fn wire_defaults_applied_for_default_request_matches_capture() {
+        // WHY: this is the project's #1 invariant. Real Claude Code 2.1.165 bodies
+        // carry captured per-model wire values; a default-shaped request (client
+        // supplies neither max_tokens nor temperature nor output_config) MUST
+        // reproduce them, or the body deviates from the fingerprint baseline on
+        // exactly the fields the gate inspects. These expectations are the
+        // captured values in fingerprint.rs MODEL_WIRE_OVERRIDES for cc-2.1.165.
+        // If this test fails, either a capture changed (rebaseline) or the
+        // wire-default wiring regressed (bug). Both must be caught.
+        let profile = crate::fingerprint::default_profile();
+        let repl = empty_repl();
+
+        // (input alias, expected outbound model, expected max_tokens,
+        //  expected temperature, expected output_config effort)
+        type WireCase = (
+            &'static str,
+            &'static str,
+            u32,
+            Option<f32>,
+            Option<&'static str>,
+        );
+        let cases: &[WireCase] = &[
+            ("opus", "claude-opus-4-8", 64_000, None, Some("high")),
+            (
+                "sonnet",
+                "claude-sonnet-4-6",
+                32_000,
+                Some(1.0),
+                Some("high"),
+            ),
+            // The "haiku" alias resolves to the dated canonical; its wire override
+            // carries the same 32k / 1.0 / no-effort values as the undated entry.
+            (
+                "haiku",
+                "claude-haiku-4-5-20251001",
+                32_000,
+                Some(1.0),
+                None,
+            ),
+        ];
+
+        for (alias, exp_model, exp_max, exp_temp, exp_effort) in cases {
+            let canon = CanonicalRequest {
+                model: (*alias).into(),
+                messages: vec![CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Text("hi".into()),
+                }],
+                ..Default::default()
+            };
+            let anth = prepare_anthropic_request(&canon, profile, &repl, false).unwrap();
+            assert_eq!(anth.model, *exp_model, "outbound model for {alias}");
+            assert_eq!(
+                anth.max_tokens, *exp_max,
+                "wire max_tokens for {alias} (must be the captured value, not the catalog default)"
+            );
+            assert_eq!(anth.temperature, *exp_temp, "wire temperature for {alias}");
+            assert_eq!(
+                anth.output_config.as_ref().map(|o| o.effort.as_str()),
+                *exp_effort,
+                "wire output_config.effort for {alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_supplied_values_override_wire_defaults() {
+        // WHY: wire defaults fill UNSET fields only. A client that explicitly
+        // sets max_tokens/temperature must have those honored (proxy fidelity),
+        // and the wire default must not clobber them. Guards the is_none()/==0
+        // gating in apply_profile_wire_defaults against regressing to
+        // unconditional overwrite.
+        let profile = crate::fingerprint::default_profile();
+        let repl = empty_repl();
+        let canon = CanonicalRequest {
+            model: "sonnet".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            max_tokens: Some(7),
+            temperature: Some(0.3),
+            ..Default::default()
+        };
+        let anth = prepare_anthropic_request(&canon, profile, &repl, false).unwrap();
+        assert_eq!(anth.max_tokens, 7, "client max_tokens must be preserved");
+        assert_eq!(
+            anth.temperature,
+            Some(0.3),
+            "client temperature must be preserved"
+        );
+        // output_config still filled from wire default (client did not set it).
+        assert_eq!(
+            anth.output_config.as_ref().map(|o| o.effort.as_str()),
+            Some("high")
+        );
+    }
+
+    #[test]
     fn build_messages_drops_unsupported_canonical_fields() {
         // Current canonical adapter intentionally drops provider_extras,
         // some reasoning non-effort, etc. The wire shape for cch/identity
@@ -866,7 +1011,6 @@ mod tests {
                 output_tokens: 3,
                 cache_creation_input_tokens: Some(2),
                 cache_read_input_tokens: Some(1),
-                ..Default::default()
             },
         };
         let canon = build_canonical_response(&resp, "haiku", &empty_repl());
