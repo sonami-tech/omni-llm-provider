@@ -1,15 +1,23 @@
-// Minimal self-contained stats for prototype (full redb logic from original preserved where possible, comments updated).
-// The original had Anthropic usage comments; kept as-is for fidelity but the struct is provider-agnostic.
+// Persistent, provider-agnostic request/usage statistics.
+//
+// Durable counters (total/per-model/per-key request counts, total errors,
+// per-model token usage, last-request timestamp) live in a redb file the app
+// owns. Volatile, bounded series that only matter while the process is alive
+// (recent error messages, latency samples used to compute rolling averages)
+// live in an in-memory mutex-guarded buffer. `snapshot()` joins both into the
+// serializable shape the GET /stats endpoint serves.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Sender, SyncSender, sync_channel};
 use std::time::Instant;
 
+use chrono::Utc;
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+
+use crate::error::AppError;
 
 const TOTAL_REQUESTS: TableDefinition<&str, u64> = TableDefinition::new("total_requests");
 const REQUESTS_BY_MODEL: TableDefinition<&str, u64> = TableDefinition::new("requests_by_model");
@@ -19,7 +27,11 @@ const REQUESTS_BY_KEY: TableDefinition<&str, u64> = TableDefinition::new("reques
 const LAST_REQUEST_AT: TableDefinition<&str, &str> = TableDefinition::new("last_request_at");
 const TOTAL_KEY: &str = "total";
 
+// The recent-errors ring buffer is a debugging aid, not an audit log: it must
+// not grow without bound as the process serves traffic for days.
 const MAX_RECENT_ERRORS: usize = 50;
+// Rolling latency averages are computed over a bounded window of the most
+// recent samples per model so memory stays flat under sustained load.
 const MAX_SAMPLES: usize = 1000;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -30,6 +42,8 @@ pub struct TokenUsage {
     pub cache_creation_input_tokens: u64,
 }
 
+// Persisted per-model token tally. Serialized to bytes in TOKENS_BY_MODEL so a
+// single value carries the full token breakdown for a model across restarts.
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct TokenStats {
     input_tokens: u64,
@@ -72,45 +86,341 @@ pub struct ModelStats {
     pub cache_creation_input_tokens: u64,
 }
 
+// Volatile per-model latency window. Bounded to MAX_SAMPLES so averages reflect
+// recent behavior without unbounded growth.
+#[derive(Default)]
+struct LatencyWindow {
+    ttft_ms: VecDeque<f64>,
+    duration_ms: VecDeque<f64>,
+}
+
+impl LatencyWindow {
+    fn push_ttft(&mut self, v: f64) {
+        push_bounded(&mut self.ttft_ms, v, MAX_SAMPLES);
+    }
+    fn push_duration(&mut self, v: f64) {
+        push_bounded(&mut self.duration_ms, v, MAX_SAMPLES);
+    }
+    fn avg_ttft(&self) -> f64 {
+        avg(&self.ttft_ms)
+    }
+    fn avg_duration(&self) -> f64 {
+        avg(&self.duration_ms)
+    }
+}
+
+// In-memory state that is intentionally not persisted: a debugging ring buffer
+// of recent errors and rolling latency windows per model.
+#[derive(Default)]
+struct Volatile {
+    recent_errors: VecDeque<ErrorRecord>,
+    latency: HashMap<String, LatencyWindow>,
+}
+
 pub struct Stats {
     db: Database,
-    // ... (full original logic for open, record_*, snapshot etc. would be here; for prototype we stub the public API to keep compile)
-    _active: AtomicU64,
-    _start: Instant,
+    volatile: Mutex<Volatile>,
+    active: AtomicU64,
+    start: Instant,
 }
 
 impl Stats {
+    /// Open (creating if absent) the stats database at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
         let db = Database::create(path)?;
-        // original table creation would go here
+        // Create the tables up front so reads in snapshot() before any write
+        // succeed instead of erroring on a missing table.
+        let wtx = db.begin_write()?;
+        {
+            wtx.open_table(TOTAL_REQUESTS)?;
+            wtx.open_table(REQUESTS_BY_MODEL)?;
+            wtx.open_table(REQUESTS_BY_KEY)?;
+            wtx.open_table(TOKENS_BY_MODEL)?;
+            wtx.open_table(TOTAL_ERRORS)?;
+            wtx.open_table(LAST_REQUEST_AT)?;
+        }
+        wtx.commit()?;
         Ok(Stats {
             db,
-            _active: AtomicU64::new(0),
-            _start: Instant::now(),
+            volatile: Mutex::new(Volatile::default()),
+            active: AtomicU64::new(0),
+            start: Instant::now(),
         })
     }
 
-    pub fn record_request(&self, _model: &str, _key: Option<&str>) { /* full impl */
+    /// Record an inbound request: bumps the global counter, the per-model and
+    /// per-key counters, and stamps the last-request time. Per-key attribution
+    /// is what lets the dashboard show which API key drives load.
+    pub fn record_request(&self, model: &str, key: Option<&str>) {
+        if let Err(e) = self.record_request_inner(model, key) {
+            tracing::warn!("stats: record_request failed: {e}");
+        }
     }
-    pub fn record_response(&self, _model: &str, _usage: TokenUsage, _ttft: Option<f64>, _dur: f64) { /* */
+
+    fn record_request_inner(&self, model: &str, key: Option<&str>) -> Result<(), AppError> {
+        let now = Utc::now().to_rfc3339();
+        let wtx = self.db.begin_write().map_err(db_err)?;
+        {
+            increment(&wtx, TOTAL_REQUESTS, TOTAL_KEY, 1)?;
+            increment(&wtx, REQUESTS_BY_MODEL, model, 1)?;
+            if let Some(k) = key {
+                increment(&wtx, REQUESTS_BY_KEY, k, 1)?;
+            }
+            let mut t = wtx.open_table(LAST_REQUEST_AT).map_err(db_err)?;
+            t.insert(TOTAL_KEY, now.as_str()).map_err(db_err)?;
+        }
+        wtx.commit().map_err(db_err)?;
+        Ok(())
     }
-    pub fn record_error(&self, _model: &str, _msg: &str) { /* */
+
+    /// Record a completed response: accumulates token usage for the model and
+    /// feeds the rolling latency window (ttft + total duration).
+    pub fn record_response(&self, model: &str, usage: TokenUsage, ttft: Option<f64>, dur: f64) {
+        if let Err(e) = self.record_response_inner(model, usage) {
+            tracing::warn!("stats: record_response failed: {e}");
+        }
+        // Latency samples are volatile; never let a poisoned lock take down the
+        // request path.
+        if let Ok(mut v) = self.volatile.lock() {
+            let w = v.latency.entry(model.to_string()).or_default();
+            if let Some(t) = ttft {
+                w.push_ttft(t);
+            }
+            w.push_duration(dur);
+        }
     }
-    // snapshot, guards etc. stubbed for compile in this pass; the redb + per-model tracking is the reusable concept.
+
+    fn record_response_inner(&self, model: &str, usage: TokenUsage) -> Result<(), AppError> {
+        let wtx = self.db.begin_write().map_err(db_err)?;
+        {
+            let mut t = wtx.open_table(TOKENS_BY_MODEL).map_err(db_err)?;
+            let mut stats: TokenStats = match t.get(model).map_err(db_err)? {
+                Some(bytes) => serde_json::from_slice(bytes.value())
+                    .map_err(|e| AppError::ServerError(format!("stats decode: {e}")))?,
+                None => TokenStats::default(),
+            };
+            stats.input_tokens += usage.input_tokens;
+            stats.output_tokens += usage.output_tokens;
+            stats.cache_read_input_tokens += usage.cache_read_input_tokens;
+            stats.cache_creation_input_tokens += usage.cache_creation_input_tokens;
+            let encoded = serde_json::to_vec(&stats)
+                .map_err(|e| AppError::ServerError(format!("stats encode: {e}")))?;
+            t.insert(model, encoded.as_slice()).map_err(db_err)?;
+        }
+        wtx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Record an error: bumps the durable error counter and pushes the message
+    /// onto the bounded in-memory recent-errors ring (newest at the front).
+    pub fn record_error(&self, model: &str, msg: &str) {
+        if let Err(e) = self.bump_total_errors() {
+            tracing::warn!("stats: record_error failed: {e}");
+        }
+        if let Ok(mut v) = self.volatile.lock() {
+            v.recent_errors.push_front(ErrorRecord {
+                timestamp: Utc::now().to_rfc3339(),
+                model: model.to_string(),
+                message: msg.to_string(),
+            });
+            while v.recent_errors.len() > MAX_RECENT_ERRORS {
+                v.recent_errors.pop_back();
+            }
+        }
+    }
+
+    fn bump_total_errors(&self) -> Result<(), AppError> {
+        let wtx = self.db.begin_write().map_err(db_err)?;
+        increment(&wtx, TOTAL_ERRORS, TOTAL_KEY, 1)?;
+        wtx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Build the full serializable snapshot served by GET /stats. Joins durable
+    /// redb counters with the volatile latency windows and recent-errors ring.
+    pub fn snapshot(&self) -> StatsSnapshot {
+        self.snapshot_inner().unwrap_or_else(|e| {
+            tracing::warn!("stats: snapshot read failed, returning empty: {e}");
+            self.empty_snapshot()
+        })
+    }
+
+    fn snapshot_inner(&self) -> Result<StatsSnapshot, AppError> {
+        let rtx = self.db.begin_read().map_err(db_err)?;
+
+        let total_requests = read_one(&rtx, TOTAL_REQUESTS, TOTAL_KEY)?;
+        let errors = read_one(&rtx, TOTAL_ERRORS, TOTAL_KEY)?;
+        let last_request_at = {
+            let t = rtx.open_table(LAST_REQUEST_AT).map_err(db_err)?;
+            t.get(TOTAL_KEY)
+                .map_err(db_err)?
+                .map(|v| v.value().to_string())
+        };
+
+        let mut api_keys = HashMap::new();
+        {
+            let t = rtx.open_table(REQUESTS_BY_KEY).map_err(db_err)?;
+            for row in t.iter().map_err(db_err)? {
+                let (k, v) = row.map_err(db_err)?;
+                api_keys.insert(k.value().to_string(), v.value());
+            }
+        }
+
+        let mut req_by_model: HashMap<String, u64> = HashMap::new();
+        {
+            let t = rtx.open_table(REQUESTS_BY_MODEL).map_err(db_err)?;
+            for row in t.iter().map_err(db_err)? {
+                let (k, v) = row.map_err(db_err)?;
+                req_by_model.insert(k.value().to_string(), v.value());
+            }
+        }
+
+        let mut tokens_by_model: HashMap<String, TokenStats> = HashMap::new();
+        {
+            let t = rtx.open_table(TOKENS_BY_MODEL).map_err(db_err)?;
+            for row in t.iter().map_err(db_err)? {
+                let (k, v) = row.map_err(db_err)?;
+                let ts: TokenStats = serde_json::from_slice(v.value())
+                    .map_err(|e| AppError::ServerError(format!("stats decode: {e}")))?;
+                tokens_by_model.insert(k.value().to_string(), ts);
+            }
+        }
+
+        // Snapshot the volatile latency windows so the held lock is brief.
+        let (recent_errors, latency_avgs) = {
+            let v = self
+                .volatile
+                .lock()
+                .map_err(|_| AppError::ServerError("stats lock poisoned".into()))?;
+            let recent: Vec<ErrorRecord> = v.recent_errors.iter().cloned().collect();
+            let avgs: HashMap<String, (f64, f64)> = v
+                .latency
+                .iter()
+                .map(|(m, w)| (m.clone(), (w.avg_ttft(), w.avg_duration())))
+                .collect();
+            (recent, avgs)
+        };
+
+        // Union of every model seen via requests, tokens, or latency samples.
+        let mut model_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        model_names.extend(req_by_model.keys().cloned());
+        model_names.extend(tokens_by_model.keys().cloned());
+        model_names.extend(latency_avgs.keys().cloned());
+
+        let mut models = HashMap::new();
+        let mut total_input = 0u64;
+        let mut total_output = 0u64;
+        let mut total_cache_read = 0u64;
+        let mut total_cache_creation = 0u64;
+        for name in model_names {
+            let toks = tokens_by_model.get(&name).cloned().unwrap_or_default();
+            let (avg_ttft_ms, avg_duration_ms) =
+                latency_avgs.get(&name).copied().unwrap_or((0.0, 0.0));
+            total_input += toks.input_tokens;
+            total_output += toks.output_tokens;
+            total_cache_read += toks.cache_read_input_tokens;
+            total_cache_creation += toks.cache_creation_input_tokens;
+            models.insert(
+                name.clone(),
+                ModelStats {
+                    requests: req_by_model.get(&name).copied().unwrap_or(0),
+                    avg_ttft_ms,
+                    avg_duration_ms,
+                    input_tokens: toks.input_tokens,
+                    output_tokens: toks.output_tokens,
+                    cache_read_input_tokens: toks.cache_read_input_tokens,
+                    cache_creation_input_tokens: toks.cache_creation_input_tokens,
+                },
+            );
+        }
+
+        Ok(StatsSnapshot {
+            uptime_seconds: self.start.elapsed().as_secs(),
+            total_requests,
+            active_requests: self.active.load(Ordering::Relaxed),
+            errors,
+            total_input_tokens: total_input,
+            total_output_tokens: total_output,
+            total_cache_read_input_tokens: total_cache_read,
+            total_cache_creation_input_tokens: total_cache_creation,
+            last_request_at,
+            models,
+            api_keys,
+            recent_errors,
+        })
+    }
+
+    fn empty_snapshot(&self) -> StatsSnapshot {
+        StatsSnapshot {
+            uptime_seconds: self.start.elapsed().as_secs(),
+            total_requests: 0,
+            active_requests: self.active.load(Ordering::Relaxed),
+            errors: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cache_read_input_tokens: 0,
+            total_cache_creation_input_tokens: 0,
+            last_request_at: None,
+            models: HashMap::new(),
+            api_keys: HashMap::new(),
+            recent_errors: Vec::new(),
+        }
+    }
+}
+
+fn db_err(e: impl std::fmt::Display) -> AppError {
+    AppError::ServerError(format!("stats db: {e}"))
+}
+
+// Read-modify-write a single u64 counter row by `delta` inside an open write tx.
+fn increment(
+    wtx: &redb::WriteTransaction,
+    table: TableDefinition<&'static str, u64>,
+    key: &str,
+    delta: u64,
+) -> Result<(), AppError> {
+    let mut t = wtx.open_table(table).map_err(db_err)?;
+    let current = t.get(key).map_err(db_err)?.map(|v| v.value()).unwrap_or(0);
+    t.insert(key, current + delta).map_err(db_err)?;
+    Ok(())
+}
+
+fn read_one(
+    rtx: &redb::ReadTransaction,
+    table: TableDefinition<&'static str, u64>,
+    key: &str,
+) -> Result<u64, AppError> {
+    let t = rtx.open_table(table).map_err(db_err)?;
+    Ok(t.get(key).map_err(db_err)?.map(|v| v.value()).unwrap_or(0))
+}
+
+fn push_bounded(buf: &mut VecDeque<f64>, v: f64, max: usize) {
+    buf.push_back(v);
+    while buf.len() > max {
+        buf.pop_front();
+    }
+}
+
+fn avg(buf: &VecDeque<f64>) -> f64 {
+    if buf.is_empty() {
+        0.0
+    } else {
+        buf.iter().sum::<f64>() / buf.len() as f64
+    }
 }
 
 pub struct ActiveRequestGuard<'a> {
-    _s: &'a Stats,
+    stats: &'a Stats,
 }
 impl<'a> ActiveRequestGuard<'a> {
     pub fn new(s: &'a Stats) -> Self {
-        s._active.fetch_add(1, Ordering::Relaxed);
-        Self { _s: s }
+        s.active.fetch_add(1, Ordering::Relaxed);
+        Self { stats: s }
     }
 }
 impl Drop for ActiveRequestGuard<'_> {
     fn drop(&mut self) {
-        self._s._active.fetch_sub(1, Ordering::Relaxed);
+        self.stats.active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -119,8 +429,17 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    // Each test owns a unique temp file (clearly labeled test data) so parallel
+    // `cargo test` runs never collide on the same redb path.
     fn temp_db_path() -> PathBuf {
         std::env::temp_dir().join(format!("omni-stats-test-{}.redb", uuid::Uuid::new_v4()))
+    }
+
+    struct TempDb(PathBuf);
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
 
     #[test]
@@ -136,404 +455,180 @@ mod tests {
         assert_eq!(u2.input_tokens, 10);
     }
 
+    // The core product requirement: requests, responses and errors must be
+    // attributed per-model and per-key and survive into the snapshot with exact
+    // counts (this is what the /stats dashboard renders).
     #[test]
-    fn stats_open_and_records_do_not_panic() {
+    fn records_persist_with_exact_per_model_and_per_key_counts() {
         let path = temp_db_path();
+        let _cleanup = TempDb(path.clone());
         let stats = Stats::open(&path).expect("open temp stats db");
-        stats.record_request("claude-haiku", Some("...key"));
+
+        // Two requests, same model, two distinct keys.
+        stats.record_request("m", Some("keyA"));
+        stats.record_request("m", Some("keyB"));
         stats.record_response(
-            "claude-haiku",
+            "m",
             TokenUsage {
                 input_tokens: 7,
                 output_tokens: 3,
+                cache_read_input_tokens: 1,
+                cache_creation_input_tokens: 2,
+            },
+            Some(120.0),
+            300.0,
+        );
+        stats.record_error("m", "rate limit");
+
+        let snap = stats.snapshot();
+
+        assert_eq!(snap.total_requests, 2, "both requests counted globally");
+        assert_eq!(
+            snap.models["m"].requests, 2,
+            "both requests attributed to model m"
+        );
+        assert_eq!(snap.api_keys.len(), 2, "two distinct keys tracked");
+        assert_eq!(snap.api_keys["keyA"], 1);
+        assert_eq!(snap.api_keys["keyB"], 1);
+
+        // Response tokens accumulate against the model and the totals.
+        assert_eq!(snap.models["m"].input_tokens, 7);
+        assert_eq!(snap.models["m"].output_tokens, 3);
+        assert_eq!(snap.total_input_tokens, 7);
+        assert_eq!(snap.total_output_tokens, 3);
+        assert_eq!(snap.total_cache_read_input_tokens, 1);
+        assert_eq!(snap.total_cache_creation_input_tokens, 2);
+
+        // Error counter and recent-errors ring both reflect the one error.
+        assert_eq!(snap.errors, 1);
+        assert_eq!(snap.recent_errors.len(), 1);
+        assert_eq!(snap.recent_errors[0].message, "rate limit");
+
+        // last_request_at was stamped (RFC3339, non-empty).
+        assert!(snap.last_request_at.is_some());
+        assert!(!snap.last_request_at.unwrap().is_empty());
+    }
+
+    // Token usage for the same model must accumulate across calls, not overwrite
+    // (the redb value is a read-modify-write of TokenStats).
+    #[test]
+    fn token_usage_accumulates_across_responses() {
+        let path = temp_db_path();
+        let _cleanup = TempDb(path.clone());
+        let stats = Stats::open(&path).expect("open");
+
+        stats.record_response(
+            "m",
+            TokenUsage {
+                input_tokens: 10,
+                output_tokens: 4,
                 ..Default::default()
             },
-            Some(123.4),
-            456.7,
+            None,
+            10.0,
         );
-        stats.record_error("grok", "rate limit");
-        // guard
-        {
-            let _g = ActiveRequestGuard::new(&stats);
-            let _g2 = ActiveRequestGuard::new(&stats);
-        }
-        // cleanup best effort
-        let _ = std::fs::remove_file(&path);
+        stats.record_response(
+            "m",
+            TokenUsage {
+                input_tokens: 5,
+                output_tokens: 1,
+                ..Default::default()
+            },
+            None,
+            20.0,
+        );
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.models["m"].input_tokens, 15, "input tokens summed");
+        assert_eq!(snap.models["m"].output_tokens, 5, "output tokens summed");
+        assert_eq!(snap.total_input_tokens, 15);
     }
 
+    // The recent-errors ring is a debugging aid that must never grow without
+    // bound: it caps at MAX_RECENT_ERRORS and keeps the most recent entries.
     #[test]
-    fn stats_snapshot_shape_serializable() {
-        // construct one like the type used in reexport / API
-        let snap = StatsSnapshot {
-            uptime_seconds: 42,
-            total_requests: 100,
-            active_requests: 1,
-            errors: 3,
-            total_input_tokens: 1000,
-            total_output_tokens: 500,
-            total_cache_read_input_tokens: 10,
-            total_cache_creation_input_tokens: 5,
-            last_request_at: Some("2026-06-08T12:00:00Z".into()),
-            models: std::collections::HashMap::new(),
-            api_keys: std::collections::HashMap::new(),
-            recent_errors: vec![],
-        };
+    fn recent_errors_are_bounded_and_keep_newest() {
+        let path = temp_db_path();
+        let _cleanup = TempDb(path.clone());
+        let stats = Stats::open(&path).expect("open");
+
+        let n = MAX_RECENT_ERRORS + 5;
+        for i in 0..n {
+            stats.record_error("m", &format!("err{i}"));
+        }
+
+        let snap = stats.snapshot();
+        // Every error still counted durably, even those evicted from the ring.
+        assert_eq!(snap.errors, n as u64);
+        // Ring is capped.
+        assert_eq!(snap.recent_errors.len(), MAX_RECENT_ERRORS);
+        // Newest is at the front; the oldest few were evicted.
+        assert_eq!(snap.recent_errors[0].message, format!("err{}", n - 1));
+        assert_eq!(
+            snap.recent_errors.last().unwrap().message,
+            format!("err{}", n - MAX_RECENT_ERRORS)
+        );
+    }
+
+    // Counters must survive reopening the database file (durability is the whole
+    // point of using redb rather than in-memory counters).
+    #[test]
+    fn counters_persist_across_reopen() {
+        let path = temp_db_path();
+        let _cleanup = TempDb(path.clone());
+        {
+            let stats = Stats::open(&path).expect("open");
+            stats.record_request("m", Some("k"));
+            stats.record_request("m", Some("k"));
+        } // db dropped/closed here
+
+        let reopened = Stats::open(&path).expect("reopen");
+        let snap = reopened.snapshot();
+        assert_eq!(snap.total_requests, 2, "request count survived reopen");
+        assert_eq!(snap.models["m"].requests, 2);
+        assert_eq!(snap.api_keys["k"], 2, "per-key count survived reopen");
+        // recent_errors is volatile and intentionally empty after reopen.
+        assert!(snap.recent_errors.is_empty());
+    }
+
+    // Latency averages are computed over a bounded window and reflect samples.
+    #[test]
+    fn latency_averages_reflect_samples_and_serialize() {
+        let path = temp_db_path();
+        let _cleanup = TempDb(path.clone());
+        let stats = Stats::open(&path).expect("open");
+
+        stats.record_response("m", TokenUsage::default(), Some(100.0), 200.0);
+        stats.record_response("m", TokenUsage::default(), Some(300.0), 400.0);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.models["m"].avg_ttft_ms, 200.0);
+        assert_eq!(snap.models["m"].avg_duration_ms, 300.0);
+
+        // Snapshot is the wire shape for GET /stats; it must serialize.
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("uptime_seconds"));
-        assert!(json.contains("total_input_tokens"));
+        assert!(json.contains("avg_ttft_ms"));
     }
 
-    // Snapshot with models that have data (requests + token breakdowns) mirrors CCP
-    // per-model aggregation in dashboard.
+    // ActiveRequestGuard tracks in-flight requests: increment on construction,
+    // decrement on drop, surfaced as active_requests in the snapshot.
     #[test]
-    fn snapshot_includes_models_with_data() {
-        let mut models = std::collections::HashMap::new();
-        models.insert(
-            "claude-haiku".into(),
-            ModelStats {
-                requests: 5,
-                avg_ttft_ms: 123.4,
-                avg_duration_ms: 456.7,
-                input_tokens: 100,
-                output_tokens: 50,
-                cache_read_input_tokens: 10,
-                cache_creation_input_tokens: 0,
-            },
-        );
-        models.insert(
-            "grok-3".into(),
-            ModelStats {
-                requests: 2,
-                avg_ttft_ms: 0.0,
-                avg_duration_ms: 10.0,
-                input_tokens: 20,
-                output_tokens: 5,
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-            },
-        );
-        let snap = StatsSnapshot {
-            uptime_seconds: 100,
-            total_requests: 7,
-            active_requests: 0,
-            errors: 0,
-            total_input_tokens: 120,
-            total_output_tokens: 55,
-            total_cache_read_input_tokens: 10,
-            total_cache_creation_input_tokens: 0,
-            last_request_at: None,
-            models,
-            api_keys: std::collections::HashMap::new(),
-            recent_errors: vec![],
-        };
-        assert_eq!(snap.models.len(), 2);
-        assert_eq!(snap.models["claude-haiku"].requests, 5);
-        assert_eq!(snap.models["grok-3"].input_tokens, 20);
-        let json = serde_json::to_string(&snap).unwrap();
-        assert!(json.contains("claude-haiku"));
-    }
-
-    // api_keys populated from per-key request counts (CCP: REQUESTS_BY_KEY table).
-    #[test]
-    fn snapshot_includes_api_keys() {
-        let mut api_keys = std::collections::HashMap::new();
-        api_keys.insert("sk-...abcd".into(), 42);
-        api_keys.insert("...short".into(), 7);
-        let snap = StatsSnapshot {
-            uptime_seconds: 1,
-            total_requests: 49,
-            active_requests: 0,
-            errors: 0,
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            total_cache_read_input_tokens: 0,
-            total_cache_creation_input_tokens: 0,
-            last_request_at: None,
-            models: std::collections::HashMap::new(),
-            api_keys,
-            recent_errors: vec![],
-        };
-        assert_eq!(*snap.api_keys.get("sk-...abcd").unwrap(), 42);
-        assert_eq!(snap.api_keys.len(), 2);
-    }
-
-    // recent_errors cap exact: in-mem is MAX_RECENT_ERRORS=50; snapshot surfaces up to that
-    // (mirrors CCP record_error + snapshot take; here we assert cap behavior via construction).
-    #[test]
-    fn recent_errors_cap_exact_in_snapshot() {
-        let mut errs = vec![];
-        for i in 0..55 {
-            errs.push(ErrorRecord {
-                timestamp: format!("t{}", i),
-                model: "m".into(),
-                message: format!("err{}", i),
-            });
-        }
-        // simulate cap at 50 in the vec passed to snapshot (as record path does)
-        let capped: Vec<_> = errs.into_iter().rev().take(50).collect(); // newest first like CCP
-        let snap = StatsSnapshot {
-            uptime_seconds: 10,
-            total_requests: 0,
-            active_requests: 0,
-            errors: 55,
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            total_cache_read_input_tokens: 0,
-            total_cache_creation_input_tokens: 0,
-            last_request_at: None,
-            models: std::collections::HashMap::new(),
-            api_keys: std::collections::HashMap::new(),
-            recent_errors: capped,
-        };
-        assert_eq!(snap.errors, 55);
-        assert_eq!(snap.recent_errors.len(), 50);
-        assert_eq!(snap.recent_errors[0].message, "err54"); // newest
-    }
-
-    // uptime monotonic: successive snapshots show non-decreasing uptime (from _start Instant).
-    #[test]
-    fn uptime_monotonic_across_snapshots() {
-        // construct two snapshots simulating time progression (real Stats uses _start)
-        let s0 = StatsSnapshot {
-            uptime_seconds: 5,
-            ..make_empty_snap()
-        };
-        let s1 = StatsSnapshot {
-            uptime_seconds: 7,
-            ..make_empty_snap()
-        };
-        assert!(s1.uptime_seconds >= s0.uptime_seconds);
-    }
-
-    // record on all paths: every record_* is exercised and contributes to totals in snap
-    // (even in stub, the shape test + construction verifies the fields they target).
-    #[test]
-    fn record_on_all_paths_affects_snapshot_fields() {
-        // simulate effects of record_request (total+models+keys), record_response (tokens), record_error
-        let mut models = std::collections::HashMap::new();
-        models.insert(
-            "m".into(),
-            ModelStats {
-                requests: 1,
-                avg_ttft_ms: 0.0,
-                avg_duration_ms: 0.0,
-                input_tokens: 10,
-                output_tokens: 2,
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-            },
-        );
-        let mut keys = std::collections::HashMap::new();
-        keys.insert("k1".into(), 1);
-        let errs = vec![ErrorRecord {
-            timestamp: "now".into(),
-            model: "m".into(),
-            message: "boom".into(),
-        }];
-        let snap = StatsSnapshot {
-            uptime_seconds: 1,
-            total_requests: 1,
-            active_requests: 0,
-            errors: 1,
-            total_input_tokens: 10,
-            total_output_tokens: 2,
-            total_cache_read_input_tokens: 0,
-            total_cache_creation_input_tokens: 0,
-            last_request_at: Some("ts".into()),
-            models,
-            api_keys: keys,
-            recent_errors: errs,
-        };
-        assert_eq!(snap.total_requests, 1);
-        assert_eq!(snap.errors, 1);
-        assert_eq!(snap.models["m"].input_tokens, 10);
-        assert_eq!(*snap.api_keys.get("k1").unwrap(), 1);
-        assert_eq!(snap.recent_errors.len(), 1);
-    }
-
-    fn make_empty_snap() -> StatsSnapshot {
-        StatsSnapshot {
-            uptime_seconds: 0,
-            total_requests: 0,
-            active_requests: 0,
-            errors: 0,
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            total_cache_read_input_tokens: 0,
-            total_cache_creation_input_tokens: 0,
-            last_request_at: None,
-            models: std::collections::HashMap::new(),
-            api_keys: std::collections::HashMap::new(),
-            recent_errors: vec![],
-        }
-    }
-
-    // Guards: ActiveRequestGuard increments on new, decrements on drop (per-request active count).
-    // Mirrors CCP guard usage around handler.
-    #[test]
-    fn active_request_guards_increment_and_decrement() {
+    fn active_request_guard_tracks_in_flight() {
         let path = temp_db_path();
+        let _cleanup = TempDb(path.clone());
         let stats = Stats::open(&path).expect("open");
-        assert_eq!(stats._active.load(Ordering::Relaxed), 0);
+
+        assert_eq!(stats.snapshot().active_requests, 0);
         {
             let _g1 = ActiveRequestGuard::new(&stats);
-            assert_eq!(stats._active.load(Ordering::Relaxed), 1);
+            assert_eq!(stats.snapshot().active_requests, 1);
             {
                 let _g2 = ActiveRequestGuard::new(&stats);
-                assert_eq!(stats._active.load(Ordering::Relaxed), 2);
+                assert_eq!(stats.snapshot().active_requests, 2);
             }
-            assert_eq!(stats._active.load(Ordering::Relaxed), 1);
+            assert_eq!(stats.snapshot().active_requests, 1);
         }
-        assert_eq!(stats._active.load(Ordering::Relaxed), 0);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    // Per-key and per-model accumulation: multiple records should conceptually accumulate (tested via
-    // snapshot construction that mirrors what real impl would produce after records).
-    #[test]
-    fn per_key_and_model_accumulation_in_snapshot() {
-        let mut models = std::collections::HashMap::new();
-        models.insert(
-            "m1".into(),
-            ModelStats {
-                requests: 10,
-                avg_ttft_ms: 5.0,
-                avg_duration_ms: 100.0,
-                input_tokens: 200,
-                output_tokens: 100,
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-            },
-        );
-        models.insert(
-            "m2".into(),
-            ModelStats {
-                requests: 3,
-                avg_ttft_ms: 0.0,
-                avg_duration_ms: 0.0,
-                input_tokens: 30,
-                output_tokens: 15,
-                cache_read_input_tokens: 5,
-                cache_creation_input_tokens: 0,
-            },
-        );
-        let mut keys = std::collections::HashMap::new();
-        keys.insert("keyA".into(), 8);
-        keys.insert("keyB".into(), 5);
-        let snap = StatsSnapshot {
-            uptime_seconds: 42,
-            total_requests: 13,
-            active_requests: 2,
-            errors: 0,
-            total_input_tokens: 230,
-            total_output_tokens: 115,
-            total_cache_read_input_tokens: 5,
-            total_cache_creation_input_tokens: 0,
-            last_request_at: Some("ts".into()),
-            models,
-            api_keys: keys,
-            recent_errors: vec![],
-        };
-        assert_eq!(snap.models.len(), 2);
-        assert_eq!(snap.models["m1"].requests, 10);
-        assert_eq!(snap.api_keys["keyA"], 8);
-        assert_eq!(snap.total_requests, 13);
-    }
-
-    // Snapshot serialization + fields with data present; recent errors cap verified at 50 exactly (via construction mirroring record cap).
-    // (No Deserialize derive on StatsSnapshot in this prototype; only test to_string path + manual asserts.)
-    #[test]
-    fn snapshot_serde_and_recent_errors_cap() {
-        let mut errs = vec![];
-        for i in 0..50 {
-            errs.push(ErrorRecord {
-                timestamp: format!("t{i}"),
-                model: "m".into(),
-                message: format!("e{i}"),
-            });
-        }
-        let snap = StatsSnapshot {
-            uptime_seconds: 99,
-            total_requests: 123,
-            active_requests: 0,
-            errors: 77,
-            total_input_tokens: 1000,
-            total_output_tokens: 500,
-            total_cache_read_input_tokens: 20,
-            total_cache_creation_input_tokens: 10,
-            last_request_at: None,
-            models: std::collections::HashMap::new(),
-            api_keys: std::collections::HashMap::new(),
-            recent_errors: errs,
-        };
-        let json = serde_json::to_string(&snap).unwrap();
-        assert!(json.contains("\"uptime_seconds\":99"));
-        assert!(json.contains("recent_errors"));
-        assert_eq!(snap.recent_errors.len(), 50);
-        assert_eq!(snap.errors, 77);
-        // re-serialize after construction to prove shape stable
-        let json2 = serde_json::to_string(&snap).unwrap();
-        assert!(json2.contains("e49")); // last (messages are "e0".."e49"; cap logic exercised in real record path in full impl)
-    }
-
-    // Uptime monotonic + record paths exercised in open stats (stubs still increment active etc).
-    #[test]
-    fn uptime_monotonic_and_record_paths_exercised() {
-        let path = temp_db_path();
-        let stats = Stats::open(&path).expect("open");
-        let s0 = StatsSnapshot {
-            uptime_seconds: 10,
-            ..make_empty_snap()
-        };
-        let s1 = StatsSnapshot {
-            uptime_seconds: 20,
-            ..make_empty_snap()
-        };
-        assert!(s1.uptime_seconds > s0.uptime_seconds);
-        // exercise all record paths (no panic even in stub)
-        stats.record_request("mod", Some("k"));
-        stats.record_response("mod", TokenUsage::default(), None, 1.0);
-        stats.record_error("mod", "err");
-        {
-            let _g = ActiveRequestGuard::new(&stats);
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-
-    // Models with data + api_keys present; guards interact with active in snapshot shape.
-    #[test]
-    fn snapshot_models_with_data_and_api_keys_and_active() {
-        let mut m = std::collections::HashMap::new();
-        m.insert(
-            "haiku".into(),
-            ModelStats {
-                requests: 1,
-                avg_ttft_ms: 10.0,
-                avg_duration_ms: 20.0,
-                input_tokens: 5,
-                output_tokens: 3,
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-            },
-        );
-        let mut k = std::collections::HashMap::new();
-        k.insert("sk-abc".into(), 1);
-        let snap = StatsSnapshot {
-            uptime_seconds: 5,
-            total_requests: 1,
-            active_requests: 1,
-            errors: 0,
-            total_input_tokens: 5,
-            total_output_tokens: 3,
-            total_cache_read_input_tokens: 0,
-            total_cache_creation_input_tokens: 0,
-            last_request_at: None,
-            models: m,
-            api_keys: k,
-            recent_errors: vec![],
-        };
-        assert_eq!(snap.models["haiku"].requests, 1);
-        assert_eq!(*snap.api_keys.get("sk-abc").unwrap(), 1);
-        assert_eq!(snap.active_requests, 1);
+        assert_eq!(stats.snapshot().active_requests, 0);
     }
 }
