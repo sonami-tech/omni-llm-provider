@@ -247,7 +247,7 @@ async fn chat_completions_handler(
     Json(body): Json<ChatCompletionRequest>,
 ) -> Result<axum::response::Response, AppError> {
     let model = body.model.clone();
-    let canon = to_canonical(&body);
+    let canon = to_canonical(&body).map_err(AppError::BadRequest)?;
 
     // Record the inbound request (best-effort; never blocks serving).
     if let Some(s) = &state.stats {
@@ -658,12 +658,16 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
             }],
             stream: true,
             max_tokens: Some(8),
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
+            tools: None,
+            tool_choice: None,
             extras: Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
@@ -714,12 +718,16 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
             }],
             stream: false,
             max_tokens: Some(8),
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
+            tools: None,
+            tool_choice: None,
             extras: Value::Null,
         };
         let res = chat_completions_handler(State(state.clone()), Json(req)).await;
@@ -931,18 +939,21 @@ mod tests {
 
     #[tokio::test]
     async fn responses_unsupported_input_is_bad_request() {
-        // WHY: v1 rejects non-message input items loudly as an OAI-shaped 400
-        // naming the offender, instead of silently mangling tool conversations.
+        // WHY: input shapes the canonical layer still cannot represent (an
+        // `input_image` content part) are rejected loudly as an OAI-shaped 400
+        // naming the offender, instead of silently mangling the request.
+        // (function_call / function_call_output items ARE now supported and
+        // round-trip through canonical tool blocks.)
         let (state, _guard) = test_state(false);
         let req: omni_common::ResponsesRequest = serde_json::from_str(
-            r#"{"model":"sonnet","input":[{"type":"function_call_output","call_id":"c1","output":"42"}]}"#,
+            r#"{"model":"sonnet","input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":"x"}]}]}"#,
         )
         .expect("responses request json");
         let res = responses_handler(State(state), Json(req)).await;
         match res {
             Err(AppError::BadRequest(msg)) => assert!(
-                msg.contains("function_call_output"),
-                "400 must name the unsupported item type: {msg}"
+                msg.contains("input_image"),
+                "400 must name the unsupported content part type: {msg}"
             ),
             other => panic!("expected BadRequest for unsupported input, got {other:?}"),
         }
@@ -962,7 +973,7 @@ mod tests {
                     .uri("/v1/responses")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
-                        r#"{"model":"sonnet","input":[{"type":"function_call_output","call_id":"c","output":"x"}]}"#,
+                        r#"{"model":"sonnet","input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":"x"}]}]}"#,
                     ))
                     .unwrap(),
             )
@@ -985,7 +996,7 @@ mod tests {
         // path keeps this test hermetic (no upstream call ever happens).
         let (state, _guard) = test_state(true);
         let req: omni_common::ResponsesRequest = serde_json::from_str(
-            r#"{"model":"sonnet","input":[{"type":"function_call_output","call_id":"c","output":"x"}]}"#,
+            r#"{"model":"sonnet","input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":"x"}]}]}"#,
         )
         .expect("responses request json");
         let _ = responses_handler(State(state.clone()), Json(req)).await;

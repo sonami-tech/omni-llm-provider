@@ -314,7 +314,7 @@ async fn chat_completions_handler(
         .ok_or_else(|| AppError::ServerError("provider disappeared".into()))?;
 
     // Build canonical *with the stripped model* so the delegated provider sees the real model name.
-    let mut canon = to_canonical(&body);
+    let mut canon = to_canonical(&body).map_err(AppError::BadRequest)?;
     canon.model = stripped_model.clone();
 
     let chat_id = format!("chatcmpl-{}", Uuid::new_v4());
@@ -479,16 +479,20 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: Some("tell me a joke".into()),
+                tool_calls: None,
+                tool_call_id: None,
             }],
             stream: false,
             max_tokens: Some(64),
             max_completion_tokens: None,
             temperature: Some(0.7),
             top_p: None,
+            tools: None,
+            tool_choice: None,
             extras: serde_json::Value::Null,
         };
 
-        let mut canon = to_canonical(&oai_req);
+        let mut canon = to_canonical(&oai_req).unwrap();
         canon.model = stripped;
 
         let provider = map.get(&key).unwrap();
@@ -695,12 +699,16 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
             }],
             stream: true,
             max_tokens: None,
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
+            tools: None,
+            tool_choice: None,
             extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
@@ -745,12 +753,16 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: Some("Reply with the single word PONG".into()),
+                tool_calls: None,
+                tool_call_id: None,
             }],
             stream: true,
             max_tokens: Some(16),
             max_completion_tokens: None,
             temperature: Some(0.0),
             top_p: None,
+            tools: None,
+            tool_choice: None,
             extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
@@ -777,12 +789,16 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
             }],
             stream: false,
             max_tokens: None,
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
+            tools: None,
+            tool_choice: None,
             extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
@@ -808,12 +824,16 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
             }],
             stream: false,
             max_tokens: None,
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
+            tools: None,
+            tool_choice: None,
             extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
@@ -840,12 +860,16 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
             }],
             stream: false,
             max_tokens: None,
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
+            tools: None,
+            tool_choice: None,
             extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
@@ -874,12 +898,16 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: Some("ping".into()),
+                tool_calls: None,
+                tool_call_id: None,
             }],
             stream: false,
             max_tokens: None,
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
+            tools: None,
+            tool_choice: None,
             extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
@@ -910,12 +938,16 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: Some("Reply with the word PONG only.".into()),
+                tool_calls: None,
+                tool_call_id: None,
             }],
             stream: false,
             max_tokens: Some(16),
             max_completion_tokens: None,
             temperature: Some(0.0),
             top_p: None,
+            tools: None,
+            tool_choice: None,
             extras: serde_json::Value::Null,
         };
         let res = chat_completions_handler(State(state), Json(req)).await;
@@ -1039,12 +1071,16 @@ rule = [
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: Some("c".into()),
+                tool_calls: None,
+                tool_call_id: None,
             }],
             stream: false,
             max_tokens: None,
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
+            tools: None,
+            tool_choice: None,
             extras: serde_json::Value::Null,
         };
         let _ = chat_completions_handler(State(state), Json(req)).await; // will err on net but cred code ran in provider
@@ -1400,21 +1436,24 @@ rule = [
 
     #[tokio::test]
     async fn test_responses_unsupported_input_is_bad_request() {
-        // WHY: v1 rejects non-message input items (function_call_output needs
-        // richer-than-text canonical content) LOUDLY as an OAI-shaped 400 naming
-        // the offender; a 500 or silent mangling would corrupt tool conversations.
+        // WHY: input shapes the canonical layer still cannot represent (an
+        // `input_image` content part) are rejected LOUDLY as an OAI-shaped 400
+        // naming the offender, BEFORE any provider call; a 500 or silent
+        // mangling would corrupt the request. (Tool-conversation items like
+        // function_call / function_call_output ARE now supported and round-trip
+        // through canonical blocks, so they are no longer the rejection case.)
         let c = Arc::new(ClaudeProvider::new().expect("c"));
         let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
         map.insert("claude".into(), c);
         let state = Arc::new(AppState { providers: map });
         let req = responses_req(
-            r#"{"model":"claude:sonnet","input":[{"type":"function_call_output","call_id":"c1","output":"42"}]}"#,
+            r#"{"model":"claude:sonnet","input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":"x"}]}]}"#,
         );
         let res = responses_handler(State(state), Json(req)).await;
         match res {
             Err(AppError::BadRequest(msg)) => assert!(
-                msg.contains("function_call_output"),
-                "400 must name the unsupported item type: {msg}"
+                msg.contains("input_image"),
+                "400 must name the unsupported content part type: {msg}"
             ),
             other => panic!("expected BadRequest for unsupported input, got {other:?}"),
         }
@@ -1523,7 +1562,7 @@ rule = [
                 "-H",
                 "content-type: application/json",
                 "-d",
-                r#"{"model":"claude:sonnet","input":[{"type":"function_call_output","call_id":"c","output":"x"}]}"#,
+                r#"{"model":"claude:sonnet","input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":"x"}]}]}"#,
                 &format!("http://127.0.0.1:{}/v1/responses", port),
             ])
             .output()

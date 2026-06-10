@@ -52,9 +52,9 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use omni_common::{GrokCredentials, Replacements};
 use omni_core::{
-    CanonicalContent, CanonicalReasoning, CanonicalRequest, CanonicalResponse, CanonicalStream,
-    CanonicalStreamEvent, CanonicalToolCall, CanonicalToolChoice, CanonicalUsage, LlmProvider,
-    ProviderError,
+    CanonicalBlock, CanonicalContent, CanonicalReasoning, CanonicalRequest, CanonicalResponse,
+    CanonicalStream, CanonicalStreamEvent, CanonicalToolCall, CanonicalToolChoice, CanonicalUsage,
+    LlmProvider, ProviderError,
 };
 use reqwest::Client;
 use serde::Deserialize;
@@ -177,10 +177,66 @@ impl GrokProvider {
 fn to_xai_chat_request(req: &CanonicalRequest, repl: &Replacements) -> Value {
     let mut messages: Vec<Value> = Vec::new();
     for m in &req.messages {
-        let text = match &m.content {
-            CanonicalContent::Text(t) => repl.apply_prompt(t),
-        };
-        messages.push(json!({ "role": m.role, "content": text }));
+        match &m.content {
+            CanonicalContent::Text(t) => {
+                messages.push(json!({ "role": m.role, "content": repl.apply_prompt(t) }));
+            }
+            CanonicalContent::Blocks(blocks) => {
+                // OpenAI/xAI wire shape for multi-turn tools: a tool result becomes its own
+                // `role:"tool"` message; an assistant turn with tool calls becomes a single
+                // assistant message carrying text (or null) plus a `tool_calls` array.
+                let has_tool_result = blocks
+                    .iter()
+                    .any(|b| matches!(b, CanonicalBlock::ToolResult { .. }));
+                if has_tool_result {
+                    for b in blocks {
+                        if let CanonicalBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } = b
+                        {
+                            messages.push(json!({
+                                "role": "tool",
+                                "tool_call_id": tool_use_id,
+                                "content": repl.apply_prompt(content)
+                            }));
+                        }
+                    }
+                } else {
+                    let mut text = String::new();
+                    let mut tool_calls: Vec<Value> = Vec::new();
+                    for b in blocks {
+                        match b {
+                            CanonicalBlock::Text(t) => text.push_str(&repl.apply_prompt(t)),
+                            CanonicalBlock::ToolUse {
+                                id,
+                                name,
+                                arguments,
+                            } => {
+                                tool_calls.push(json!({
+                                    "id": id,
+                                    "type": "function",
+                                    "function": { "name": name, "arguments": arguments }
+                                }));
+                            }
+                            CanonicalBlock::ToolResult { .. } => {}
+                        }
+                    }
+                    // OpenAI contract: when there are tool_calls but no text, content is null.
+                    let content = if text.is_empty() && !tool_calls.is_empty() {
+                        Value::Null
+                    } else {
+                        json!(text)
+                    };
+                    messages.push(json!({
+                        "role": m.role,
+                        "content": content,
+                        "tool_calls": tool_calls
+                    }));
+                }
+            }
+        }
     }
 
     let tools: Option<Vec<Value>> = req.tools.as_ref().map(|ts| {
@@ -216,6 +272,7 @@ fn to_xai_chat_request(req: &CanonicalRequest, repl: &Replacements) -> Value {
             CanonicalToolChoice::Specific { name } => {
                 json!({"type": "function", "function": {"name": name}})
             }
+            CanonicalToolChoice::None => json!("none"),
         };
         body["tool_choice"] = v;
     }

@@ -8,11 +8,12 @@
 //! `sequence_number`s and NO `[DONE]` sentinel (that is a Chat Completions
 //! convention only).
 //!
-//! v1 scope (mirrors the canonical layer's flat-Text content): text input
-//! (string or message items with `input_text`/`output_text` parts), function
-//! tools, text + function-call output, non-stream and stream. Unsupported
-//! input shapes (e.g. `function_call_output`, `input_image`, non-function
-//! tools) are rejected loudly with a clear error instead of degraded silently.
+//! Scope: text input (string or message items with `input_text`/`output_text`
+//! parts), function tools, and full multi-turn tool conversations
+//! (`function_call` / `function_call_output` items round-trip through canonical
+//! tool blocks), non-stream and stream. Input shapes the canonical layer still
+//! cannot represent (e.g. `input_image` parts, non-function tools) are rejected
+//! loudly with a clear error instead of degraded silently.
 //!
 //! TDD status: the types below are the wire contract; the three conversion
 //! functions are stubs pinned by the failing tests in this module (red phase).
@@ -25,8 +26,8 @@ use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 
 use omni_core::{
-    CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest, CanonicalResponse,
-    CanonicalStream, CanonicalStreamEvent, CanonicalTool, CanonicalToolChoice,
+    CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
+    CanonicalResponse, CanonicalStream, CanonicalStreamEvent, CanonicalTool, CanonicalToolChoice,
 };
 
 /// The boxed SSE event stream produced by the Responses framer. Boxed so the
@@ -72,8 +73,9 @@ pub enum ResponsesInput {
 }
 
 /// One entry of an `input` array. Message items carry `role` + `content`
-/// (`type` defaults to "message" when absent). Non-message item types
-/// (`function_call_output`, ...) are detected via `kind` and rejected in v1.
+/// (`type` defaults to "message" when absent). Tool-conversation items use
+/// `type:"function_call"` (the assistant's prior tool call) and
+/// `type:"function_call_output"` (the result fed back), keyed by `call_id`.
 #[derive(Debug, Deserialize)]
 pub struct ResponsesInputItem {
     #[serde(rename = "type", default)]
@@ -82,6 +84,18 @@ pub struct ResponsesInputItem {
     pub role: Option<String>,
     #[serde(default)]
     pub content: Option<ResponsesInputContent>,
+    /// `function_call` / `function_call_output`: links a call to its result.
+    #[serde(default)]
+    pub call_id: Option<String>,
+    /// `function_call`: the called tool's name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// `function_call`: the raw JSON arguments string.
+    #[serde(default)]
+    pub arguments: Option<String>,
+    /// `function_call_output`: the tool's result text.
+    #[serde(default)]
+    pub output: Option<String>,
 }
 
 /// Message content: a bare string or typed parts.
@@ -200,13 +214,16 @@ pub struct ResponsesUsage {
 /// - `instructions` -> a leading "system" message
 /// - message items: role preserved ("developer" maps to "system"); string
 ///   content used verbatim; multiple text parts joined with "\n"
+/// - `function_call` item -> an assistant message with a ToolUse block;
+///   `function_call_output` item -> a "tool" message with a ToolResult block
+///   (both keyed by `call_id`), so multi-turn tool loops round-trip
 /// - `max_output_tokens`/`temperature`/`top_p` -> canonical sampling
 /// - `reasoning.effort` -> canonical reasoning effort
 /// - flattened function tools -> canonical tools; `tool_choice` "auto" ->
-///   Auto, "required" -> Required, `{type:"function",name}` -> Specific;
-///   "none" -> drop tools and tool_choice entirely
-/// - unsupported shapes (non-message item types, non-text parts, non-function
-///   tools, message items without a role) -> Err naming the offender
+///   Auto, "required" -> Required, "none" -> None (tools stay visible, model
+///   must not call), `{type:"function",name}` -> Specific
+/// - unsupported shapes (unknown item types, non-text parts like `input_image`,
+///   non-function tools, message items without a role) -> Err naming the offender
 pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest, String> {
     let mut messages: Vec<CanonicalMessage> = Vec::new();
 
@@ -227,39 +244,73 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
         }
         ResponsesInput::Items(items) => {
             for item in items {
-                // Non-message item types (function_call_output, ...) need richer
-                // canonical content than v1 has; reject by name rather than mangle.
-                if let Some(kind) = item.kind.as_deref()
-                    && kind != "message"
-                {
-                    return Err(format!("unsupported input item type: {kind}"));
-                }
-                let role = item
-                    .role
-                    .as_deref()
-                    .ok_or_else(|| "message input item missing role".to_string())?;
-                let role = if role == "developer" { "system" } else { role };
-                let text = match item.content.as_ref() {
-                    Some(ResponsesInputContent::Text(t)) => t.clone(),
-                    Some(ResponsesInputContent::Parts(parts)) => {
-                        let mut fragments = Vec::with_capacity(parts.len());
-                        for part in parts {
-                            if part.kind != "input_text" && part.kind != "output_text" {
-                                return Err(format!(
-                                    "unsupported content part type: {}",
-                                    part.kind
-                                ));
-                            }
-                            fragments.push(part.text.clone().unwrap_or_default());
-                        }
-                        fragments.join("\n")
+                match item.kind.as_deref() {
+                    // The assistant's prior tool call -> a ToolUse block.
+                    Some("function_call") => {
+                        let call_id = item
+                            .call_id
+                            .clone()
+                            .ok_or_else(|| "function_call item missing call_id".to_string())?;
+                        let name = item
+                            .name
+                            .clone()
+                            .ok_or_else(|| "function_call item missing name".to_string())?;
+                        messages.push(CanonicalMessage {
+                            role: "assistant".into(),
+                            content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolUse {
+                                id: call_id,
+                                name,
+                                arguments: item.arguments.clone().unwrap_or_default(),
+                            }]),
+                        });
                     }
-                    None => String::new(),
-                };
-                messages.push(CanonicalMessage {
-                    role: role.to_string(),
-                    content: CanonicalContent::Text(text),
-                });
+                    // A tool result fed back -> a ToolResult block.
+                    Some("function_call_output") => {
+                        let call_id = item.call_id.clone().ok_or_else(|| {
+                            "function_call_output item missing call_id".to_string()
+                        })?;
+                        messages.push(CanonicalMessage {
+                            role: "tool".into(),
+                            content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
+                                tool_use_id: call_id,
+                                content: item.output.clone().unwrap_or_default(),
+                                is_error: false,
+                            }]),
+                        });
+                    }
+                    // A message item (the default when `type` is absent).
+                    None | Some("message") => {
+                        let role = item
+                            .role
+                            .as_deref()
+                            .ok_or_else(|| "message input item missing role".to_string())?;
+                        let role = if role == "developer" { "system" } else { role };
+                        let text = match item.content.as_ref() {
+                            Some(ResponsesInputContent::Text(t)) => t.clone(),
+                            Some(ResponsesInputContent::Parts(parts)) => {
+                                let mut fragments = Vec::with_capacity(parts.len());
+                                for part in parts {
+                                    if part.kind != "input_text" && part.kind != "output_text" {
+                                        return Err(format!(
+                                            "unsupported content part type: {}",
+                                            part.kind
+                                        ));
+                                    }
+                                    fragments.push(part.text.clone().unwrap_or_default());
+                                }
+                                fragments.join("\n")
+                            }
+                            None => String::new(),
+                        };
+                        messages.push(CanonicalMessage {
+                            role: role.to_string(),
+                            content: CanonicalContent::Text(text),
+                        });
+                    }
+                    Some(other) => {
+                        return Err(format!("unsupported input item type: {other}"));
+                    }
+                }
             }
         }
     }
@@ -286,17 +337,13 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
         _ => None,
     };
 
-    // tool_choice: "auto"->Auto, "required"->Required, {function,name}->Specific,
-    // "none"-> drop tools + tool_choice entirely (canonical has no None variant).
-    let mut tools = tools;
+    // tool_choice: "auto"->Auto, "required"->Required, "none"->None (tools stay
+    // visible but the model must not call them), {function,name}->Specific.
     let tool_choice = match req.tool_choice.as_ref() {
         Some(ResponsesToolChoice::Mode(mode)) => match mode.as_str() {
             "auto" => Some(CanonicalToolChoice::Auto),
             "required" => Some(CanonicalToolChoice::Required),
-            "none" => {
-                tools = None;
-                None
-            }
+            "none" => Some(CanonicalToolChoice::None),
             other => return Err(format!("unsupported tool_choice mode: {other}")),
         },
         Some(ResponsesToolChoice::Function { name, .. }) => {
@@ -638,6 +685,7 @@ mod tests {
     fn text_of(content: &CanonicalContent) -> &str {
         match content {
             CanonicalContent::Text(t) => t,
+            CanonicalContent::Blocks(_) => panic!("unexpected blocks content"),
         }
     }
 
@@ -814,9 +862,12 @@ mod tests {
     }
 
     #[test]
-    fn to_canonical_tool_choice_modes_map_and_none_strips_tools() {
-        // WHY: "none" means "never call tools"; canonical has no None variant,
-        // so the equivalent contract is dropping tools + tool_choice entirely.
+    fn to_canonical_tool_choice_modes_map_including_none_keeps_tools_visible() {
+        // WHY: OpenAI `tool_choice:"none"` means "tools stay visible to the
+        // model, but it must not call any of them" -- NOT "remove the tools".
+        // Dropping the tool schemas would lose visibility/token accounting and
+        // diverge from the spec, so "none" maps to CanonicalToolChoice::None
+        // while the tool list is preserved.
         let auto = parse(
             r#"{"model":"m","input":"q","tools":[{"type":"function","name":"f"}],"tool_choice":"auto"}"#,
         );
@@ -837,8 +888,15 @@ mod tests {
             r#"{"model":"m","input":"q","tools":[{"type":"function","name":"f"}],"tool_choice":"none"}"#,
         );
         let canon = responses_to_canonical(&none).unwrap();
-        assert!(canon.tools.is_none(), "tool_choice none drops tools");
-        assert!(canon.tool_choice.is_none());
+        assert!(
+            canon.tools.is_some(),
+            "tool_choice none must keep the tools visible to the model"
+        );
+        assert!(
+            matches!(canon.tool_choice, Some(CanonicalToolChoice::None)),
+            "tool_choice none must map to CanonicalToolChoice::None, got {:?}",
+            canon.tool_choice
+        );
     }
 
     #[test]
@@ -851,18 +909,53 @@ mod tests {
     }
 
     #[test]
-    fn to_canonical_rejects_function_call_output_items() {
-        // WHY: tool-result items need richer-than-text canonical content to be
-        // faithful; v1 fails loudly (naming the item type) instead of silently
-        // mangling a multi-turn tool conversation.
+    fn to_canonical_maps_tool_conversation_items_to_blocks() {
+        // WHY: a multi-turn tool conversation (the assistant's function_call
+        // followed by the caller's function_call_output) must survive into the
+        // canonical layer as ToolUse / ToolResult blocks keyed by the same
+        // call_id, so the linkage reaches the upstream intact rather than being
+        // dropped or rejected. This is the behavior that replaced the old v1
+        // "reject function_call_output" rule once canonical gained tool blocks.
         let req = parse(
-            r#"{"model":"m","input":[{"type":"function_call_output","call_id":"c1","output":"42"}]}"#,
+            r#"{"model":"m","input":[
+                {"type":"message","role":"user","content":"weather in SF?"},
+                {"type":"function_call","call_id":"c1","name":"get_weather","arguments":"{\"city\":\"SF\"}"},
+                {"type":"function_call_output","call_id":"c1","output":"72F"}
+            ]}"#,
         );
-        let err = responses_to_canonical(&req).expect_err("must reject");
-        assert!(
-            err.contains("function_call_output"),
-            "error must name the unsupported item type, got: {err}"
-        );
+        let canon = responses_to_canonical(&req).expect("tool items must convert");
+        assert_eq!(canon.messages.len(), 3);
+        // The assistant function_call -> a ToolUse block keyed by call_id.
+        match &canon.messages[1].content {
+            CanonicalContent::Blocks(blocks) => match &blocks[0] {
+                CanonicalBlock::ToolUse {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    assert_eq!(id, "c1");
+                    assert_eq!(name, "get_weather");
+                    assert!(arguments.contains("SF"));
+                }
+                other => panic!("expected ToolUse block, got {other:?}"),
+            },
+            other => panic!("function_call must become Blocks, got {other:?}"),
+        }
+        // The function_call_output -> a ToolResult block keyed by the same id.
+        match &canon.messages[2].content {
+            CanonicalContent::Blocks(blocks) => match &blocks[0] {
+                CanonicalBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
+                    assert_eq!(tool_use_id, "c1");
+                    assert_eq!(content, "72F");
+                }
+                other => panic!("expected ToolResult block, got {other:?}"),
+            },
+            other => panic!("function_call_output must become Blocks, got {other:?}"),
+        }
     }
 
     #[test]

@@ -18,8 +18,8 @@ use serde_json::Value;
 
 use omni_common::Replacements;
 use omni_core::{
-    CanonicalContent, CanonicalReasoning, CanonicalRequest, CanonicalResponse, CanonicalTool,
-    CanonicalToolCall, CanonicalToolChoice, CanonicalUsage,
+    CanonicalBlock, CanonicalContent, CanonicalReasoning, CanonicalRequest, CanonicalResponse,
+    CanonicalTool, CanonicalToolCall, CanonicalToolChoice, CanonicalUsage,
 };
 
 use crate::fingerprint::FingerprintProfile;
@@ -266,14 +266,43 @@ pub fn build_messages_request_from_canonical(
     // Apply prompt-scope replacements to the canonical texts (and tool surfaces).
     let mut messages: Vec<Message> = Vec::new();
     for m in &req.messages {
-        let text = match &m.content {
-            CanonicalContent::Text(t) => repl.apply_prompt(t),
+        let content = match &m.content {
+            CanonicalContent::Text(t) => MessageContent::Text(repl.apply_prompt(t)),
+            CanonicalContent::Blocks(blocks) => {
+                let out: Vec<ContentBlock> = blocks
+                    .iter()
+                    .map(|b| match b {
+                        CanonicalBlock::Text(t) => ContentBlock::Text {
+                            text: repl.apply_prompt(t),
+                            cache_control: None,
+                        },
+                        CanonicalBlock::ToolUse {
+                            id,
+                            name,
+                            arguments,
+                        } => ContentBlock::ToolUse {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: serde_json::from_str(arguments)
+                                .unwrap_or_else(|_| serde_json::json!({})),
+                        },
+                        CanonicalBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } => ContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: Some(ToolResultContent::Text(repl.apply_prompt(content))),
+                            is_error: if *is_error { Some(true) } else { None },
+                        },
+                    })
+                    .collect();
+                MessageContent::Blocks(out)
+            }
         };
-        // For simplicity with current Canonical (Text only): emit as text content.
-        // When Canonical grows Blocks we will extend.
         messages.push(Message {
             role: m.role.clone(),
-            content: MessageContent::Text(text),
+            content,
         });
     }
 
@@ -429,6 +458,7 @@ fn translate_tool_choice(
             name: name.clone(),
             disable_parallel_tool_use: None,
         }),
+        Some(CanonicalToolChoice::None) => Some(ToolChoice::None {}),
     }
 }
 

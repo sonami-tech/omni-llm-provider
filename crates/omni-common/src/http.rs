@@ -15,13 +15,13 @@ use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 
 use omni_core::{
-    CanonicalContent, CanonicalMessage, CanonicalRequest, CanonicalResponse, CanonicalStream,
-    CanonicalStreamEvent, CanonicalToolCall,
+    CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalRequest, CanonicalResponse,
+    CanonicalStream, CanonicalStreamEvent, CanonicalTool, CanonicalToolCall, CanonicalToolChoice,
 };
 
-/// Minimal OpenAI-compatible chat completion request (the supported subset:
-/// text messages + core sampling). Unknown fields are captured in `extras` so a
-/// client request never fails to deserialize on an unrecognized key.
+/// OpenAI-compatible chat completion request (text messages, tools, and core
+/// sampling). Unknown fields are captured in `extras` so a client request never
+/// fails to deserialize on an unrecognized key.
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -36,15 +36,72 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub top_p: Option<f32>,
+    /// Tool (function) definitions the model may call. OpenAI's nested shape:
+    /// `{type:"function", function:{name, description, parameters}}`.
+    #[serde(default)]
+    pub tools: Option<Vec<ChatTool>>,
+    /// How the model should choose among `tools`: a string mode
+    /// (`"auto"`/`"required"`/`"none"`) or a forced function selection.
+    #[serde(default)]
+    pub tool_choice: Option<ChatToolChoice>,
     #[serde(flatten)]
     pub extras: serde_json::Value,
 }
 
+/// One message in a chat request. Beyond `role`/`content`, an *assistant* turn
+/// can carry `tool_calls` (the model's prior tool requests) and a *tool* turn
+/// carries the result keyed by `tool_call_id` — both required so multi-turn
+/// tool conversations can be fed back through the proxy.
 #[derive(Debug, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     #[serde(default)]
     pub content: Option<String>,
+    /// Present on assistant messages that called tools (OpenAI echoes these
+    /// back into the next request's history).
+    #[serde(default)]
+    pub tool_calls: Option<Vec<ChatToolCallReq>>,
+    /// Present on `role:"tool"` messages: the id of the tool call this result
+    /// answers.
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+}
+
+/// A tool definition in OpenAI's nested form. Only `function` tools are
+/// supported (the canonical layer and both backends model function tools).
+#[derive(Debug, Deserialize)]
+pub struct ChatTool {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ChatToolFunction,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatToolFunction {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<serde_json::Value>,
+}
+
+/// `tool_choice`: either a bare mode string or a forced function selection.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ChatToolChoice {
+    /// `"auto" | "required" | "none"`
+    Mode(String),
+    /// `{type:"function", function:{name}}`
+    Function {
+        #[serde(rename = "type")]
+        kind: String,
+        function: ChatToolChoiceFunction,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatToolChoiceFunction {
+    pub name: String,
 }
 
 /// Minimal OpenAI-compatible chat completion response (non-streaming).
@@ -81,6 +138,28 @@ pub struct ChatToolCall {
     pub function: ChatFunctionCall,
 }
 
+/// Request-side counterpart of [`ChatToolCall`]: an assistant tool call echoed
+/// back by the client in a follow-up turn. Separate from the response type
+/// because it deserializes a client-supplied `type` string.
+#[derive(Debug, Deserialize)]
+pub struct ChatToolCallReq {
+    pub id: String,
+    #[serde(rename = "type", default = "default_function_kind")]
+    pub kind: String,
+    pub function: ChatFunctionCallReq,
+}
+
+fn default_function_kind() -> String {
+    "function".into()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatFunctionCallReq {
+    pub name: String,
+    #[serde(default)]
+    pub arguments: String,
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct ChatFunctionCall {
     pub name: String,
@@ -97,21 +176,61 @@ pub struct ChatUsage {
 /// Convert an OpenAI request into a `CanonicalRequest`. The `model` field is the
 /// caller-supplied value; single-backend binaries pass it through, the
 /// aggregator overwrites it with the prefix-stripped model before delegating.
-pub fn to_canonical(req: &ChatCompletionRequest) -> CanonicalRequest {
+///
+/// Fallible because a malformed tool surface (non-function tool, unknown
+/// `tool_choice` mode, a tool-result message missing its `tool_call_id`) is
+/// rejected by name as a 400 rather than silently dropped — the same contract
+/// the Responses protocol enforces.
+pub fn to_canonical(req: &ChatCompletionRequest) -> Result<CanonicalRequest, String> {
     let messages: Vec<CanonicalMessage> = req
         .messages
         .iter()
-        .map(|m| CanonicalMessage {
-            role: m.role.clone(),
-            content: CanonicalContent::Text(m.content.clone().unwrap_or_default()),
-        })
-        .collect();
+        .map(chat_message_to_canonical)
+        .collect::<Result<_, _>>()?;
 
-    CanonicalRequest {
+    // Nested function tools -> canonical tools (non-function tools rejected).
+    let tools = match req.tools.as_ref() {
+        Some(ts) if !ts.is_empty() => {
+            let mut out = Vec::with_capacity(ts.len());
+            for t in ts {
+                if t.kind != "function" {
+                    return Err(format!("unsupported tool type: {}", t.kind));
+                }
+                out.push(CanonicalTool {
+                    name: t.function.name.clone(),
+                    description: t.function.description.clone(),
+                    parameters: t
+                        .function
+                        .parameters
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({})),
+                });
+            }
+            Some(out)
+        }
+        _ => None,
+    };
+
+    // tool_choice: "auto"->Auto, "required"->Required, "none"->None (tools stay
+    // visible), {function,name}->Specific.
+    let tool_choice = match req.tool_choice.as_ref() {
+        Some(ChatToolChoice::Mode(mode)) => match mode.as_str() {
+            "auto" => Some(CanonicalToolChoice::Auto),
+            "required" => Some(CanonicalToolChoice::Required),
+            "none" => Some(CanonicalToolChoice::None),
+            other => return Err(format!("unsupported tool_choice mode: {other}")),
+        },
+        Some(ChatToolChoice::Function { function, .. }) => Some(CanonicalToolChoice::Specific {
+            name: function.name.clone(),
+        }),
+        None => None,
+    };
+
+    Ok(CanonicalRequest {
         model: req.model.clone(),
         messages,
-        tools: None,
-        tool_choice: None,
+        tools,
+        tool_choice,
         // OpenAI's max_completion_tokens supersedes the legacy max_tokens.
         max_tokens: req.max_completion_tokens.or(req.max_tokens),
         temperature: req.temperature,
@@ -119,7 +238,55 @@ pub fn to_canonical(req: &ChatCompletionRequest) -> CanonicalRequest {
         reasoning: None,
         metadata: Default::default(),
         provider_extras: None,
+    })
+}
+
+/// Convert one chat message into a canonical message. Plain text and
+/// tool-bearing turns both map here; tool turns become `Blocks` so the call/
+/// result linkage survives into the canonical layer.
+fn chat_message_to_canonical(m: &ChatMessage) -> Result<CanonicalMessage, String> {
+    // A `role:"tool"` message carries a tool result keyed by tool_call_id.
+    if m.role == "tool" {
+        let id = m
+            .tool_call_id
+            .clone()
+            .ok_or_else(|| "tool message missing tool_call_id".to_string())?;
+        return Ok(CanonicalMessage {
+            role: "tool".into(),
+            content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
+                tool_use_id: id,
+                content: m.content.clone().unwrap_or_default(),
+                is_error: false,
+            }]),
+        });
     }
+
+    // An assistant message may interleave text with tool calls.
+    if let Some(tool_calls) = m.tool_calls.as_ref().filter(|tc| !tc.is_empty()) {
+        let mut blocks: Vec<CanonicalBlock> = Vec::new();
+        if let Some(text) = m.content.as_ref().filter(|t| !t.is_empty()) {
+            blocks.push(CanonicalBlock::Text(text.clone()));
+        }
+        for tc in tool_calls {
+            if tc.kind != "function" {
+                return Err(format!("unsupported tool_call type: {}", tc.kind));
+            }
+            blocks.push(CanonicalBlock::ToolUse {
+                id: tc.id.clone(),
+                name: tc.function.name.clone(),
+                arguments: tc.function.arguments.clone(),
+            });
+        }
+        return Ok(CanonicalMessage {
+            role: m.role.clone(),
+            content: CanonicalContent::Blocks(blocks),
+        });
+    }
+
+    Ok(CanonicalMessage {
+        role: m.role.clone(),
+        content: CanonicalContent::Text(m.content.clone().unwrap_or_default()),
+    })
 }
 
 /// Convert a `CanonicalResponse` into the OpenAI non-streaming response shape.
@@ -343,12 +510,16 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
             }],
             stream: false,
             max_tokens: Some(10),
             max_completion_tokens: None,
             temperature: Some(0.5),
             top_p: None,
+            tools: None,
+            tool_choice: None,
             extras: serde_json::Value::Null,
         }
     }
@@ -357,10 +528,11 @@ mod tests {
     fn to_canonical_maps_text_and_sampling() {
         // WHY: the canonical request is the contract every provider consumes;
         // dropping a message or a sampling field silently changes behavior.
-        let canon = to_canonical(&sample_oai_req());
+        let canon = to_canonical(&sample_oai_req()).unwrap();
         assert_eq!(canon.messages.len(), 1);
         match &canon.messages[0].content {
             CanonicalContent::Text(t) => assert_eq!(t, "hi"),
+            CanonicalContent::Blocks(_) => panic!("unexpected blocks content"),
         }
         assert_eq!(canon.max_tokens, Some(10));
         assert_eq!(canon.temperature, Some(0.5));
@@ -374,7 +546,7 @@ mod tests {
         let mut req = sample_oai_req();
         req.max_tokens = Some(10);
         req.max_completion_tokens = Some(99);
-        assert_eq!(to_canonical(&req).max_tokens, Some(99));
+        assert_eq!(to_canonical(&req).unwrap().max_tokens, Some(99));
     }
 
     #[test]

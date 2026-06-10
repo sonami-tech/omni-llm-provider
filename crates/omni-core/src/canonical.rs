@@ -26,10 +26,62 @@ pub struct CanonicalMessage {
     pub content: CanonicalContent,
 }
 
+/// Message content in a backend-neutral form.
+///
+/// `Text` is the common case (a plain string). `Blocks` carries an ordered
+/// sequence of content blocks, used when a turn mixes text with tool-call /
+/// tool-result data — i.e. multi-turn tool loops. Keeping `Text` as its own
+/// variant means every plain-text producer stays valid; only tool turns need
+/// `Blocks`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CanonicalContent {
     Text(String),
-    // Extend with Blocks(vec![Text, Image, ToolUse, ToolResult, Reasoning...]) for full fidelity.
+    Blocks(Vec<CanonicalBlock>),
+    // Future: an Image block can join CanonicalBlock without touching this enum.
+}
+
+/// One block inside a [`CanonicalContent::Blocks`] sequence.
+///
+/// These map 1:1 onto each backend's native content blocks:
+/// - Anthropic `ContentBlock::{Text, ToolUse, ToolResult}`
+/// - OpenAI/xAI assistant `tool_calls` + `role:"tool"` result messages
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum CanonicalBlock {
+    /// Plain text within a multi-block message.
+    Text(String),
+    /// An assistant request to call a tool (the model's tool-call). `arguments`
+    /// is the raw JSON arguments string, as both wire formats carry it.
+    ToolUse {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+    /// A tool's result fed back by the caller, keyed to the `ToolUse` it answers.
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        #[serde(default)]
+        is_error: bool,
+    },
+}
+
+impl CanonicalContent {
+    /// Concatenate all text in this content, ignoring tool blocks. Convenience
+    /// for the many call sites that only care about the human-readable text
+    /// (billing fingerprints, replacement scoping, plain-text emission).
+    pub fn as_text(&self) -> String {
+        match self {
+            CanonicalContent::Text(t) => t.clone(),
+            CanonicalContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    CanonicalBlock::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +96,10 @@ pub enum CanonicalToolChoice {
     Auto,
     Required,
     Specific { name: String },
+    /// Tools remain visible to the model, but it must not call any of them.
+    /// Distinct from "no tools": the schemas are still sent upstream. Maps to
+    /// Anthropic `tool_choice:{type:"none"}` and OpenAI `tool_choice:"none"`.
+    None,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +199,7 @@ mod tests {
                         .first()
                         .map(|m| match &m.content {
                             CanonicalContent::Text(t) => t.as_str(),
+                            CanonicalContent::Blocks(_) => panic!("unexpected blocks content"),
                         })
                         .unwrap_or("")
                 ),
@@ -291,18 +348,6 @@ mod tests {
             .replace("rawname", "maskedname")
     }
 
-    // helper to access Text for tests (avoids exposing in lib)
-    trait ContentExt {
-        fn as_text(&self) -> Option<&str>;
-    }
-    impl ContentExt for CanonicalContent {
-        fn as_text(&self) -> Option<&str> {
-            match self {
-                CanonicalContent::Text(t) => Some(t),
-            }
-        }
-    }
-
     #[test]
     fn full_canonical_request_serde_all_variants() {
         // covers model, messages Text, tools, tool_choice Specific, sampling, reasoning full, metadata, provider_extras
@@ -342,13 +387,7 @@ mod tests {
         let back: CanonicalRequest = serde_json::from_str(&j).unwrap();
         assert_eq!(back.model, "grok-4.3");
         assert_eq!(back.messages.len(), 2);
-        assert!(
-            back.messages[1]
-                .content
-                .as_text()
-                .unwrap()
-                .contains("REDACTED")
-        );
+        assert!(back.messages[1].content.as_text().contains("REDACTED"));
         assert!(back.tools.as_ref().unwrap().len() == 1);
         match &back.tool_choice {
             Some(CanonicalToolChoice::Specific { name }) => assert_eq!(name, "get_info"),
@@ -452,10 +491,10 @@ mod tests {
                 req.model.clone()
             };
             let applied = sim_apply_prompt(
-                req.messages
+                &req.messages
                     .first()
-                    .and_then(|m| m.content.as_text())
-                    .unwrap_or(""),
+                    .map(|m| m.content.as_text())
+                    .unwrap_or_default(),
             );
             Ok(CanonicalResponse {
                 model: stripped,
@@ -588,13 +627,7 @@ mod tests {
         };
         let j = serde_json::to_string(&req).unwrap();
         let back: CanonicalRequest = serde_json::from_str(&j).unwrap();
-        assert!(
-            back.messages[0]
-                .content
-                .as_text()
-                .unwrap()
-                .contains("REDACTED")
-        );
+        assert!(back.messages[0].content.as_text().contains("REDACTED"));
         assert!(back.tools.as_ref().unwrap()[0].name.contains("bar-tool"));
 
         let resp = GrokMock.send(back).await.unwrap();
@@ -687,7 +720,7 @@ mod tests {
         let c = CanonicalContent::Text("hello secret".into());
         let j = serde_json::to_string(&c).unwrap();
         let back: CanonicalContent = serde_json::from_str(&j).unwrap();
-        assert!(back.as_text().unwrap().contains("secret"));
+        assert!(back.as_text().contains("secret"));
     }
 
     #[test]
@@ -918,13 +951,7 @@ mod tests {
         };
         let j = serde_json::to_string(&req).unwrap();
         let back: CanonicalRequest = serde_json::from_str(&j).unwrap();
-        assert!(
-            back.messages[0]
-                .content
-                .as_text()
-                .unwrap()
-                .contains("REDACTED")
-        );
+        assert!(back.messages[0].content.as_text().contains("REDACTED"));
     }
 
     #[test]
@@ -995,7 +1022,7 @@ mod tests {
         let j = serde_json::to_string(&m).unwrap();
         let back: CanonicalMessage = serde_json::from_str(&j).unwrap();
         assert_eq!(back.role, "assistant");
-        assert_eq!(back.content.as_text().unwrap(), "resp");
+        assert_eq!(back.content.as_text(), "resp");
     }
 
     #[tokio::test]
