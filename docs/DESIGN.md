@@ -1,13 +1,21 @@
 # Design: Monorepo with Separate Binaries + Shared Components
 
-## Decision (current step)
-We are building a monorepo that produces **multiple separate binaries**:
-- `omni-claude` — the high-fidelity Claude Code / Anthropic Max provider (preserves the original "core invariant" of byte-exact Claude Code wire fingerprint for the subscription OAuth gate).
+> **Status update (as built).** All three binaries are now full proxies, not a
+> deferred idea: `omni` (the aggregator that routes to either backend by model
+> prefix), `omni-claude`, and `omni-grok`. Each serves OpenAI Chat Completions
+> (non-stream JSON + streaming SSE), `/v1/models`, `/stats`, and `/health` over
+> the shared `omni-common::http` layer, with `LlmProvider::send_stream` wired
+> end to end. The "native `/v1/messages`" and OpenAI Responses surfaces are not
+> implemented. The original decision and rationale below are kept as a record.
+
+## Decision (original step)
+We started by building a monorepo that produces **separate binaries**:
+- `omni-claude` — the high-fidelity Claude Code / Anthropic Max provider (preserves the "core invariant" of byte-exact Claude Code wire fingerprint for the subscription OAuth gate).
 - `omni-grok` — the Grok / xAI provider (standard OpenAI-compatible, much lighter).
 
 Shared components live in library crates so we avoid duplication without compromising isolation.
 
-The "Omni wrapper/aggregator" (single binary that can speak to multiple providers) is interesting for later but deferred. We start with focused binaries.
+The "Omni wrapper/aggregator" (single binary that can speak to multiple providers) was deferred at first; it has since been built as the `omni` binary and is the primary entry point.
 
 ## Crate Layout
 - `crates/omni-common` — Truly shared, provider-agnostic pieces: replacements engine, redb stats, auth middleware, conversation logging, session derivation, base error types, time utilities, etc.

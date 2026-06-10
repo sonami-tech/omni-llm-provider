@@ -253,11 +253,14 @@ Use `https://api.x.ai/v1` + `XAI_API_KEY` (or the same JWT) + public slugs (`gro
 - No Responses surface in the main code (focus is Claude fidelity).
 
 ### Omni-llm-provider Integration Notes
-This monorepo is structured perfectly for the three formats:
-- `crates/frontends/openai-chat/` → Chat Completions surface (like claude-code-provider's primary path).
-- `crates/frontends/anthropic-messages/` → Native Anthropic.
-- `crates/providers/grok/` and `provider-claude/` → back-end specific logic.
-- Add a `responses` frontend (or extend openai-chat) that speaks the Responses shape and a `grok` provider that knows the proxy fingerprint + JWT handling.
+Current structure (as built):
+- OpenAI Chat Completions surface lives in `crates/omni-common/src/http.rs`
+  (request/response types, canonical conversion, SSE framing) and is served by
+  all three binaries.
+- Back-end specific logic: `crates/provider-grok/` and `crates/provider-claude/`.
+- The OpenAI Responses shape (`/v1/responses`) and a native Anthropic Messages
+  inbound surface are NOT yet implemented; they would be added as new modules in
+  `omni-common::http` (see the Responses follow-up task).
 
 **Recommended canonical internal model (inspired by redclaw):**
 Use something like `RcRequest` (system + messages + tools + max_tokens) + rich `RcMessage` (text + tool_calls + tool_results) + separate thinking/reasoning metadata. Then have adapters:

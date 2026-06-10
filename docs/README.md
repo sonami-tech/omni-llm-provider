@@ -1,32 +1,65 @@
 # omni-llm-provider (monorepo)
 
-Monorepo for pluggable LLM providers and frontends.
+OpenAI-compatible proxy that aggregates Anthropic Claude (via the Claude Code
+wire fingerprint for the subscription OAuth gate) and xAI Grok behind one
+OpenAI Chat Completions surface.
 
-**Current focus (initial step):** Separate binaries with shared components.
+## Binaries
 
-- `omni-claude` — High-fidelity binary for Claude Max / Claude Code (preserves the exact wire fingerprint invariant for Anthropic's subscription OAuth gate).
-- `omni-grok` — Binary for xAI Grok (standard OpenAI-compatible backend).
+All three are full proxies (non-stream JSON + streaming SSE, auth, persistent
+stats):
 
-## Structure
+- `omni` — aggregator. Routes to either backend by model prefix
+  (`claude:...` / `grok:...`) or, when only one provider is enabled, by bare
+  model name. Enable providers with `--providers claude,grok` or
+  `OMNI_PROVIDERS`.
+- `omni-claude` — single backend locked to Claude.
+- `omni-grok` — single backend locked to Grok.
 
-- `crates/omni-common` — Shared cross-cutting concerns (auth, stats/redb, replacements/TOML, logging, session derivation, base error shapes, etc.).
-- `crates/omni-core` — Canonical types + core traits (LlmProvider, etc.) for "connect anything to anything".
-- `crates/provider-claude` — All Claude-specific logic (fingerprint, credentials, Anthropic Messages translation, identity injection, cch, profiles). Isolated to protect the invariant.
-- `crates/provider-grok` — Grok/xAI specific logic (light adapter).
-- `crates/bin/omni-claude` — Produces the `omni-claude` binary.
-- `crates/bin/omni-grok` — Produces the `omni-grok` binary.
+## Crates
 
-## Building the binaries
+- `crates/omni-core` — canonical types (`CanonicalRequest`/`Response`/
+  `StreamEvent`) and the `LlmProvider` trait (`send` + `send_stream`). The
+  cross-backend contract.
+- `crates/omni-common` — shared cross-cutting infrastructure: the
+  OpenAI-compatible HTTP layer (`http`: request/response types,
+  canonical conversion, SSE stream framing), auth middleware, persistent stats
+  (redb), TOML replacements, error envelope, session derivation.
+- `crates/provider-claude` — all Claude-specific logic (fingerprint profiles,
+  cch, credentials, Anthropic Messages translation, identity injection, wire
+  defaults, model catalog). Isolated to protect the fingerprint invariant; no
+  Claude specifics leak into `omni-*`.
+- `crates/provider-grok` — xAI Grok provider (OpenAI-compatible upstream).
+- `crates/bin/{omni,omni-claude,omni-grok}` — the three binaries.
+
+## HTTP surface (all binaries)
+
+- `POST /v1/chat/completions` — text + sampling; non-stream JSON, or
+  `stream:true` for OpenAI SSE chunks terminated by `data: [DONE]`.
+- `GET /v1/models`, `GET /models` — model catalog.
+- `GET /stats` — persistent counters (requests, tokens-by-model, errors).
+- `GET /health`, `GET /`.
+
+The OpenAI Responses API (`/v1/responses`) is not implemented; the OAI surface
+is Chat Completions only.
+
+## Build, run, test
 
 ```bash
-cargo build -p omni-claude
-cargo build -p omni-grok
+cargo build --workspace
+cargo run -p omni -- --providers grok --no-auth --port 18323   # one backend, no creds gate on startup
+cargo test --workspace                                          # hermetic: live tests skip without creds
 ```
 
-This produces separate executables while maximizing code reuse in the shared crates.
+Credentials are read fresh per request (never cached): Claude from
+`~/.claude/.credentials.json` (or `$CLAUDE_CREDENTIALS_PATH`), Grok from
+`$XAI_API_KEY` / `$XAI_CREDENTIALS_PATH` / `~/.xai/.credentials.json`. Tests
+that would call a real upstream skip cleanly when the corresponding credentials
+are absent, so the suite is green offline.
 
-The "Omni wrapper/aggregator" idea is noted for later (a single binary that can activate multiple providers).
+## More
 
-See DESIGN.md and INVESTIGATION.md for architecture rationale and prior art (cliproxyapi, LiteLLM, original claude-code-provider).
-
-Reference copy of the original CCP source lives in `reference-src-claude/` for porting the Claude logic.
+- Architecture rationale and prior art: `DESIGN.md`, `INVESTIGATION.md`.
+- Claude fingerprint invariant and rebaseline: `CLAUDE.md`.
+- Grok wire details: `grok-gate.md`, `GROK_AND_MULTI_PROVIDER_ACCESS_GUIDE.md`.
+- The original CCP source (ported from) lives in `reference-src-claude/`.
