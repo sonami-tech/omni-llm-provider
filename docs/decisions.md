@@ -30,7 +30,7 @@
 ## Tests (Fully Encompassing Both Backends)
 - omni-common: replacements (all scopes, hooks, parity, duplicates), stats (records, active guards, snapshots, per-key/model), auth, error, session.
 - omni-core: canonical serde roundtrips, trait parity (mocks for grok + claude).
-- provider-grok: mappers (tools, reasoning, extras, repl hooks), send (mocked bad-port + real-if-XAI_API_KEY present).
+- provider-grok: mappers (tools, reasoning, extras, repl hooks), send (mocked bad-port + real-if-creds-file present).
 - provider-claude: ported fingerprint/models/translate/upstream + new (ctors, shared repl, full send path exercising cch/headers/identity).
 - Wrapper (in bin mains): routing by name/prefix/config to *both*, unified surfaces (OAI + health), shared usage, error cases (unknown provider).
 - Mocks: bad ports for grok upstream, no-creds/auth-err or live for claude (depends on ~/.claude creds in env). Real-if-key for grok.

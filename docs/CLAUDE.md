@@ -46,7 +46,11 @@ and never burns subscription quota. CI runs the four gates above on push/PR.
 
 - Claude OAuth: `~/.claude/.credentials.json` (override `$CLAUDE_CREDENTIALS_PATH`).
   On a 401 the client re-reads once and retries (picks up a CLI refresh).
-- Grok: `$XAI_API_KEY`, or `$XAI_CREDENTIALS_PATH`, or `~/.xai/.credentials.json`.
+- Grok: file-only (no env-var key), mirroring Claude. Sources in precedence order:
+  `$XAI_CREDENTIALS_PATH` -> `~/.xai/.credentials.json` (static key `{"apiKey":"xai-..."}`)
+  -> `~/.grok/auth.json` (the Grok CLI's own OIDC login, auto-detected just like Claude
+  reads `~/.claude`). The OIDC JWT is read read-only; on expiry omni warns and the user
+  re-runs the Grok CLI login (omni never refreshes or rewrites that file).
 
 ## Routing (omni aggregator)
 

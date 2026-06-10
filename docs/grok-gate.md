@@ -37,24 +37,32 @@ In the body (not header):
 We deliberately copied the exact pattern from the original Claude Code Provider (see `reference-src-claude/src/upstream/credentials.rs` and the "Locked design" comments):
 
 - **Never cache** the key in memory for the lifetime of the process.
-- **Always re-read fresh per request** (via `load_fresh` / `load_fresh_async`).
-- This lets any background refresh (user running a helper that writes the file, rotating a key in the console, etc.) be picked up without restarting the server.
-- **Default path logic with env override**:
-  - `$XAI_CREDENTIALS_PATH` (if set) → use exactly that file.
-  - Otherwise `~/.xai/.credentials.json` (or a reasonable fallback).
-- Simple on-disk JSON shape (documented so users/tools can create it):
-  ```json
-  {
-    "apiKey": "xai-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-  }
-  ```
-  We also accept a top-level `"xaiApiKey"` for compatibility with third-party tools that store xAI material.
+- **Always re-read fresh per request** (via `load_resolved_async`, layered on `load_fresh` / `load_fresh_async`).
+- This lets any background refresh (the Grok CLI refreshing its login, rotating a console key, etc.) be picked up without restarting the server.
+- **File-only, no env-var key.** There is no `XAI_API_KEY`-as-key path. Just as the Claude provider reads the Claude CLI's own `~/.claude/.credentials.json`, the Grok provider reads the Grok CLI's own login file, so an existing `grok` login Just Works.
+- **Source precedence (highest first):**
+  1. `$XAI_CREDENTIALS_PATH` (if set) → use exactly that file. A failure here is loud (we do not silently fall through a deliberately-pointed path).
+  2. `~/.xai/.credentials.json` → a simple static key you created on purpose. Explicit beats ambient, so this wins over the CLI login.
+  3. `~/.grok/auth.json` → the Grok CLI's own OIDC login file (auto-detected).
+- **Two on-disk shapes** (either may sit behind `$XAI_CREDENTIALS_PATH`):
+  - Static key (`~/.xai/.credentials.json`):
+    ```json
+    { "apiKey": "xai-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" }
+    ```
+    (a top-level `"xaiApiKey"` alias is also accepted.)
+  - Grok CLI OIDC (`~/.grok/auth.json`), keyed by `https://auth.x.ai::<client-id>`:
+    ```json
+    { "https://auth.x.ai::<id>": { "key": "<JWT>", "auth_mode": "oidc",
+        "refresh_token": "...", "expires_at": "2026-06-10T22:20:22.000000Z" } }
+    ```
+    The `key` JWT is a Bearer that authenticates `api.x.ai/v1` directly.
+- **OIDC tokens are read READ-ONLY.** We never write `~/.grok/auth.json` or consume its single-use `refresh_token`. The parsed `expires_at` drives a non-fatal expiry warning; on a genuinely dead token the upstream 401s and the user re-runs the Grok CLI login (exactly as they re-auth the Claude CLI). Static keys carry no expiry and never warn.
 
-The loader lives in `omni-common::credentials::GrokCredentials` (modeled 1:1 on CCP's `Credentials` — same method names, same "fresh per request" contract, same expiry-check hook for future OAuth tokens).
+The loader lives in `omni-common::credentials::GrokCredentials` (modeled on CCP's `Credentials` — same "fresh per request" contract and a real expiry check for OIDC tokens).
 
-In `provider-grok` the key is obtained inside the `send` path (fresh load, with env fallback for compatibility) and used only for that request's `Authorization: Bearer ...` header. The `GrokProvider` struct no longer holds a long-lived key (except in test helpers).
+In `provider-grok` the key is obtained inside the `send` / `send_stream` path (fresh resolution through the source chain) and used only for that request's `Authorization: Bearer ...` header. The `GrokProvider` struct no longer holds a long-lived key (except in test helpers).
 
-This is the "same technique for omni and for grok" as requested.
+This is the "same technique for omni and for grok" as requested: read the CLI's own login file, fresh, every request.
 
 ## Relationship to the Rest of Omni
 - The "grok gate" logic (headers + fresh creds) lives only inside the Grok provider (or the thin common credentials loader it uses). It does not leak into `omni-common` policy or the Claude path.

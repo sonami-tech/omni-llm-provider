@@ -51,11 +51,14 @@ cargo run -p omni -- --providers grok --no-auth --port 18323   # one backend, no
 cargo test --workspace                                          # hermetic: live tests skip without creds
 ```
 
-Credentials are read fresh per request (never cached): Claude from
-`~/.claude/.credentials.json` (or `$CLAUDE_CREDENTIALS_PATH`), Grok from
-`$XAI_API_KEY` / `$XAI_CREDENTIALS_PATH` / `~/.xai/.credentials.json`. Tests
-that would call a real upstream skip cleanly when the corresponding credentials
-are absent, so the suite is green offline.
+Credentials are read fresh per request (never cached). Both backends are file-only
+(no env-var key): omni piggybacks on the CLIs' own logins. Claude reads
+`~/.claude/.credentials.json` (the Claude CLI's file; override `$CLAUDE_CREDENTIALS_PATH`).
+Grok resolves in precedence order: `$XAI_CREDENTIALS_PATH` ->
+`~/.xai/.credentials.json` (a static `{"apiKey":"xai-..."}` key) -> `~/.grok/auth.json`
+(the Grok CLI's OIDC login, auto-detected). So a logged-in `grok` CLI Just Works, exactly
+as a logged-in Claude CLI does. Tests that would call a real upstream skip cleanly when the
+corresponding credentials are absent, so the suite is green offline.
 
 ## More
 

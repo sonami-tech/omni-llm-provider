@@ -1,7 +1,6 @@
 # Live Testing Results for Omni LLM Provider
 
 ## Environment for this run
-- XAI_API_KEY: NO (not set in this session)
 - ~/.claude/.credentials.json: YES (real Claude Max creds present)
 - No ~/.xai/.credentials.json (as expected for Grok in this env)
 - All binaries freshly built from workspace.
