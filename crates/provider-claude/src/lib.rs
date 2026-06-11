@@ -809,7 +809,7 @@ mod tests {
     // cannot race the live test (which also takes it) or each other.
 
     use std::sync::Mutex as StdMutex;
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Serializes every test that reads or mutates `CLAUDE_CREDENTIALS_PATH`
@@ -824,7 +824,9 @@ mod tests {
     /// whole lifetime so the env mutation is not observed by a concurrent test.
     struct TempCreds {
         path: std::path::PathBuf,
-        prev: Option<String>,
+        /// Prior value as an OsString so a non-UTF-8 prior path is restored exactly
+        /// (var() would treat it as absent and wrongly remove the var on drop).
+        prev: Option<std::ffi::OsString>,
     }
 
     impl TempCreds {
@@ -846,7 +848,7 @@ mod tests {
                 std::process::id()
             ));
             std::fs::write(&path, body).expect("write temp claude creds");
-            let prev = std::env::var("CLAUDE_CREDENTIALS_PATH").ok();
+            let prev = std::env::var_os("CLAUDE_CREDENTIALS_PATH");
             // SAFETY (edition 2024): single-threaded mutation while holding
             // CREDS_ENV_LOCK; no other thread reads the env concurrently.
             unsafe {
@@ -1014,6 +1016,9 @@ mod tests {
                 "authorization",
                 format!("Bearer {}", TempCreds::dummy_token()).as_str(),
             ))
+            // send_stream flips the wire body to stream:true; pin it so a regression
+            // that stopped requesting a stream can't pass against an SSE-only mock.
+            .and(body_partial_json(serde_json::json!({"stream": true})))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
@@ -1087,6 +1092,9 @@ mod tests {
                 "authorization",
                 format!("Bearer {}", TempCreds::dummy_token()).as_str(),
             ))
+            // send_stream flips the wire body to stream:true; pin it so a regression
+            // that stopped requesting a stream can't pass against an SSE-only mock.
+            .and(body_partial_json(serde_json::json!({"stream": true})))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")

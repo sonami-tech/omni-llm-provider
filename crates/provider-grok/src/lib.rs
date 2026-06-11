@@ -2359,20 +2359,35 @@ mod tests {
     // CREDS ISOLATION (load-bearing): `resolve_api_key` reads the creds FILE chain
     // FIRST ($XAI_CREDENTIALS_PATH -> ~/.xai -> ~/.grok), and ~/.grok/auth.json
     // exists on dev boxes, so without isolation the provider would send the REAL
-    // OIDC bearer and the `Bearer xai-dummy` matcher would 404. Each test takes
-    // CRED_ENV_LOCK and points XAI_CREDENTIALS_PATH at a temp `{"apiKey":"xai-dummy"}`
-    // static-key file (the explicit-override branch), so the dummy key is what flows.
+    // OIDC bearer and the `Bearer xai-dummy-file` matcher would 404. Each test
+    // takes CRED_ENV_LOCK and points XAI_CREDENTIALS_PATH at a temp creds file
+    // (the explicit-override branch), so the file's key is what flows. The ctor is
+    // given a DIFFERENT key so that ONLY successful file resolution satisfies the
+    // matcher (see DummyXaiCreds::WRONG_CTOR_KEY) — the file is load-bearing even
+    // on a cred-less CI box where the ctor fallback would otherwise mask it.
 
-    /// RAII guard: writes a temp `{"apiKey": "xai-dummy"}` file, sets
+    /// RAII guard: writes a temp `{"apiKey": "xai-dummy-file"}` file, sets
     /// `XAI_CREDENTIALS_PATH` to it, and restores the prior env + removes the file
     /// on drop. Caller must hold CRED_ENV_LOCK for the guard's whole lifetime.
     struct DummyXaiCreds {
         path: ::std::path::PathBuf,
-        prev: Option<String>,
+        /// Prior value as an OsString so a non-UTF-8 prior path is restored exactly
+        /// (var() would treat it as absent and wrongly remove the var on drop).
+        prev: Option<::std::ffi::OsString>,
     }
 
     impl DummyXaiCreds {
-        const KEY: &'static str = "xai-dummy";
+        /// The key written to the temp creds FILE — this is what the mock's
+        /// `Bearer` matcher expects, so the request only matches when the provider
+        /// resolves the key from the file via `XAI_CREDENTIALS_PATH`.
+        const KEY: &'static str = "xai-dummy-file";
+
+        /// A DIFFERENT key passed to the ctor. `resolve_api_key` only falls back to
+        /// the ctor key when the file chain fails, so if isolation regressed (file
+        /// not resolved) this key would flow instead and the `Bearer xai-dummy-file`
+        /// matcher would 404 — making the temp creds file genuinely load-bearing
+        /// (and proving file-chain resolution even on a cred-less CI box).
+        const WRONG_CTOR_KEY: &'static str = "xai-ctor-must-not-be-used";
 
         fn install(tag: &str) -> Self {
             let path = ::std::env::temp_dir().join(format!(
@@ -2382,7 +2397,7 @@ mod tests {
             ));
             ::std::fs::write(&path, format!(r#"{{"apiKey": "{}"}}"#, Self::KEY))
                 .expect("write temp xai creds");
-            let prev = ::std::env::var("XAI_CREDENTIALS_PATH").ok();
+            let prev = ::std::env::var_os("XAI_CREDENTIALS_PATH");
             unsafe {
                 ::std::env::set_var("XAI_CREDENTIALS_PATH", &path);
             }
@@ -2406,10 +2421,10 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn grok_nonstream_success_roundtrip_via_wiremock() {
         // WHY: proves a successful non-stream completion end to end offline — the
-        // request leaves with `Authorization: Bearer xai-dummy`, the right method
-        // and path, and a body carrying the model + messages; and the real decoder
-        // maps the xAI response to canonical content/finish_reason/usage. CI could
-        // not prove a green Grok round-trip before this.
+        // request leaves with the file-resolved `Authorization: Bearer`, the right
+        // method and path, and a body carrying the model + messages; and the real
+        // decoder maps the xAI response to canonical content/finish_reason/usage.
+        // CI could not prove a green Grok round-trip before this.
         use wiremock::matchers::{body_partial_json, header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2439,7 +2454,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let p = GrokProvider::new_for_test(DummyXaiCreds::KEY, server.uri());
+        let p = GrokProvider::new_for_test(DummyXaiCreds::WRONG_CTOR_KEY, server.uri());
         let req = CanonicalRequest {
             model: "grok-3-mini".into(),
             messages: vec![CanonicalMessage {
@@ -2499,7 +2514,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let p = GrokProvider::new_for_test(DummyXaiCreds::KEY, server.uri());
+        let p = GrokProvider::new_for_test(DummyXaiCreds::WRONG_CTOR_KEY, server.uri());
         let req = CanonicalRequest {
             model: "grok-3-mini".into(),
             messages: vec![CanonicalMessage {
@@ -2530,7 +2545,7 @@ mod tests {
         // terminated by exactly one Finish at `[DONE]`. Pins ordered TextDelta ->
         // ToolCallDelta -> Usage -> single terminal Finish over the wire (the
         // in-memory drive_sse test covers the parser; this covers the transport).
-        use wiremock::matchers::{header, method, path};
+        use wiremock::matchers::{body_partial_json, header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -2552,6 +2567,12 @@ mod tests {
                 "authorization",
                 format!("Bearer {}", DummyXaiCreds::KEY).as_str(),
             ))
+            // The streaming builder MUST set stream:true (and include_usage); pin it
+            // so a regression that stopped requesting a stream can't pass against an
+            // unconditionally-SSE mock.
+            .and(body_partial_json(
+                json!({"stream": true, "stream_options": {"include_usage": true}}),
+            ))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
@@ -2561,7 +2582,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let p = GrokProvider::new_for_test(DummyXaiCreds::KEY, server.uri());
+        let p = GrokProvider::new_for_test(DummyXaiCreds::WRONG_CTOR_KEY, server.uri());
         let req = CanonicalRequest {
             model: "grok-3-mini".into(),
             messages: vec![CanonicalMessage {
