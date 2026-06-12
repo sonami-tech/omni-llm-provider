@@ -6,6 +6,7 @@
 //!
 //! ## Supported configuration (per task)
 //! - --providers claude,grok   or   OMNI_PROVIDERS=claude,grok (comma sep, order preserved)
+//! - --bind 127.0.0.1 by default, or --public as shorthand for --bind 0.0.0.0
 //! - Model prefix routing: "grok:foo" or "claude:bar" (case-insensitive prefix)
 //! - When only one provider enabled, bare model names (e.g. "grok-4") are routed to it.
 //! - When multiple enabled, bare models are rejected with clear error (forces prefix).
@@ -48,7 +49,7 @@
 //!   auth error on the first grok request.
 //!
 //! Build: cargo build -p omni
-//! Run (claude only, no keys needed): OMNI_PROVIDERS=claude cargo run -p omni -- --no-auth --port 18323
+//! Run (claude only, no keys needed): OMNI_PROVIDERS=claude cargo run -p omni -- --no-auth --port 18321
 //! Test: cargo test -p omni
 //!
 //! Documented here per "document any findings in the code or note for docs/" (no new .md).
@@ -78,7 +79,7 @@ use provider_claude::ClaudeProvider;
 use provider_grok::GrokProvider;
 
 /// CLI for the light omni aggregator.
-/// Env vars: OMNI_PROVIDERS, OMNI_PORT, OMNI_NO_AUTH (clap env support).
+/// Env vars: OMNI_PROVIDERS, OMNI_BIND, OMNI_PUBLIC, OMNI_PORT, OMNI_NO_AUTH (clap env support).
 #[derive(Parser, Debug)]
 #[command(
     name = "omni",
@@ -95,8 +96,16 @@ struct Cli {
     providers: Vec<String>,
 
     /// Listen port.
-    #[arg(long, env = "OMNI_PORT", default_value_t = 18323)]
+    #[arg(long, env = "OMNI_PORT", default_value_t = 18321)]
     port: u16,
+
+    /// Listen address. Defaults to localhost only.
+    #[arg(long, env = "OMNI_BIND")]
+    bind: Option<String>,
+
+    /// Listen on all interfaces. Equivalent to --bind 0.0.0.0.
+    #[arg(long, env = "OMNI_PUBLIC")]
+    public: bool,
 
     /// Disable API key auth (if omitted, still allows all unless OMNI_API_KEYS is set).
     #[arg(long, env = "OMNI_NO_AUTH")]
@@ -182,7 +191,8 @@ async fn main() -> anyhow::Result<()> {
             move |req, next| auth_layer(keys.clone(), req, next)
         }));
 
-    let addr: SocketAddr = format!("127.0.0.1:{}", cli.port).parse()?;
+    let bind_host = resolve_bind_host(cli.public, cli.bind.as_deref())?;
+    let addr: SocketAddr = format!("{}:{}", bind_host, cli.port).parse()?;
     info!("omni listening on http://{}", addr);
     info!("  providers: {}", enabled.join(","));
     info!("  try: curl http://{}/health", addr);
@@ -196,6 +206,19 @@ async fn main() -> anyhow::Result<()> {
         .context("server error")?;
 
     Ok(())
+}
+
+/// Resolve the configured listen host. `--public` is intentional shorthand for
+/// all interfaces, while the default remains loopback-only.
+fn resolve_bind_host(public: bool, bind: Option<&str>) -> anyhow::Result<String> {
+    let bind = bind.map(str::trim).filter(|s| !s.is_empty());
+    if public && bind.is_some() {
+        anyhow::bail!("--public cannot be used with --bind/OMNI_BIND");
+    }
+    if public {
+        return Ok("0.0.0.0".to_string());
+    }
+    Ok(bind.unwrap_or("127.0.0.1").to_string())
 }
 
 /// Normalize/validate the providers CLI/env list.
@@ -455,6 +478,30 @@ mod tests {
     fn test_normalize_providers() {
         let n = normalize_providers(&[" claude ".into(), "GROK".into(), "claude".into()]).unwrap();
         assert_eq!(n, vec!["claude".to_string(), "grok".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_bind_host_default_loopback() {
+        assert_eq!(resolve_bind_host(false, None).unwrap(), "127.0.0.1");
+    }
+
+    #[test]
+    fn test_resolve_bind_host_explicit_bind() {
+        assert_eq!(
+            resolve_bind_host(false, Some("192.168.1.25")).unwrap(),
+            "192.168.1.25"
+        );
+    }
+
+    #[test]
+    fn test_resolve_bind_host_public_all_interfaces() {
+        assert_eq!(resolve_bind_host(true, None).unwrap(), "0.0.0.0");
+    }
+
+    #[test]
+    fn test_resolve_bind_host_public_conflicts_with_bind() {
+        let err = resolve_bind_host(true, Some("127.0.0.1")).unwrap_err();
+        assert!(err.to_string().contains("cannot be used with --bind"));
     }
 
     #[tokio::test]

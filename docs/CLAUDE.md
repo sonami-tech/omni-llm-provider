@@ -33,7 +33,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo test --workspace        # hermetic: live tests skip when creds are absent
 
-cargo run -p omni -- --providers claude,grok --port 18323
+cargo run -p omni -- --providers claude,grok --port 18321
 cargo run -p omni-claude -- --no-auth --port 18401
 cargo run -p omni-grok -- --no-auth --port 18402
 ```

@@ -47,7 +47,7 @@ is Chat Completions only.
 
 ```bash
 cargo build --workspace
-cargo run -p omni -- --providers grok --no-auth --port 18323   # one backend, no creds gate on startup
+cargo run -p omni -- --providers grok --no-auth --port 18321   # one backend, no creds gate on startup
 cargo test --workspace                                          # hermetic: live tests skip without creds
 ```
 
