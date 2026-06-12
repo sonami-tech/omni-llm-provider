@@ -23,9 +23,9 @@ Provider implementations remain separate crates:
 - Auth, stats, HTTP routes, and model-list behavior have one implementation.
 - Provider crates still protect provider invariants; no Claude cch or
   fingerprint logic moves into `omni`.
-- Multi-provider ambiguity is explicit: with multiple providers enabled, model
-  IDs require `claude:` or `grok:` prefixes. With one provider enabled, bare
-  model names route to that provider.
+- Model routing uses provider-owned catalogs. Bare canonical ids and documented
+  aliases route when they uniquely match an enabled provider. `claude:` and
+  `grok:` prefixes remain as an explicit provider escape hatch.
 
 ## HTTP Surface
 
@@ -45,8 +45,8 @@ cargo run -p omni -- --providers claude,grok --port 18321
 ## Non-Goals
 
 - Do not merge provider internals into `omni`.
-- Do not route bare model names heuristically when more than one provider is
-  enabled.
+- Do not route unknown or ambiguous bare model names heuristically when more
+  than one provider is enabled.
 - Do not add provider-specific server binaries unless there is a concrete
   compatibility requirement.
 

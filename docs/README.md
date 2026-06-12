@@ -6,8 +6,10 @@ logic remains isolated in provider crates.
 
 ## Binary
 
-- `omni` - the only server binary. Routes by model prefix (`claude:...` /
-  `grok:...`) or, when only one provider is enabled, by bare model name.
+- `omni` - the only server binary. Routes by canonical upstream model id
+  (`claude-sonnet-4-6`, `grok-4.3`), documented shorthand alias (`sonnet`,
+  `opus`, `haiku`, `grok`, `composer`), or optional provider prefix
+  (`claude:...`, `grok:...`) when a caller needs to force a provider.
 
 ## Crates
 
@@ -29,8 +31,8 @@ logic remains isolated in provider crates.
   chunks terminated by `data: [DONE]`.
 - `POST /v1/responses` - supported OpenAI Responses subset, non-stream JSON or
   Responses SSE events.
-- `GET /v1/models`, `GET /models` - provider-owned model catalogs with prefixed
-  IDs.
+- `GET /v1/models`, `GET /models` - provider-owned canonical model catalogs.
+  Shorthand aliases are accepted on requests but are not emitted as model ids.
 - `GET /stats` - persistent request, token, and error counters.
 - `GET /health`, `GET /`.
 
@@ -61,6 +63,14 @@ If `--stats-db` is omitted, Omni writes stats to a fixed temp-file path
 stats or when running more than one server instance.
 
 `OMNI_API_KEYS` enables bearer-token auth when set to a comma-separated key list.
+
+Current shorthand aliases are resolved from provider-owned catalogs at startup:
+
+- `sonnet` -> `claude-sonnet-4-6`
+- `opus` -> `claude-opus-4-8`
+- `haiku` -> `claude-haiku-4-5-20251001`
+- `grok` -> `grok-4.3`
+- `composer` -> `grok-composer-2.5-fast`
 
 Credentials are read fresh per request, never cached. Claude reads
 `~/.claude/.credentials.json` or `$CLAUDE_CREDENTIALS_PATH`. Grok resolves

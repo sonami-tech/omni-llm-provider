@@ -1,8 +1,9 @@
 # Claude Code cch fingerprint
 
-Canonical target: Claude Code `2.1.158`, profile `cc-2.1.158-sdk-cli`.
+Canonical target: Claude Code `2.1.165`, profile `cc-2.1.165-sdk-cli`.
 The same checksum algorithm remains verified for `cc-2.1.142-sdk-cli`,
-`cc-2.1.150-sdk-cli`, and `cc-2.1.154-sdk-cli`.
+`cc-2.1.150-sdk-cli`, `cc-2.1.154-sdk-cli`, `cc-2.1.158-sdk-cli`,
+`cc-2.1.161-sdk-cli`, and `cc-2.1.162-sdk-cli`.
 
 This document is the repo-canonical record for the `cch` field in Claude
 Code's billing marker. If this conflicts with an agent memory note, update the
@@ -20,7 +21,7 @@ Before the final HTTP request leaves the process, Claude Code rewrites the five
 zeroes. The rewrite is deterministic for the exact request-body bytes.
 
 Algorithm recovered for `2.1.142` and re-verified for `2.1.150`, `2.1.154`, and
-`2.1.158`:
+`2.1.158` through `2.1.165`:
 
 1. Serialize the final `/v1/messages` JSON request body with `cch=00000;`
    still present.
@@ -109,3 +110,10 @@ tools/providers/claude/fingerprint/check_claude_code_drift.py
 The script captures a live local Claude Code request against a fake Anthropic
 server, reports the installed version, and verifies whether the observed final
 body still matches the pinned checksum algorithm.
+
+## 2.1.175 Status
+
+Claude Code 2.1.175 still exposes a `cch=00000` marker before transport, but
+the final request body observed on 2026-06-12 does not match this xxHash64 body
+algorithm. Do not reuse this algorithm for 2.1.175 or promote that release until
+the new checksum path is recovered and pinned with vectors.

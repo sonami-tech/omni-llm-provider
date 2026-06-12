@@ -14,6 +14,14 @@ Active baseline: 2026-06-05 against local Claude Code 2.1.165 (re-baselined per 
 
 `latest` resolves to `cc-2.1.165-sdk-cli`, the newest known-good pinned profile. Do not make the default an automatic max-version calculation; only move `latest` after a profile has been re-baselined and live-smoked.
 
+2026-06-12 note: local Claude Code 2.1.175 was captured against the live API and
+accepted default, Fable, Opus, Sonnet, and Haiku requests. Its headers remain on
+SDK package `0.94.0`, runtime `v24.3.0`, and Anthropic version `2023-06-01`.
+However, the final transport `cch` changed and no longer matches the supported
+xxHash64 body algorithm below. Because Claude fingerprint exactness is a hard
+gate, Omni does not promote a 2.1.175 profile or move `latest` until that
+checksum path is recovered and tested.
+
 2.1.165 is a pure version bump from 2.1.162: the 2026-06-05 capture re-confirmed that the per-model beta lists, stainless versions (`0.94.0` / `v24.3.0`), wire defaults (opus 64k/no-temp/effort=high; sonnet & haiku 32k/temp=1; haiku no effort - all three confirmed on full untruncated bodies), default-model resolution (opus → `claude-opus-4-8`), the model catalog, and the cch algorithm (xxh64 seed `0x4d659218e32a3268`, validated `ok`, synthetic-probe cch `b5d33`) are all unchanged. Only the version string and the version-derived `cc_version` suffix moved (real on-wire billing header read `cc_version=2.1.165.492` for the "Say OK" probe). The model catalog is carried forward from 2.1.158/2.1.161/2.1.162 (the capture sets `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, which suppresses the startup `/v1/models` GET, so the catalog is not freshly GET-enumerable; all three pinned ids were confirmed accepted in real bodies and 2.1.165 carries no model rename).
 
 2.1.162 was likewise a pure version bump from 2.1.161 (2026-06-04 capture; "Say OK" suffix `2.1.162.b87`). 2.1.161 was a pure version bump from 2.1.158 (2026-06-03 capture; "Say OK" suffix `2.1.161.d2b`).

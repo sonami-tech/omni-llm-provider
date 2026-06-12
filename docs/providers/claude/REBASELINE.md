@@ -9,6 +9,8 @@ upstream.
 - Keep raw flows on RAM-backed tmpfs only.
 - Never commit `.flow` files, credentials, extracted bearer tokens, or local
   reports containing unredacted auth.
+- Use clean HOME/CWD captures so project or user instruction files are not
+  copied into request bodies or reports.
 - Do not run live capture without explicit operator approval.
 
 ## Tools
@@ -39,8 +41,9 @@ upstream.
    ```
 
    The helper starts mitmdump as a reverse proxy to `https://api.anthropic.com`,
-   drives the installed `claude` CLI, extracts a redacted Markdown report, and
-   removes the token-bearing flow unless `KEEP_FLOW=1`.
+   copies only Claude credentials into a clean tmpfs HOME, drives the installed
+   `claude` CLI from that clean HOME/CWD, extracts a redacted structural
+   Markdown report, and removes the token-bearing flow unless `KEEP_FLOW=1`.
 
 3. Analyze the extract:
 
@@ -54,6 +57,8 @@ upstream.
    - Confirm default model from the no-`--model` capture.
    - Confirm all pinned catalog models are accepted.
    - Confirm the billing suffix and cch behavior.
+   - If any checksum or body mutation cannot be reproduced exactly, do not
+     promote the profile to `latest`.
 
 4. Update code:
 
@@ -95,3 +100,16 @@ upstream.
 - Captured fields are represented in source.
 - Recovered vectors are local to this repo and covered by Rust tests.
 - Default workspace tests pass without credentials or network.
+
+## Current 2.1.175 Status
+
+On 2026-06-12, Claude Code 2.1.175 was captured and model behavior was verified
+for default, `fable`, `opus`, `sonnet`, and `haiku` flows. Headers still use SDK
+package `0.94.0`, runtime `v24.3.0`, Anthropic version `2023-06-01`, and
+`claude-cli/2.1.175 (external, sdk-cli)`.
+
+Do not promote 2.1.175 yet. The visible billing marker still contains the
+`cch=00000` sentinel before transport, but the final five-hex `cch` no longer
+matches the proven xxHash64 body algorithm used by 2.1.165 and earlier supported
+profiles. Keep `cc-2.1.165-sdk-cli` as `latest` until the 2.1.175 checksum path
+is recovered and covered by vectors/tests.

@@ -66,7 +66,42 @@ use tracing::{debug, error, warn};
 
 const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
 
-const GROK_MODELS: &[&str] = &["grok-3", "grok-4", "grok-4.3"];
+const GROK_MODELS: &[GrokModelDef] = &[
+    GrokModelDef {
+        id: "grok-4.3",
+        aliases: &["grok", "grok-4", "grok-3"],
+    },
+    GrokModelDef {
+        id: "grok-build",
+        aliases: &["build"],
+    },
+    GrokModelDef {
+        id: "grok-build-0.1",
+        aliases: &[],
+    },
+    GrokModelDef {
+        id: "grok-composer-2.5-fast",
+        aliases: &["composer"],
+    },
+    GrokModelDef {
+        id: "grok-4.20-0309-reasoning",
+        aliases: &[],
+    },
+    GrokModelDef {
+        id: "grok-4.20-0309-non-reasoning",
+        aliases: &[],
+    },
+];
+
+/// xAI chat model entry and aliases verified against `/v1/chat/completions`.
+///
+/// Aliases are accepted inbound conveniences only. They are not emitted from
+/// `/v1/models`, which keeps that surface limited to real upstream IDs.
+#[derive(Debug, Clone, Copy)]
+pub struct GrokModelDef {
+    pub id: &'static str,
+    pub aliases: &'static [&'static str],
+}
 
 /// OpenAI-compatible model entry exposed by the server's `/v1/models` route.
 #[derive(Debug, Clone, Serialize)]
@@ -149,11 +184,22 @@ impl GrokProvider {
     pub fn models_list() -> Vec<GrokModelInfo> {
         GROK_MODELS
             .iter()
-            .map(|id| GrokModelInfo {
-                id: (*id).to_string(),
+            .map(|model| GrokModelInfo {
+                id: model.id.to_string(),
                 object: "model",
                 created: 0,
                 owned_by: "grok",
+            })
+            .collect()
+    }
+
+    /// Static alias map for router-level shorthand support.
+    pub fn model_aliases() -> Vec<(&'static str, &'static str)> {
+        GROK_MODELS
+            .iter()
+            .flat_map(|model| {
+                std::iter::once((model.id, model.id))
+                    .chain(model.aliases.iter().map(move |alias| (*alias, model.id)))
             })
             .collect()
     }
@@ -280,8 +326,9 @@ fn to_xai_chat_request(req: &CanonicalRequest, repl: &Replacements) -> Value {
             .collect()
     });
 
+    let model = resolve_model_alias(&req.model).unwrap_or(req.model.as_str());
     let mut body = json!({
-        "model": req.model,
+        "model": model,
         "messages": messages,
         "stream": false,
     });
@@ -336,6 +383,16 @@ fn to_xai_chat_request(req: &CanonicalRequest, repl: &Replacements) -> Value {
     // (Real rules for tool names etc. are typically applied by the frontend before producing CanonicalRequest,
     // or the provider ctor would be given a live Replacements instance instead of always empty().)
     body
+}
+
+fn resolve_model_alias(model: &str) -> Option<&'static str> {
+    GROK_MODELS.iter().find_map(|entry| {
+        if entry.id == model || entry.aliases.contains(&model) {
+            Some(entry.id)
+        } else {
+            None
+        }
+    })
 }
 
 /// Map a CanonicalRequest to the JSON body for a *streaming* xAI /v1/chat/completions call.
@@ -896,6 +953,37 @@ mod tests {
     }
 
     #[test]
+    fn test_model_catalog_exposes_canonical_ids_and_aliases_normalize() {
+        // WHY: `/v1/models` must expose real xAI ids, while inbound shorthand
+        // aliases are normalized before hitting the upstream chat API.
+        let ids: Vec<String> = GrokProvider::models_list()
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert!(ids.iter().any(|id| id == "grok-4.3"));
+        assert!(ids.iter().any(|id| id == "grok-composer-2.5-fast"));
+        assert!(
+            !ids.iter().any(|id| id == "grok" || id == "composer"),
+            "aliases must not be advertised as canonical models: {ids:?}"
+        );
+
+        let aliases = GrokProvider::model_aliases();
+        assert!(aliases.contains(&("grok", "grok-4.3")));
+        assert!(aliases.contains(&("composer", "grok-composer-2.5-fast")));
+
+        let req = CanonicalRequest {
+            model: "composer".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            ..Default::default()
+        };
+        let body = to_xai_chat_request(&req, &empty_repl());
+        assert_eq!(body["model"], "grok-composer-2.5-fast");
+    }
+
+    #[test]
     fn test_to_xai_tools_and_choice() {
         let req = CanonicalRequest {
             model: "grok-4.3".into(),
@@ -1168,7 +1256,7 @@ mod tests {
     #[test]
     fn test_to_xai_with_tools_and_extras_and_reasoning() {
         let req = CanonicalRequest {
-            model: "grok-4".into(),
+            model: "grok-4.3".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("search".into()),
@@ -1190,7 +1278,7 @@ mod tests {
             provider_extras: Some(serde_json::json!({"service_tier": "standard"})),
         };
         let body = to_xai_chat_request(&req, &empty_repl());
-        assert_eq!(body["model"], "grok-4");
+        assert_eq!(body["model"], "grok-4.3");
         assert!(body.get("tools").is_some());
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["max_completion_tokens"], 256);
@@ -1207,7 +1295,7 @@ mod tests {
     #[test]
     fn test_from_xai_with_details_and_refusal() {
         let raw = XaiChatCompletion {
-            model: Some("grok-3".into()),
+            model: Some("grok-4.3".into()),
             choices: Some(vec![XaiChoice {
                 message: Some(XaiAssistantMessage {
                     content: Some("ok".into()),
@@ -1290,7 +1378,7 @@ mod tests {
         };
         let p = GrokProvider::new(Some(key)).expect("ctor with explicit key");
         let req = CanonicalRequest {
-            model: "grok-3-mini".into(), // use a generally available lightweight model for the real probe
+            model: "grok-4.3".into(), // use a generally available lightweight model for the real probe
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("Reply with the single word: PONG".into()),
@@ -1376,7 +1464,7 @@ mod tests {
     fn test_to_xai_parallel_tool_calls_response_format_user_seed_stop_n() {
         // these come via provider_extras passthrough (canonical has limited native sampling)
         let req = CanonicalRequest {
-            model: "grok-4".into(),
+            model: "grok-4.3".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("x".into()),
@@ -1421,7 +1509,7 @@ mod tests {
     fn test_to_xai_built_in_web_search_and_tool_roundtrip() {
         // built-in via extras (overwrites or provides the tools array); function tools via canonical
         let req = CanonicalRequest {
-            model: "grok-4".into(),
+            model: "grok-4.3".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("search web".into()),
@@ -1477,7 +1565,7 @@ mod tests {
         )
         .unwrap();
         let req = CanonicalRequest {
-            model: "grok-4".into(),
+            model: "grok-4.3".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("tell SECRET".into()),
@@ -1630,7 +1718,7 @@ mod tests {
             .expect("new(None) succeeds")
             .with_base_url("http://127.0.0.1:1");
         let req = CanonicalRequest {
-            model: "grok-3-mini".into(),
+            model: "grok-4.3".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("cred file test".into()),
@@ -1676,7 +1764,7 @@ mod tests {
         }
         let p = GrokProvider::new(None).expect("ctor ok"); // no ctor key, file is the only source
         let req = CanonicalRequest {
-            model: "grok-3-mini".into(),
+            model: "grok-4.3".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("x".into()),
@@ -1719,7 +1807,7 @@ mod tests {
         }
         let p = GrokProvider::new_for_test("ignored-ctor-key", "http://127.0.0.1:1");
         let req = CanonicalRequest {
-            model: "grok-3-mini".into(),
+            model: "grok-4.3".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("override send".into()),
@@ -1768,7 +1856,7 @@ mod tests {
         }
         let p = GrokProvider::new_for_test("xai-the-only-ctor-key", "http://127.0.0.1:1");
         let req = CanonicalRequest {
-            model: "grok-3-mini".into(),
+            model: "grok-4.3".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("ctor fallback".into()),
@@ -1842,7 +1930,7 @@ mod tests {
 
         let p = GrokProvider::new_for_test("ignored-ctor-key", server.uri());
         let req = CanonicalRequest {
-            model: "grok-3-mini".into(),
+            model: "grok-4.3".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("auth test".into()),
@@ -1900,7 +1988,7 @@ mod tests {
         // success part (similar to existing)
         let p_ok = GrokProvider::new(Some(key.clone())).expect("ctor");
         let req_ok = CanonicalRequest {
-            model: "grok-3-mini".into(),
+            model: "grok-4.3".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("PING".into()),
@@ -1971,7 +2059,7 @@ mod tests {
     fn test_tool_roundtrip_to_from_and_streaming_note() {
         // full roundtrip mapper for a tool-using turn (to body shape + from response shape)
         let req = CanonicalRequest {
-            model: "grok-4".into(),
+            model: "grok-4.3".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("call tool please".into()),
@@ -1992,7 +2080,7 @@ mod tests {
 
         // corresponding response from xai
         let raw = XaiChatCompletion {
-            model: Some("grok-4".into()),
+            model: Some("grok-4.3".into()),
             choices: Some(vec![XaiChoice {
                 message: Some(XaiAssistantMessage {
                     content: Some("".into()),
@@ -2136,7 +2224,7 @@ mod tests {
             .expect("new(None) succeeds")
             .with_base_url("http://127.0.0.1:1");
         let req = CanonicalRequest {
-            model: "grok-3-mini".into(),
+            model: "grok-4.3".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("file key resolve test".into()),
@@ -2173,13 +2261,13 @@ mod tests {
         // Edge for from_xai robustness (more from_xai coverage): partial/empty responses from wire must not panic; defaults to 0 usage, empty content/tools.
         // Why: xAI (and OpenAI compat) can return such in certain error/early-finish/tool-only or rate cases; canonical must stay usable.
         let raw = XaiChatCompletion {
-            model: Some("grok-3-mini".into()),
+            model: Some("grok-4.3".into()),
             choices: Some(vec![]),
             usage: None,
             ..Default::default()
         };
         let canon = from_xai_chat_response(raw, &empty_repl());
-        assert_eq!(canon.model, "grok-3-mini");
+        assert_eq!(canon.model, "grok-4.3");
         assert!(canon.content.is_empty());
         assert!(canon.tool_calls.is_empty());
         assert_eq!(canon.usage.input_tokens, 0);
@@ -2381,7 +2469,7 @@ mod tests {
         };
         let p = GrokProvider::new(Some(key)).expect("ctor for live stream test");
         let req = CanonicalRequest {
-            model: "grok-3-mini".into(),
+            model: "grok-4.3".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("Reply with the single word: PONG".into()),
@@ -2496,11 +2584,11 @@ mod tests {
                 "authorization",
                 format!("Bearer {}", DummyXaiCreds::KEY).as_str(),
             ))
-            .and(body_partial_json(json!({"model": "grok-3-mini"})))
+            .and(body_partial_json(json!({"model": "grok-4.3"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "chatcmpl-hermetic",
                 "object": "chat.completion",
-                "model": "grok-3-mini",
+                "model": "grok-4.3",
                 "choices": [ {
                     "index": 0,
                     "message": { "role": "assistant", "content": "Hello back" },
@@ -2514,7 +2602,7 @@ mod tests {
 
         let p = GrokProvider::new_for_test(DummyXaiCreds::WRONG_CTOR_KEY, server.uri());
         let req = CanonicalRequest {
-            model: "grok-3-mini".into(),
+            model: "grok-4.3".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("hi".into()),
@@ -2552,7 +2640,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "chatcmpl-tool",
                 "object": "chat.completion",
-                "model": "grok-3-mini",
+                "model": "grok-4.3",
                 "choices": [ {
                     "index": 0,
                     "message": {
@@ -2574,7 +2662,7 @@ mod tests {
 
         let p = GrokProvider::new_for_test(DummyXaiCreds::WRONG_CTOR_KEY, server.uri());
         let req = CanonicalRequest {
-            model: "grok-3-mini".into(),
+            model: "grok-4.3".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("weather?".into()),
@@ -2642,7 +2730,7 @@ mod tests {
 
         let p = GrokProvider::new_for_test(DummyXaiCreds::WRONG_CTOR_KEY, server.uri());
         let req = CanonicalRequest {
-            model: "grok-3-mini".into(),
+            model: "grok-4.3".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("hi".into()),

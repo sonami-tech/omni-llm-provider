@@ -14,9 +14,9 @@
   - omni-core: canonical roundtrips + LlmProvider trait parity (grok + claude mocks) - 4 tests
   - provider-claude: 39 tests (ported fingerprint invariant pins + cch + headers + identity + mappers + send path exercising full gate)
   - provider-grok: 10 tests (mappers for tools/reasoning/extras/replacements + send mocked + real-if-key (skipped cleanly))
-- Omni routing tests in `crates/bin/omni`: cover prefix (`grok:`,
-  `claude:`), config-based routing, unified OpenAI-compatible surfaces, and both
-  backends.
+- Omni routing tests in `crates/bin/omni`: cover canonical ids, shorthand
+  aliases, optional prefixes (`grok:`, `claude:`), config-based routing,
+  unified OpenAI-compatible surfaces, and both backends.
 
 ## Live Server Tests Performed
 (Using timeout + bg server + curl for functional verification. Servers started with --no-auth.)
@@ -37,7 +37,7 @@
 
 3. **Omni routing to Grok (file creds technique)**:
    - Temp creds file + env.
-   - `omni` with `--providers grok`, model="grok:grok-3-mini".
+   - `omni` with `--providers grok`, model="grok:grok-4.3".
    - Init ok via loader; request hit gate (fake key).
    - Result: Omni correctly routes to Grok using the shared credential loader.
 

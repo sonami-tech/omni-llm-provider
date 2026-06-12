@@ -2,6 +2,10 @@
 
 **Date:** 2026-06-09 · **Commit audited:** `6ed9ad0` (initial commit) · **Method:** full read of all 7 workspace crates + both stub binaries + all docs; fresh runs of `cargo build`, `cargo clippy --workspace --all-targets`, `cargo fmt --all --check`, `cargo test --workspace` (2 independent full-suite runs). `reference-src-claude/` treated as vendored port source (light review). Findings are labeled **(Fact)** — verified in code/output — or **(Judgment)**.
 
+> Historical audit record: this file describes the initial commit state. Current
+> builds ship one server binary, `omni`; provider implementations remain in
+> separate crates.
+
 ---
 
 ## 1. Executive Summary

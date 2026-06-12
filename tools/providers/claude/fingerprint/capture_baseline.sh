@@ -2,8 +2,9 @@
 # Capture a real Claude Code -> api.anthropic.com flow for fingerprint re-baselining.
 #
 # Starts mitmdump as a reverse-proxy recorder in front of the real API, drives the
-# installed `claude` CLI through it for the default model + each model id passed as
-# an argument, then extracts each captured POST /v1/messages and the model-list GET.
+# installed `claude` CLI from a clean HOME/CWD for the default model + each model
+# id passed as an argument, then extracts each captured POST /v1/messages and the
+# model-list GET.
 #
 # Usage:
 #   tools/providers/claude/fingerprint/capture_baseline.sh claude-haiku-4-5 claude-sonnet-4-6 claude-opus-4-8
@@ -13,7 +14,8 @@
 # bearer token, so: the script REFUSES to run without a tmpfs (never writes the
 # token to persistent disk), creates the dir with umask 077, and shreds the flow on
 # exit unless you set KEEP_FLOW=1 (retention is still tmpfs-only, gone on reboot).
-# The extract has auth/x-api-key headers redacted by extract_flow.py.
+# The extract has auth/x-api-key headers redacted and summarizes JSON bodies by
+# default so local prompt context is not copied into the report.
 #
 # Token-safety is best-effort against TRAPPABLE termination (normal exit, INT, TERM,
 # HUP, QUIT). An untrappable SIGKILL, a hard crash, or power loss cannot run the
@@ -64,8 +66,21 @@ WORKDIR="$(mktemp -d "$WORKBASE/omni-claude-baseline.XXXXXX")"
 FLOW="$WORKDIR/omni-claude-baseline.flow"
 EXTRACT="$WORKDIR/omni-claude-baseline-extract.md"
 MITMLOG="$WORKDIR/cc-mitm.log"
+CLEAN_HOME="$WORKDIR/clean-home"
 PROMPT="Say OK"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+mkdir -p "$CLEAN_HOME/.claude"
+if [ -n "${CLAUDE_CREDENTIALS_PATH:-}" ]; then
+  CREDS_SRC="$CLAUDE_CREDENTIALS_PATH"
+else
+  CREDS_SRC="${HOME:-}/.claude/.credentials.json"
+fi
+if [ ! -f "$CREDS_SRC" ]; then
+  echo "[capture] FATAL: Claude credentials not found at $CREDS_SRC" >&2
+  exit 1
+fi
+cp "$CREDS_SRC" "$CLEAN_HOME/.claude/.credentials.json"
 
 # Resolve mitmdump: prefer PATH, else uv.
 if command -v mitmdump >/dev/null 2>&1; then
@@ -197,18 +212,22 @@ if [ -z "$bound" ]; then
 fi
 echo "[capture] mitmdump listening on :$PORT" >&2
 
-export ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT"
-export CLAUDE_CODE_ENTRYPOINT="sdk-cli"
-export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-
 drive() { # $1 = optional model
+  local -a env_cmd=(
+    env -i
+    "HOME=$CLEAN_HOME"
+    "PATH=${PATH:-}"
+    "ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT"
+    "CLAUDE_CODE_ENTRYPOINT=sdk-cli"
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
+  )
   if [ -n "${1:-}" ]; then
     echo "[capture] claude --model $1" >&2
-    claude --print --no-session-persistence --model "$1" -- "$PROMPT" >/dev/null 2>&1 || \
+    (cd "$CLEAN_HOME" && "${env_cmd[@]}" claude --print --no-session-persistence --model "$1" -- "$PROMPT") >/dev/null 2>&1 || \
       echo "[capture] WARN: claude call for model '$1' returned nonzero (continuing)" >&2
   else
     echo "[capture] claude (default model, no --model)" >&2
-    claude --print --no-session-persistence -- "$PROMPT" >/dev/null 2>&1 || \
+    (cd "$CLEAN_HOME" && "${env_cmd[@]}" claude --print --no-session-persistence -- "$PROMPT") >/dev/null 2>&1 || \
       echo "[capture] WARN: default claude call returned nonzero (continuing)" >&2
   fi
 }
@@ -224,9 +243,9 @@ cleanup
 
 echo "[capture] extracting $FLOW -> $EXTRACT" >&2
 if command -v mitmdump >/dev/null 2>&1 && python3 -c "import mitmproxy" 2>/dev/null; then
-  python3 "$SCRIPT_DIR/extract_flow.py" "$FLOW" --body-bytes 8000 | tee "$EXTRACT"
+  python3 "$SCRIPT_DIR/extract_flow.py" "$FLOW" | tee "$EXTRACT"
 else
-  uv tool run --from mitmproxy python3 "$SCRIPT_DIR/extract_flow.py" "$FLOW" --body-bytes 8000 | tee "$EXTRACT"
+  uv tool run --from mitmproxy python3 "$SCRIPT_DIR/extract_flow.py" "$FLOW" | tee "$EXTRACT"
 fi
 echo "[capture] done. workdir=$WORKDIR extract=$EXTRACT (redacted)" >&2
 if [ "${KEEP_FLOW:-0}" = "1" ]; then

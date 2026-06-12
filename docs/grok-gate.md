@@ -67,7 +67,10 @@ This is the "same technique for omni and for grok" as requested: read the CLI's 
 ## Relationship to the Rest of Omni
 - The "grok gate" logic (headers + fresh creds) lives only inside the Grok provider (or the thin common credentials loader it uses). It does not leak into `omni-common` policy or the Claude path.
 - Replacements (from omni-common) are still applied at the prompt/response boundaries around the gate, exactly as for Claude.
-- The Omni server can enable "grok" (and/or "claude") via `--providers` / `OMNI_PROVIDERS` and route by model prefix. No special Grok knowledge is required at the server layer.
+- The Omni server can enable "grok" (and/or "claude") via `--providers` /
+  `OMNI_PROVIDERS` and route by canonical model id, documented alias, or
+  optional provider prefix. No Grok wire-gate knowledge is required at the
+  server layer.
 
 ## References
 - Official xAI docs (quickstart, /v1/chat/completions, /v1/responses, tools).
