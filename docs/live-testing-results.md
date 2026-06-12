@@ -1,5 +1,8 @@
 # Live Testing Results for Omni LLM Provider
 
+> Historical note: this file records an earlier multi-binary test run. Current
+> builds ship one server binary, `omni`; see `README.md` and `DESIGN.md`.
+
 ## Environment for this run
 - ~/.claude/.credentials.json: YES (real Claude Max creds present)
 - No ~/.xai/.credentials.json (as expected for Grok in this env)

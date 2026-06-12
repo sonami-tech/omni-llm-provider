@@ -24,7 +24,7 @@ From official docs and observed SDK/proxy behavior (2026):
 - `Content-Type: application/json`
 
 **Optional but useful for "passing gates" in certain environments:**
-- `X-Title`: Human-readable client name (e.g. "omni-grok", "my-app"). Seen in proxy examples (TypingMind, etc.) for usage attribution and to avoid generic blocks.
+- `X-Title`: Human-readable client name (e.g. "omni", "my-app"). Seen in proxy examples (TypingMind, etc.) for usage attribution and to avoid generic blocks.
 - `HTTP-Referer`: Origin URL (e.g. "https://example.com"). Helps with tracking and some rate-limit policies in shared/proxy scenarios.
 
 These are **not** enforced on the raw wire for direct calls (the API happily accepts plain `curl` with only Bearer), but they are the practical "headers needed for Grok in order to pass their gates" when using proxies, IDEs, or enterprise routing layers.
@@ -67,7 +67,7 @@ This is the "same technique for omni and for grok" as requested: read the CLI's 
 ## Relationship to the Rest of Omni
 - The "grok gate" logic (headers + fresh creds) lives only inside the Grok provider (or the thin common credentials loader it uses). It does not leak into `omni-common` policy or the Claude path.
 - Replacements (from omni-common) are still applied at the prompt/response boundaries around the gate, exactly as for Claude.
-- The light Omni wrapper can enable "grok" (and/or "claude") via `--providers` / `OMNI_PROVIDERS` and route by model prefix. No special Grok knowledge is required at the aggregator layer.
+- The Omni server can enable "grok" (and/or "claude") via `--providers` / `OMNI_PROVIDERS` and route by model prefix. No special Grok knowledge is required at the server layer.
 
 ## References
 - Official xAI docs (quickstart, /v1/chat/completions, /v1/responses, tools).

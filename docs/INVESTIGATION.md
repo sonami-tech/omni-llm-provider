@@ -6,6 +6,10 @@
 
 This document is written *as if we are seriously pursuing the monorepo/shared approach* for further exploration (per user request), while remaining ruthlessly honest about boundaries, risks to the Claude "core invariant", and complexity.
 
+> Historical note: this investigation predates the single-binary layout. Current
+> builds ship one server binary, `omni`, with provider implementation still kept
+> in separate crates.
+
 ---
 
 ## 1. Executive Summary of Findings (Current Pass)

@@ -27,4 +27,4 @@ pub use responses::{
     ResponsesRequest, ResponsesResponse, responses_from_canonical, responses_to_canonical,
     sse_from_canonical_stream_responses,
 };
-pub use stats::{Stats, StatsSnapshot, TokenUsage};
+pub use stats::{ActiveRequestGuard, Stats, StatsSnapshot, TokenUsage};

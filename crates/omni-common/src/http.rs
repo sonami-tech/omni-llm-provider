@@ -1,12 +1,9 @@
 //! Shared OpenAI-compatible HTTP surface: request/response types, canonical
 //! conversion, and SSE streaming framing.
 //!
-//! All three binaries (omni, omni-claude, omni-grok) speak the same
-//! OpenAI-compatible wire shape and delegate to `LlmProvider`. This module is
-//! the single source of truth for that translation so the binaries do not
-//! triplicate it. The aggregator (`omni`) adds prefix routing on top; the
-//! single-backend binaries (`omni-claude`, `omni-grok`) use these helpers
-//! directly against their one provider.
+//! The `omni` server speaks this OpenAI-compatible wire shape and delegates to
+//! provider crates through `LlmProvider`. This module is the single source of
+//! truth for request/response translation and SSE framing.
 
 use std::convert::Infallible;
 
@@ -174,8 +171,8 @@ pub struct ChatUsage {
 }
 
 /// Convert an OpenAI request into a `CanonicalRequest`. The `model` field is the
-/// caller-supplied value; single-backend binaries pass it through, the
-/// aggregator overwrites it with the prefix-stripped model before delegating.
+/// caller-supplied value; the `omni` router overwrites it with the
+/// prefix-stripped model before delegating when needed.
 ///
 /// Fallible because a malformed tool surface (non-function tool, unknown
 /// `tool_choice` mode, a tool-result message missing its `tool_call_id`) is

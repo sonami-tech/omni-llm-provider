@@ -4,8 +4,6 @@ members = [
   "crates/omni-core",
   "crates/provider-claude",
   "crates/provider-grok",
-  "crates/bin/omni-claude",
-  "crates/bin/omni-grok",
   "crates/bin/omni",
 ]
 resolver = "2"

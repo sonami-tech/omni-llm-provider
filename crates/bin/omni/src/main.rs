@@ -1,8 +1,8 @@
-//! Light Omni wrapper/aggregator binary.
+//! Omni multi-provider server binary.
 //!
-//! Thin routing layer only. No heavy logic, no fingerprint, no provider-specific
-//! translation or gate code. Delegates to pluggable LlmProvider impls from
-//! provider-claude and provider-grok via omni-core::LlmProvider + Canonical*.
+//! This is the only server binary. Provider-specific protocol, credential, and
+//! fingerprint logic stays in `provider-claude` and `provider-grok`; this binary
+//! owns HTTP routing, auth, stats, and OpenAI-compatible response framing.
 //!
 //! ## Supported configuration (per task)
 //! - --providers claude,grok   or   OMNI_PROVIDERS=claude,grok (comma sep, order preserved)
@@ -13,7 +13,9 @@
 //!
 //! ## Surfaces (unified OpenAI-compatible)
 //! - POST /v1/chat/completions  (text + sampling; non-stream JSON and stream SSE)
+//! - POST /v1/responses          (supported OpenAI Responses subset)
 //! - GET  /v1/models , /models
+//! - GET  /stats
 //! - GET  /health
 //! - GET  /
 //!
@@ -28,25 +30,12 @@
 //! Prefix takes precedence. Provider keys in the map and for prefixes are "claude" / "grok"
 //! (matching task examples and GrokProvider::id()).
 //!
-//! ## Light by design + findings
-//! - Claude backend here is a *stub* (see provider-claude/src/lib.rs). This is
-//!   intentional: the real Claude Code fingerprint invariant, OAuth creds handling,
-//!   cch, betas, preamble, full Anthropic Messages translate etc. MUST stay
-//!   isolated in the dedicated `omni-claude` binary (and eventual full provider-claude
-//!   port) per DESIGN.md / fingerprint rules. The stub only proves uniform routing +
-//!   canonical delegation works for "claude" without risking the gate.
-//! - Grok is the real impl (OpenAI-compat upstream). Its internal replacements hook
-//!   and mappers are exercised when delegated to.
-//! - Streaming, tools, vision, full sampling, native Anthropic surfaces etc. are
-//!   out of scope for this "light" aggregator (would live in frontends/ or per-provider).
-//! - Auth: always layers omni-common::auth_layer. Empty key set (via --no-auth or
-//!   no OMNI_API_KEYS) means "allow all" (passthrough), matching original CCP behavior.
-//! - No stats/replacements loaded at this layer (cross-cutting; providers demonstrate
-//!   the hook; real bins can inject Arc<Replacements> etc. into provider ctors later).
-//! - Startup: both providers construct without reading credentials; the grok key is
-//!   read fresh per request from files ($XAI_CREDENTIALS_PATH -> ~/.xai/.credentials.json
-//!   -> ~/.grok/auth.json, the Grok CLI's OIDC login). A missing source surfaces as an
-//!   auth error on the first grok request.
+//! ## Boundaries
+//! - Claude fingerprint logic, cch, betas, preamble, and fresh credential reads
+//!   stay in `provider-claude`.
+//! - Grok wire mapping and fresh xAI credential reads stay in `provider-grok`.
+//! - Auth and stats are server concerns handled here with `omni-common`.
+//! - Empty key set (via --no-auth or no OMNI_API_KEYS) means "allow all".
 //!
 //! Build: cargo build -p omni
 //! Run (claude only, no keys needed): OMNI_PROVIDERS=claude cargo run -p omni -- --no-auth --port 18321
@@ -56,7 +45,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use axum::{
@@ -68,23 +59,26 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
-use omni_common::{AppError, ChatCompletionRequest, auth_layer, from_canonical, to_canonical};
-use omni_core::{CanonicalResponse, LlmProvider, ProviderError};
+use omni_common::{
+    ActiveRequestGuard, AppError, ChatCompletionRequest, Stats, TokenUsage, auth_layer,
+    from_canonical, to_canonical,
+};
+use omni_core::{
+    CanonicalResponse, CanonicalStream, CanonicalStreamEvent, LlmProvider, ProviderError,
+};
 
 // Re-export the concrete providers so main can construct them by name.
 use provider_claude::ClaudeProvider;
 use provider_grok::GrokProvider;
 
 /// CLI for the light omni aggregator.
-/// Env vars: OMNI_PROVIDERS, OMNI_BIND, OMNI_PUBLIC, OMNI_PORT, OMNI_NO_AUTH (clap env support).
+/// Env vars: OMNI_PROVIDERS, OMNI_BIND, OMNI_PUBLIC, OMNI_PORT, OMNI_NO_AUTH,
+/// OMNI_STATS_DB (clap env support). OMNI_API_KEYS configures auth keys.
 #[derive(Parser, Debug)]
-#[command(
-    name = "omni",
-    about = "Light Omni LLM aggregator (claude + grok backends)"
-)]
+#[command(name = "omni", about = "Omni LLM server (claude + grok backends)")]
 struct Cli {
     /// Comma-separated list of providers to enable (claude,grok). Prefix routing uses these names.
     #[arg(
@@ -110,13 +104,23 @@ struct Cli {
     /// Disable API key auth (if omitted, still allows all unless OMNI_API_KEYS is set).
     #[arg(long, env = "OMNI_NO_AUTH")]
     no_auth: bool,
+
+    /// Path to the stats redb file. Defaults to a clearly named temp file.
+    #[arg(long, env = "OMNI_STATS_DB")]
+    stats_db: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct ProviderEntry {
+    provider: Arc<dyn LlmProvider>,
+    models: Vec<serde_json::Value>,
 }
 
 #[derive(Clone)]
 struct AppState {
-    /// Map from provider key ("claude" | "grok") -> live LlmProvider.
-    /// Thin indirection: the wrapper only selects and delegates .send().
-    providers: HashMap<String, Arc<dyn LlmProvider>>,
+    /// Map from provider key ("claude" | "grok") to live provider + catalog.
+    providers: HashMap<String, ProviderEntry>,
+    stats: Option<Arc<Stats>>,
 }
 
 #[tokio::main]
@@ -131,35 +135,53 @@ async fn main() -> anyhow::Result<()> {
     let enabled: Vec<String> = normalize_providers(&cli.providers)?;
     info!(?enabled, "omni enabled providers");
 
-    // Instantiate providers (thin). Claude stub never needs keys/creds.
-    let mut providers_map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+    let mut providers_map: HashMap<String, ProviderEntry> = HashMap::new();
     for name in &enabled {
-        let arc: Arc<dyn LlmProvider> = match name.as_str() {
+        let entry = match name.as_str() {
             "claude" => {
                 info!("initializing claude provider");
-                // new() returns Result because of optional creds/profile load for the real gate logic.
-                // In production bin this would be .expect or proper error handling.
-                Arc::new(ClaudeProvider::new().expect(
-                    "claude provider init (valid ~/.claude/.credentials.json or explicit profile)",
-                ))
+                let provider = ClaudeProvider::new()
+                    .context("failed to initialize claude provider (fingerprint profile)")?;
+                let models = prefixed_model_values("claude", provider.profile().models_list())?;
+                ProviderEntry {
+                    provider: Arc::new(provider),
+                    models,
+                }
             }
             "grok" => {
                 info!(
                     "initializing grok provider (key read per request from ~/.xai/.credentials.json)"
                 );
                 let p = GrokProvider::new(None).context("failed to init grok provider")?;
-                Arc::new(p)
+                let models = prefixed_model_values("grok", GrokProvider::models_list())?;
+                ProviderEntry {
+                    provider: Arc::new(p),
+                    models,
+                }
             }
             other => {
                 // Should be impossible after normalize.
                 anyhow::bail!("unknown provider in list: {}", other);
             }
         };
-        providers_map.insert(name.clone(), arc);
+        providers_map.insert(name.clone(), entry);
     }
+
+    let stats_path = cli.stats_db.clone().unwrap_or_else(default_stats_db_path);
+    let stats: Option<Arc<Stats>> = match Stats::open(&stats_path) {
+        Ok(s) => {
+            info!(path = %stats_path.display(), "stats db opened");
+            Some(Arc::new(s))
+        }
+        Err(e) => {
+            warn!(path = %stats_path.display(), error = %e, "stats db open failed; continuing with stats disabled");
+            None
+        }
+    };
 
     let state = AppState {
         providers: providers_map,
+        stats,
     };
 
     // Auth keys: empty set => allow-all (see omni-common::auth_layer).
@@ -177,19 +199,7 @@ async fn main() -> anyhow::Result<()> {
     };
     info!(no_auth_effective = auth_keys.is_empty(), "auth layer ready");
 
-    let app = Router::new()
-        .route("/health", get(health_handler))
-        .route("/", get(root_handler))
-        .route("/v1/chat/completions", post(chat_completions_handler))
-        .route("/v1/responses", post(responses_handler))
-        .route("/v1/models", get(models_handler))
-        .route("/models", get(models_handler))
-        .with_state(Arc::new(state))
-        // Always layer; the common impl short-circuits when keys empty.
-        .layer(middleware::from_fn({
-            let keys = auth_keys.clone();
-            move |req, next| auth_layer(keys.clone(), req, next)
-        }));
+    let app = build_router(Arc::new(state), auth_keys);
 
     let bind_host = resolve_bind_host(cli.public, cli.bind.as_deref())?;
     let addr: SocketAddr = format!("{}:{}", bind_host, cli.port).parse()?;
@@ -197,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
     info!("  providers: {}", enabled.join(","));
     info!("  try: curl http://{}/health", addr);
     info!("  models:  curl http://{}/v1/models", addr);
+    info!("  stats:   curl http://{}/stats", addr);
     info!(
         "  completions example: model=grok:grok-4 or claude:claude-3-5-sonnet-20241022 (or bare if single provider)"
     );
@@ -206,6 +217,53 @@ async fn main() -> anyhow::Result<()> {
         .context("server error")?;
 
     Ok(())
+}
+
+fn build_router(state: Arc<AppState>, auth_keys: Arc<HashSet<String>>) -> Router {
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/", get(root_handler))
+        .route("/v1/chat/completions", post(chat_completions_handler))
+        .route("/v1/responses", post(responses_handler))
+        .route("/v1/models", get(models_handler))
+        .route("/models", get(models_handler))
+        .route("/stats", get(stats_handler))
+        .with_state(state)
+        // Always layer; the common impl short-circuits when keys are empty.
+        .layer(middleware::from_fn({
+            let keys = auth_keys.clone();
+            move |req, next| auth_layer(keys.clone(), req, next)
+        }))
+}
+
+fn default_stats_db_path() -> PathBuf {
+    std::env::temp_dir().join("omni-stats.redb")
+}
+
+fn prefixed_model_values<T: serde::Serialize>(
+    provider: &str,
+    models: Vec<T>,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    models
+        .into_iter()
+        .map(|model| {
+            let mut value = serde_json::to_value(model)
+                .context("failed to serialize provider model catalog entry")?;
+            let obj = value
+                .as_object_mut()
+                .context("provider model catalog entry must serialize as an object")?;
+            let id = obj
+                .get("id")
+                .and_then(|v| v.as_str())
+                .context("provider model catalog entry missing string id")?;
+            obj.insert(
+                "id".to_string(),
+                serde_json::json!(format!("{provider}:{id}")),
+            );
+            obj.insert("owned_by".to_string(), serde_json::json!(provider));
+            Ok(value)
+        })
+        .collect()
 }
 
 /// Resolve the configured listen host. `--public` is intentional shorthand for
@@ -290,39 +348,31 @@ async fn health_handler() -> impl IntoResponse {
 
 /// Handler: GET /
 async fn root_handler() -> impl IntoResponse {
-    "omni - light multi-backend OpenAI-compatible aggregator (claude + grok via prefix or --providers)"
+    "omni - multi-backend OpenAI-compatible server (claude + grok via prefix or --providers)"
 }
 
 /// Handler: GET /v1/models (and /models)
 async fn models_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let enabled = state.providers.keys().cloned().collect::<Vec<_>>();
     let mut data = Vec::new();
-    for p in &enabled {
-        let examples: &[&str] = match p.as_str() {
-            "claude" => &[
-                "claude:claude-3-5-sonnet-20241022",
-                "claude:claude-opus-4-1",
-            ],
-            "grok" => &["grok:grok-3", "grok:grok-4.3"],
-            _ => &[],
-        };
-        for ex in examples {
-            data.push(serde_json::json!({
-                "id": ex,
-                "object": "model",
-                "created": 0,
-                "owned_by": p,
-            }));
+    let mut providers = state.providers.keys().collect::<Vec<_>>();
+    providers.sort();
+    for p in providers {
+        if let Some(entry) = state.providers.get(p) {
+            data.extend(entry.models.iter().cloned());
         }
-        // Also expose a bare-ish example under the prefix for discoverability.
-        data.push(serde_json::json!({
-            "id": format!("{}:default", p),
-            "object": "model",
-            "created": 0,
-            "owned_by": p,
-        }));
     }
     Json(serde_json::json!({ "object": "list", "data": data }))
+}
+
+/// Handler: GET /stats
+async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match &state.stats {
+        Some(stats) => Json(serde_json::json!(stats.snapshot())),
+        None => Json(serde_json::json!({
+            "stats_enabled": false,
+            "note": "stats db unavailable; counters not being recorded",
+        })),
+    }
 }
 
 /// Handler: POST /v1/chat/completions
@@ -330,18 +380,29 @@ async fn chat_completions_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ChatCompletionRequest>,
 ) -> Result<axum::response::Response, AppError> {
+    let requested_model = body.model.clone();
+    let stats_key = if requested_model.contains(':') {
+        requested_model.clone()
+    } else {
+        format_single_provider_model_for_stats(&state, &requested_model)
+    };
     let enabled: Vec<String> = state.providers.keys().cloned().collect();
-    let (prov_key, stripped_model) =
-        resolve_provider_and_model(&body.model, &enabled).map_err(AppError::BadRequest)?;
+    let (prov_key, stripped_model) = resolve_provider_and_model(&requested_model, &enabled)
+        .map_err(|e| record_bad_request(&state, &stats_key, e))?;
 
-    let provider = state
+    let entry = state
         .providers
         .get(&prov_key)
         .ok_or_else(|| AppError::ServerError("provider disappeared".into()))?;
+    let provider = &entry.provider;
 
     // Build canonical *with the stripped model* so the delegated provider sees the real model name.
-    let mut canon = to_canonical(&body).map_err(AppError::BadRequest)?;
+    let mut canon = to_canonical(&body).map_err(|e| record_bad_request(&state, &stats_key, e))?;
     canon.model = stripped_model.clone();
+
+    if let Some(stats) = &state.stats {
+        stats.record_request(&stats_key, None);
+    }
 
     let chat_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created = omni_common::unix_now_secs();
@@ -350,20 +411,34 @@ async fn chat_completions_handler(
         // Streaming: delegate to the provider's native SSE stream and frame it as
         // OpenAI chat.completion.chunk events (terminated by [DONE]) via the shared
         // serializer. Prefix routing has already selected the provider above.
-        let stream = provider
-            .send_stream(canon)
-            .await
-            .map_err(map_provider_err)?;
+        let stream = provider.send_stream(canon).await.map_err(|e| {
+            if let Some(stats) = &state.stats {
+                stats.record_error(&stats_key, &e.to_string());
+            }
+            map_provider_err(e)
+        })?;
+        let stream = wrap_stream_for_stats(stream, state.stats.clone(), stats_key.clone());
         // requested_model echoed is the *original* (with prefix if any) for client UX.
-        let sse = omni_common::sse_from_canonical_stream(stream, body.model, chat_id, created);
+        let sse = omni_common::sse_from_canonical_stream(stream, requested_model, chat_id, created);
         return Ok(sse.into_response());
     }
 
     // The actual delegation (thin by design).
-    let canon_resp: CanonicalResponse = provider.send(canon).await.map_err(map_provider_err)?;
+    let _active = state.stats.as_deref().map(ActiveRequestGuard::new);
+    let started = Instant::now();
+    let canon_resp: CanonicalResponse = provider.send(canon).await.map_err(|e| {
+        if let Some(stats) = &state.stats {
+            stats.record_error(&stats_key, &e.to_string());
+        }
+        map_provider_err(e)
+    })?;
+
+    if let Some(stats) = &state.stats {
+        record_response_stats(stats, &stats_key, &canon_resp, started);
+    }
 
     // requested_model echoed is the *original* (with prefix if client used one) for client UX.
-    let oai = from_canonical(canon_resp, body.model, chat_id, created);
+    let oai = from_canonical(canon_resp, requested_model, chat_id, created);
     Ok(Json(oai).into_response())
 }
 
@@ -377,6 +452,94 @@ fn map_provider_err(e: ProviderError) -> AppError {
     }
 }
 
+fn record_bad_request(state: &AppState, model: &str, msg: String) -> AppError {
+    if let Some(stats) = &state.stats {
+        stats.record_error(model, &msg);
+    }
+    AppError::BadRequest(msg)
+}
+
+fn record_response_stats(
+    stats: &Stats,
+    model: &str,
+    canon_resp: &CanonicalResponse,
+    started: Instant,
+) {
+    let usage = TokenUsage {
+        input_tokens: canon_resp.usage.input_tokens,
+        output_tokens: canon_resp.usage.output_tokens,
+        cache_read_input_tokens: canon_resp.usage.cache_read,
+        cache_creation_input_tokens: canon_resp.usage.cache_creation,
+    };
+    let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
+    stats.record_response(model, usage, None, dur_ms);
+}
+
+fn wrap_stream_for_stats(
+    mut stream: CanonicalStream,
+    stats: Option<Arc<Stats>>,
+    model: String,
+) -> CanonicalStream {
+    let Some(stats) = stats else {
+        return stream;
+    };
+    Box::pin(async_stream::stream! {
+        let _active = ActiveRequestGuard::new(&stats);
+        let started = Instant::now();
+        let mut usage = TokenUsage::default();
+        let mut saw_usage = false;
+        let mut finished = false;
+
+        while let Some(item) = futures_util::StreamExt::next(&mut stream).await {
+            match item {
+                Ok(CanonicalStreamEvent::Usage(u)) => {
+                    usage = TokenUsage {
+                        input_tokens: u.input_tokens,
+                        output_tokens: u.output_tokens,
+                        cache_read_input_tokens: u.cache_read,
+                        cache_creation_input_tokens: u.cache_creation,
+                    };
+                    saw_usage = true;
+                    yield Ok(CanonicalStreamEvent::Usage(u));
+                }
+                Ok(CanonicalStreamEvent::Finish { finish_reason }) => {
+                    finished = true;
+                    let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    stats.record_response(
+                        &model,
+                        usage,
+                        None,
+                        dur_ms,
+                    );
+                    yield Ok(CanonicalStreamEvent::Finish { finish_reason });
+                }
+                Ok(other) => {
+                    yield Ok(other);
+                }
+                Err(e) => {
+                    stats.record_error(&model, &e.to_string());
+                    yield Err(e);
+                }
+            }
+        }
+
+        if !finished {
+            let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let usage = if saw_usage { usage } else { TokenUsage::default() };
+            stats.record_response(&model, usage, None, dur_ms);
+        }
+    })
+}
+
+fn format_single_provider_model_for_stats(state: &AppState, requested_model: &str) -> String {
+    if state.providers.len() == 1
+        && let Some(provider) = state.providers.keys().next()
+    {
+        return format!("{provider}:{requested_model}");
+    }
+    requested_model.to_string()
+}
+
 /// Handler for POST /v1/responses (OpenAI Responses API protocol).
 ///
 /// Contract (pinned by the responses tests below + omni-common::responses):
@@ -387,42 +550,67 @@ async fn responses_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<omni_common::ResponsesRequest>,
 ) -> Result<axum::response::Response, AppError> {
+    let requested_model = body.model.clone();
+    let stats_key = if requested_model.contains(':') {
+        requested_model.clone()
+    } else {
+        format_single_provider_model_for_stats(&state, &requested_model)
+    };
     let enabled: Vec<String> = state.providers.keys().cloned().collect();
-    let (prov_key, stripped_model) =
-        resolve_provider_and_model(&body.model, &enabled).map_err(AppError::BadRequest)?;
+    let (prov_key, stripped_model) = resolve_provider_and_model(&requested_model, &enabled)
+        .map_err(|e| record_bad_request(&state, &stats_key, e))?;
 
-    let provider = state
+    let entry = state
         .providers
         .get(&prov_key)
         .ok_or_else(|| AppError::ServerError("provider disappeared".into()))?;
+    let provider = &entry.provider;
 
     // Convert the Responses request to canonical, then swap in the stripped model
     // so the delegated provider sees the real backend model name. Unsupported
     // input shapes are rejected loudly as a 400 naming the offender.
-    let mut canon = omni_common::responses_to_canonical(&body).map_err(AppError::BadRequest)?;
+    let mut canon = omni_common::responses_to_canonical(&body)
+        .map_err(|e| record_bad_request(&state, &stats_key, e))?;
     canon.model = stripped_model;
+
+    if let Some(stats) = &state.stats {
+        stats.record_request(&stats_key, None);
+    }
 
     let response_id = format!("resp_{}", Uuid::new_v4());
     let created_at = omni_common::unix_now_secs();
 
     if body.stream {
-        let stream = provider
-            .send_stream(canon)
-            .await
-            .map_err(map_provider_err)?;
+        let stream = provider.send_stream(canon).await.map_err(|e| {
+            if let Some(stats) = &state.stats {
+                stats.record_error(&stats_key, &e.to_string());
+            }
+            map_provider_err(e)
+        })?;
+        let stream = wrap_stream_for_stats(stream, state.stats.clone(), stats_key.clone());
         // Echo the original (prefixed) model for client UX.
         let sse = omni_common::sse_from_canonical_stream_responses(
             stream,
-            body.model,
+            requested_model,
             response_id,
             created_at,
         );
         return Ok(sse.into_response());
     }
 
-    let canon_resp: CanonicalResponse = provider.send(canon).await.map_err(map_provider_err)?;
+    let _active = state.stats.as_deref().map(ActiveRequestGuard::new);
+    let started = Instant::now();
+    let canon_resp: CanonicalResponse = provider.send(canon).await.map_err(|e| {
+        if let Some(stats) = &state.stats {
+            stats.record_error(&stats_key, &e.to_string());
+        }
+        map_provider_err(e)
+    })?;
+    if let Some(stats) = &state.stats {
+        record_response_stats(stats, &stats_key, &canon_resp, started);
+    }
     let resp =
-        omni_common::responses_from_canonical(canon_resp, body.model, response_id, created_at);
+        omni_common::responses_from_canonical(canon_resp, requested_model, response_id, created_at);
     Ok(Json(resp).into_response())
 }
 
@@ -505,19 +693,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn smoke_routing_and_delegate_claude_stub() {
+    async fn smoke_routing_and_delegate_claude() {
         // Verifies the full path resolve + to_canonical + delegate + from_canonical
         // against the real Claude upstream. Live-conditional: skips cleanly when no
         // Claude credentials are present so the suite stays green offline (the
         // routing + conversion logic without the live send is covered by the
         // hermetic handler tests below).
         if !has_claude_creds() {
-            eprintln!("skipping smoke_routing_and_delegate_claude_stub: no claude creds");
+            eprintln!("skipping smoke_routing_and_delegate_claude: no claude creds");
             return;
         }
         let claude = Arc::new(ClaudeProvider::new().expect("claude provider for wrapper test"));
-        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        map.insert("claude".to_string(), claude);
 
         let enabled: Vec<String> = vec!["claude".into()];
         let (key, stripped) = resolve_provider_and_model("claude:sonnet", &enabled).unwrap();
@@ -545,7 +731,7 @@ mod tests {
         let mut canon = to_canonical(&oai_req).unwrap();
         canon.model = stripped;
 
-        let provider = map.get(&key).unwrap();
+        let provider = claude;
         let canon_resp = provider.send(canon).await.unwrap();
 
         assert_eq!(canon_resp.model, "sonnet");
@@ -583,7 +769,7 @@ mod tests {
         assert_eq!(stripped, "grok-4.3");
 
         // Compile-time assertion that the real grok type can be used exactly as the omni router does
-        // (stored in HashMap<String, Arc<dyn LlmProvider>> and delegated to).
+        // (stored in HashMap<String, ProviderEntry> and delegated to).
         fn assert_impls_dyn<P: LlmProvider + 'static>() {
             // If this compiles, GrokProvider (and Claude) can be the pointee for the thin router.
         }
@@ -598,6 +784,7 @@ mod tests {
     use omni_core::CanonicalResponse;
     use serde_json::Value;
     use std::collections::HashSet;
+    use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use std::sync::Arc;
     use std::thread;
@@ -637,6 +824,62 @@ mod tests {
             || std::path::Path::new(&format!("{home}/.grok/auth.json")).exists()
     }
 
+    fn claude_entry() -> ProviderEntry {
+        let provider = ClaudeProvider::new().expect("claude");
+        let models = prefixed_model_values("claude", provider.profile().models_list())
+            .expect("claude model catalog serializes");
+        ProviderEntry {
+            provider: Arc::new(provider),
+            models,
+        }
+    }
+
+    fn grok_entry(base_url: &str) -> ProviderEntry {
+        ProviderEntry {
+            provider: Arc::new(GrokProvider::new_for_test("k", base_url)),
+            models: prefixed_model_values("grok", GrokProvider::models_list())
+                .expect("grok model catalog serializes"),
+        }
+    }
+
+    fn live_grok_entry() -> ProviderEntry {
+        ProviderEntry {
+            provider: Arc::new(GrokProvider::new(None).expect("grok provider with creds")),
+            models: prefixed_model_values("grok", GrokProvider::models_list())
+                .expect("grok model catalog serializes"),
+        }
+    }
+
+    fn state_with(providers: HashMap<String, ProviderEntry>) -> Arc<AppState> {
+        Arc::new(AppState {
+            providers,
+            stats: None,
+        })
+    }
+
+    fn state_with_stats(providers: HashMap<String, ProviderEntry>) -> (Arc<AppState>, TempStats) {
+        let path = temp_stats_path();
+        let stats = Stats::open(&path).expect("open temp stats");
+        (
+            Arc::new(AppState {
+                providers,
+                stats: Some(Arc::new(stats)),
+            }),
+            TempStats(path),
+        )
+    }
+
+    fn temp_stats_path() -> PathBuf {
+        std::env::temp_dir().join(format!("omni-stats-TEST-{}.redb", Uuid::new_v4()))
+    }
+
+    struct TempStats(PathBuf);
+    impl Drop for TempStats {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     fn wait_for_200_health(port: u16, timeout: Duration) -> bool {
         let start = Instant::now();
         let url = format!("http://127.0.0.1:{}/health", port);
@@ -673,34 +916,17 @@ mod tests {
     }
 
     fn mk_app_with(
-        providers: HashMap<String, Arc<dyn LlmProvider>>,
+        providers: HashMap<String, ProviderEntry>,
         auth_keys: Arc<HashSet<String>>,
     ) -> axum::Router {
-        // Test-only router builder (dupe of main construction for full surface tests w/o editing prod).
-        // Mirrors CCP test server setup.
-        let state = Arc::new(AppState { providers });
-        axum::Router::new()
-            .route("/health", axum::routing::get(health_handler))
-            .route("/", axum::routing::get(root_handler))
-            .route(
-                "/v1/chat/completions",
-                axum::routing::post(chat_completions_handler),
-            )
-            .route("/v1/models", axum::routing::get(models_handler))
-            .route("/models", axum::routing::get(models_handler))
-            .with_state(state)
-            .layer(axum::middleware::from_fn({
-                let keys = auth_keys.clone();
-                move |req, next| auth_layer(keys.clone(), req, next)
-            }))
+        build_router(state_with(providers), auth_keys)
     }
 
     #[test]
     fn test_mk_app_with_and_router_surfaces() {
         // Verifies we can build the full router for different provider configs (used below for in-proc handler flows).
-        let cl = Arc::new(ClaudeProvider::new().expect("claude"));
-        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        map.insert("claude".into(), cl);
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("claude".into(), claude_entry());
         let app = mk_app_with(map, Arc::new(HashSet::new()));
         // construction success + state present proves unified surfaces setup
         assert!(format!("{:?}", app).contains("Router")); // loose but exercises
@@ -716,18 +942,235 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_models_handler_single_and_multi() {
-        let c = Arc::new(ClaudeProvider::new().expect("c"));
-        let g = Arc::new(GrokProvider::new_for_test("k", "http://127.0.0.1:9"));
-        let mut m1: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        m1.insert("claude".into(), c.clone());
-        let state1 = Arc::new(AppState { providers: m1 });
+        let mut m1: HashMap<String, ProviderEntry> = HashMap::new();
+        m1.insert("claude".into(), claude_entry());
+        let state1 = state_with(m1);
         let _j1 = models_handler(State(state1)).await;
         // models always returns json; call succeeds proves /v1/models and /models surface
-        let mut m2: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        m2.insert("claude".into(), c);
-        m2.insert("grok".into(), g);
-        let state2 = Arc::new(AppState { providers: m2 });
+        let mut m2: HashMap<String, ProviderEntry> = HashMap::new();
+        m2.insert("claude".into(), claude_entry());
+        m2.insert("grok".into(), grok_entry("http://127.0.0.1:9"));
+        let state2 = state_with(m2);
         let _j2 = models_handler(State(state2)).await;
+    }
+
+    #[tokio::test]
+    async fn test_models_handler_uses_real_prefixed_provider_catalogs() {
+        // WHY: omni is the only server binary, so /v1/models must expose the
+        // provider-owned catalogs instead of a small hand-written example list.
+        let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
+        providers.insert("claude".into(), claude_entry());
+        providers.insert("grok".into(), grok_entry("http://127.0.0.1:9"));
+        let resp = models_handler(State(state_with(providers)))
+            .await
+            .into_response();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<String> = v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["id"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            ids.iter().any(|id| id == "grok:grok-4"),
+            "grok real catalog entry missing: {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| id.starts_with("claude:claude-")),
+            "claude real catalog entries missing: {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id.ends_with(":default")),
+            "old placeholder default entries must not remain: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stats_records_request_response_and_error() {
+        // WHY: /stats replaces the provider-specific binary stats endpoints.
+        // It must count routed requests, token usage on successful non-stream
+        // responses, and errors on failed provider calls.
+        #[derive(Debug)]
+        struct StaticProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for StaticProvider {
+            fn id(&self) -> &'static str {
+                "static"
+            }
+
+            async fn send(
+                &self,
+                req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalResponse, ProviderError> {
+                Ok(CanonicalResponse {
+                    model: req.model,
+                    content: "ok".into(),
+                    tool_calls: vec![],
+                    finish_reason: Some("stop".into()),
+                    usage: omni_core::CanonicalUsage {
+                        input_tokens: 3,
+                        output_tokens: 2,
+                        cache_read: 1,
+                        cache_creation: 0,
+                    },
+                })
+            }
+        }
+
+        let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
+        providers.insert(
+            "grok".into(),
+            ProviderEntry {
+                provider: Arc::new(StaticProvider),
+                models: prefixed_model_values("grok", GrokProvider::models_list()).unwrap(),
+            },
+        );
+        let (state, _guard) = state_with_stats(providers);
+        let req = ChatCompletionRequest {
+            model: "grok:grok-3".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: false,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            extras: serde_json::Value::Null,
+        };
+        let ok = chat_completions_handler(State(state.clone()), Json(req))
+            .await
+            .expect("static provider succeeds");
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        let bad_req = ChatCompletionRequest {
+            model: "claude:sonnet".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: false,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            extras: serde_json::Value::Null,
+        };
+        let err = chat_completions_handler(State(state.clone()), Json(bad_req))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+
+        let resp = stats_handler(State(state)).await.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["total_requests"], 1);
+        assert_eq!(v["errors"], 1);
+        assert_eq!(v["models"]["grok:grok-3"]["requests"], 1);
+        assert_eq!(v["models"]["grok:grok-3"]["input_tokens"], 3);
+        assert_eq!(v["models"]["grok:grok-3"]["output_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_stats_records_stream_usage_after_body_consumed() {
+        // WHY: stats active_requests must track the streamed body lifetime, not
+        // just the handler future, and streamed Usage events must feed /stats.
+        #[derive(Debug)]
+        struct StreamingProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for StreamingProvider {
+            fn id(&self) -> &'static str {
+                "streaming"
+            }
+
+            async fn send(
+                &self,
+                _req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalResponse, ProviderError> {
+                unreachable!("stream test uses send_stream")
+            }
+
+            async fn send_stream(
+                &self,
+                _req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalStream, ProviderError> {
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(CanonicalStreamEvent::TextDelta("hi".into())),
+                    Ok(CanonicalStreamEvent::Usage(omni_core::CanonicalUsage {
+                        input_tokens: 11,
+                        output_tokens: 7,
+                        cache_read: 3,
+                        cache_creation: 2,
+                    })),
+                    Ok(CanonicalStreamEvent::Finish {
+                        finish_reason: Some("stop".into()),
+                    }),
+                ])))
+            }
+        }
+
+        let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
+        providers.insert(
+            "grok".into(),
+            ProviderEntry {
+                provider: Arc::new(StreamingProvider),
+                models: prefixed_model_values("grok", GrokProvider::models_list()).unwrap(),
+            },
+        );
+        let (state, _guard) = state_with_stats(providers);
+        let req = ChatCompletionRequest {
+            model: "grok:grok-3".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: true,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            extras: serde_json::Value::Null,
+        };
+        let resp = chat_completions_handler(State(state.clone()), Json(req))
+            .await
+            .expect("stream opens");
+        assert_eq!(
+            state.stats.as_ref().unwrap().snapshot().active_requests,
+            0,
+            "SSE body has not been polled before into_body"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let sse_body = String::from_utf8_lossy(&body);
+        assert!(sse_body.contains("[DONE]"));
+
+        let snap = state.stats.as_ref().unwrap().snapshot();
+        assert_eq!(snap.active_requests, 0);
+        assert_eq!(snap.total_requests, 1);
+        assert_eq!(snap.models["grok:grok-3"].requests, 1);
+        assert_eq!(snap.models["grok:grok-3"].input_tokens, 11);
+        assert_eq!(snap.models["grok:grok-3"].output_tokens, 7);
+        assert_eq!(snap.models["grok:grok-3"].cache_read_input_tokens, 3);
+        assert_eq!(snap.models["grok:grok-3"].cache_creation_input_tokens, 2);
     }
 
     #[tokio::test]
@@ -738,10 +1181,9 @@ mod tests {
         // 400. We use the grok test provider pointed at a dead port: routing +
         // stream-open is exercised; the dead upstream surfaces as a ServerError
         // (NOT a BadRequest stream-rejection), proving the stream branch is live.
-        let g = Arc::new(GrokProvider::new_for_test("dummy", "http://127.0.0.1:1"));
-        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        map.insert("grok".into(), g);
-        let state = Arc::new(AppState { providers: map });
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("grok".into(), grok_entry("http://127.0.0.1:1"));
+        let state = state_with(map);
         let req = ChatCompletionRequest {
             model: "grok:grok-3".into(),
             messages: vec![ChatMessage {
@@ -792,10 +1234,9 @@ mod tests {
             eprintln!("skipping SSE-reachable test: no grok creds");
             return;
         }
-        let g = Arc::new(GrokProvider::new(None).expect("grok provider with creds"));
-        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        map.insert("grok".into(), g);
-        let state = Arc::new(AppState { providers: map });
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("grok".into(), live_grok_entry());
+        let state = state_with(map);
         let req = ChatCompletionRequest {
             model: "grok:grok-3".into(),
             messages: vec![ChatMessage {
@@ -828,10 +1269,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_completions_unknown_provider_prefix_error() {
-        let c = Arc::new(ClaudeProvider::new().expect("c"));
-        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        map.insert("claude".into(), c);
-        let state = Arc::new(AppState { providers: map });
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("claude".into(), claude_entry());
+        let state = state_with(map);
         let req = ChatCompletionRequest {
             model: "codex:bar".into(),
             messages: vec![ChatMessage {
@@ -863,10 +1303,9 @@ mod tests {
     #[tokio::test]
     async fn test_http_completions_disabled_provider_error() {
         // only claude enabled; grok: prefix should 400
-        let c = Arc::new(ClaudeProvider::new().expect("c"));
-        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        map.insert("claude".into(), c);
-        let state = Arc::new(AppState { providers: map });
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("claude".into(), claude_entry());
+        let state = state_with(map);
         let req = ChatCompletionRequest {
             model: "grok:bar".into(),
             messages: vec![ChatMessage {
@@ -897,12 +1336,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_completions_bare_model_requires_prefix_when_multi() {
-        let c = Arc::new(ClaudeProvider::new().expect("c"));
-        let g = Arc::new(GrokProvider::new_for_test("k", "http://127.0.0.1:9"));
-        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        map.insert("claude".into(), c);
-        map.insert("grok".into(), g);
-        let state = Arc::new(AppState { providers: map });
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("claude".into(), claude_entry());
+        map.insert("grok".into(), grok_entry("http://127.0.0.1:9"));
+        let state = state_with(map);
         let req = ChatCompletionRequest {
             model: "bare-model".into(),
             messages: vec![ChatMessage {
@@ -934,13 +1371,9 @@ mod tests {
     #[tokio::test]
     async fn test_http_completions_routes_via_prefix_to_grok_test_provider() {
         // grok test ctor points to bad port -> upstream err mapped to 5xx server err (delegation exercised)
-        let g = Arc::new(GrokProvider::new_for_test(
-            "dummy-key",
-            "http://127.0.0.1:1",
-        ));
-        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        map.insert("grok".into(), g);
-        let state = Arc::new(AppState { providers: map });
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("grok".into(), grok_entry("http://127.0.0.1:1"));
+        let state = state_with(map);
         let req = ChatCompletionRequest {
             model: "grok:grok-3".into(),
             messages: vec![ChatMessage {
@@ -977,10 +1410,9 @@ mod tests {
     #[tokio::test]
     async fn test_http_completions_routes_via_prefix_to_claude() {
         // claude via prefix; will succeed if live creds (canonical delegation + real response), else auth err from cred load inside provider.
-        let c = Arc::new(ClaudeProvider::new().expect("claude"));
-        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        map.insert("claude".into(), c);
-        let state = Arc::new(AppState { providers: map });
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("claude".into(), claude_entry());
+        let state = state_with(map);
         let req = ChatCompletionRequest {
             model: "claude:claude-3-5-sonnet-20241022".into(),
             messages: vec![ChatMessage {
@@ -1089,11 +1521,9 @@ rule = [
     #[tokio::test]
     async fn test_multi_backend_enable_both_and_route_each() {
         // Multi backend (enable both, test both in one test)
-        let gc = GrokProvider::new_for_test("dummy", "http://127.0.0.1:1");
-        let cc = ClaudeProvider::new().expect("claude for multi");
-        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        map.insert("grok".to_string(), Arc::new(gc));
-        map.insert("claude".to_string(), Arc::new(cc));
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("grok".to_string(), grok_entry("http://127.0.0.1:1"));
+        map.insert("claude".to_string(), claude_entry());
         let enabled: Vec<String> = map.keys().cloned().collect();
         assert_eq!(enabled.len(), 2);
         let (kg, mg) = resolve_provider_and_model("grok:x", &enabled).unwrap();
@@ -1110,10 +1540,9 @@ rule = [
     async fn test_credential_loading_in_wrapper_delegation_context() {
         // Wrapper delegates; creds loaded fresh inside provider send (claude ~/.claude, grok xai file/env) - exercised on real send
         // Use grok test that forces load path (falls to ctor key but covers the fresh load attempt in prod path)
-        let g = GrokProvider::new_for_test("xai-test-cred", "http://127.0.0.1:1");
-        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        map.insert("grok".into(), Arc::new(g));
-        let state = Arc::new(AppState { providers: map });
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("grok".into(), grok_entry("http://127.0.0.1:1"));
+        let state = state_with(map);
         let req = ChatCompletionRequest {
             model: "grok:grok-3".into(),
             messages: vec![ChatMessage {
@@ -1156,7 +1585,7 @@ rule = [
             .output()
             .unwrap();
         let body = String::from_utf8_lossy(&out.stdout);
-        assert!(body.contains("omni - light multi-backend"));
+        assert!(body.contains("omni - multi-backend"));
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -1178,6 +1607,37 @@ rule = [
         let v: Value = serde_json::from_slice(&out.stdout).expect("models json");
         assert_eq!(v["object"], "list");
         assert!(v["data"].as_array().unwrap().len() >= 2); // at least defaults for enabled (default claude,grok)
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn test_subprocess_omni_binary_stats_route_exists() {
+        // WHY: /stats is the replacement for the removed provider-specific
+        // binaries' stats endpoints; the production router must expose JSON.
+        let port = free_port();
+        let stats_path = temp_stats_path();
+        let _guard = TempStats(stats_path.clone());
+        let mut child = Command::new(omni_bin_path())
+            .args([
+                "--no-auth",
+                "--port",
+                &port.to_string(),
+                "--stats-db",
+                stats_path.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+        let out = Command::new("curl")
+            .args(["-s", &format!("http://127.0.0.1:{}/stats", port)])
+            .output()
+            .unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout).expect("stats json");
+        assert!(v["uptime_seconds"].is_u64(), "stats shape missing: {v}");
+        assert!(v["models"].is_object(), "stats models missing: {v}");
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -1490,10 +1950,9 @@ rule = [
         // mangling would corrupt the request. (Tool-conversation items like
         // function_call / function_call_output ARE now supported and round-trip
         // through canonical blocks, so they are no longer the rejection case.)
-        let c = Arc::new(ClaudeProvider::new().expect("c"));
-        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        map.insert("claude".into(), c);
-        let state = Arc::new(AppState { providers: map });
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("claude".into(), claude_entry());
+        let state = state_with(map);
         let req = responses_req(
             r#"{"model":"claude:sonnet","input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":"x"}]}]}"#,
         );
@@ -1511,12 +1970,10 @@ rule = [
     async fn test_responses_bare_model_multi_requires_prefix() {
         // WHY: the aggregator's prefix-routing contract applies to EVERY inbound
         // protocol; Responses requests route exactly like chat completions.
-        let c = Arc::new(ClaudeProvider::new().expect("c"));
-        let g = Arc::new(GrokProvider::new_for_test("k", "http://127.0.0.1:9"));
-        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        map.insert("claude".into(), c);
-        map.insert("grok".into(), g);
-        let state = Arc::new(AppState { providers: map });
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("claude".into(), claude_entry());
+        map.insert("grok".into(), grok_entry("http://127.0.0.1:9"));
+        let state = state_with(map);
         let req = responses_req(r#"{"model":"bare-model","input":"hi"}"#);
         let res = responses_handler(State(state), Json(req)).await;
         match res {
@@ -1530,10 +1987,9 @@ rule = [
         // WHY: proves the Responses handler delegates through the same provider
         // map: a dead grok upstream surfaces as ServerError (delegation reached
         // the provider), never as a routing-level BadRequest.
-        let g = Arc::new(GrokProvider::new_for_test("dummy", "http://127.0.0.1:1"));
-        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        map.insert("grok".into(), g);
-        let state = Arc::new(AppState { providers: map });
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("grok".into(), grok_entry("http://127.0.0.1:1"));
+        let state = state_with(map);
         let req = responses_req(r#"{"model":"grok:grok-3","input":"ping"}"#);
         let res = responses_handler(State(state), Json(req)).await;
         match res {
@@ -1550,10 +2006,9 @@ rule = [
         // even a dead upstream yields an SSE response whose terminal event is
         // response.failed. This pins both halves hermetically: stream:true is
         // routed (not rejected) AND errors surface in Responses SSE framing.
-        let g = Arc::new(GrokProvider::new_for_test("dummy", "http://127.0.0.1:1"));
-        let mut map: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        map.insert("grok".into(), g);
-        let state = Arc::new(AppState { providers: map });
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("grok".into(), grok_entry("http://127.0.0.1:1"));
+        let state = state_with(map);
         let req = responses_req(r#"{"model":"grok:grok-3","input":"ping","stream":true}"#);
         let res = responses_handler(State(state), Json(req)).await;
         let resp = match res {

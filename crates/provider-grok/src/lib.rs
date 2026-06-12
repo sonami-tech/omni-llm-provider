@@ -60,11 +60,22 @@ use omni_core::{
     LlmProvider, ProviderError,
 };
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, error, warn};
 
 const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
+
+const GROK_MODELS: &[&str] = &["grok-3", "grok-4", "grok-4.3"];
+
+/// OpenAI-compatible model entry exposed by the server's `/v1/models` route.
+#[derive(Debug, Clone, Serialize)]
+pub struct GrokModelInfo {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub owned_by: &'static str,
+}
 
 /// The Grok / xAI provider. Holds a reqwest client.
 /// Credentials are loaded fresh per request using the same technique as the
@@ -95,7 +106,7 @@ impl GrokProvider {
     /// and a descriptive User-Agent.
     pub fn new(api_key: Option<String>) -> Result<Self, ProviderError> {
         let client = Client::builder()
-            .user_agent("omni-grok/0.1 (+https://github.com/omni-llm-provider; rust-reqwest)")
+            .user_agent("omni/0.1 (+https://github.com/omni-llm-provider; rust-reqwest)")
             .timeout(std::time::Duration::from_secs(300))
             .build()
             .map_err(|e| {
@@ -132,6 +143,19 @@ impl GrokProvider {
     /// Returns the configured upstream base (without trailing slash).
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Static xAI model catalog for `/v1/models`.
+    pub fn models_list() -> Vec<GrokModelInfo> {
+        GROK_MODELS
+            .iter()
+            .map(|id| GrokModelInfo {
+                id: (*id).to_string(),
+                object: "model",
+                created: 0,
+                owned_by: "grok",
+            })
+            .collect()
     }
 
     /// Resolve the effective bearer key the same way for every request: load the operator's

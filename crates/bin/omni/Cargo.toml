@@ -23,7 +23,10 @@ thiserror.workspace = true
 uuid.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+async-stream.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
+async-trait = "0.1"
 # Enable the build-and-locate helper used by the subprocess integration tests.
 omni-common = { path = "../../omni-common", features = ["test-support"] }

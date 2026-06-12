@@ -1,8 +1,7 @@
-//! Test-only helpers shared by the binary crates' subprocess integration tests.
+//! Test-only helpers for subprocess integration tests.
 //!
-//! NOT used in production code paths. Lives here (rather than duplicated in each
-//! binary's `mod tests`) so the build-and-locate logic has a single source of
-//! truth across `omni`, `omni-grok`, and `omni-claude`.
+//! NOT used in production code paths. Lives here so the build-and-locate logic
+//! for the `omni` binary has a single source of truth.
 
 use std::path::PathBuf;
 use std::process::Command;
