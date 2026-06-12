@@ -929,7 +929,7 @@ mod tests {
         // client already injected (passthrough path); must leave user system.
         let billing = SystemBlock {
             kind: "text".into(),
-            text: "x-anthropic-billing-header: cc_version=2.1.165.492; cc_entrypoint=sdk-cli; cch=00000;".into(),
+            text: "x-anthropic-billing-header: cc_version=2.1.175.174; cc_entrypoint=sdk-cli; cch=00000;".into(),
             cache_control: None,
         };
         let pre = SystemBlock {
@@ -1019,12 +1019,12 @@ mod tests {
 
     #[test]
     fn wire_defaults_applied_for_default_request_matches_capture() {
-        // WHY: this is the project's #1 invariant. Real Claude Code 2.1.165 bodies
+        // WHY: this is the project's #1 invariant. Real Claude Code bodies
         // carry captured per-model wire values; a default-shaped request (client
         // supplies neither max_tokens nor temperature nor output_config) MUST
         // reproduce them, or the body deviates from the fingerprint baseline on
         // exactly the fields the gate inspects. These expectations are the
-        // captured values in fingerprint.rs MODEL_WIRE_OVERRIDES for cc-2.1.165.
+        // captured values in fingerprint.rs MODEL_WIRE_OVERRIDES for the default profile.
         // If this test fails, either a capture changed (rebaseline) or the
         // wire-default wiring regressed (bug). Both must be caught.
         let profile = crate::fingerprint::default_profile();
@@ -1040,7 +1040,8 @@ mod tests {
             Option<&'static str>,
         );
         let cases: &[WireCase] = &[
-            ("opus", "claude-opus-4-8", 64_000, None, Some("high")),
+            ("fable", "claude-fable-5", 64_000, None, Some("xhigh")),
+            ("opus", "claude-opus-4-8", 64_000, None, Some("xhigh")),
             (
                 "sonnet",
                 "claude-sonnet-4-6",
@@ -1053,6 +1054,13 @@ mod tests {
             (
                 "haiku",
                 "claude-haiku-4-5-20251001",
+                32_000,
+                Some(1.0),
+                None,
+            ),
+            (
+                "claude-haiku-4-5",
+                "claude-haiku-4-5",
                 32_000,
                 Some(1.0),
                 None,

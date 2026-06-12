@@ -25,10 +25,11 @@ except ImportError:
 	sys.exit(2)
 
 
-PINNED_VERSION = "2.1.165"
-PINNED_PROFILE = "cc-2.1.165-sdk-cli"
+PINNED_VERSION = "2.1.175"
+PINNED_PROFILE = "cc-2.1.175-sdk-cli"
 CCH_SEED = 0x4D659218E32A3268
 CCH_RE = re.compile(r"(cc_entrypoint=sdk-cli; cch=)([0-9a-f]{5})(;)")
+MODEL_RE = re.compile(rb'("model":")((?:\\.|[^"\\])*)(")')
 
 # --- Clean-room recovered-vector capture (--emit-vectors) ---------------------
 # The ONLY per-request-volatile field inside the captured body is
@@ -241,14 +242,48 @@ def run_claude_probe(
 
 
 def recompute_cch(body_bytes: bytes) -> str:
-	"""Omni's cch over exact body bytes: replace the first sdk-cli cch with the
-	00000 sentinel, xxh64(seed) the result, take the low 20 bits as 5 hex."""
+	"""Omni's pinned cch over a body with the first sdk-cli cch set to 00000."""
 	placeholder = CCH_RE.sub(
 		lambda m: m.group(1) + "00000" + m.group(3),
 		body_bytes.decode("utf-8"),
 		count=1,
 	).encode("utf-8")
-	return f"{xxhash.xxh64(placeholder, seed=CCH_SEED).intdigest() & 0xfffff:05x}"
+	return cch_for_placeholder_body(placeholder)
+
+
+def cch_for_placeholder_body(placeholder: bytes) -> str:
+	body = cch_input_bytes(placeholder)
+	return f"{xxhash.xxh64(body, seed=CCH_SEED).intdigest() & 0xfffff:05x}"
+
+
+def cch_input_bytes(placeholder: bytes) -> bytes:
+	if PINNED_VERSION == "2.1.175":
+		return body_without_model_values_and_max_tokens(placeholder)
+	return placeholder
+
+
+def body_without_model_values_and_max_tokens(body: bytes) -> bytes:
+	body = MODEL_RE.sub(lambda m: m.group(1) + m.group(3), body)
+	out = bytearray()
+	cursor = 0
+	needle = b'"max_tokens":'
+	while True:
+		found = body.find(needle, cursor)
+		if found < 0:
+			out.extend(body[cursor:])
+			return bytes(out)
+		value_start = found + len(needle)
+		value_end = value_start
+		while value_end < len(body) and 48 <= body[value_end] <= 57:
+			value_end += 1
+		range_start = found
+		range_end = value_end
+		if found > cursor and body[found - 1:found] == b",":
+			range_start = found - 1
+		elif value_end < len(body) and body[value_end:value_end + 1] == b",":
+			range_end = value_end + 1
+		out.extend(body[cursor:range_start])
+		cursor = range_end
 
 
 def normalize_vector_body(raw: bytes, home: str) -> bytes:
@@ -379,7 +414,7 @@ def emit_vectors(claude_bin: str, version: str, out_dir: str, timeout: int) -> i
 		return 1
 
 	os.makedirs(out_dir, exist_ok=True)
-	models = ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-8"]
+	models = ["claude-fable-5", "claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-8"]
 	home = make_clean_home()
 	emitted: list[dict[str, object]] = []
 	try:
@@ -469,7 +504,7 @@ def validate_body(body: str) -> tuple[bool, str]:
 		return False, "no sdk-cli cch marker found"
 	actual = match.group(2)
 	placeholder = CCH_RE.sub(r"\g<1>00000\g<3>", body, count=1).encode()
-	expected = f"{xxhash.xxh64(placeholder, seed=CCH_SEED).intdigest() & 0xfffff:05x}"
+	expected = cch_for_placeholder_body(placeholder)
 	if actual != expected:
 		return False, f"cch mismatch: actual={actual} expected={expected}"
 	if actual == "00000":

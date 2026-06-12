@@ -1,9 +1,7 @@
 # Claude Code cch fingerprint
 
-Canonical target: Claude Code `2.1.165`, profile `cc-2.1.165-sdk-cli`.
-The same checksum algorithm remains verified for `cc-2.1.142-sdk-cli`,
-`cc-2.1.150-sdk-cli`, `cc-2.1.154-sdk-cli`, `cc-2.1.158-sdk-cli`,
-`cc-2.1.161-sdk-cli`, and `cc-2.1.162-sdk-cli`.
+Canonical target: Claude Code `2.1.175`, profile `cc-2.1.175-sdk-cli`.
+Older supported profiles remain pinned in `crates/provider-claude/src/fingerprint.rs`.
 
 This document is the repo-canonical record for the `cch` field in Claude
 Code's billing marker. If this conflicts with an agent memory note, update the
@@ -30,6 +28,17 @@ Algorithm recovered for `2.1.142` and re-verified for `2.1.150`, `2.1.154`, and
 4. Format as five lowercase hex digits with zero padding.
 5. Overwrite the five `00000` bytes in the billing header.
 
+Algorithm recovered for `2.1.175`:
+
+1. Serialize the final `/v1/messages` JSON request body with `cch=00000;`
+   still present.
+2. Remove every JSON `"model":"<value>"` string value while preserving
+   `"model":""`.
+3. Remove each numeric `"max_tokens":<n>` field plus one adjacent comma.
+4. Compute standard `xxHash64(transformed_bytes, seed = 0x4d659218e32a3268)`.
+5. Take `hash & 0xfffff`, format as five lowercase hex digits, and overwrite
+   the five `00000` bytes.
+
 The body length does not change. A non-sentinel value such as `cch=abcde;` is
 left untouched.
 
@@ -40,7 +49,8 @@ must re-check serializer order.
 
 ## Omni implementation notes
 
-- The active profile `cc-2.1.158-sdk-cli` owns the checksum behavior.
+- The active profile owns the checksum behavior; do not infer it from the
+  version number alone.
 - The visible billing header still starts with `cch=00000;`; the final-body
   hook rewrites it immediately before logging/sending the upstream body.
 - The rewrite targets the first matching billing header under the serialized
@@ -66,6 +76,9 @@ algorithm above, and compare.
 | watchpoint marker body | `c159b` |
 
 Rust unit tests in `crates/provider-claude/src/fingerprint.rs` lock these fixtures in.
+
+Clean-room vectors also pin full real Claude Code bodies for `2.1.162`,
+`2.1.165`, and `2.1.175` under `tools/providers/claude/fingerprint/vectors/`.
 
 ## Reverse-engineering playbook
 
@@ -113,7 +126,6 @@ body still matches the pinned checksum algorithm.
 
 ## 2.1.175 Status
 
-Claude Code 2.1.175 still exposes a `cch=00000` marker before transport, but
-the final request body observed on 2026-06-12 does not match this xxHash64 body
-algorithm. Do not reuse this algorithm for 2.1.175 or promote that release until
-the new checksum path is recovered and pinned with vectors.
+Claude Code 2.1.175 is supported as the default profile. The recovered transform
+above is covered by clean-room vectors for Fable, Opus, Sonnet, and Haiku, and by
+the opt-in drift checker.

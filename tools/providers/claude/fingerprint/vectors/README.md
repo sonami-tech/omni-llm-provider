@@ -4,11 +4,9 @@ Each `vector-<version>-<model>.json` in this directory is a **real Claude Code
 request body** captured from the installed CLI, used as a recovered-capture
 fixture for Omni's `x-anthropic-billing-header` cch checksum.
 
-The Rust tests `cch_matches_real_2_1_162_clean_room_capture_vectors` and
-`cch_matches_real_2_1_165_clean_room_capture_vectors`
-(`crates/provider-claude/src/fingerprint.rs`) loads these via `include_str!`, replaces the
-embedded `cch=<value>` with the `cch=00000` sentinel, recomputes the checksum
-with Omni's own `claude_code_cch_checksum`, and asserts it reproduces the
+Rust tests in `crates/provider-claude/src/fingerprint.rs` load these via
+`include_str!`, replace the embedded `cch=<value>` with the `cch=00000`
+sentinel, recompute the profile's checksum, and assert it reproduces the
 captured value. This proves Omni's body serialization + cch algorithm match real
 Claude Code traffic **over a full-shape body** (`metadata`,
 `context_management`, `thinking`, `tools`, `cache_control`, multiple `system`
@@ -25,12 +23,12 @@ to a fixed placeholder and recomputes the cch over the normalized bytes:
 | Field | Placeholder | Why |
 |---|---|---|
 | `metadata.user_id.session_id` | `00000000-0000-4000-8000-000000000000` | fresh per request |
-| `metadata.user_id.device_id` | 64× `0` | per-machine id |
+| `metadata.user_id.device_id` | 64 x `0` | per-machine id |
 | clean `HOME` path (3 encodings) | `/home/omni-vector` | random + uid-bearing |
 | account email | `vector@example.com` | from the OAuth identity |
 
 The generator fails closed if a bearer token, an email address, or the
-structural signal of a loaded instruction file (a `Contents of …/CLAUDE.md`
+structural signal of a loaded instruction file (a `Contents of .../CLAUDE.md`
 header) survives into a vector - so a future Claude Code version that re-injects
 local instructions via a new path aborts the emit instead of leaking them.
 

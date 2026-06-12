@@ -8,7 +8,7 @@ logic remains isolated in provider crates.
 
 - `omni` - the only server binary. Routes by canonical upstream model id
   (`claude-sonnet-4-6`, `grok-4.3`), documented shorthand alias (`sonnet`,
-  `opus`, `haiku`, `grok`, `composer`), or optional provider prefix
+  `opus`, `haiku`, `fable`, `grok`, `composer`), or optional provider prefix
   (`claude:...`, `grok:...`) when a caller needs to force a provider.
 
 ## Crates
@@ -69,6 +69,7 @@ Current shorthand aliases are resolved from provider-owned catalogs at startup:
 - `sonnet` -> `claude-sonnet-4-6`
 - `opus` -> `claude-opus-4-8`
 - `haiku` -> `claude-haiku-4-5-20251001`
+- `fable` -> `claude-fable-5`
 - `grok` -> `grok-4.3`
 - `composer` -> `grok-composer-2.5-fast`
 

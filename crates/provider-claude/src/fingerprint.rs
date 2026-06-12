@@ -15,11 +15,10 @@
 //! wire types + identity prepend). It never leaks into omni-common or
 //! omni-core.
 //!
-//! Active baseline captured 2026-06-05 against claude CLI 2.1.165
-//! SDK 0.94.0 (a pure version bump from 2.1.162: beta flags, stainless
-//! versions, wire defaults, default model, model catalog, and the cch algorithm
-//! were all re-confirmed unchanged from a live clean-CWD mitmproxy capture; only
-//! the version string and version-derived cc_version suffix moved).
+//! Active baseline captured 2026-06-12 against claude CLI 2.1.175
+//! SDK 0.94.0. This profile adds Fable 5, xhigh Opus/Fable effort, and the
+//! recovered 2.1.175 cch transform that removes model string values and
+//! max_tokens fields before hashing.
 //!
 //! Ported/adapted directly from reference-src-claude/upstream/fingerprint.rs
 //! (the authoritative source for the invariant).
@@ -30,8 +29,8 @@ use uuid::Uuid;
 
 use crate::credentials::Credentials;
 use crate::models::{
-    CATALOG_CC_2_1_142, CATALOG_CC_2_1_150, CATALOG_CC_2_1_154, CATALOG_CC_2_1_158, ModelDef,
-    ModelInfo, models_list_from_catalog, resolve_model_in_catalog,
+    CATALOG_CC_2_1_142, CATALOG_CC_2_1_150, CATALOG_CC_2_1_154, CATALOG_CC_2_1_158,
+    CATALOG_CC_2_1_175, ModelDef, ModelInfo, models_list_from_catalog, resolve_model_in_catalog,
 };
 
 /// Static identity Omni claims on the wire. These values must move together
@@ -95,6 +94,7 @@ enum BillingCchMode {
     #[allow(dead_code)]
     Static(&'static str),
     FinalBodyChecksum,
+    FinalBodyChecksumSkipModelsAndMaxTokens,
 }
 
 impl FingerprintProfile {
@@ -185,20 +185,28 @@ impl FingerprintProfile {
     }
 
     fn finalize_body_bytes(&self, bytes: Vec<u8>, _ctx: &RequestContext) -> Vec<u8> {
-        // Claude Code 2.1.142, 2.1.150, 2.1.154, 2.1.158, 2.1.161, 2.1.162, and 2.1.165 cch is a pure body-byte hash. Keep the
-        // context in this API so future pinned profiles can add ctx-sensitive
-        // behavior without changing call sites.
         match self.billing.cch {
             BillingCchMode::Static(_) => bytes,
-            BillingCchMode::FinalBodyChecksum => self.finalize_body_cch_checksum(bytes),
+            BillingCchMode::FinalBodyChecksum => {
+                self.finalize_body_cch_checksum(bytes, claude_code_cch_checksum)
+            }
+            BillingCchMode::FinalBodyChecksumSkipModelsAndMaxTokens => self
+                .finalize_body_cch_checksum(
+                    bytes,
+                    claude_code_cch_checksum_skip_models_and_max_tokens,
+                ),
         }
     }
 
-    fn finalize_body_cch_checksum(&self, mut bytes: Vec<u8>) -> Vec<u8> {
+    fn finalize_body_cch_checksum(
+        &self,
+        mut bytes: Vec<u8>,
+        checksum_fn: fn(&[u8]) -> u64,
+    ) -> Vec<u8> {
         let Some(offset) = self.find_billing_cch_placeholder(&bytes) else {
             return bytes;
         };
-        let checksum = claude_code_cch_checksum(&bytes);
+        let checksum = checksum_fn(&bytes);
         let replacement = format!("{checksum:05x}");
         debug_assert_eq!(replacement.len(), 5);
         bytes[offset..offset + 5].copy_from_slice(replacement.as_bytes());
@@ -249,7 +257,8 @@ impl BillingCchMode {
     fn placeholder(self) -> &'static str {
         match self {
             BillingCchMode::Static(value) => value,
-            BillingCchMode::FinalBodyChecksum => "00000",
+            BillingCchMode::FinalBodyChecksum
+            | BillingCchMode::FinalBodyChecksumSkipModelsAndMaxTokens => "00000",
         }
     }
 }
@@ -268,6 +277,12 @@ const BILLING_SCHEME_V1_CCH_XXH64_BODY: BillingScheme = BillingScheme {
     seed: BILLING_SUFFIX_SEED_V1,
     sample_indices: &BILLING_SUFFIX_INDICES_V1,
     cch: BillingCchMode::FinalBodyChecksum,
+};
+const BILLING_SCHEME_V1_CCH_XXH64_SKIP_MODELS_AND_MAX_TOKENS: BillingScheme = BillingScheme {
+    suffix_algorithm: BillingSuffixAlgorithm::Sha256Utf16SampleV1,
+    seed: BILLING_SUFFIX_SEED_V1,
+    sample_indices: &BILLING_SUFFIX_INDICES_V1,
+    cch: BillingCchMode::FinalBodyChecksumSkipModelsAndMaxTokens,
 };
 
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -320,6 +335,15 @@ pub const BETA_CC_2_1_162_HAIKU: &str = BETA_CC_2_1_158_HAIKU;
 pub const BETA_CC_2_1_165_DEFAULT: &str = BETA_CC_2_1_158_DEFAULT;
 pub const BETA_CC_2_1_165_SONNET: &str = BETA_CC_2_1_158_SONNET;
 pub const BETA_CC_2_1_165_HAIKU: &str = BETA_CC_2_1_158_HAIKU;
+
+/// 2.1.175 betas captured 2026-06-12 with local fake-server probes. Default
+/// model resolution to Opus carries context-1m, but explicit Opus does not.
+/// Fable adds the fallback-credit beta.
+pub const BETA_CC_2_1_175_DEFAULT: &str = BETA_CC_2_1_158_DEFAULT;
+pub const BETA_CC_2_1_175_OPUS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11";
+pub const BETA_CC_2_1_175_SONNET: &str = BETA_CC_2_1_158_SONNET;
+pub const BETA_CC_2_1_175_HAIKU: &str = BETA_CC_2_1_158_HAIKU;
+pub const BETA_CC_2_1_175_FABLE: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11";
 
 const MODEL_BETA_OVERRIDES_CC_2_1_154: &[ModelBetaOverride] = &[
     ModelBetaOverride {
@@ -486,6 +510,33 @@ const MODEL_BETA_OVERRIDES_CC_2_1_165: &[ModelBetaOverride] = &[
     ModelBetaOverride {
         model: "haiku",
         beta_reply: BETA_CC_2_1_165_HAIKU,
+    },
+];
+
+const MODEL_BETA_OVERRIDES_CC_2_1_175: &[ModelBetaOverride] = &[
+    ModelBetaOverride {
+        model: "claude-fable-5",
+        beta_reply: BETA_CC_2_1_175_FABLE,
+    },
+    ModelBetaOverride {
+        model: "claude-opus-4-8",
+        beta_reply: BETA_CC_2_1_175_OPUS,
+    },
+    ModelBetaOverride {
+        model: "claude-sonnet-4-6",
+        beta_reply: BETA_CC_2_1_175_SONNET,
+    },
+    ModelBetaOverride {
+        model: "claude-haiku-4-5",
+        beta_reply: BETA_CC_2_1_175_HAIKU,
+    },
+    ModelBetaOverride {
+        model: "claude-haiku-4-5-20251001",
+        beta_reply: BETA_CC_2_1_175_HAIKU,
+    },
+    ModelBetaOverride {
+        model: "haiku",
+        beta_reply: BETA_CC_2_1_175_HAIKU,
     },
 ];
 
@@ -699,6 +750,39 @@ const MODEL_WIRE_OVERRIDES_CC_2_1_165: &[ModelWireOverride] = &[
     },
 ];
 
+const MODEL_WIRE_OVERRIDES_CC_2_1_175: &[ModelWireOverride] = &[
+    ModelWireOverride {
+        model: "claude-fable-5",
+        max_tokens: 64_000,
+        temperature: None,
+        output_effort: Some("xhigh"),
+    },
+    ModelWireOverride {
+        model: "claude-opus-4-8",
+        max_tokens: 64_000,
+        temperature: None,
+        output_effort: Some("xhigh"),
+    },
+    ModelWireOverride {
+        model: "claude-sonnet-4-6",
+        max_tokens: 32_000,
+        temperature: Some(1.0),
+        output_effort: Some("high"),
+    },
+    ModelWireOverride {
+        model: "claude-haiku-4-5",
+        max_tokens: 32_000,
+        temperature: Some(1.0),
+        output_effort: None,
+    },
+    ModelWireOverride {
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 32_000,
+        temperature: Some(1.0),
+        output_effort: None,
+    },
+];
+
 pub const WIRE_DEFAULTS_LEGACY: WireDefaults = WireDefaults {
     max_tokens: 64_000,
     opus_max_tokens: 128_000,
@@ -746,7 +830,14 @@ pub const WIRE_DEFAULTS_CC_2_1_165: WireDefaults = WireDefaults {
     output_effort: Some("high"),
 };
 
-pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.165-sdk-cli";
+pub const WIRE_DEFAULTS_CC_2_1_175: WireDefaults = WireDefaults {
+    max_tokens: 32_000,
+    opus_max_tokens: 64_000,
+    temperature: Some(1.0),
+    output_effort: Some("high"),
+};
+
+pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.175-sdk-cli";
 pub const LATEST_PROFILE_ALIAS: &str = "latest";
 
 pub const PROFILE_CLAUDE_2_1_142_SDK_CLI: FingerprintProfile = FingerprintProfile {
@@ -885,7 +976,7 @@ pub const PROFILE_CLAUDE_2_1_162_SDK_CLI: FingerprintProfile = FingerprintProfil
 // `preserve_explicit_model` is set deliberately to true, matching 2.1.162 (not
 // defaulted).
 pub const PROFILE_CLAUDE_2_1_165_SDK_CLI: FingerprintProfile = FingerprintProfile {
-    name: DEFAULT_PROFILE_NAME,
+    name: "cc-2.1.165-sdk-cli",
     aliases: &["2.1.165"],
     claude_cli_version: "2.1.165",
     stainless_package_version: "0.94.0",
@@ -902,7 +993,30 @@ pub const PROFILE_CLAUDE_2_1_165_SDK_CLI: FingerprintProfile = FingerprintProfil
     billing: BILLING_SCHEME_V1_CCH_XXH64_BODY,
 };
 
+// Captured 2026-06-12 against installed Claude Code 2.1.175. Headers keep SDK
+// 0.94.0 / Node v24.3.0. Body defaults changed: Opus now emits
+// output_config.effort=xhigh, Fable is in the catalog with fallback-credit beta,
+// and the cch input omits model values plus the max_tokens field.
+pub const PROFILE_CLAUDE_2_1_175_SDK_CLI: FingerprintProfile = FingerprintProfile {
+    name: DEFAULT_PROFILE_NAME,
+    aliases: &["2.1.175"],
+    claude_cli_version: "2.1.175",
+    stainless_package_version: "0.94.0",
+    stainless_runtime_version: "v24.3.0",
+    entrypoint: "sdk-cli",
+    beta_reply: BETA_CC_2_1_175_DEFAULT,
+    model_beta_overrides: MODEL_BETA_OVERRIDES_CC_2_1_175,
+    system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
+    models: CATALOG_CC_2_1_175,
+    default_model: "opus",
+    preserve_explicit_model: true,
+    wire_defaults: WIRE_DEFAULTS_CC_2_1_175,
+    model_wire_overrides: MODEL_WIRE_OVERRIDES_CC_2_1_175,
+    billing: BILLING_SCHEME_V1_CCH_XXH64_SKIP_MODELS_AND_MAX_TOKENS,
+};
+
 pub static FINGERPRINT_PROFILES: &[FingerprintProfile] = &[
+    PROFILE_CLAUDE_2_1_175_SDK_CLI,
     PROFILE_CLAUDE_2_1_165_SDK_CLI,
     PROFILE_CLAUDE_2_1_162_SDK_CLI,
     PROFILE_CLAUDE_2_1_161_SDK_CLI,
@@ -1151,6 +1265,69 @@ const XXH64_PRIME5: u64 = 2_870_177_450_012_600_261;
 
 fn claude_code_cch_checksum(bytes: &[u8]) -> u64 {
     xxh64(bytes, CCH_XXH64_SEED) & 0xfffff
+}
+
+fn claude_code_cch_checksum_skip_models_and_max_tokens(bytes: &[u8]) -> u64 {
+    xxh64(
+        &body_for_cch_skip_models_and_max_tokens(bytes),
+        CCH_XXH64_SEED,
+    ) & 0xfffff
+}
+
+fn body_for_cch_skip_models_and_max_tokens(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut cursor = 0;
+    while let Some((range_start, range_end)) = find_next_max_tokens_range(bytes, cursor) {
+        append_with_model_values_removed(&mut out, &bytes[cursor..range_start]);
+        cursor = range_end;
+    }
+    append_with_model_values_removed(&mut out, &bytes[cursor..]);
+    out
+}
+
+fn find_next_max_tokens_range(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let found = find_subslice(&bytes[start..], br#""max_tokens":"#)? + start;
+    let value_start = found + br#""max_tokens":"#.len();
+    let mut value_end = value_start;
+    while value_end < bytes.len() && bytes[value_end].is_ascii_digit() {
+        value_end += 1;
+    }
+    if value_end == value_start {
+        return Some((found, value_end));
+    }
+    if found > start && bytes[found - 1] == b',' {
+        Some((found - 1, value_end))
+    } else if value_end < bytes.len() && bytes[value_end] == b',' {
+        Some((found, value_end + 1))
+    } else {
+        Some((found, value_end))
+    }
+}
+
+fn append_with_model_values_removed(out: &mut Vec<u8>, bytes: &[u8]) {
+    let mut cursor = 0;
+    while let Some(rel) = find_subslice(&bytes[cursor..], br#""model":""#) {
+        let start = cursor + rel;
+        let value_start = start + br#""model":""#.len();
+        let Some(value_end) = find_json_string_end(bytes, value_start) else {
+            break;
+        };
+        out.extend_from_slice(&bytes[cursor..value_start]);
+        cursor = value_end;
+    }
+    out.extend_from_slice(&bytes[cursor..]);
+}
+
+fn find_json_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut idx = start;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'\\' => idx = idx.saturating_add(2),
+            b'"' => return Some(idx),
+            _ => idx += 1,
+        }
+    }
+    None
 }
 
 fn xxh64(bytes: &[u8], seed: u64) -> u64 {
@@ -1439,6 +1616,29 @@ mod tests {
     }
 
     #[test]
+    fn claude_2_1_175_uses_captured_beta_list_per_model() {
+        let profile = resolve_profile("2.1.175").unwrap();
+        let creds = fixture_creds();
+        let cases = [
+            ("claude-fable-5", BETA_CC_2_1_175_FABLE),
+            ("claude-opus-4-8", BETA_CC_2_1_175_OPUS),
+            ("claude-sonnet-4-6", BETA_CC_2_1_175_SONNET),
+            ("claude-haiku-4-5", BETA_CC_2_1_175_HAIKU),
+            ("claude-haiku-4-5-20251001", BETA_CC_2_1_175_HAIKU),
+        ];
+        for (model, expected_beta) in cases {
+            let ctx = RequestContext::new_reply().with_model(model.to_string());
+            let beta = build_headers(&creds, &ctx, profile)
+                .get("anthropic-beta")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(beta, expected_beta, "unexpected beta list for {model}");
+        }
+    }
+
+    #[test]
     fn bare_aliases_resolve_to_correct_per_model_beta_on_default_profile() {
         // Regression guard for the FULL handler path: a client sending a bare
         // alias ("sonnet"/"haiku"/"opus") must get that model's captured beta,
@@ -1447,12 +1647,13 @@ mod tests {
         // ever regresses, a `sonnet` request would silently leak the opus DEFAULT
         // beta (with context-1m) - an inexact fingerprint. Covers the alias gap
         // the canonical-only test above does not exercise.
-        let profile = default_profile(); // 2.1.165
+        let profile = default_profile();
         let creds = fixture_creds();
         let cases = [
-            ("opus", BETA_CC_2_1_165_DEFAULT, true), // default has context-1m
-            ("sonnet", BETA_CC_2_1_165_SONNET, false), // sonnet must NOT
-            ("haiku", BETA_CC_2_1_165_HAIKU, false),
+            ("fable", BETA_CC_2_1_175_FABLE, false),
+            ("opus", BETA_CC_2_1_175_OPUS, false),
+            ("sonnet", BETA_CC_2_1_175_SONNET, false),
+            ("haiku", BETA_CC_2_1_175_HAIKU, false),
         ];
         for (alias, expected_beta, has_context_1m) in cases {
             // Mirror the handler: resolve + canonicalize before building headers.
@@ -1596,15 +1797,16 @@ mod tests {
     #[test]
     fn default_profile_matches_refreshed_claude_code_baseline() {
         let profile = default_profile();
-        assert_eq!(profile.name, "cc-2.1.165-sdk-cli");
-        assert_eq!(profile.claude_cli_version, "2.1.165");
+        assert_eq!(profile.name, "cc-2.1.175-sdk-cli");
+        assert_eq!(profile.claude_cli_version, "2.1.175");
         assert_eq!(profile.stainless_package_version, "0.94.0");
         assert_eq!(profile.stainless_runtime_version, "v24.3.0");
         assert_eq!(
             profile.user_agent(),
-            "claude-cli/2.1.165 (external, sdk-cli)"
+            "claude-cli/2.1.175 (external, sdk-cli)"
         );
         assert_eq!(profile.default_model, "opus");
+        assert_eq!(profile.resolve_model("fable").canonical, "claude-fable-5");
         assert_eq!(profile.resolve_model("opus").canonical, "claude-opus-4-8");
         assert_eq!(
             profile.resolve_model("sonnet").canonical,
@@ -1620,7 +1822,17 @@ mod tests {
     fn profile_registry_resolves_known_selectors() {
         assert_eq!(
             resolve_profile("latest").unwrap().name,
-            "cc-2.1.165-sdk-cli"
+            "cc-2.1.175-sdk-cli"
+        );
+        assert_eq!(
+            resolve_profile("cc-2.1.175-sdk-cli")
+                .unwrap()
+                .claude_cli_version,
+            "2.1.175"
+        );
+        assert_eq!(
+            resolve_profile("2.1.175").unwrap().name,
+            "cc-2.1.175-sdk-cli"
         );
         assert_eq!(
             resolve_profile("cc-2.1.165-sdk-cli")
@@ -1725,9 +1937,12 @@ mod tests {
         // and prompt "Say OK" on 2026-06-05 (live clean-CWD mitmproxy capture: the
         // real billing header read `cc_version=2.1.165.492`).
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.165"), "492");
+        // Captured from Claude Code 2.1.175 with CLAUDE_CODE_ENTRYPOINT=sdk-cli
+        // and prompt "Say OK" on 2026-06-12.
+        assert_eq!(claude_code_version_suffix("Say OK", "2.1.175"), "174");
         assert_eq!(
             default_profile().billing_header_text("Say OK"),
-            "x-anthropic-billing-header: cc_version=2.1.165.492; cc_entrypoint=sdk-cli; cch=00000;"
+            "x-anthropic-billing-header: cc_version=2.1.175.174; cc_entrypoint=sdk-cli; cch=00000;"
         );
     }
 
@@ -1759,7 +1974,10 @@ mod tests {
         let placeholder = serde_json::to_vec(&body).unwrap();
         let bytes = profile.finalize_body_json(&body, &ctx).unwrap();
         let json = String::from_utf8(bytes).unwrap();
-        let expected = format!("{:05x}", claude_code_cch_checksum(&placeholder));
+        let expected = format!(
+            "{:05x}",
+            claude_code_cch_checksum_skip_models_and_max_tokens(&placeholder)
+        );
 
         assert!(json.contains(&format!("cch={expected};")));
         assert_eq!(json.len(), placeholder.len());
@@ -1795,16 +2013,14 @@ mod tests {
         });
         let json = String::from_utf8(profile.finalize_body_json(&body, &ctx).unwrap()).unwrap();
 
-        // cch over this fixed body for the DEFAULT profile (2.1.165). Re-derived
+        // cch over this fixed body for the DEFAULT profile. Re-derived
         // from the rebuilt binary, not hand-edited: it moves whenever the embedded
-        // cc_version suffix changes (here b87 -> 492 for 2.1.162 -> 2.1.165), which
-        // alters the hashed bytes. Regenerate this literal whenever the default
-        // profile's version/suffix changes.
+        // cc_version suffix or cch algorithm changes.
         let marker = "cc_entrypoint=sdk-cli; cch=";
         let idx = json.find(marker).expect("snapshot body missing cch marker");
         let got = &json[idx + marker.len()..idx + marker.len() + 5];
         assert_eq!(
-            got, "32282",
+            got, "527d7",
             "default-profile snapshot cch changed (re-derive literal)"
         );
     }
@@ -1856,7 +2072,7 @@ mod tests {
         assert!(json.contains(user_text));
         assert_eq!(json.matches("cch=00000").count(), 1);
         assert!(json.contains(
-            "x-anthropic-billing-header: cc_version=2.1.165.492; cc_entrypoint=sdk-cli; cch="
+            "x-anthropic-billing-header: cc_version=2.1.175.174; cc_entrypoint=sdk-cli; cch="
         ));
         assert!(!json.contains("cc_entrypoint=sdk-cli; cch=00000;"));
     }
@@ -2057,7 +2273,7 @@ mod tests {
 
     #[test]
     fn cch_matches_real_2_1_165_clean_room_capture_vectors() {
-        // Sibling for current default 2.1.165 profile. Local capture vectors
+        // Sibling coverage for the older 2.1.165 profile. Local capture vectors
         // ensure our impl matches live Claude Code wire cch over rich shapes,
         // not just our synthetic bodies.
         let vectors = [
@@ -2103,6 +2319,63 @@ mod tests {
                 ),
                 embedded,
                 "cch != real Claude Code 2.1.165 cch for the {model} capture vector"
+            );
+        }
+    }
+
+    #[test]
+    fn cch_matches_real_2_1_175_clean_room_capture_vectors() {
+        let vectors = [
+            (
+                "claude-fable-5",
+                include_str!(
+                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.175-claude-fable-5.json"
+                ),
+            ),
+            (
+                "claude-haiku-4-5",
+                include_str!(
+                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.175-claude-haiku-4-5.json"
+                ),
+            ),
+            (
+                "claude-sonnet-4-6",
+                include_str!(
+                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.175-claude-sonnet-4-6.json"
+                ),
+            ),
+            (
+                "claude-opus-4-8",
+                include_str!(
+                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.175-claude-opus-4-8.json"
+                ),
+            ),
+        ];
+        for (model, body) in vectors {
+            let marker = "cc_entrypoint=sdk-cli; cch=";
+            let idx = body
+                .find(marker)
+                .unwrap_or_else(|| panic!("no billing cch marker in {model} vector"));
+            let start = idx + marker.len();
+            let embedded = &body[start..start + 5];
+            let placeholder_body = body.replacen(
+                &format!("{marker}{embedded};"),
+                &format!("{marker}00000;"),
+                1,
+            );
+            assert_ne!(
+                placeholder_body, body,
+                "{model}: cch substitution was a no-op"
+            );
+            assert_eq!(
+                format!(
+                    "{:05x}",
+                    claude_code_cch_checksum_skip_models_and_max_tokens(
+                        placeholder_body.as_bytes()
+                    )
+                ),
+                embedded,
+                "cch != real Claude Code 2.1.175 cch for the {model} capture vector"
             );
         }
     }

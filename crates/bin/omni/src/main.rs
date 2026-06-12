@@ -9,8 +9,8 @@
 //! - --bind 127.0.0.1 by default, or --public as shorthand for --bind 0.0.0.0
 //! - Canonical model routing: real model ids (e.g. "claude-sonnet-4-6", "grok-4.3")
 //!   route directly when they uniquely identify an enabled provider.
-//! - Alias routing: "sonnet", "opus", "grok", and "composer" resolve to current
-//!   provider-owned model ids when unique.
+//! - Alias routing: "fable", "opus", "sonnet", "haiku", "grok", and "composer"
+//!   resolve to current provider-owned model ids when unique.
 //! - Optional prefix routing remains an escape hatch: "grok:foo" or "claude:bar".
 //!
 //! ## Surfaces (unified OpenAI-compatible)
@@ -367,7 +367,7 @@ impl ModelCatalog {
 fn format_aliases_for_log(providers: &HashMap<String, ProviderEntry>) -> Option<String> {
     let catalogs = provider_catalogs(providers);
     let mut pairs = Vec::new();
-    for alias in ["sonnet", "opus", "haiku", "grok", "composer"] {
+    for alias in ["sonnet", "opus", "haiku", "fable", "grok", "composer"] {
         let matches = model_matches(alias, &catalogs);
         if matches.len() == 1 {
             pairs.push(format!("{}={}", alias, matches[0].1));
@@ -996,14 +996,48 @@ mod tests {
         let (k, m) = resolve_provider_and_model("claude-sonnet-4-6", &catalogs).unwrap();
         assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-sonnet-4-6"));
 
+        let (k, m) = resolve_provider_and_model("fable", &catalogs).unwrap();
+        assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-fable-5"));
+
         let (k, m) = resolve_provider_and_model("sonnet", &catalogs).unwrap();
         assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-sonnet-4-6"));
+
+        let (k, m) = resolve_provider_and_model("claude-haiku-4-5", &catalogs).unwrap();
+        assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-haiku-4-5"));
+
+        let (k, m) = resolve_provider_and_model("haiku", &catalogs).unwrap();
+        assert_eq!(
+            (k.as_str(), m.as_str()),
+            ("claude", "claude-haiku-4-5-20251001")
+        );
 
         let (k, m) = resolve_provider_and_model("grok", &catalogs).unwrap();
         assert_eq!((k.as_str(), m.as_str()), ("grok", "grok-4.3"));
 
         let (k, m) = resolve_provider_and_model("composer", &catalogs).unwrap();
         assert_eq!((k.as_str(), m.as_str()), ("grok", "grok-composer-2.5-fast"));
+    }
+
+    #[test]
+    fn test_startup_alias_log_lists_documented_shorthands() {
+        let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
+        providers.insert("claude".into(), claude_entry());
+        providers.insert("grok".into(), grok_entry("http://127.0.0.1:1"));
+
+        let text = format_aliases_for_log(&providers).expect("aliases format");
+        for expected in [
+            "sonnet=claude-sonnet-4-6",
+            "opus=claude-opus-4-8",
+            "haiku=claude-haiku-4-5-20251001",
+            "fable=claude-fable-5",
+            "grok=grok-4.3",
+            "composer=grok-composer-2.5-fast",
+        ] {
+            assert!(
+                text.contains(expected),
+                "startup alias log missing {expected}: {text}"
+            );
+        }
     }
 
     #[test]
@@ -2137,7 +2171,7 @@ mod tests {
         );
         let state = state_with(map);
         let req = ChatCompletionRequest {
-            model: "claude:claude-3-5-sonnet-20241022".into(),
+            model: "claude:sonnet".into(),
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: Some("Reply with the word PONG only.".into()),
@@ -2755,7 +2789,7 @@ rule = [
             backends.push("grok:grok-4.3");
         }
         if has_claude_creds() {
-            backends.push("claude:claude-3-5-haiku-20241022");
+            backends.push("claude:haiku");
         }
         for model in backends {
             // Hop 1: declare a tool; model must emit a get_weather tool_call.
@@ -2840,7 +2874,7 @@ rule = [
         let out = post_json(
             port,
             "/v1/responses",
-            r#"{"model":"claude:claude-3-5-haiku-20241022","input":"Reply with the single word PONG","max_output_tokens":16}"#,
+            r#"{"model":"claude:haiku","input":"Reply with the single word PONG","max_output_tokens":16}"#,
         );
         assert_eq!(out.status, 200, "live body: {}", out.body);
         let v = omni_common::test_support::parse_json(&out.body);
@@ -2859,7 +2893,7 @@ rule = [
         let out2 = post_json(
             port,
             "/v1/responses",
-            r#"{"model":"claude:claude-3-5-haiku-20241022","input":"Reply with the single word PONG","max_output_tokens":16,"stream":true}"#,
+            r#"{"model":"claude:haiku","input":"Reply with the single word PONG","max_output_tokens":16,"stream":true}"#,
         );
         assert_eq!(out2.status, 200, "live stream body: {}", out2.body);
         let body = out2.body;
@@ -2877,7 +2911,7 @@ rule = [
         let out3 = post_json(
             port,
             "/v1/responses",
-            r#"{"model":"claude:claude-3-5-haiku-20241022","input":[{"type":"message","role":"user","content":"Weather in SF?"},{"type":"function_call","call_id":"c1","name":"get_weather","arguments":"{\"city\":\"SF\"}"},{"type":"function_call_output","call_id":"c1","output":"72F and sunny"}],"tools":[{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}],"max_output_tokens":256}"#,
+            r#"{"model":"claude:haiku","input":[{"type":"message","role":"user","content":"Weather in SF?"},{"type":"function_call","call_id":"c1","name":"get_weather","arguments":"{\"city\":\"SF\"}"},{"type":"function_call_output","call_id":"c1","output":"72F and sunny"}],"tools":[{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}],"max_output_tokens":256}"#,
         );
         assert_eq!(out3.status, 200, "responses tool body: {}", out3.body);
         let v3 = omni_common::test_support::parse_json(&out3.body);

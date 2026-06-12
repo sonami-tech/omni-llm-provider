@@ -7,7 +7,7 @@
 # model-list GET.
 #
 # Usage:
-#   tools/providers/claude/fingerprint/capture_baseline.sh claude-haiku-4-5 claude-sonnet-4-6 claude-opus-4-8
+#   tools/providers/claude/fingerprint/capture_baseline.sh claude-fable-5 claude-haiku-4-5 claude-sonnet-4-6 claude-opus-4-8
 #
 # Output: writes the raw flow + extracted report into a private, owner-only dir on
 # a RAM-backed tmpfs (printed at the end). The raw .flow contains the LIVE OAuth

@@ -37,7 +37,7 @@ upstream.
 
    ```sh
    tools/providers/claude/fingerprint/capture_baseline.sh \
-     claude-haiku-4-5 claude-sonnet-4-6 claude-opus-4-8
+     claude-fable-5 claude-haiku-4-5 claude-sonnet-4-6 claude-opus-4-8
    ```
 
    The helper starts mitmdump as a reverse proxy to `https://api.anthropic.com`,
@@ -108,8 +108,7 @@ for default, `fable`, `opus`, `sonnet`, and `haiku` flows. Headers still use SDK
 package `0.94.0`, runtime `v24.3.0`, Anthropic version `2023-06-01`, and
 `claude-cli/2.1.175 (external, sdk-cli)`.
 
-Do not promote 2.1.175 yet. The visible billing marker still contains the
-`cch=00000` sentinel before transport, but the final five-hex `cch` no longer
-matches the proven xxHash64 body algorithm used by 2.1.165 and earlier supported
-profiles. Keep `cc-2.1.165-sdk-cli` as `latest` until the 2.1.175 checksum path
-is recovered and covered by vectors/tests.
+2.1.175 is the current `latest` profile. Its cch path is still xxHash64 seeded
+with `0x4d659218e32a3268`, but the hashed input removes model string values and
+the numeric `max_tokens` field before hashing. The transform is covered by
+clean-room vectors for Fable, Opus, Sonnet, and Haiku.
