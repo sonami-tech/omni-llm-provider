@@ -6,32 +6,32 @@ logic remains isolated in provider crates.
 
 ## Binary
 
-- `omni` — the only server binary. Routes by model prefix (`claude:...` /
+- `omni` - the only server binary. Routes by model prefix (`claude:...` /
   `grok:...`) or, when only one provider is enabled, by bare model name.
 
 ## Crates
 
-- `crates/omni-core` — canonical types and the `LlmProvider` trait.
-- `crates/omni-common` — OpenAI-compatible HTTP conversion and SSE framing,
+- `crates/omni-core` - canonical types and the `LlmProvider` trait.
+- `crates/omni-common` - OpenAI-compatible HTTP conversion and SSE framing,
   Responses conversion, auth middleware, persistent stats, replacements, error
   envelope, session derivation.
-- `crates/provider-claude` — Claude-specific fingerprint profiles, cch,
+- `crates/provider-claude` - Claude-specific fingerprint profiles, cch,
   credentials, Anthropic Messages translation, identity injection, wire defaults,
   and model catalog.
-- `crates/provider-grok` — xAI Grok provider and OpenAI-compatible xAI wire
+- `crates/provider-grok` - xAI Grok provider and OpenAI-compatible xAI wire
   mapping.
-- `crates/bin/omni` — server setup, routing, auth, stats, and model catalog
+- `crates/bin/omni` - server setup, routing, auth, stats, and model catalog
   aggregation.
 
 ## HTTP Surface
 
-- `POST /v1/chat/completions` — non-stream JSON or `stream:true` OpenAI SSE
+- `POST /v1/chat/completions` - non-stream JSON or `stream:true` OpenAI SSE
   chunks terminated by `data: [DONE]`.
-- `POST /v1/responses` — supported OpenAI Responses subset, non-stream JSON or
+- `POST /v1/responses` - supported OpenAI Responses subset, non-stream JSON or
   Responses SSE events.
-- `GET /v1/models`, `GET /models` — provider-owned model catalogs with prefixed
+- `GET /v1/models`, `GET /models` - provider-owned model catalogs with prefixed
   IDs.
-- `GET /stats` — persistent request, token, and error counters.
+- `GET /stats` - persistent request, token, and error counters.
 - `GET /health`, `GET /`.
 
 ## Build, Run, Test
@@ -49,6 +49,11 @@ Useful server flags:
 - `--bind 127.0.0.1` / `OMNI_BIND`
 - `--public` / `OMNI_PUBLIC` for `0.0.0.0`
 - `--stats-db <path>` / `OMNI_STATS_DB`
+- `--log-conversations` / `OMNI_LOG_CONVERSATIONS`
+- `--log-file <path>` / `OMNI_LOG_FILE`
+- `--log-dir <path>` / `OMNI_LOG_DIR`
+- `--log-max-bytes <n>` / `OMNI_LOG_MAX_BYTES`
+- `--log-backups <n>` / `OMNI_LOG_BACKUPS`
 - `--no-auth` / `OMNI_NO_AUTH`
 
 If `--stats-db` is omitted, Omni writes stats to a fixed temp-file path
@@ -61,3 +66,13 @@ Credentials are read fresh per request, never cached. Claude reads
 `~/.claude/.credentials.json` or `$CLAUDE_CREDENTIALS_PATH`. Grok resolves
 `$XAI_CREDENTIALS_PATH`, then `~/.xai/.credentials.json`, then
 `~/.grok/auth.json`.
+
+Provider maintenance docs live under `docs/providers/`. Live provider tests are
+explicitly opt-in:
+
+```bash
+OMNI_LIVE_TESTS=1 cargo test --workspace
+```
+
+Do not enable `OMNI_LIVE_TESTS` in normal CI or shell profiles; live tests may
+spend provider quota and depend on account state.

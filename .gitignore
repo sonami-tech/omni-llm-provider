@@ -1,6 +1,8 @@
 /target
 **/*.rs.bk
 *.pdb
+__pycache__/
+*.py[cod]
 
 # Local agent/session state (worktrees, transient tool data)
 /.claude/
@@ -8,3 +10,6 @@
 # Credentials must never be committed (loaded fresh from ~/.claude, ~/.xai, or env)
 .credentials.json
 *.credentials.json
+
+# Raw MITM captures contain live bearer tokens and account identifiers.
+*.flow

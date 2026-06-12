@@ -31,3 +31,4 @@ futures-util.workspace = true
 async-trait = "0.1"
 # Enable the build-and-locate helper used by the subprocess integration tests.
 omni-common = { path = "../../omni-common", features = ["test-support"] }
+tower = "0.5"

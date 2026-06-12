@@ -39,7 +39,7 @@ pub type ResponsesSseStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible
 /// `POST /v1/responses` request body (supported subset). Unknown fields are
 /// captured in `extras` so a request never fails to parse on an
 /// unrecognized key.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ResponsesRequest {
     pub model: String,
     pub input: ResponsesInput,
@@ -64,7 +64,7 @@ pub struct ResponsesRequest {
 }
 
 /// `input` is either a bare string (one user message) or a list of items.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ResponsesInput {
     Text(String),
@@ -75,7 +75,7 @@ pub enum ResponsesInput {
 /// (`type` defaults to "message" when absent). Tool-conversation items use
 /// `type:"function_call"` (the assistant's prior tool call) and
 /// `type:"function_call_output"` (the result fed back), keyed by `call_id`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ResponsesInputItem {
     #[serde(rename = "type", default)]
     pub kind: Option<String>,
@@ -98,7 +98,7 @@ pub struct ResponsesInputItem {
 }
 
 /// Message content: a bare string or typed parts.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ResponsesInputContent {
     Text(String),
@@ -107,7 +107,7 @@ pub enum ResponsesInputContent {
 
 /// One typed content part. Only `input_text` / `output_text` are supported in
 /// v1; anything else (e.g. `input_image`) is rejected by name.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ResponsesContentPart {
     #[serde(rename = "type")]
     pub kind: String,
@@ -115,7 +115,7 @@ pub struct ResponsesContentPart {
     pub text: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ResponsesReasoning {
     #[serde(default)]
     pub effort: Option<String>,
@@ -123,7 +123,7 @@ pub struct ResponsesReasoning {
 
 /// Responses tools are FLATTENED function definitions (unlike Chat
 /// Completions' nested `function` object): `{type:"function", name, ...}`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ResponsesTool {
     #[serde(rename = "type")]
     pub kind: String,
@@ -135,7 +135,7 @@ pub struct ResponsesTool {
     pub parameters: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ResponsesToolChoice {
     /// "auto" | "required" | "none"
@@ -666,7 +666,7 @@ fn responses_sse_events(
                 "response": env,
             })));
         }
-        // NB: no [DONE] sentinel — that is Chat Completions framing only.
+        // NB: no [DONE] sentinel - that is Chat Completions framing only.
     }
 }
 

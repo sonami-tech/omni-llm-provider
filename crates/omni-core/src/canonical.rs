@@ -30,7 +30,7 @@ pub struct CanonicalMessage {
 ///
 /// `Text` is the common case (a plain string). `Blocks` carries an ordered
 /// sequence of content blocks, used when a turn mixes text with tool-call /
-/// tool-result data — i.e. multi-turn tool loops. Keeping `Text` as its own
+/// tool-result data - i.e. multi-turn tool loops. Keeping `Text` as its own
 /// variant means every plain-text producer stays valid; only tool turns need
 /// `Blocks`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,7 +169,7 @@ pub enum CanonicalStreamEvent {
     Finish { finish_reason: Option<String> },
 }
 
-/// A boxed, pinned stream of canonical stream events — the return type of
+/// A boxed, pinned stream of canonical stream events - the return type of
 /// [`crate::LlmProvider::send_stream`]. Boxed so the trait stays object-safe
 /// (`Arc<dyn LlmProvider>`), pinned + `Send` so it can cross `.await` points
 /// and be driven from an axum handler.
@@ -337,8 +337,9 @@ mod tests {
 
     // --- expanded tests for contract stability (added per task: 13 new) ---
 
-    // WHY: ensures canonical is stable contract for dual backend (grok + claude-code via LlmProvider).
-    // router covers wrapper logic for both (prefix stripping, config enable, multi, unknown, bare model default) - simulated here via core mocks since routing lives in thin bin wrapper.
+    // WHY: ensures canonical is stable contract for dual backend (grok + claude via LlmProvider).
+    // router covers omni routing logic for both (prefix stripping, config enable, multi, unknown,
+    // bare model default) - simulated here via core mocks since routing lives in the server binary.
 
     fn sim_apply_prompt(s: &str) -> String {
         // inline sim of omni-common::Replacements::apply_prompt (simple replaces, no dep allowed in core)
@@ -671,7 +672,7 @@ mod tests {
 
         assert!(sim_resolve("bare", &["grok", "claude"]).is_err()); // multi + bare
         assert!(sim_resolve("xxx: y", &["grok"]).is_err()); // unknown prefix
-        // WHY: core canonical + mocks exercise the selection rules the wrapper applies before delegating send().
+        // WHY: core canonical + mocks exercise the selection rules omni applies before delegating send().
     }
 
     #[test]
@@ -712,7 +713,7 @@ mod tests {
 
     // --- 16 additional tests expanding to huge suite (total >>15 new across edits) ---
     // WHY: canonical types + LlmProvider trait form the stable cross-backend contract for dual backends
-    // (grok + claude-code). The router sims + parity + repl roundtrips here encode+verify the wrapper
+    // (grok + claude). The router sims + parity + repl roundtrips here encode+verify the omni router
     // selection logic (prefix strip, config enable, multi/unknown, bare defaults to claude when single)
     // that the thin omni bin (and providers) apply around the shared send() path. Tests verify the
     // *intent* of stable interchangeability, not just serde.

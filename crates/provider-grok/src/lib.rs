@@ -79,12 +79,12 @@ pub struct GrokModelInfo {
 
 /// The Grok / xAI provider. Holds a reqwest client.
 /// Credentials are loaded fresh per request using the same technique as the
-/// original Claude Code Provider (see omni-common::credentials::GrokCredentials
-/// and docs/grok-gate.md).
+/// Claude provider (see omni-common::credentials::GrokCredentials and
+/// docs/grok-gate.md).
 ///
 /// The loader looks for $XAI_CREDENTIALS_PATH or ~/.xai/.credentials.json and
 /// re-reads on every send (never cached). This picks up key rotations or
-/// refreshes without restarting the process — exactly like CCP does for
+/// refreshes without restarting the process - exactly like Claude does for
 /// ~/.claude/.credentials.json.
 #[derive(Debug)]
 pub struct GrokProvider {
@@ -131,7 +131,7 @@ impl GrokProvider {
 
     /// Test-only constructor (no env, custom client possible in future).
     /// Not under cfg(test) so bin integration tests and other dependents can construct
-    /// a mock instance for routing/wrapper tests (while production still uses new()).
+    /// a mock instance for routing tests (while production still uses new()).
     pub fn new_for_test(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
             client: Client::new(),
@@ -678,7 +678,7 @@ impl LlmProvider for GrokProvider {
         let url = format!("{}/chat/completions", self.base_url);
         debug!(%url, "POST xAI chat completions");
 
-        // Fresh credentials load (the "Grok gate" technique, copied from CCP).
+        // Fresh credentials load using the same read-per-request contract as Claude.
         // See docs/grok-gate.md and omni-common::credentials::GrokCredentials.
         let effective_key = self.resolve_api_key().await?;
 
@@ -1132,7 +1132,7 @@ mod tests {
     #[test]
     fn test_provider_id_and_ctor() {
         assert_eq!(provider_id(), "grok");
-        // new(None) succeeds (the "same technique as CCP": the fresh file load
+        // new(None) succeeds: the fresh file load
         // happens inside send(), not at construction time). This lets the binary start without
         // the key and pick it up (or pick up a rotated key) on the first request.
         let p = GrokProvider::new(None)
@@ -1268,10 +1268,15 @@ mod tests {
     // threads while the std Mutex guard is held.
     #[allow(clippy::await_holding_lock)]
     async fn test_send_real_if_key_present() {
-        // "real if creds, but mocked" -- when real Grok creds are reachable (a static file or the
-        // Grok CLI login), exercises the full send path against live xAI (real key, real net);
-        // otherwise returns early (mocked/no-op for CI without secrets).
+        // Live opt-in: when OMNI_LIVE_TESTS=1 and real Grok creds are reachable
+        // (a static file or the Grok CLI login), exercises the full send path
+        // against live xAI. Otherwise returns early so credentialed machines do
+        // not spend quota during normal `cargo test`.
         let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        if !omni_common::test_support::live_tests_enabled() {
+            eprintln!("skipping real grok send test: set OMNI_LIVE_TESTS=1");
+            return;
+        }
         let key = {
             match live_grok_key() {
                 Some(k) => k,
@@ -1309,7 +1314,7 @@ mod tests {
     // credentials (file/env/bad), headers (via reqwest builder assert),
     // tool roundtrips + built-in, replacements full, error cases,
     // passthroughs, usage/refusal/citations variants, etc.
-    // Mirrors CCP style: mapper unit pins + mocked upstream + conditional real.
+    // Mapper unit pins + mocked upstream + conditional real.
     // Uses only existing patterns (bad-port mock, new_for_test, temp fs for creds, no new deps).
     // ============================================================
 
@@ -1799,10 +1804,13 @@ mod tests {
     // on the current-thread test runtime.
     #[allow(clippy::await_holding_lock)]
     async fn test_send_401_on_bad_key_forced_via_creds_path() {
-        // Always exercises 401 path from xAI (no secret needed): a deliberately invalid key is
-        // placed in a VALID creds file the loader reads, real base_url -> 401 upstream error.
-        // (Using a valid file -- not a missing one -- so the key actually resolves and reaches
-        // xAI under the new "explicit override failure is loud" contract.)
+        // Exercises the 401 path hermetically: a deliberately invalid key is
+        // placed in a valid creds file the loader reads, and a local mock returns
+        // the xAI-style 401. This must not call the real provider during normal
+        // tests.
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
         let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp =
             ::std::env::temp_dir().join(format!("xai-badkey-401-{}.json", ::std::process::id()));
@@ -1815,7 +1823,24 @@ mod tests {
         unsafe {
             ::std::env::set_var("XAI_CREDENTIALS_PATH", tmp.to_str().unwrap());
         }
-        let p = GrokProvider::new_for_test("ignored-ctor-key", "https://api.x.ai/v1");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header(
+                "authorization",
+                "Bearer xai-DEFINITELY-INVALID-KEY-FOR-TEST-401-XYZ",
+            ))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {
+                    "message": "invalid API key",
+                    "type": "authentication_error"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let p = GrokProvider::new_for_test("ignored-ctor-key", server.uri());
         let req = CanonicalRequest {
             model: "grok-3-mini".into(),
             messages: vec![CanonicalMessage {
@@ -1856,8 +1881,13 @@ mod tests {
     // current-thread test runtime.
     #[allow(clippy::await_holding_lock)]
     async fn test_send_400_and_real_error_cases_conditional() {
-        // When real creds present, exercise a 4xx error path (bad model) in addition to success path.
+        // Live opt-in: with OMNI_LIVE_TESTS=1 and real creds, exercise a 4xx
+        // error path (bad model) in addition to success path.
         let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        if !omni_common::test_support::live_tests_enabled() {
+            eprintln!("skipping live Grok 400/success case: set OMNI_LIVE_TESTS=1");
+            return;
+        }
         let key = match live_grok_key() {
             Some(k) => k,
             None => {
@@ -2334,10 +2364,14 @@ mod tests {
     // Safe on the current-thread test runtime.
     #[allow(clippy::await_holding_lock)]
     async fn test_send_stream_real_if_creds_present() {
-        // Guarded live test: only runs when real Grok creds are reachable (static file or Grok CLI
-        // login). Otherwise skips so the offline suite stays green. Mirrors the existing guarded-live
-        // pattern (test_send_real_if_key_present).
+        // Live opt-in: only runs when OMNI_LIVE_TESTS=1 and real Grok creds are
+        // reachable (static file or Grok CLI login). Otherwise skips so normal
+        // tests stay hermetic.
         let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        if !omni_common::test_support::live_tests_enabled() {
+            eprintln!("skipping real grok stream test: set OMNI_LIVE_TESTS=1");
+            return;
+        }
         let key = match live_grok_key() {
             Some(k) => k,
             None => {
@@ -2387,7 +2421,7 @@ mod tests {
     // takes CRED_ENV_LOCK and points XAI_CREDENTIALS_PATH at a temp creds file
     // (the explicit-override branch), so the file's key is what flows. The ctor is
     // given a DIFFERENT key so that ONLY successful file resolution satisfies the
-    // matcher (see DummyXaiCreds::WRONG_CTOR_KEY) — the file is load-bearing even
+    // matcher (see DummyXaiCreds::WRONG_CTOR_KEY) - the file is load-bearing even
     // on a cred-less CI box where the ctor fallback would otherwise mask it.
 
     /// RAII guard: writes a temp `{"apiKey": "xai-dummy-file"}` file, sets
@@ -2401,7 +2435,7 @@ mod tests {
     }
 
     impl DummyXaiCreds {
-        /// The key written to the temp creds FILE — this is what the mock's
+        /// The key written to the temp creds FILE - this is what the mock's
         /// `Bearer` matcher expects, so the request only matches when the provider
         /// resolves the key from the file via `XAI_CREDENTIALS_PATH`.
         const KEY: &'static str = "xai-dummy-file";
@@ -2409,7 +2443,7 @@ mod tests {
         /// A DIFFERENT key passed to the ctor. `resolve_api_key` only falls back to
         /// the ctor key when the file chain fails, so if isolation regressed (file
         /// not resolved) this key would flow instead and the `Bearer xai-dummy-file`
-        /// matcher would 404 — making the temp creds file genuinely load-bearing
+        /// matcher would 404 - making the temp creds file genuinely load-bearing
         /// (and proving file-chain resolution even on a cred-less CI box).
         const WRONG_CTOR_KEY: &'static str = "xai-ctor-must-not-be-used";
 
@@ -2444,7 +2478,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn grok_nonstream_success_roundtrip_via_wiremock() {
-        // WHY: proves a successful non-stream completion end to end offline — the
+        // WHY: proves a successful non-stream completion end to end offline - the
         // request leaves with the file-resolved `Authorization: Bearer`, the right
         // method and path, and a body carrying the model + messages; and the real
         // decoder maps the xAI response to canonical content/finish_reason/usage.

@@ -6,9 +6,11 @@
 - Rationale:
   - Claude fingerprint logic is isolated in `provider-claude`.
   - Grok wire logic is isolated in `provider-grok`.
-  - Shared HTTP conversion, Responses conversion, auth, stats, replacements, and
-    error envelopes live in `omni-common`.
-  - `omni` only routes, frames responses, exposes catalogs, and records stats.
+  - Shared HTTP conversion, Responses conversion, auth, stats, replacements,
+    session derivation, conversation logging, and error envelopes live in
+    `omni-common`.
+  - `omni` only routes, frames responses, exposes catalogs, records stats, and
+    wires optional conversation logging.
 
 ## Routing
 
@@ -40,3 +42,10 @@ Credentials are read fresh per request.
 - Claude: `$CLAUDE_CREDENTIALS_PATH` or `~/.claude/.credentials.json`
 - Grok: `$XAI_CREDENTIALS_PATH`, `~/.xai/.credentials.json`, or
   `~/.grok/auth.json`
+
+## Tests
+
+- Default tests are hermetic and must not call live providers.
+- Live provider tests require `OMNI_LIVE_TESTS=1` plus usable credentials.
+- Subprocess HTTP tests use shared Rust helpers in `omni-common::test_support`
+  instead of shelling out to `curl`.

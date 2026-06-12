@@ -11,10 +11,11 @@ Provider implementations remain separate crates:
 - `provider-grok` owns the xAI wire mapping, credential resolution, streaming
   parser, and Grok model catalog.
 - `omni-common` owns shared OpenAI-compatible HTTP conversion, Responses
-  conversion, SSE framing, auth, stats, replacements, and error envelopes.
+  conversion, SSE framing, auth, stats, conversation logging, session
+  derivation, replacements, and error envelopes.
 - `omni-core` owns canonical types and the `LlmProvider` trait.
-- `crates/bin/omni` owns server startup, routing, auth wiring, stats wiring, and
-  model catalog aggregation.
+- `crates/bin/omni` owns server startup, routing, auth wiring, stats wiring,
+  optional conversation-log wiring, and model catalog aggregation.
 
 ## Why One Binary
 
@@ -54,3 +55,8 @@ cargo run -p omni -- --providers claude,grok --port 18321
 Stats default to `omni-stats.redb` under the OS temp directory. Production or
 multi-instance runs should set `--stats-db` / `OMNI_STATS_DB` to a durable,
 instance-specific path.
+
+Conversation logging is disabled by default. It can write to stderr, a rotating
+single file, or per-session files via `--log-conversations`, `--log-file`, or
+`--log-dir`. Session ids prefer `x-session-id`, then request `user`, then API-key
+id, then an anonymous fallback.

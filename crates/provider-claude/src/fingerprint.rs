@@ -3,7 +3,7 @@
 //!
 //! **CRITICAL INVARIANT (Claude Code fingerprint exactness):**
 //! For every Claude Code version this crate supports, it MUST reproduce that
-//! version's wire fingerprint **byte-for-byte** — the version string,
+//! version's wire fingerprint **byte-for-byte** - the version string,
 //! `anthropic-beta` flags, stainless versions, the `x-anthropic-billing-header`
 //! cch checksum, the model catalog, wire defaults, and identity preamble
 //! injection. This exactness is the entire point of provider-claude: an
@@ -34,7 +34,7 @@ use crate::models::{
     ModelInfo, models_list_from_catalog, resolve_model_in_catalog,
 };
 
-/// Static identity CCP claims on the wire. These values must move together
+/// Static identity Omni claims on the wire. These values must move together
 /// when re-baselining against a new Claude Code release.
 #[derive(Debug, Clone, Copy)]
 pub struct FingerprintProfile {
@@ -298,7 +298,7 @@ pub const BETA_CC_2_1_158_HAIKU: &str = "oauth-2025-04-20,interleaved-thinking-2
 
 /// 2.1.161 betas captured 2026-06-03 via mitmproxy reverse proxy + real claude
 /// CLI 2.1.161 (default/opus, sonnet, haiku). Byte-identical to the 2.1.158
-/// per-model lists — aliased rather than re-typed so a future drift is a single
+/// per-model lists - aliased rather than re-typed so a future drift is a single
 /// edit. Confirmed from live traffic, not carried forward blind.
 pub const BETA_CC_2_1_161_DEFAULT: &str = BETA_CC_2_1_158_DEFAULT;
 pub const BETA_CC_2_1_161_SONNET: &str = BETA_CC_2_1_158_SONNET;
@@ -307,7 +307,7 @@ pub const BETA_CC_2_1_161_HAIKU: &str = BETA_CC_2_1_158_HAIKU;
 /// 2.1.162 betas captured 2026-06-04 via mitmproxy reverse proxy + real claude
 /// CLI 2.1.162 (default/opus, sonnet, haiku), driven from a clean CWD. Confirmed
 /// byte-identical to the 2.1.158/2.1.161 per-model lists from live traffic, not
-/// carried forward blind — aliased so a future drift is a single edit.
+/// carried forward blind - aliased so a future drift is a single edit.
 pub const BETA_CC_2_1_162_DEFAULT: &str = BETA_CC_2_1_158_DEFAULT;
 pub const BETA_CC_2_1_162_SONNET: &str = BETA_CC_2_1_158_SONNET;
 pub const BETA_CC_2_1_162_HAIKU: &str = BETA_CC_2_1_158_HAIKU;
@@ -315,7 +315,7 @@ pub const BETA_CC_2_1_162_HAIKU: &str = BETA_CC_2_1_158_HAIKU;
 /// 2.1.165 betas captured 2026-06-05 via mitmproxy reverse proxy + real claude
 /// CLI 2.1.165 (default/opus, sonnet, haiku), driven from a clean CWD. Confirmed
 /// byte-identical to the 2.1.158/2.1.161/2.1.162 per-model lists from live
-/// traffic, not carried forward blind — aliased so a future drift is a single
+/// traffic, not carried forward blind - aliased so a future drift is a single
 /// edit.
 pub const BETA_CC_2_1_165_DEFAULT: &str = BETA_CC_2_1_158_DEFAULT;
 pub const BETA_CC_2_1_165_SONNET: &str = BETA_CC_2_1_158_SONNET;
@@ -354,7 +354,7 @@ const MODEL_BETA_OVERRIDES_CC_2_1_154: &[ModelBetaOverride] = &[
 
 // The opus-4-7 / opus-4-6 rows are off-catalog for 2.1.158 (not in
 // CATALOG_CC_2_1_158); real 2.1.158 never emits them, so there is no captured
-// fingerprint to match — they are carry-forward fallbacks for consumers that
+// fingerprint to match - they are carry-forward fallbacks for consumers that
 // explicitly request those ids, mapped to the closest captured beta (SONNET).
 const MODEL_BETA_OVERRIDES_CC_2_1_158: &[ModelBetaOverride] = &[
     ModelBetaOverride {
@@ -720,7 +720,7 @@ pub const WIRE_DEFAULTS_CC_2_1_158: WireDefaults = WireDefaults {
     output_effort: Some("high"),
 };
 
-// 2.1.161 wire defaults — captured 2026-06-03, identical to 2.1.158.
+// 2.1.161 wire defaults - captured 2026-06-03, identical to 2.1.158.
 pub const WIRE_DEFAULTS_CC_2_1_161: WireDefaults = WireDefaults {
     max_tokens: 32_000,
     opus_max_tokens: 64_000,
@@ -728,7 +728,7 @@ pub const WIRE_DEFAULTS_CC_2_1_161: WireDefaults = WireDefaults {
     output_effort: Some("high"),
 };
 
-// 2.1.162 wire defaults — captured 2026-06-04 (clean-CWD mitmproxy), identical to
+// 2.1.162 wire defaults - captured 2026-06-04 (clean-CWD mitmproxy), identical to
 // 2.1.158/2.1.161.
 pub const WIRE_DEFAULTS_CC_2_1_162: WireDefaults = WireDefaults {
     max_tokens: 32_000,
@@ -737,7 +737,7 @@ pub const WIRE_DEFAULTS_CC_2_1_162: WireDefaults = WireDefaults {
     output_effort: Some("high"),
 };
 
-// 2.1.165 wire defaults — captured 2026-06-05 (clean-CWD mitmproxy), identical to
+// 2.1.165 wire defaults - captured 2026-06-05 (clean-CWD mitmproxy), identical to
 // 2.1.158/2.1.161/2.1.162.
 pub const WIRE_DEFAULTS_CC_2_1_165: WireDefaults = WireDefaults {
     max_tokens: 32_000,
@@ -847,7 +847,7 @@ pub const PROFILE_CLAUDE_2_1_161_SDK_CLI: FingerprintProfile = FingerprintProfil
 // version-derived cc_version suffix moved (d2b -> b87 for "Say OK"). The model
 // catalog is carried forward from 2.1.158 (reused, as 161 does): the capture ran
 // with CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1, which suppresses the startup
-// /v1/models GET, so the catalog is not freshly GET-enumerable here — but all
+// /v1/models GET, so the catalog is not freshly GET-enumerable here - but all
 // three pinned ids (opus-4-8/sonnet-4-6/haiku-4-5) were confirmed accepted in
 // real bodies and 2.1.162 carries no model rename. `preserve_explicit_model` is
 // set deliberately to true, matching 2.1.161 (not defaulted).
@@ -879,7 +879,7 @@ pub const PROFILE_CLAUDE_2_1_162_SDK_CLI: FingerprintProfile = FingerprintProfil
 // only the version string and the version-derived cc_version suffix moved. The
 // model catalog is carried forward from 2.1.158 (reused, as 161/162 do): the
 // capture ran with CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1, which suppresses
-// the startup /v1/models GET, so the catalog is not freshly GET-enumerable here —
+// the startup /v1/models GET, so the catalog is not freshly GET-enumerable here -
 // but all three pinned ids (opus-4-8/sonnet-4-6/haiku-4-5) were confirmed
 // accepted in real bodies and 2.1.165 carries no model rename.
 // `preserve_explicit_model` is set deliberately to true, matching 2.1.162 (not
@@ -946,7 +946,7 @@ pub fn is_claude_code_billing_header(text: &str) -> bool {
         && text.contains("; cch=")
 }
 
-/// What kind of request this is — controls minor header variations.
+/// What kind of request this is - controls minor header variations.
 #[derive(Debug, Clone, Copy)]
 pub enum RequestKind {
     /// A user-facing reply request. Default beta list.
@@ -1315,12 +1315,12 @@ mod tests {
         // Locks the 2.1.158 per-model anthropic-beta header against the values
         // captured from real claude CLI 2.1.158 traffic (2026-05-30). The
         // load-bearing fact: opus-4-8 carries the new `context-1m-2025-08-07`
-        // flag (DEFAULT beta) while sonnet/haiku do NOT — both byte-confirmed
+        // flag (DEFAULT beta) while sonnet/haiku do NOT - both byte-confirmed
         // against live capture.
         let profile = resolve_profile("2.1.158").unwrap();
         let creds = fixture_creds();
         // All six pinned model ids, including the off-catalog opus-4-7/4-6
-        // carry-forward fallbacks — every override row gets a full-string lock,
+        // carry-forward fallbacks - every override row gets a full-string lock,
         // not just the three on-catalog models.
         let cases = [
             ("claude-opus-4-8", BETA_CC_2_1_158_DEFAULT),
@@ -1445,7 +1445,7 @@ mod tests {
         // NOT the profile DEFAULT beta. This only holds because outbound_model()
         // canonicalizes the alias *before* the header is built; if that ordering
         // ever regresses, a `sonnet` request would silently leak the opus DEFAULT
-        // beta (with context-1m) — an inexact fingerprint. Covers the alias gap
+        // beta (with context-1m) - an inexact fingerprint. Covers the alias gap
         // the canonical-only test above does not exercise.
         let profile = default_profile(); // 2.1.165
         let creds = fixture_creds();
@@ -1547,7 +1547,7 @@ mod tests {
 
         // The default-reply anthropic-beta header must be the profile's EXACT
         // captured string, byte-for-byte (order included), not merely contain a
-        // few tokens — beta-flag order and membership are part of the
+        // few tokens - beta-flag order and membership are part of the
         // fingerprint. Per-model variants are locked separately by the
         // claude_2_1_<ver>_uses_captured_beta_list_per_model tests; this asserts
         // the no-model reply path for every registered profile.
@@ -1767,7 +1767,7 @@ mod tests {
     }
 
     #[test]
-    fn ccp_serialized_body_cch_snapshot_stays_stable() {
+    fn omni_serialized_body_cch_snapshot_stays_stable() {
         let profile = default_profile();
         let ctx = RequestContext::new_reply();
         let body = serde_json::json!({
@@ -1958,10 +1958,9 @@ mod tests {
 
     #[test]
     fn cch_checksum_matches_recovered_claude_code_captures() {
-        // Self-consistency over small recovered bodies (from CCP ref); proves
+        // Self-consistency over small recovered bodies from the original provider reference; proves
         // the xxh64 impl + sentinel rewrite produces the embedded cch that real
-        // Claude Code emitted for those exact (normalized) shapes. Mirrors the
-        // CCP invariant check.
+        // Claude Code emitted for those exact normalized shapes.
         let cases = [
             (
                 "3bc55",
@@ -2006,27 +2005,26 @@ mod tests {
     fn cch_matches_real_2_1_162_clean_room_capture_vectors() {
         // Breaks the self-consistency circularity: these are REAL Claude Code
         // 2.1.162 request bodies (one per pinned model), captured in clean room
-        // and committed under tools/fingerprint/vectors/ (ref from CCP).
+        // and committed under tools/providers/claude/fingerprint/vectors/.
         // Asserts our xxh64 + finalize reproduces the real cch over full body
-        // shapes including metadata/thinking/tools/cache_control. Mirrors CCP
-        // vector test for invariant verification.
+        // shapes including metadata/thinking/tools/cache_control.
         let vectors = [
             (
                 "claude-haiku-4-5",
                 include_str!(
-                    "../../../../claude-code-provider/tools/fingerprint/vectors/vector-2.1.162-claude-haiku-4-5.json"
+                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.162-claude-haiku-4-5.json"
                 ),
             ),
             (
                 "claude-sonnet-4-6",
                 include_str!(
-                    "../../../../claude-code-provider/tools/fingerprint/vectors/vector-2.1.162-claude-sonnet-4-6.json"
+                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.162-claude-sonnet-4-6.json"
                 ),
             ),
             (
                 "claude-opus-4-8",
                 include_str!(
-                    "../../../../claude-code-provider/tools/fingerprint/vectors/vector-2.1.162-claude-opus-4-8.json"
+                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.162-claude-opus-4-8.json"
                 ),
             ),
         ];
@@ -2059,26 +2057,26 @@ mod tests {
 
     #[test]
     fn cch_matches_real_2_1_165_clean_room_capture_vectors() {
-        // Sibling for current default 2.1.165 profile. Real capture vectors from
-        // ref CCP tools/fingerprint/vectors ensure our impl matches live Claude
-        // Code wire cch over rich shapes, not just our synthetic bodies.
+        // Sibling for current default 2.1.165 profile. Local capture vectors
+        // ensure our impl matches live Claude Code wire cch over rich shapes,
+        // not just our synthetic bodies.
         let vectors = [
             (
                 "claude-haiku-4-5",
                 include_str!(
-                    "../../../../claude-code-provider/tools/fingerprint/vectors/vector-2.1.165-claude-haiku-4-5.json"
+                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.165-claude-haiku-4-5.json"
                 ),
             ),
             (
                 "claude-sonnet-4-6",
                 include_str!(
-                    "../../../../claude-code-provider/tools/fingerprint/vectors/vector-2.1.165-claude-sonnet-4-6.json"
+                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.165-claude-sonnet-4-6.json"
                 ),
             ),
             (
                 "claude-opus-4-8",
                 include_str!(
-                    "../../../../claude-code-provider/tools/fingerprint/vectors/vector-2.1.165-claude-opus-4-8.json"
+                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.165-claude-opus-4-8.json"
                 ),
             ),
         ];
@@ -2111,7 +2109,7 @@ mod tests {
 
     #[test]
     fn xxh64_matches_independent_small_input_vectors() {
-        // Cross-checked against Bun.hash.xxHash64 with the recovered seed (from CCP ref).
+        // Cross-checked against Bun.hash.xxHash64 with the recovered seed.
         assert_eq!(xxh64(b"", CCH_XXH64_SEED), 0xb8b30e7de65b46c5);
         assert_eq!(xxh64(b"abc", CCH_XXH64_SEED), 0xdfc4f4d6913699b6);
         assert_eq!(xxh64(b"hello", CCH_XXH64_SEED), 0xfc8105d2d40e53f1);
@@ -2153,7 +2151,7 @@ mod tests {
     fn billing_header_text_end_to_end_matches_suffix_oracle_for_varied_first_text() {
         // END-TO-END of suffix on the billing_header_text path (the one used
         // for real first-user text before identity). Covers empty/short/emoji
-        // etc. Mirrors CCP ref.
+        // etc. Mirrors the original provider reference.
         let profile = default_profile();
         let ver = profile.claude_cli_version;
         let inputs = [

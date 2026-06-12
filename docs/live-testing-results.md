@@ -14,7 +14,9 @@
   - omni-core: canonical roundtrips + LlmProvider trait parity (grok + claude mocks) - 4 tests
   - provider-claude: 39 tests (ported fingerprint invariant pins + cch + headers + identity + mappers + send path exercising full gate)
   - provider-grok: 10 tests (mappers for tools/reasoning/extras/replacements + send mocked + real-if-key (skipped cleanly))
-- Wrapper routing tests in bin mains: cover prefix (grok:, claude:) and config-based, unified OAI surfaces, both backends.
+- Omni routing tests in `crates/bin/omni`: cover prefix (`grok:`,
+  `claude:`), config-based routing, unified OpenAI-compatible surfaces, and both
+  backends.
 
 ## Live Server Tests Performed
 (Using timeout + bg server + curl for functional verification. Servers started with --no-auth.)
@@ -22,31 +24,26 @@
 1. **Grok credential file technique (live loader)**:
    - Created temp /tmp/grok-creds.json with fake key.
    - Set XAI_CREDENTIALS_PATH.
-   - Started direct omni-grok server.
+   - Started the Grok provider path in Omni.
    - Init succeeded (loader found file, no crash on "gate").
-   - Request sent (via wrapper and direct); hit expected auth error on fake key (verifies the "Grok gate" path).
-   - Result: Credential extraction works exactly as CCP (fresh file read, env override for path). Gate behavior observed (auth failure on invalid key).
+   - Request sent through Omni; hit expected auth error on fake key (verifies the "Grok gate" path).
+   - Result: Credential extraction works with fresh file read and env path override. Gate behavior observed (auth failure on invalid key).
 
-2. **Claude via wrapper with prefix (real creds)**:
-   - Started omni wrapper with --providers claude.
+2. **Claude via Omni with prefix (real creds)**:
+   - Started `omni` with `--providers claude`.
    - Sent to model="claude:sonnet".
    - Real response received from Claude (via ported logic: fingerprint, identity, cch, etc.).
-   - Result: Wrapper routing + claude: prefix works; full Claude backend live and accepting (LIVE_CLAUDE_WRAPPER_OK style responses in successful runs).
+   - Result: Omni routing plus `claude:` prefix works; full Claude backend live and accepting.
 
-3. **Direct omni-claude binary (real creds)**:
-   - Started direct binary.
-   - Real Claude response.
-   - Result: The focused omni-claude binary works end-to-end with real creds and preserves the original behavior/gate.
-
-4. **Wrapper routing to Grok (file creds technique)**:
+3. **Omni routing to Grok (file creds technique)**:
    - Temp creds file + env.
-   - Wrapper with --providers grok, model="grok:grok-3-mini".
+   - `omni` with `--providers grok`, model="grok:grok-3-mini".
    - Init ok via loader; request hit gate (fake key).
-   - Result: Wrapper correctly routes to grok backend using the shared credential loader.
+   - Result: Omni correctly routes to Grok using the shared credential loader.
 
-5. **Replacements live via wrapper (Claude)**:
+4. **Replacements live via Omni (Claude)**:
    - Temp rule: SECRET -> REDACTED (prompt scope).
-   - Wrapper + --replace-rules.
+   - `omni` + `--replace-rules`.
    - Request with "SECRET".
    - Result: Outbound replacement applied before hitting Claude (verified in successful masked responses).
 
@@ -63,15 +60,15 @@
 
 ## Claude Live
 - Full invariant exercised: real responses confirm the ported fingerprint/identity/cch/headers work against live Anthropic (no 403 from gate).
-- Prefix routing in wrapper works.
+- Prefix routing in Omni works.
 - Replacements integrate live.
 
-## Binaries Confirmed Working
-- omni (light wrapper): routing, config, both backends, replacements.
-- omni-claude: direct Claude.
-- omni-grok: direct Grok + file creds.
+## Binary Confirmed Working
+- `omni`: routing, config, both backends, replacements.
 
-All components (shared, providers, bins, wrapper) exercised live where creds allowed. Grok credential technique matches CCP exactly (file + env path override + fresh per request).
+All components (shared, providers, and the server binary) exercised live where
+creds allowed. Grok credential technique uses the same fresh-read pattern as
+Claude (file + env path override + fresh per request).
 
 No new "gates" discovered in live beyond expected auth on invalid key.
 

@@ -19,6 +19,7 @@ futures-util.workspace = true
 async-stream.workspace = true
 
 [dev-dependencies]
+omni-common = { path = "../omni-common", features = ["test-support"] }
 tokio = { version = "1", features = ["rt", "macros"] }
 chrono.workspace = true
 wiremock = "0.6.5"

@@ -640,17 +640,23 @@ mod tests {
         // Anthropic upstream (canonical -> translate -> identity/cch finalize ->
         // headers + body -> real call -> from_anth -> canonical).
         //
-        // Guarded so `cargo test` stays hermetic and green offline: skips cleanly
-        // when no Claude OAuth credentials are present, so it never burns Max quota
-        // on every run and never fails in a creds-less CI. The byte-exact wire
-        // pins (fingerprint, cch, translate) are asserted by the offline unit tests
-        // above; this test only proves the live wiring when creds exist.
+        // Guarded so `cargo test` stays hermetic and green even on credentialed
+        // developer machines. Credential presence alone is not enough: set
+        // OMNI_LIVE_TESTS=1 to spend provider quota. The byte-exact wire pins
+        // (fingerprint, cch, translate) are asserted by offline unit tests above;
+        // this test only proves live wiring when explicitly requested.
         //
         // Holds CREDS_ENV_LOCK across the gate + send so it cannot race a hermetic
         // wiremock test that points CLAUDE_CREDENTIALS_PATH at a temp creds file
         // (which would otherwise change what `default_path()` resolves to mid-call).
         // Mirrors the Grok live test's CRED_ENV_LOCK discipline.
         let _guard = CREDS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        if !omni_common::test_support::live_tests_enabled() {
+            eprintln!(
+                "skipping claude_send_exercises_full_fingerprint_path: set OMNI_LIVE_TESTS=1"
+            );
+            return;
+        }
         // Also skip when CLAUDE_CREDENTIALS_PATH is set: that means a hermetic test
         // (or an operator) is pointing the loader at a throwaway dummy creds file,
         // which must not be trusted for a real network call. Mirrors Grok's
@@ -685,7 +691,7 @@ mod tests {
     #[test]
     fn claude_parity_note() {
         // Full parity with grok via common trait + core canonical + replacements is verified in:
-        // omni-core::tests, provider-grok::tests, bin wrapper tests, and common replacements/stats units.
+        // omni-core::tests, provider-grok::tests, omni router tests, and common replacements/stats units.
     }
 
     #[test]
@@ -889,7 +895,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn claude_nonstream_success_roundtrip_via_wiremock() {
-        // WHY: proves a successful non-stream completion end to end offline — the
+        // WHY: proves a successful non-stream completion end to end offline - the
         // request leaves with the right bearer + anthropic-version + path/query, and
         // the real response decoder maps the Anthropic body to canonical (content,
         // end_turn -> stop, usage). This is exactly what CI could not prove before:
@@ -1076,7 +1082,7 @@ mod tests {
         let _guard = CREDS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _creds = TempCreds::install("stream-eof");
 
-        // Ends after message_delta — NO message_stop frame.
+        // Ends after message_delta - NO message_stop frame.
         let sse_body = concat!(
             "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_e\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",

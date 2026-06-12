@@ -19,7 +19,7 @@ use omni_core::{
 /// OpenAI-compatible chat completion request (text messages, tools, and core
 /// sampling). Unknown fields are captured in `extras` so a client request never
 /// fails to deserialize on an unrecognized key.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
@@ -47,9 +47,9 @@ pub struct ChatCompletionRequest {
 
 /// One message in a chat request. Beyond `role`/`content`, an *assistant* turn
 /// can carry `tool_calls` (the model's prior tool requests) and a *tool* turn
-/// carries the result keyed by `tool_call_id` — both required so multi-turn
+/// carries the result keyed by `tool_call_id` - both required so multi-turn
 /// tool conversations can be fed back through the proxy.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ChatMessage {
     pub role: String,
     #[serde(default)]
@@ -66,14 +66,14 @@ pub struct ChatMessage {
 
 /// A tool definition in OpenAI's nested form. Only `function` tools are
 /// supported (the canonical layer and both backends model function tools).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ChatTool {
     #[serde(rename = "type")]
     pub kind: String,
     pub function: ChatToolFunction,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ChatToolFunction {
     pub name: String,
     #[serde(default)]
@@ -83,7 +83,7 @@ pub struct ChatToolFunction {
 }
 
 /// `tool_choice`: either a bare mode string or a forced function selection.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ChatToolChoice {
     /// `"auto" | "required" | "none"`
@@ -96,7 +96,7 @@ pub enum ChatToolChoice {
     },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ChatToolChoiceFunction {
     pub name: String,
 }
@@ -138,7 +138,7 @@ pub struct ChatToolCall {
 /// Request-side counterpart of [`ChatToolCall`]: an assistant tool call echoed
 /// back by the client in a follow-up turn. Separate from the response type
 /// because it deserializes a client-supplied `type` string.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ChatToolCallReq {
     pub id: String,
     #[serde(rename = "type", default = "default_function_kind")]
@@ -150,7 +150,7 @@ fn default_function_kind() -> String {
     "function".into()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ChatFunctionCallReq {
     pub name: String,
     #[serde(default)]
@@ -176,7 +176,7 @@ pub struct ChatUsage {
 ///
 /// Fallible because a malformed tool surface (non-function tool, unknown
 /// `tool_choice` mode, a tool-result message missing its `tool_call_id`) is
-/// rejected by name as a 400 rather than silently dropped — the same contract
+/// rejected by name as a 400 rather than silently dropped - the same contract
 /// the Responses protocol enforces.
 pub fn to_canonical(req: &ChatCompletionRequest) -> Result<CanonicalRequest, String> {
     let messages: Vec<CanonicalMessage> = req

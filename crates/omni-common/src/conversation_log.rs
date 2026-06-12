@@ -86,7 +86,7 @@ fn spawn_writer(mut target: Target) -> (SyncSender<LogMsg>, std::sync::mpsc::Rec
     let (tx, rx) = sync_channel::<LogMsg>(LOG_QUEUE_CAPACITY);
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     let spawned = std::thread::Builder::new()
-        .name("ccp-conversation-log".into())
+        .name("omni-conversation-log".into())
         .spawn(move || {
             for msg in rx {
                 // One wedged/oversized record must not kill the writer thread.
@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn rotates_file_when_max_bytes_is_exceeded() {
-        let dir = std::env::temp_dir().join(format!("ccp-log-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("omni-log-test-{}", uuid::Uuid::new_v4()));
         let path = dir.join("conversations.log");
         let log = ConversationLog::to_file(&path, 220, 2).unwrap();
 
@@ -355,7 +355,7 @@ mod tests {
 
     #[test]
     fn max_bytes_zero_disables_rotation() {
-        let dir = std::env::temp_dir().join(format!("ccp-log-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("omni-log-test-{}", uuid::Uuid::new_v4()));
         let path = dir.join("conversations.log");
         let log = ConversationLog::to_file(&path, 0, 2).unwrap();
 
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn directory_logging_writes_one_file_per_sanitized_session() {
-        let dir = std::env::temp_dir().join(format!("ccp-log-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("omni-log-test-{}", uuid::Uuid::new_v4()));
         let log = ConversationLog::to_dir(&dir).unwrap();
 
         log.log("x:alpha beta", "reqone", ">>>", "First", "one");
@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn directory_logging_uses_request_id_for_unknown_session() {
-        let dir = std::env::temp_dir().join(format!("ccp-log-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("omni-log-test-{}", uuid::Uuid::new_v4()));
         let log = ConversationLog::to_dir(&dir).unwrap();
 
         log.log("-", "reqsolo", ">>>", "Only", "payload");
