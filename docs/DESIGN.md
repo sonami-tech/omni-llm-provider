@@ -48,3 +48,9 @@ cargo run -p omni -- --providers claude,grok --port 18321
   enabled.
 - Do not add provider-specific server binaries unless there is a concrete
   compatibility requirement.
+
+## Runtime State
+
+Stats default to `omni-stats.redb` under the OS temp directory. Production or
+multi-instance runs should set `--stats-db` / `OMNI_STATS_DB` to a durable,
+instance-specific path.

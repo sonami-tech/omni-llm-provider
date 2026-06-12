@@ -51,6 +51,10 @@ Useful server flags:
 - `--stats-db <path>` / `OMNI_STATS_DB`
 - `--no-auth` / `OMNI_NO_AUTH`
 
+If `--stats-db` is omitted, Omni writes stats to a fixed temp-file path
+(`omni-stats.redb` under the OS temp directory). Use `--stats-db` for durable
+stats or when running more than one server instance.
+
 `OMNI_API_KEYS` enables bearer-token auth when set to a comma-separated key list.
 
 Credentials are read fresh per request, never cached. Claude reads

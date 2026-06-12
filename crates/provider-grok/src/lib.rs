@@ -28,7 +28,7 @@
 //!   or as special tool entries (e.g. {"type":"web_search"}). Custom tools use {"type":"function", "function":{...}}.
 //!   search_parameters (legacy) is deprecated in favor of tools.
 //! - Streaming: SSE on ?stream=true (or "stream":true in body), deltas for content + tool_calls (incremental args).
-//!   Not yet exposed via the LlmProvider trait (trait only has non-stream send today); wire is ready.
+//!   Exposed through `LlmProvider::send_stream`.
 //! - Usage: prompt_tokens / completion_tokens + details (cached_tokens in prompt, reasoning_tokens in completion).
 //!   We map the main counters; reasoning_tokens are part of billing but surfaced in provider_extras on future
 //!   CanonicalResponse extensions if needed.
@@ -40,7 +40,7 @@
 //!   provider_extras["tools"] in some flows); /responses surface exists for stateful/agentic use cases but
 //!   chat/completions remains the primary for canonical OpenAI-compat.
 //! - No Replacements or Stats are *required* inside the provider (they are cross-cutting and applied in
-//!   frontends/bin layers per omni design). However this crate depends on omni-common and lightly exercises
+//!   the server layer per omni design). However this crate depends on omni-common and lightly exercises
 //!   Replacements::empty() + apply paths inside the mappers as a hook demonstration. In a fuller integration
 //!   the ctor would accept `Arc<Replacements>` (and/or Stats handle) from omni-common and apply prompt-scope
 //!   rules to message texts/tool surfaces before serialization, and response-scope rules to returned content +

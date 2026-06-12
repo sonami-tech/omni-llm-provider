@@ -2,6 +2,7 @@
 name = "provider-grok"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 omni-common = { path = "../omni-common" }

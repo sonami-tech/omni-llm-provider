@@ -15,8 +15,8 @@
 //! cannot represent (e.g. `input_image` parts, non-function tools) are rejected
 //! loudly with a clear error instead of degraded silently.
 //!
-//! TDD status: the types below are the wire contract; the three conversion
-//! functions are stubs pinned by the failing tests in this module (red phase).
+//! The types below are the wire contract. The conversion and SSE-framing
+//! functions are pinned by tests in this module.
 
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -31,8 +31,7 @@ use omni_core::{
 };
 
 /// The boxed SSE event stream produced by the Responses framer. Boxed so the
-/// signature stays stable while the implementation evolves (and so the TDD
-/// stub compiles without an unconstrained `impl Trait`).
+/// signature stays stable while the implementation evolves.
 pub type ResponsesSseStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
 
 // ── Request (Deserialize) ─────────────────────────────────────────
@@ -205,7 +204,7 @@ pub struct ResponsesUsage {
     pub total_tokens: u64,
 }
 
-// ── Conversions + SSE framing (stubs: pinned by the tests below) ──
+// ── Conversions + SSE framing ─────────────────────────────────────
 
 /// Convert a Responses request into a `CanonicalRequest`.
 ///

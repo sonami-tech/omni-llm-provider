@@ -105,7 +105,8 @@ struct Cli {
     #[arg(long, env = "OMNI_NO_AUTH")]
     no_auth: bool,
 
-    /// Path to the stats redb file. Defaults to a clearly named temp file.
+    /// Path to the stats redb file. Defaults to a fixed temp file; use a
+    /// durable, per-instance path for long-running or concurrent servers.
     #[arg(long, env = "OMNI_STATS_DB")]
     stats_db: Option<PathBuf>,
 }

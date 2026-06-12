@@ -7,7 +7,7 @@
 - Grok Build CLI (`~/.grok/bin/grok`, v0.2.33)
 - claude-code-provider (OpenAI Chat Completions surface + Anthropic Messages passthrough)
 - redclaw/redclaw (normalized `rc:` model + Format::Anthropic + Format::OpenAi adapters)
-- omni-llm-provider (this monorepo: frontends for `anthropic-messages` and `openai-chat`; providers for claude and grok)
+- omni-llm-provider (this monorepo: one `omni` server binary with shared OpenAI-compatible surfaces and separate Claude/Grok provider crates)
 - xAI public API (`api.x.ai/v1`) and internal CLI proxy (`cli-chat-proxy.grok.com/v1`)
 
 ---
