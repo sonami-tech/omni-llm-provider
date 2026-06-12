@@ -75,11 +75,23 @@ use omni_core::{
 use provider_claude::ClaudeProvider;
 use provider_grok::GrokProvider;
 
+const OMNI_ASCII_BANNER: &str = r#"
+   ___  __  __ _   _ ___
+  / _ \|  \/  | \ | |_ _|
+ | | | | |\/| |  \| || |
+ | |_| | |  | | |\  || |
+  \___/|_|  |_|_| \_|___|
+"#;
+
 /// CLI for the light omni aggregator.
 /// Env vars: OMNI_PROVIDERS, OMNI_BIND, OMNI_PUBLIC, OMNI_PORT, OMNI_NO_AUTH,
 /// OMNI_STATS_DB (clap env support). OMNI_API_KEYS configures auth keys.
 #[derive(Parser, Debug)]
-#[command(name = "omni", about = "Omni LLM server (claude + grok backends)")]
+#[command(
+    name = "omni",
+    version,
+    about = "Omni LLM server (claude + grok backends)"
+)]
 struct Cli {
     /// Comma-separated list of providers to enable (claude,grok). Prefix routing uses these names.
     #[arg(
@@ -167,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    log_startup_banner();
 
     // Normalize + validate providers list (unique, known names only).
     let enabled: Vec<String> = normalize_providers(&cli.providers)?;
@@ -259,6 +272,14 @@ async fn main() -> anyhow::Result<()> {
         .context("server error")?;
 
     Ok(())
+}
+
+fn log_startup_banner() {
+    info!(
+        "\n{}\n\n  Omni LLM Provider\n  Version: {}\n",
+        OMNI_ASCII_BANNER.trim_matches('\n'),
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 fn build_router(state: Arc<AppState>, auth_keys: Arc<HashSet<String>>) -> Router {
@@ -1038,6 +1059,18 @@ mod tests {
                 "startup alias log missing {expected}: {text}"
             );
         }
+    }
+
+    #[test]
+    fn test_cli_version_switch_reports_package_version() {
+        // WHY: release artifacts must expose the same version Cargo embeds in
+        // startup logs and package metadata.
+        let err = Cli::try_parse_from(["omni", "--version"]).expect_err("--version exits early");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(
+            err.to_string().contains(env!("CARGO_PKG_VERSION")),
+            "--version output must include package version"
+        );
     }
 
     #[test]
