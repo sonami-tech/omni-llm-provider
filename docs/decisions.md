@@ -17,13 +17,20 @@
 - Prefix routing selects the backend: `claude:<model>` or `grok:<model>`.
 - With exactly one provider enabled, bare model names are accepted.
 - With multiple providers enabled, bare model names are rejected.
+- Anthropic inbound (`/v1/messages` and `/v1/messages/count_tokens`) is
+  Claude-only. Non-Claude prefixes or models return an Anthropic-shaped request
+  error instead of falling back to another provider.
 
 ## Provider Boundaries
 
 - Claude: cch, betas, preamble, profiles, model aliases, credentials, and
-  Anthropic wire defaults stay in `provider-claude`.
+  Anthropic wire defaults stay in `provider-claude`. Native Anthropic inbound
+  reconciliation, raw JSON passthrough, raw SSE forwarding, and count-token body
+  shaping also stay there.
 - Grok: xAI request/response mapping, streaming parsing, credential resolution,
   and model catalog stay in `provider-grok`.
+- Planned Codex/OpenAI backend: Codex config discovery, auth parsing, provider
+  override handling, and OpenAI-compatible wire mapping stay in a provider crate.
 - Server concerns: auth, stats, bind/public flags, route registration, and model
   prefixing stay in `omni`.
 
@@ -31,6 +38,8 @@
 
 - OpenAI Chat Completions: `/v1/chat/completions`
 - OpenAI Responses subset: `/v1/responses`
+- Anthropic Messages, Claude only: `/v1/messages`
+- Anthropic token count, Claude only: `/v1/messages/count_tokens`
 - Models: `/v1/models`, `/models`
 - Stats: `/stats`
 - Health/root: `/health`, `/`

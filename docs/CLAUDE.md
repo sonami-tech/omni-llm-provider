@@ -11,9 +11,13 @@
   `~/.claude/.credentials.json` or `$CLAUDE_CREDENTIALS_PATH`.
 - `crates/provider-claude/src/translate.rs` - canonical request/response
   conversion and Claude Code identity injection.
+- `crates/provider-claude/src/anthropic_passthrough.rs` - Claude-native
+  Anthropic inbound preparation, closed client allowlist, raw response/SSE
+  replacement helpers, and count-token body shaping.
 - `crates/provider-claude/src/upstream.rs` - Anthropic HTTP client and SSE
   handling.
-- `crates/bin/omni` - server routing, auth, stats, `/v1/models`, and `/stats`.
+- `crates/bin/omni` - server routing, auth, stats, `/v1/models`, `/stats`, and
+  Claude-only Anthropic inbound route registration.
 
 Nothing Claude-specific, including cch, betas, preamble, profiles, billing
 suffixes, or Claude Code header values, belongs in `omni`.
@@ -39,6 +43,11 @@ is a failure, not a partial success.
 
 The offline unit tests pin the captured bytes. Live tests are credential-gated
 and prove Anthropic accepts the current profile when the account has capacity.
+
+Omni's `/v1/messages` and `/v1/messages/count_tokens` routes are native
+Anthropic inbound routes for Claude only. They do not use canonical OpenAI
+framing, but they still run through the same Claude provider fingerprint,
+credential, retry, identity, and cch machinery before reaching Anthropic.
 
 Rebaseline procedure and tooling are documented at
 `docs/providers/claude/REBASELINE.md` and

@@ -22,6 +22,7 @@
 //! logic with its unit-test pins (header names/values, beta per-model lists,
 //! billing suffix vectors, cch snapshots) intact.
 
+pub mod anthropic_passthrough;
 pub mod credentials;
 pub mod fingerprint;
 pub mod models;

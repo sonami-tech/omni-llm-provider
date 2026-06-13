@@ -31,9 +31,21 @@ Provider implementations remain separate crates:
 
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
+- `POST /v1/messages` for Claude-native Anthropic Messages inbound
+- `POST /v1/messages/count_tokens` for Claude-native Anthropic token counting
 - `GET /v1/models`, `GET /models`
 - `GET /stats`
 - `GET /health`, `GET /`
+
+OpenAI-compatible inbound surfaces route through `LlmProvider` and can target
+any enabled provider. Anthropic inbound is different: it is provider-native and
+routes only to Claude. The Claude provider owns the closed Anthropic allowlist,
+model resolution, identity injection, cch finalization, raw JSON response path,
+raw SSE forwarding, and `count_tokens` body shaping.
+
+`LlmProvider` remains canonical-only. Native Anthropic methods are not on the
+shared trait because Grok and the planned Codex/OpenAI backend cannot preserve
+Anthropic wire fidelity.
 
 ## Build
 
@@ -47,8 +59,18 @@ cargo run -p omni -- --providers claude,grok --port 18321
 - Do not merge provider internals into `omni`.
 - Do not route unknown or ambiguous bare model names heuristically when more
   than one provider is enabled.
+- Do not emulate Anthropic inbound for non-Claude providers.
 - Do not add provider-specific server binaries unless there is a concrete
   compatibility requirement.
+
+## Planned Codex/OpenAI Backend
+
+The planned Codex backend should be a new provider crate implementing
+`LlmProvider` for OpenAI-compatible inbound surfaces. It should read Codex
+configuration from `$CODEX_HOME` or `~/.codex`, including provider overrides
+such as `base_url` and `wire_api`, and read secret auth material fresh per
+request without logging or embedding token values. Anthropic inbound remains
+Claude-only after that backend is added.
 
 ## Runtime State
 

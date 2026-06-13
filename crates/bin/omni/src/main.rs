@@ -45,6 +45,7 @@
 //! Documented here per "document any findings in the code or note for docs/" (no new .md).
 
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,19 +54,24 @@ use std::time::Instant;
 use anyhow::Context;
 use axum::{
     Router,
+    body::Body,
     extract::{Extension, Json, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Request, StatusCode, header},
     middleware,
-    response::IntoResponse,
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
 use clap::Parser;
+use futures_util::StreamExt;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use omni_common::{
-    ActiveRequestGuard, ApiKeyId, AppError, ChatCompletionRequest, ConversationLog, Stats,
-    TokenUsage, auth_layer, from_canonical, to_canonical,
+    ActiveRequestGuard, ApiKeyId, AppError, ChatCompletionRequest, ConversationLog, Replacements,
+    Stats, TokenUsage, from_canonical, to_canonical,
 };
 use omni_core::{
     CanonicalResponse, CanonicalStream, CanonicalStreamEvent, LlmProvider, ProviderError,
@@ -155,6 +161,7 @@ struct Cli {
 #[derive(Clone)]
 struct ProviderEntry {
     provider: Arc<dyn LlmProvider>,
+    claude_native: Option<Arc<ClaudeProvider>>,
     models: Vec<serde_json::Value>,
     catalog: ModelCatalog,
 }
@@ -194,8 +201,10 @@ async fn main() -> anyhow::Result<()> {
                     .context("failed to initialize claude provider (fingerprint profile)")?;
                 let models = provider_model_values("claude", provider.profile().models_list())?;
                 let catalog = claude_model_catalog(provider.profile());
+                let provider = Arc::new(provider);
                 ProviderEntry {
-                    provider: Arc::new(provider),
+                    provider: provider.clone(),
+                    claude_native: Some(provider),
                     models,
                     catalog,
                 }
@@ -209,6 +218,7 @@ async fn main() -> anyhow::Result<()> {
                 let catalog = grok_model_catalog();
                 ProviderEntry {
                     provider: Arc::new(p),
+                    claude_native: None,
                     models,
                     catalog,
                 }
@@ -288,6 +298,11 @@ fn build_router(state: Arc<AppState>, auth_keys: Arc<HashSet<String>>) -> Router
         .route("/", get(root_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
         .route("/v1/responses", post(responses_handler))
+        .route("/v1/messages", post(anthropic_messages_handler))
+        .route(
+            "/v1/messages/count_tokens",
+            post(anthropic_count_tokens_handler),
+        )
         .route("/v1/models", get(models_handler))
         .route("/models", get(models_handler))
         .route("/stats", get(stats_handler))
@@ -295,8 +310,57 @@ fn build_router(state: Arc<AppState>, auth_keys: Arc<HashSet<String>>) -> Router
         // Always layer; the common impl short-circuits when keys are empty.
         .layer(middleware::from_fn({
             let keys = auth_keys.clone();
-            move |req, next| auth_layer(keys.clone(), req, next)
+            move |req, next| omni_auth_layer(keys.clone(), req, next)
         }))
+}
+
+async fn omni_auth_layer(
+    valid_keys: Arc<HashSet<String>>,
+    mut req: Request<Body>,
+    next: middleware::Next,
+) -> Response {
+    if valid_keys.is_empty() {
+        return next.run(req).await;
+    }
+
+    let is_anthropic =
+        req.uri().path() == "/v1/messages" || req.uri().path() == "/v1/messages/count_tokens";
+    let key = req
+        .headers()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .map(str::to_string);
+
+    match key {
+        Some(key) if valid_keys.contains(&key) => {
+            req.extensions_mut().insert(ApiKeyId(auth_key_id(&key)));
+            next.run(req).await
+        }
+        Some(_) if is_anthropic => {
+            anthropic_error_response(AppError::Unauthorized("Invalid API key".into()))
+        }
+        None if is_anthropic => anthropic_error_response(AppError::Unauthorized(
+            "Missing API key. Include 'Authorization: Bearer <key>' header.".into(),
+        )),
+        Some(_) => AppError::Unauthorized("Invalid API key".into()).into_response(),
+        None => AppError::Unauthorized(
+            "Missing API key. Include 'Authorization: Bearer <key>' header.".into(),
+        )
+        .into_response(),
+    }
+}
+
+fn auth_key_id(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() < 12 {
+        let suffix: String = chars.iter().rev().take(4).rev().collect();
+        return format!("...{}", suffix);
+    }
+    let prefix: String = chars.iter().take(4).collect();
+    let suffix: String = chars.iter().rev().take(4).rev().collect();
+    format!("{}...{}", prefix, suffix)
 }
 
 fn default_stats_db_path() -> PathBuf {
@@ -782,6 +846,13 @@ fn stats_model_key(provider: &str, model: &str) -> String {
     format!("{provider}:{model}")
 }
 
+fn derive_session_uuid(session_id: &str) -> uuid::Uuid {
+    if let Ok(uuid) = uuid::Uuid::parse_str(session_id) {
+        return uuid;
+    }
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, session_id.as_bytes())
+}
+
 fn session_header(headers: &HeaderMap) -> Option<&str> {
     headers.get("x-session-id").and_then(|v| v.to_str().ok())
 }
@@ -845,6 +916,436 @@ fn log_text(
     if let Some(log) = state.conversation_log.as_ref() {
         log.log(session_id, request_id, direction, label, content);
     }
+}
+
+async fn anthropic_messages_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    api_key: Option<Extension<ApiKeyId>>,
+    request: Request<Body>,
+) -> Response {
+    match anthropic_messages_inner(state, headers, api_key, request).await {
+        Ok(response) => response,
+        Err(error) => anthropic_error_response(error),
+    }
+}
+
+async fn anthropic_messages_inner(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    api_key: Option<Extension<ApiKeyId>>,
+    request: Request<Body>,
+) -> Result<Response, AppError> {
+    let request_id = Uuid::new_v4().to_string();
+    let short_request_id = request_id.chars().take(8).collect::<String>();
+    let raw_body = read_anthropic_body(request).await?;
+    let requested_model = raw_body
+        .get("model")
+        .and_then(|value| value.as_str())
+        .unwrap_or("<missing>")
+        .to_string();
+    let session_id = anthropic_session_id(
+        &headers,
+        raw_body
+            .get("metadata")
+            .and_then(|metadata| metadata.get("user_id"))
+            .and_then(|value| value.as_str()),
+        api_key.as_ref().map(|key| key.0.0.as_str()),
+        &short_request_id,
+    );
+    log_json(
+        &state,
+        &session_id,
+        &short_request_id,
+        ">>>",
+        "Inbound Anthropic Messages body",
+        &raw_body,
+    );
+
+    let claude = claude_native_for_anthropic(&state, &requested_model)?;
+    let raw_body = strip_claude_model_prefix(raw_body)?;
+    let replacements = Replacements::empty();
+    let prepared = claude
+        .prepare_anthropic_messages(raw_body, &replacements, true)
+        .map_err(map_anthropic_prepare_err)?;
+    if !prepared.dropped_fields.is_empty() {
+        warn!(
+            dropped = ?prepared.dropped_fields,
+            "anthropic request dropped non-forwarded client body fields"
+        );
+    }
+
+    let stats_key = stats_model_key("claude", &prepared.model_canonical);
+    if let Some(stats) = &state.stats {
+        stats.record_request(&stats_key, api_key.as_ref().map(|key| key.0.0.as_str()));
+    }
+    let ctx = provider_claude::RequestContext::new_reply()
+        .with_session(derive_session_uuid(&session_id))
+        .with_model(prepared.outbound_model.clone());
+
+    log_json(
+        &state,
+        &session_id,
+        &short_request_id,
+        ">>>",
+        "Anthropic upstream body",
+        prepared.body(),
+    );
+
+    if prepared.stream {
+        let stream = claude
+            .send_anthropic_messages_stream(prepared.body(), &ctx)
+            .await
+            .map_err(|error| {
+                if let Some(stats) = &state.stats {
+                    stats.record_error(&stats_key, &error.to_string());
+                }
+                map_provider_err(error)
+            })?;
+        log_text(
+            &state,
+            &session_id,
+            &short_request_id,
+            "<<<",
+            "Anthropic Messages stream opened",
+            &format!("model={}", prepared.requested_model),
+        );
+        return Ok(anthropic_sse_response(
+            stream,
+            state.stats.clone(),
+            state.conversation_log.clone(),
+            stats_key,
+            session_id,
+            short_request_id,
+            replacements,
+        ));
+    }
+
+    let _active = state.stats.as_deref().map(ActiveRequestGuard::new);
+    let started = Instant::now();
+    let mut value = claude
+        .send_anthropic_messages_json(prepared.body(), &ctx)
+        .await
+        .map_err(|error| {
+            if let Some(stats) = &state.stats {
+                stats.record_error(&stats_key, &error.to_string());
+            }
+            map_provider_err(error)
+        })?;
+    provider_claude::anthropic_passthrough::apply_response_replacements_raw(
+        &mut value,
+        &replacements,
+    );
+    if let Some(stats) = &state.stats {
+        stats.record_response(
+            &stats_key,
+            provider_claude::anthropic_passthrough::token_usage_from_response(&value),
+            None,
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+    log_json(
+        &state,
+        &session_id,
+        &short_request_id,
+        "<<<",
+        "Anthropic Messages response",
+        &value,
+    );
+    Ok((anthropic_request_id_header(&short_request_id), Json(value)).into_response())
+}
+
+async fn anthropic_count_tokens_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    api_key: Option<Extension<ApiKeyId>>,
+    request: Request<Body>,
+) -> Response {
+    match anthropic_count_tokens_inner(state, headers, api_key, request).await {
+        Ok(response) => response,
+        Err(error) => anthropic_error_response(error),
+    }
+}
+
+async fn anthropic_count_tokens_inner(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    api_key: Option<Extension<ApiKeyId>>,
+    request: Request<Body>,
+) -> Result<Response, AppError> {
+    let request_id = Uuid::new_v4().to_string();
+    let short_request_id = request_id.chars().take(8).collect::<String>();
+    let raw_body = read_anthropic_body(request).await?;
+    let requested_model = raw_body
+        .get("model")
+        .and_then(|value| value.as_str())
+        .unwrap_or("<missing>")
+        .to_string();
+    let session_id = anthropic_session_id(
+        &headers,
+        raw_body
+            .get("metadata")
+            .and_then(|metadata| metadata.get("user_id"))
+            .and_then(|value| value.as_str()),
+        api_key.as_ref().map(|key| key.0.0.as_str()),
+        &short_request_id,
+    );
+
+    let claude = claude_native_for_anthropic(&state, &requested_model)?;
+    let raw_body = strip_claude_model_prefix(raw_body)?;
+    let replacements = Replacements::empty();
+    let prepared = claude
+        .prepare_anthropic_count_tokens(raw_body, &replacements)
+        .map_err(map_anthropic_prepare_err)?;
+    let stats_key = stats_model_key("claude", &prepared.model_canonical);
+    if let Some(stats) = &state.stats {
+        stats.record_request(&stats_key, api_key.as_ref().map(|key| key.0.0.as_str()));
+    }
+    let ctx = provider_claude::RequestContext::new_reply()
+        .with_session(derive_session_uuid(&session_id))
+        .with_model(prepared.outbound_model.clone());
+    log_json(
+        &state,
+        &session_id,
+        &short_request_id,
+        ">>>",
+        "Anthropic count_tokens upstream body",
+        prepared.body(),
+    );
+
+    let value = claude
+        .send_anthropic_count_tokens(prepared.body(), &ctx)
+        .await
+        .map_err(|error| {
+            if let Some(stats) = &state.stats {
+                stats.record_error(&stats_key, &error.to_string());
+            }
+            map_provider_err(error)
+        })?;
+    Ok((anthropic_request_id_header(&short_request_id), Json(value)).into_response())
+}
+
+async fn read_anthropic_body(request: Request<Body>) -> Result<serde_json::Value, AppError> {
+    let body = axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024)
+        .await
+        .map_err(|error| AppError::BadRequest(format!("failed to read body: {error}")))?;
+    serde_json::from_slice(&body)
+        .map_err(|error| AppError::BadRequest(format!("invalid JSON: {error}")))
+}
+
+fn claude_native_for_anthropic(
+    state: &AppState,
+    requested_model: &str,
+) -> Result<Arc<ClaudeProvider>, AppError> {
+    let Some(entry) = state.providers.get("claude") else {
+        return Err(AppError::BadRequest(
+            "Anthropic /v1/messages is supported only when the claude provider is enabled".into(),
+        ));
+    };
+    let Some(claude) = entry.claude_native.as_ref() else {
+        return Err(AppError::ServerError(
+            "claude provider does not expose native Anthropic support".into(),
+        ));
+    };
+    if let Some((prefix, _)) = requested_model.split_once(':')
+        && prefix != "claude"
+    {
+        return Err(AppError::BadRequest(
+            "Anthropic /v1/messages supports only claude models".into(),
+        ));
+    }
+    Ok(claude.clone())
+}
+
+fn strip_claude_model_prefix(mut body: serde_json::Value) -> Result<serde_json::Value, AppError> {
+    let Some(model) = body.get("model").and_then(|value| value.as_str()) else {
+        return Ok(body);
+    };
+    let Some((prefix, stripped)) = model.split_once(':') else {
+        return Ok(body);
+    };
+    if prefix != "claude" {
+        return Err(AppError::BadRequest(
+            "Anthropic /v1/messages supports only claude models".into(),
+        ));
+    }
+    if stripped.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "empty model after claude provider prefix".into(),
+        ));
+    }
+    body["model"] = serde_json::Value::String(stripped.trim().to_string());
+    Ok(body)
+}
+
+fn map_anthropic_prepare_err(error: ProviderError) -> AppError {
+    match error {
+        ProviderError::Auth(message) => AppError::Unauthorized(message),
+        ProviderError::Upstream(message) => AppError::BadRequest(message),
+        ProviderError::Other(error) => AppError::ServerError(error.to_string()),
+    }
+}
+
+fn anthropic_session_id(
+    headers: &HeaderMap,
+    metadata_user: Option<&str>,
+    api_key_id: Option<&str>,
+    request_id: &str,
+) -> String {
+    if let Some(session) = session_header(headers).filter(|value| !value.is_empty()) {
+        return session.to_string();
+    }
+    if let Some(user) = metadata_user.filter(|value| !value.is_empty()) {
+        return format!("user:{user}");
+    }
+    if let Some(key) = api_key_id.filter(|value| !value.is_empty()) {
+        return format!("key:{key}");
+    }
+    format!("anth:{request_id}")
+}
+
+fn anthropic_sse_response(
+    mut upstream: provider_claude::anthropic_passthrough::RawFrameStream,
+    stats: Option<Arc<Stats>>,
+    conversation_log: Option<Arc<ConversationLog>>,
+    model: String,
+    session_id: String,
+    request_id: String,
+    replacements: Replacements,
+) -> Response {
+    let response_request_id = request_id.clone();
+    let stream = async_stream::stream! {
+        let _active = stats.as_deref().map(ActiveRequestGuard::new);
+        let started = Instant::now();
+        let mut usage = TokenUsage::default();
+        let mut ttft_ms: Option<f64> = None;
+        let mut repl_state = provider_claude::anthropic_passthrough::RawSseReplState::new(&replacements);
+
+        yield Ok::<Event, Infallible>(Event::default().comment("ok"));
+
+        while let Some(item) = upstream.next().await {
+            match item {
+                Ok(frame) => {
+                    provider_claude::anthropic_passthrough::accumulate_stream_usage(&frame, &mut usage);
+                    if ttft_ms.is_none()
+                        && provider_claude::anthropic_passthrough::is_upstream_content_delta(&frame)
+                    {
+                        ttft_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    for (event, data) in repl_state.on_frame(&frame.event, frame.data, &replacements) {
+                        match anthropic_sse_event(&event, &data) {
+                            Ok(event) => yield Ok(event),
+                            Err(error) => {
+                                if let Some(stats) = stats.as_ref() {
+                                    stats.record_error(&model, &error);
+                                }
+                                yield Ok(anthropic_error_event(&error));
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    let message = truncate_for_sse(&error.to_string());
+                    if let Some(stats) = stats.as_ref() {
+                        stats.record_error(&model, &message);
+                    }
+                    for (event, data) in repl_state.flush_all(&replacements) {
+                        if let Ok(event) = anthropic_sse_event(&event, &data) {
+                            yield Ok(event);
+                        }
+                    }
+                    yield Ok(anthropic_error_event(&message));
+                    break;
+                }
+            }
+        }
+
+        for (event, data) in repl_state.flush_all(&replacements) {
+            if let Ok(event) = anthropic_sse_event(&event, &data) {
+                yield Ok(event);
+            }
+        }
+        if let Some(stats) = stats.as_ref() {
+            stats.record_response(
+                &model,
+                usage,
+                ttft_ms,
+                started.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+        if let Some(log) = conversation_log.as_ref() {
+            log.log(
+                &session_id,
+                &request_id,
+                "<<<",
+                "Anthropic Messages stream",
+                &format!("duration_ms={:.1}", started.elapsed().as_secs_f64() * 1000.0),
+            );
+        }
+    };
+    let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+    let mut response = sse.into_response();
+    response.headers_mut().insert(
+        header::HeaderName::from_static("x-request-id"),
+        request_id_header(&response_request_id),
+    );
+    response
+}
+
+fn anthropic_sse_event(event: &str, data: &serde_json::Value) -> Result<Event, String> {
+    let payload = serde_json::to_string(data)
+        .map_err(|error| format!("failed to serialize Anthropic SSE frame: {error}"))?;
+    Ok(Event::default().event(event).data(payload))
+}
+
+fn anthropic_error_event(message: &str) -> Event {
+    Event::default().event("error").data(
+        serde_json::json!({
+            "type": "error",
+            "error": {"type": "api_error", "message": message},
+        })
+        .to_string(),
+    )
+}
+
+fn truncate_for_sse(message: &str) -> String {
+    const MAX: usize = 500;
+    if message.chars().count() <= MAX {
+        return message.to_string();
+    }
+    let mut out = message.chars().take(MAX).collect::<String>();
+    out.push_str("... (truncated)");
+    out
+}
+
+fn anthropic_request_id_header(request_id: &str) -> [(header::HeaderName, header::HeaderValue); 1] {
+    [(
+        header::HeaderName::from_static("x-request-id"),
+        request_id_header(request_id),
+    )]
+}
+
+fn request_id_header(request_id: &str) -> header::HeaderValue {
+    header::HeaderValue::from_str(request_id)
+        .unwrap_or_else(|_| header::HeaderValue::from_static("unknown"))
+}
+
+fn anthropic_error_response(error: AppError) -> Response {
+    let (status, kind) = match &error {
+        AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "authentication_error"),
+        AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
+        AppError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found_error"),
+        AppError::ServerError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "api_error"),
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "type": "error",
+            "error": {"type": kind, "message": error.to_string()},
+        })),
+    )
+        .into_response()
 }
 
 /// Handler for POST /v1/responses (OpenAI Responses API protocol).
@@ -1217,7 +1718,53 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
     use std::time::{Duration, Instant};
+    use wiremock::matchers::{body_partial_json, header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    static CLAUDE_CREDS_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct TempClaudeCreds {
+        path: PathBuf,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl TempClaudeCreds {
+        fn dummy_token() -> &'static str {
+            "sk-ant-oat01-omni-dummy"
+        }
+
+        fn install(tag: &str) -> Self {
+            let body = format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"{}","expiresAt":3000000000000,"subscriptionType":"max"}}}}"#,
+                Self::dummy_token()
+            );
+            let path = std::env::temp_dir().join(format!(
+                "omni-claude-creds-{}-{}.json",
+                tag,
+                Uuid::new_v4()
+            ));
+            std::fs::write(&path, body).expect("write temp Claude creds");
+            let prev = std::env::var_os("CLAUDE_CREDENTIALS_PATH");
+            unsafe {
+                std::env::set_var("CLAUDE_CREDENTIALS_PATH", &path);
+            }
+            Self { path, prev }
+        }
+    }
+
+    impl Drop for TempClaudeCreds {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(value) => std::env::set_var("CLAUDE_CREDENTIALS_PATH", value),
+                    None => std::env::remove_var("CLAUDE_CREDENTIALS_PATH"),
+                }
+            }
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 
     fn free_port() -> u16 {
         std::net::TcpListener::bind("127.0.0.1:0")
@@ -1268,8 +1815,10 @@ mod tests {
         let models = provider_model_values("claude", provider.profile().models_list())
             .expect("claude model catalog serializes");
         let catalog = claude_model_catalog(provider.profile());
+        let provider = Arc::new(provider);
         ProviderEntry {
-            provider: Arc::new(provider),
+            provider: provider.clone(),
+            claude_native: Some(provider),
             models,
             catalog,
         }
@@ -1282,8 +1831,10 @@ mod tests {
         let models = provider_model_values("claude", provider.profile().models_list())
             .expect("claude model catalog serializes");
         let catalog = claude_model_catalog(provider.profile());
+        let provider = Arc::new(provider);
         ProviderEntry {
-            provider: Arc::new(provider),
+            provider: provider.clone(),
+            claude_native: Some(provider),
             models,
             catalog,
         }
@@ -1292,6 +1843,7 @@ mod tests {
     fn grok_entry(base_url: &str) -> ProviderEntry {
         ProviderEntry {
             provider: Arc::new(GrokProvider::new_for_test("k", base_url)),
+            claude_native: None,
             models: provider_model_values("grok", GrokProvider::models_list())
                 .expect("grok model catalog serializes"),
             catalog: grok_model_catalog(),
@@ -1301,6 +1853,7 @@ mod tests {
     fn live_grok_entry() -> ProviderEntry {
         ProviderEntry {
             provider: Arc::new(GrokProvider::new(None).expect("grok provider with creds")),
+            claude_native: None,
             models: provider_model_values("grok", GrokProvider::models_list())
                 .expect("grok model catalog serializes"),
             catalog: grok_model_catalog(),
@@ -1424,6 +1977,38 @@ mod tests {
         responses_handler(State(state), HeaderMap::new(), None, Json(req)).await
     }
 
+    async fn call_anthropic_messages_handler(
+        state: Arc<AppState>,
+        body: &str,
+    ) -> axum::response::Response {
+        anthropic_messages_handler(
+            State(state),
+            HeaderMap::new(),
+            None,
+            Request::builder()
+                .uri("/v1/messages")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn call_anthropic_count_tokens_handler(
+        state: Arc<AppState>,
+        body: &str,
+    ) -> axum::response::Response {
+        anthropic_count_tokens_handler(
+            State(state),
+            HeaderMap::new(),
+            None,
+            Request::builder()
+                .uri("/v1/messages/count_tokens")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+    }
+
     #[test]
     fn test_mk_app_with_and_router_surfaces() {
         // WHY: build_router must register all production surfaces with the auth
@@ -1448,6 +2033,29 @@ mod tests {
                 .await
                 .expect("router responds");
             assert_eq!(resp.status(), StatusCode::OK);
+
+            for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+                let app = mk_app_with(
+                    HashMap::from([("claude".to_string(), claude_entry())]),
+                    Arc::new(HashSet::new()),
+                );
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(path)
+                            .header("content-type", "application/json")
+                            .body(Body::from("not json"))
+                            .unwrap(),
+                    )
+                    .await
+                    .expect("router responds");
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{path} must be registered; 404 means build_router missed it"
+                );
+            }
         });
     }
 
@@ -1540,6 +2148,221 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_anthropic_messages_rejects_when_claude_disabled() {
+        let mut providers = HashMap::new();
+        providers.insert("grok".into(), grok_entry("http://127.0.0.1:9"));
+        let resp = call_anthropic_messages_handler(
+            state_with(providers),
+            r#"{"model":"grok-4.3","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("claude provider")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_messages_rejects_non_claude_prefix() {
+        let mut providers = HashMap::new();
+        providers.insert("claude".into(), claude_entry());
+        providers.insert("grok".into(), grok_entry("http://127.0.0.1:9"));
+        let resp = call_anthropic_messages_handler(
+            state_with(providers),
+            r#"{"model":"grok:grok-4.3","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("only claude models")
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_anthropic_messages_nonstream_passthrough_and_prefix_strip() {
+        let _guard = CLAUDE_CREDS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _creds = TempClaudeCreds::install("anth-nonstream");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(query_param("beta", "true"))
+            .and(header(
+                "authorization",
+                format!("Bearer {}", TempClaudeCreds::dummy_token()).as_str(),
+            ))
+            .and(body_partial_json(serde_json::json!({
+                "model": "claude-sonnet-4-6",
+                "stream": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_native",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type":"text","text":"hello"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": {
+                    "input_tokens": 11,
+                    "output_tokens": 3,
+                    "cache_read_input_tokens": 2,
+                    "cache_creation_input_tokens": 1
+                },
+                "future_field": {"kept": true}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut providers = HashMap::new();
+        providers.insert("claude".into(), claude_entry_with_base(&server.uri()));
+        let (state, _stats_guard) = state_with_stats(providers);
+        let resp = call_anthropic_messages_handler(
+            state.clone(),
+            r#"{"model":"claude:sonnet","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["id"], "msg_native");
+        assert_eq!(v["future_field"]["kept"], true);
+        let snap = state.stats.as_ref().unwrap().snapshot();
+        let model = &snap.models["claude:claude-sonnet-4-6"];
+        assert_eq!(model.requests, 1);
+        assert_eq!(model.input_tokens, 11);
+        assert_eq!(model.output_tokens, 3);
+        assert_eq!(model.cache_read_input_tokens, 2);
+        assert_eq!(model.cache_creation_input_tokens, 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_anthropic_count_tokens_proxies_native_shape() {
+        let _guard = CLAUDE_CREDS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _creds = TempClaudeCreds::install("anth-count");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .and(query_param("beta", "true"))
+            .and(header(
+                "authorization",
+                format!("Bearer {}", TempClaudeCreds::dummy_token()).as_str(),
+            ))
+            .and(body_partial_json(serde_json::json!({
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role":"user","content":"hi"}]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "input_tokens": 7
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut providers = HashMap::new();
+        providers.insert("claude".into(), claude_entry_with_base(&server.uri()));
+        let resp = call_anthropic_count_tokens_handler(
+            state_with(providers),
+            r#"{"model":"sonnet","max_tokens":99,"temperature":0.2,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["input_tokens"], 7);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_anthropic_messages_stream_preserves_raw_events() {
+        let _guard = CLAUDE_CREDS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _creds = TempClaudeCreds::install("anth-stream");
+
+        let sse_body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0,\"cache_read_input_tokens\":1}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(query_param("beta", "true"))
+            .and(body_partial_json(serde_json::json!({"stream": true})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_body),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut providers = HashMap::new();
+        providers.insert("claude".into(), claude_entry_with_base(&server.uri()));
+        let (state, _stats_guard) = state_with_stats(providers);
+        let resp = call_anthropic_messages_handler(
+            state.clone(),
+            r#"{"model":"sonnet","max_tokens":8,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("event: message_start"), "{text}");
+        assert!(text.contains("event: content_block_delta"), "{text}");
+        assert!(text.contains("\"text\":\"hi\""), "{text}");
+        assert!(text.contains("event: message_stop"), "{text}");
+        assert!(
+            !text.contains("[DONE]"),
+            "Anthropic SSE must not use OpenAI sentinels: {text}"
+        );
+        let snap = state.stats.as_ref().unwrap().snapshot();
+        let model = &snap.models["claude:claude-sonnet-4-6"];
+        assert_eq!(model.requests, 1);
+        assert_eq!(model.input_tokens, 5);
+        assert_eq!(model.output_tokens, 2);
+        assert_eq!(model.cache_read_input_tokens, 1);
+    }
+
+    #[tokio::test]
     async fn test_stats_records_request_response_and_error() {
         // WHY: /stats replaces the provider-specific binary stats endpoints.
         // It must count routed requests, token usage on successful non-stream
@@ -1576,6 +2399,7 @@ mod tests {
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(StaticProvider),
+                claude_native: None,
                 models: provider_model_values("grok", GrokProvider::models_list()).unwrap(),
                 catalog: grok_model_catalog(),
             },
@@ -1668,6 +2492,7 @@ mod tests {
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(StaticProvider),
+                claude_native: None,
                 models: provider_model_values("grok", GrokProvider::models_list()).unwrap(),
                 catalog: grok_model_catalog(),
             },
@@ -1748,6 +2573,7 @@ mod tests {
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(StreamingProvider),
+                claude_native: None,
                 models: provider_model_values("grok", GrokProvider::models_list()).unwrap(),
                 catalog: grok_model_catalog(),
             },
@@ -2057,6 +2883,7 @@ mod tests {
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(StaticProvider),
+                claude_native: None,
                 models: provider_model_values("grok", GrokProvider::models_list()).unwrap(),
                 catalog: grok_model_catalog(),
             },
@@ -2120,6 +2947,7 @@ mod tests {
             "grok".into(),
             ProviderEntry {
                 provider: Arc::new(StaticProvider),
+                claude_native: None,
                 models: provider_model_values("grok", GrokProvider::models_list()).unwrap(),
                 catalog: grok_model_catalog(),
             },
@@ -2467,6 +3295,15 @@ rule = [
             &[("Authorization", "Bearer wrong")],
         );
         assert_eq!(out3.status, 401);
+        let out_anth = post_json(
+            port,
+            "/v1/messages",
+            r#"{"model":"sonnet","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        assert_eq!(out_anth.status, 401);
+        let v = omni_common::test_support::parse_json(&out_anth.body);
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "authentication_error");
         drop(child);
 
         // without keys (empty or --no-auth) -> 200 even no header

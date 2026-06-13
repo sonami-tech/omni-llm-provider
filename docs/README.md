@@ -31,6 +31,11 @@ logic remains isolated in provider crates.
   chunks terminated by `data: [DONE]`.
 - `POST /v1/responses` - supported OpenAI Responses subset, non-stream JSON or
   Responses SSE events.
+- `POST /v1/messages` - native Anthropic Messages inbound for Claude models
+  only. This bypasses canonical OpenAI framing and forwards Anthropic JSON/SSE
+  through the Claude provider's fingerprint path.
+- `POST /v1/messages/count_tokens` - native Anthropic token counting for Claude
+  models only.
 - `GET /v1/models`, `GET /models` - provider-owned canonical model catalogs.
   Shorthand aliases are accepted on requests but are not emitted as model ids.
 - `GET /stats` - persistent request, token, and error counters.
@@ -77,6 +82,19 @@ Credentials are read fresh per request, never cached. Claude reads
 `~/.claude/.credentials.json` or `$CLAUDE_CREDENTIALS_PATH`. Grok resolves
 `$XAI_CREDENTIALS_PATH`, then `~/.xai/.credentials.json`, then
 `~/.grok/auth.json`.
+
+Inbound compatibility:
+
+| Inbound API surface | Claude backend | Grok backend | Planned Codex/OpenAI backend |
+|---|---:|---:|---:|
+| OpenAI `/v1/chat/completions` | Yes | Yes | Planned |
+| OpenAI `/v1/responses` | Yes | Yes | Planned |
+| Anthropic `/v1/messages` | Yes | No | No |
+| Anthropic `/v1/messages/count_tokens` | Yes | No | No |
+
+Anthropic inbound is intentionally provider-native. It routes only to Claude;
+use OpenAI-compatible inbound surfaces for Grok and the planned Codex/OpenAI
+backend.
 
 Provider maintenance docs live under `docs/providers/`. Live provider tests are
 explicitly opt-in:
