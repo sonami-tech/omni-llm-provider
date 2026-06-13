@@ -56,6 +56,7 @@ shared trait because Grok and Codex cannot preserve Anthropic wire fidelity.
 
 ```bash
 cargo build -p omni
+cargo run -p omni -- --version
 cargo run -p omni -- --providers claude,grok,codex --port 18321
 ```
 

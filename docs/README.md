@@ -50,12 +50,14 @@ fingerprint logic remains isolated in provider crates.
 
 ```bash
 cargo build --workspace
+cargo run -p omni -- --version
 cargo run -p omni -- --providers claude,grok,codex --no-auth --port 18321
 cargo test --workspace
 ```
 
 Useful server flags:
 
+- `--version` prints the Omni binary version and exits.
 - `--providers claude,grok,codex` / `OMNI_PROVIDERS`
 - `--port 18321` / `OMNI_PORT`
 - `--bind 127.0.0.1` / `OMNI_BIND`
@@ -73,6 +75,8 @@ If `--stats-db` is omitted, Omni writes stats to a fixed temp-file path
 stats or when running more than one server instance.
 
 `OMNI_API_KEYS` enables bearer-token auth when set to a comma-separated key list.
+On startup, Omni logs its banner and current package version before serving
+requests.
 
 Current shorthand aliases are resolved from provider-owned catalogs at startup:
 
