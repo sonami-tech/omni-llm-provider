@@ -13,7 +13,6 @@ use omni_common::Replacements;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::credentials::Credentials;
 use crate::fingerprint::{FingerprintProfile, RequestContext};
 use crate::models::ModelDef;
 use crate::translate::{
@@ -619,9 +618,7 @@ impl ClaudeProvider {
         body: &Value,
         ctx: &RequestContext,
     ) -> Result<Value, ProviderError> {
-        let creds = Credentials::load_fresh_async(&Credentials::default_path())
-            .await
-            .map_err(super::map_upstream_err)?;
+        let creds = self.credentials_for_request().await?;
         let mut value = self
             .client
             .send_messages_json(&creds, ctx, body)
@@ -636,9 +633,7 @@ impl ClaudeProvider {
         body: &Value,
         ctx: &RequestContext,
     ) -> Result<RawFrameStream, ProviderError> {
-        let creds = Credentials::load_fresh_async(&Credentials::default_path())
-            .await
-            .map_err(super::map_upstream_err)?;
+        let creds = self.credentials_for_request().await?;
         let stream = self
             .client
             .send_messages_stream_raw(&creds, ctx, body)
@@ -654,9 +649,7 @@ impl ClaudeProvider {
         body: &Value,
         ctx: &RequestContext,
     ) -> Result<Value, ProviderError> {
-        let creds = Credentials::load_fresh_async(&Credentials::default_path())
-            .await
-            .map_err(super::map_upstream_err)?;
+        let creds = self.credentials_for_request().await?;
         self.client
             .count_tokens(&creds, ctx, body)
             .await

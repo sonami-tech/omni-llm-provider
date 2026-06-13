@@ -740,7 +740,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::Stream;
-use reqwest::Client;
+use reqwest::{Client, header::HeaderMap};
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -763,6 +763,25 @@ pub struct UpstreamClient {
     /// server. The request paths (`/v1/messages?beta=true` etc.) are appended per
     /// call, so the exact wire path is identical for production and tests.
     base: String,
+    auth: ClaudeAuthConfig,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ClaudeAuthConfig {
+    Default,
+    Custom {
+        authorization_bearer: Option<String>,
+        headers: Vec<(String, String)>,
+        authorization_bearer_env: Option<String>,
+        api_key_env: Option<String>,
+        custom_headers_env: Option<String>,
+    },
+}
+
+impl ClaudeAuthConfig {
+    pub(crate) fn is_custom(&self) -> bool {
+        matches!(self, Self::Custom { .. })
+    }
 }
 
 impl UpstreamClient {
@@ -785,6 +804,15 @@ impl UpstreamClient {
         profile: &'static FingerprintProfile,
         base: impl Into<String>,
     ) -> Result<Self, UpstreamError> {
+        Self::new_with_profile_base_and_auth(profile, base, ClaudeAuthConfig::Default)
+    }
+
+    pub(crate) fn new_with_profile_base_and_auth(
+        profile: &'static FingerprintProfile,
+        base: impl Into<String>,
+        auth: ClaudeAuthConfig,
+    ) -> Result<Self, UpstreamError> {
+        validate_auth_config(&auth).map_err(UpstreamError::Decode)?;
         let http = Client::builder()
             .use_rustls_tls()
             .http2_prior_knowledge()
@@ -801,6 +829,7 @@ impl UpstreamClient {
             http,
             profile,
             base,
+            auth,
         })
     }
 
@@ -814,6 +843,10 @@ impl UpstreamClient {
     /// The `/v1/messages/count_tokens` URL for this client's base.
     fn count_tokens_url(&self) -> String {
         format!("{}/v1/messages/count_tokens?beta=true", self.base)
+    }
+
+    pub(crate) fn uses_custom_auth(&self) -> bool {
+        self.auth.is_custom()
     }
 
     /// Send a non-streaming JSON body to /v1/messages with retry on 5xx and
@@ -845,8 +878,10 @@ impl UpstreamClient {
                         _ => None,
                     };
 
-                    // 401: re-read credentials once, then retry.
-                    if status == Some(401) && !refreshed_credentials {
+                    // 401 on the default Claude Code path means the CLI may
+                    // have refreshed credentials on disk. Custom gateways own
+                    // their auth, so never fall back to the local OAuth file.
+                    if status == Some(401) && !refreshed_credentials && !self.auth.is_custom() {
                         refreshed_credentials = true;
                         match Credentials::load_fresh_async(&Credentials::default_path()).await {
                             Ok(fresh) => {
@@ -924,7 +959,7 @@ impl UpstreamClient {
                         UpstreamError::Anthropic { status, .. } => Some(*status),
                         _ => None,
                     };
-                    if status == Some(401) && !refreshed_credentials {
+                    if status == Some(401) && !refreshed_credentials && !self.auth.is_custom() {
                         refreshed_credentials = true;
                         match Credentials::load_fresh_async(&Credentials::default_path()).await {
                             Ok(fresh) => {
@@ -970,7 +1005,7 @@ impl UpstreamClient {
         ctx: &RequestContext,
         body: Vec<u8>,
     ) -> Result<Value, UpstreamError> {
-        let headers = build_headers(creds, ctx, self.profile);
+        let headers = self.build_headers(creds, ctx)?;
 
         let resp = self
             .http
@@ -1028,7 +1063,7 @@ impl UpstreamClient {
                         UpstreamError::Anthropic { status, .. } => Some(*status),
                         _ => None,
                     };
-                    if status == Some(401) && !refreshed_credentials {
+                    if status == Some(401) && !refreshed_credentials && !self.auth.is_custom() {
                         refreshed_credentials = true;
                         if let Ok(fresh) =
                             Credentials::load_fresh_async(&Credentials::default_path()).await
@@ -1100,7 +1135,7 @@ impl UpstreamClient {
                         UpstreamError::Anthropic { status, .. } => Some(*status),
                         _ => None,
                     };
-                    if status == Some(401) && !refreshed_credentials {
+                    if status == Some(401) && !refreshed_credentials && !self.auth.is_custom() {
                         refreshed_credentials = true;
                         if let Ok(fresh) =
                             Credentials::load_fresh_async(&Credentials::default_path()).await
@@ -1132,7 +1167,7 @@ impl UpstreamClient {
         ctx: &RequestContext,
         body: Vec<u8>,
     ) -> Result<BoxByteStream, UpstreamError> {
-        let headers = build_headers(creds, ctx, self.profile);
+        let headers = self.build_headers(creds, ctx)?;
         let resp = self
             .http
             .post(self.messages_url())
@@ -1155,6 +1190,130 @@ impl UpstreamClient {
 
         let boxed: BoxByteStream = Box::pin(resp.bytes_stream());
         Ok(boxed)
+    }
+
+    fn build_headers(
+        &self,
+        creds: &Credentials,
+        ctx: &RequestContext,
+    ) -> Result<HeaderMap, UpstreamError> {
+        let mut headers = build_headers(creds, ctx, self.profile);
+        match &self.auth {
+            ClaudeAuthConfig::Default => {}
+            ClaudeAuthConfig::Custom {
+                authorization_bearer,
+                headers: custom_headers,
+                authorization_bearer_env,
+                api_key_env,
+                custom_headers_env,
+            } => {
+                headers.remove("authorization");
+                for (name, value) in custom_headers {
+                    insert_custom_header(&mut headers, name, value);
+                }
+                if let Some(env_name) = custom_headers_env {
+                    for (name, value) in headers_from_env(env_name)? {
+                        insert_custom_header(&mut headers, &name, &value);
+                    }
+                }
+                let env_bearer = authorization_bearer_env.as_ref().and_then(|env_name| {
+                    std::env::var(env_name)
+                        .ok()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                });
+                let token = authorization_bearer
+                    .as_ref()
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+                    .or(env_bearer);
+                if let Some(token) = token {
+                    insert_authorization_bearer(&mut headers, &token);
+                } else if !custom_headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("x-api-key"))
+                    && let Some(api_key) = api_key_env.as_ref().and_then(|env_name| {
+                        std::env::var(env_name)
+                            .ok()
+                            .map(|value| value.trim().to_string())
+                            .filter(|value| !value.is_empty())
+                    })
+                {
+                    insert_custom_header(&mut headers, "x-api-key", &api_key);
+                }
+            }
+        }
+        Ok(headers)
+    }
+}
+
+fn validate_auth_config(auth: &ClaudeAuthConfig) -> Result<(), String> {
+    let ClaudeAuthConfig::Custom {
+        headers,
+        custom_headers_env,
+        ..
+    } = auth
+    else {
+        return Ok(());
+    };
+    for (name, value) in headers {
+        validate_custom_header(name, value)?;
+    }
+    if let Some(env_name) = custom_headers_env
+        && let Ok(raw) = std::env::var(env_name)
+    {
+        for (name, value) in parse_custom_headers(&raw)? {
+            validate_custom_header(&name, &value)?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_custom_headers(raw: &str) -> Result<Vec<(String, String)>, String> {
+    let mut headers = Vec::new();
+    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| "custom header must be formatted as `Name: value`".to_string())?;
+        let name = name.trim();
+        let value = value.trim();
+        if name.is_empty() || value.is_empty() {
+            return Err("custom header name and value must both be non-empty".into());
+        }
+        validate_custom_header(name, value)?;
+        headers.push((name.to_string(), value.to_string()));
+    }
+    Ok(headers)
+}
+
+fn headers_from_env(env_name: &str) -> Result<Vec<(String, String)>, UpstreamError> {
+    std::env::var(env_name)
+        .ok()
+        .map(|raw| parse_custom_headers(&raw).map_err(UpstreamError::Decode))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+fn validate_custom_header(name: &str, value: &str) -> Result<(), String> {
+    reqwest::header::HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| format!("invalid custom header name `{name}`"))?;
+    reqwest::header::HeaderValue::from_str(value)
+        .map_err(|_| format!("invalid custom header value for `{name}`"))?;
+    Ok(())
+}
+
+fn insert_custom_header(headers: &mut HeaderMap, name: &str, value: &str) {
+    if let (Ok(name), Ok(value)) = (
+        reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+        reqwest::header::HeaderValue::from_str(value),
+    ) {
+        headers.insert(name, value);
+    }
+}
+
+fn insert_authorization_bearer(headers: &mut HeaderMap, token: &str) {
+    if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
+        headers.insert(reqwest::header::AUTHORIZATION, value);
     }
 }
 

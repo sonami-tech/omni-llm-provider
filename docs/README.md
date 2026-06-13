@@ -1,15 +1,16 @@
 # omni-llm-provider
 
-OpenAI-compatible Rust proxy that serves Anthropic Claude and xAI Grok from one
-`omni` server binary. Provider-specific protocol, credential, and fingerprint
-logic remains isolated in provider crates.
+OpenAI-compatible Rust proxy that serves Anthropic Claude, xAI Grok, and Codex
+from one `omni` server binary. Provider-specific protocol, credential, and
+fingerprint logic remains isolated in provider crates.
 
 ## Binary
 
 - `omni` - the only server binary. Routes by canonical upstream model id
-  (`claude-sonnet-4-6`, `grok-4.3`), documented shorthand alias (`sonnet`,
-  `opus`, `haiku`, `fable`, `grok`, `composer`), or optional provider prefix
-  (`claude:...`, `grok:...`) when a caller needs to force a provider.
+  (`claude-sonnet-4-6`, `grok-4.3`, or the configured Codex model),
+  documented shorthand alias (`sonnet`, `opus`, `haiku`, `fable`, `grok`,
+  `composer`, `codex`), or optional provider prefix (`claude:...`,
+  `grok:...`, `codex:...`) when a caller needs to force a provider.
 
 ## Crates
 
@@ -22,15 +23,19 @@ logic remains isolated in provider crates.
   and model catalog.
 - `crates/provider-grok` - xAI Grok provider and OpenAI-compatible xAI wire
   mapping.
+- `crates/provider-codex` - Codex configuration-backed provider, Codex/OpenAI
+  auth resolution, and Responses wire mapping.
 - `crates/bin/omni` - server setup, routing, auth, stats, and model catalog
   aggregation.
 
 ## HTTP Surface
 
 - `POST /v1/chat/completions` - non-stream JSON or `stream:true` OpenAI SSE
-  chunks terminated by `data: [DONE]`.
+  chunks terminated by `data: [DONE]`. Codex supports non-streaming on this
+  route; Codex `stream:true` is rejected until native Responses SSE is added.
 - `POST /v1/responses` - supported OpenAI Responses subset, non-stream JSON or
-  Responses SSE events.
+  Responses SSE events. Codex supports non-streaming on this route; Codex
+  `stream:true` is rejected until native Responses SSE is added.
 - `POST /v1/messages` - native Anthropic Messages inbound for Claude models
   only. This bypasses canonical OpenAI framing and forwards Anthropic JSON/SSE
   through the Claude provider's fingerprint path.
@@ -45,13 +50,13 @@ logic remains isolated in provider crates.
 
 ```bash
 cargo build --workspace
-cargo run -p omni -- --providers claude,grok --no-auth --port 18321
+cargo run -p omni -- --providers claude,grok,codex --no-auth --port 18321
 cargo test --workspace
 ```
 
 Useful server flags:
 
-- `--providers claude,grok` / `OMNI_PROVIDERS`
+- `--providers claude,grok,codex` / `OMNI_PROVIDERS`
 - `--port 18321` / `OMNI_PORT`
 - `--bind 127.0.0.1` / `OMNI_BIND`
 - `--public` / `OMNI_PUBLIC` for `0.0.0.0`
@@ -77,24 +82,43 @@ Current shorthand aliases are resolved from provider-owned catalogs at startup:
 - `fable` -> `claude-fable-5`
 - `grok` -> `grok-4.3`
 - `composer` -> `grok-composer-2.5-fast`
+- `codex` -> the current Codex model from `$CODEX_HOME/config.toml` or
+  `~/.codex/config.toml`, falling back to the provider default
 
 Credentials are read fresh per request, never cached. Claude reads
 `~/.claude/.credentials.json` or `$CLAUDE_CREDENTIALS_PATH`. Grok resolves
 `$XAI_CREDENTIALS_PATH`, then `~/.xai/.credentials.json`, then
-`~/.grok/auth.json`.
+`~/.grok/auth.json`. Codex reads `$CODEX_HOME` or `~/.codex` config and auth
+state per request.
+
+Custom upstream endpoint overrides are explicit and isolated from default
+credentials:
+
+- Claude: `ANTHROPIC_BASE_URL` switches Claude to a custom Anthropic-compatible
+  gateway. `ANTHROPIC_AUTH_TOKEN` sends `Authorization: Bearer ...`; otherwise
+  `ANTHROPIC_API_KEY` sends `x-api-key`. `ANTHROPIC_CUSTOM_HEADERS` accepts one
+  `Name: value` header per line. In this mode Omni does not read or send the
+  local Claude OAuth token.
+- Grok: `GROK_MODELS_BASE_URL` switches Grok to a custom OpenAI-compatible
+  endpoint. `XAI_API_KEY` sends `Authorization: Bearer ...`; if it is unset,
+  no Authorization header is sent. In this mode Omni does not read or send
+  `$XAI_CREDENTIALS_PATH`, `~/.xai`, or `~/.grok` credentials.
+- Codex: Codex custom providers come from Codex config. A custom provider's
+  `[model_providers.<name>.auth] command`, `experimental_bearer_token`, or
+  `env_key` owns auth for that provider and does not fall back to OpenAI auth
+  unless `requires_openai_auth = true`.
 
 Inbound compatibility:
 
-| Inbound API surface | Claude backend | Grok backend | Planned Codex/OpenAI backend |
+| Inbound API surface | Claude backend | Grok backend | Codex backend |
 |---|---:|---:|---:|
-| OpenAI `/v1/chat/completions` | Yes | Yes | Planned |
-| OpenAI `/v1/responses` | Yes | Yes | Planned |
+| OpenAI `/v1/chat/completions` | Yes | Yes | Non-stream |
+| OpenAI `/v1/responses` | Yes | Yes | Non-stream |
 | Anthropic `/v1/messages` | Yes | No | No |
 | Anthropic `/v1/messages/count_tokens` | Yes | No | No |
 
 Anthropic inbound is intentionally provider-native. It routes only to Claude;
-use OpenAI-compatible inbound surfaces for Grok and the planned Codex/OpenAI
-backend.
+use OpenAI-compatible inbound surfaces for Grok and Codex.
 
 Provider maintenance docs live under `docs/providers/`. Live provider tests are
 explicitly opt-in:

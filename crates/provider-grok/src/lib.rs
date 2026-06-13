@@ -4,10 +4,13 @@
 //!
 //! Uses omni-core canonical types (CanonicalRequest / CanonicalResponse + LlmProvider trait).
 //! Makes real HTTP calls to https://api.x.ai/v1/chat/completions (primary OpenAI-compatible surface).
-//! Auth: a bearer key resolved fresh per request from files (no env-var key), mirroring
-//! the Claude provider. Precedence: `$XAI_CREDENTIALS_PATH` -> `~/.xai/.credentials.json`
-//! (static key) -> `~/.grok/auth.json` (the Grok CLI's OIDC login, auto-detected). See
-//! `omni_common::credentials::GrokCredentials` for the source chain and on-disk shapes.
+//! Auth: default xAI mode resolves a bearer key fresh per request from files,
+//! mirroring the Claude provider. Precedence: `$XAI_CREDENTIALS_PATH`,
+//! `~/.xai/.credentials.json` (static key), then `~/.grok/auth.json` (the Grok
+//! CLI's OIDC login, auto-detected). Custom endpoint mode is explicit and uses
+//! only its configured custom auth, so default xAI credentials cannot leak to an
+//! arbitrary base URL. See `omni_common::credentials::GrokCredentials` for the
+//! default source chain and on-disk shapes.
 //!
 //! ## Headers / wire notes (research findings, 2026-06)
 //! - **Standard, no special gates**: `Authorization: Bearer <api key>`, `Content-Type: application/json`.
@@ -124,10 +127,20 @@ pub struct GrokModelInfo {
 #[derive(Debug)]
 pub struct GrokProvider {
     client: Client,
-    // Stored key is only for explicit ctor / test helpers.
-    // Normal path always prefers fresh load from the credentials file.
-    api_key: Option<String>,
     base_url: String,
+    auth: GrokAuthConfig,
+}
+
+#[derive(Debug, Clone)]
+enum GrokAuthConfig {
+    Default {
+        fallback_api_key: Option<String>,
+    },
+    Custom {
+        api_key: Option<String>,
+        env_key: Option<String>,
+        extra_headers: Vec<(String, String)>,
+    },
 }
 
 impl GrokProvider {
@@ -153,8 +166,10 @@ impl GrokProvider {
 
         Ok(Self {
             client,
-            api_key,
             base_url: DEFAULT_BASE_URL.to_owned(),
+            auth: GrokAuthConfig::Default {
+                fallback_api_key: api_key,
+            },
         })
     }
 
@@ -164,14 +179,37 @@ impl GrokProvider {
         self
     }
 
+    /// Configure this provider as a custom OpenAI-compatible endpoint.
+    ///
+    /// Custom auth is isolated from the default Grok/xAI credential chain:
+    /// `api_key` wins, then `env_key`; if neither yields a token, no
+    /// Authorization header is sent. This mirrors the Grok CLI custom-model
+    /// rule that explicit model config owns auth and prevents a signed-in xAI
+    /// token from leaking to an arbitrary custom endpoint.
+    pub fn with_custom_auth(
+        mut self,
+        api_key: Option<String>,
+        env_key: Option<String>,
+        extra_headers: Vec<(String, String)>,
+    ) -> Self {
+        self.auth = GrokAuthConfig::Custom {
+            api_key,
+            env_key,
+            extra_headers,
+        };
+        self
+    }
+
     /// Test-only constructor (no env, custom client possible in future).
     /// Not under cfg(test) so bin integration tests and other dependents can construct
     /// a mock instance for routing tests (while production still uses new()).
     pub fn new_for_test(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
             client: Client::new(),
-            api_key: Some(api_key.into()),
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            auth: GrokAuthConfig::Default {
+                fallback_api_key: Some(api_key.into()),
+            },
         }
     }
 
@@ -213,6 +251,11 @@ impl GrokProvider {
     /// `new_for_test`; production `new(None)` never sets one), and otherwise return a clear `Auth`
     /// error naming where we looked.
     async fn resolve_api_key(&self) -> Result<String, ProviderError> {
+        let GrokAuthConfig::Default { fallback_api_key } = &self.auth else {
+            return Err(ProviderError::Auth(
+                "custom Grok auth does not use the default xAI credential chain".into(),
+            ));
+        };
         match GrokCredentials::load_resolved_async().await {
             Ok(creds) => {
                 if let Err(e) = creds.check_expired() {
@@ -224,7 +267,7 @@ impl GrokProvider {
                 Ok(creds.api_key)
             }
             Err(e) => {
-                if let Some(k) = &self.api_key {
+                if let Some(k) = fallback_api_key {
                     debug!(error = %e, "no grok creds file (or load failed); using explicit ctor key");
                     Ok(k.clone())
                 } else {
@@ -233,6 +276,37 @@ impl GrokProvider {
                         e
                     )))
                 }
+            }
+        }
+    }
+
+    async fn auth_headers(&self) -> Result<Vec<(String, String)>, ProviderError> {
+        match &self.auth {
+            GrokAuthConfig::Default { .. } => {
+                let key = self.resolve_api_key().await?;
+                Ok(vec![("Authorization".into(), format!("Bearer {key}"))])
+            }
+            GrokAuthConfig::Custom {
+                api_key,
+                env_key,
+                extra_headers,
+            } => {
+                let mut headers = extra_headers.clone();
+                let token = api_key
+                    .as_ref()
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+                    .or_else(|| {
+                        env_key
+                            .as_ref()
+                            .and_then(|key| std::env::var(key).ok())
+                            .filter(|value| !value.trim().is_empty())
+                    });
+                if let Some(token) = token {
+                    headers.retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
+                    headers.push(("Authorization".into(), format!("Bearer {token}")));
+                }
+                Ok(headers)
             }
         }
     }
@@ -735,19 +809,18 @@ impl LlmProvider for GrokProvider {
         let url = format!("{}/chat/completions", self.base_url);
         debug!(%url, "POST xAI chat completions");
 
-        // Fresh credentials load using the same read-per-request contract as Claude.
-        // See docs/grok-gate.md and omni-common::credentials::GrokCredentials.
-        let effective_key = self.resolve_api_key().await?;
-
-        let http_resp = self
+        let mut request = self
             .client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", effective_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Upstream(format!("network error calling xAI: {}", e)))?;
+            .header("Content-Type", "application/json");
+        for (name, value) in self.auth_headers().await? {
+            request = request.header(name, value);
+        }
+
+        let http_resp =
+            request.json(&body).send().await.map_err(|e| {
+                ProviderError::Upstream(format!("network error calling xAI: {}", e))
+            })?;
 
         let status = http_resp.status();
         if !status.is_success() {
@@ -804,19 +877,18 @@ impl LlmProvider for GrokProvider {
         let body = to_xai_chat_stream_request(&req, &repl);
         let url = format!("{}/chat/completions", self.base_url);
 
-        // Resolve the key fresh exactly like send() (shared helper; never cached).
-        let effective_key = self.resolve_api_key().await?;
+        let auth_headers = self.auth_headers().await?;
         let client = self.client.clone();
 
         let stream = async_stream::stream! {
-            let send_result = client
+            let mut request = client
                 .post(&url)
-                .header("Authorization", format!("Bearer {}", effective_key))
                 .header("Content-Type", "application/json")
-                .header("Accept", "text/event-stream")
-                .json(&body)
-                .send()
-                .await;
+                .header("Accept", "text/event-stream");
+            for (name, value) in auth_headers {
+                request = request.header(name, value);
+            }
+            let send_result = request.json(&body).send().await;
 
             let http_resp = match send_result {
                 Ok(r) => r,
@@ -981,6 +1053,121 @@ mod tests {
         };
         let body = to_xai_chat_request(&req, &empty_repl());
         assert_eq!(body["model"], "grok-composer-2.5-fast");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn custom_auth_no_key_does_not_fall_back_to_xai_credentials() {
+        // WHY: custom model endpoints are arbitrary URLs. A signed-in xAI token
+        // must never be sent to a custom base URL merely because the default
+        // Grok credential chain is available.
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let creds =
+            std::env::temp_dir().join(format!("omni-grok-custom-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&creds, r#"{"apiKey":"xai-must-not-leak"}"#).unwrap();
+        let old = std::env::var("XAI_CREDENTIALS_PATH").ok();
+        unsafe {
+            std::env::set_var("XAI_CREDENTIALS_PATH", creds.to_str().unwrap());
+        }
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "model": "grok-4.3",
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = GrokProvider::new(None)
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_custom_auth(None, None, vec![]);
+        let response = provider
+            .send(CanonicalRequest {
+                model: "grok-4.3".into(),
+                messages: vec![CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Text("hi".into()),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.content, "ok");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].headers.contains_key("authorization"),
+            "custom Grok no-auth endpoint must not receive xAI Authorization"
+        );
+
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("XAI_CREDENTIALS_PATH", v),
+                None => std::env::remove_var("XAI_CREDENTIALS_PATH"),
+            }
+        }
+        let _ = std::fs::remove_file(creds);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn custom_auth_api_key_overrides_xai_credentials() {
+        // WHY: explicit custom-provider auth owns the upstream Authorization
+        // header and must beat any default xAI credential source.
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let creds =
+            std::env::temp_dir().join(format!("omni-grok-custom-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&creds, r#"{"apiKey":"xai-must-not-leak"}"#).unwrap();
+        let old = std::env::var("XAI_CREDENTIALS_PATH").ok();
+        unsafe {
+            std::env::set_var("XAI_CREDENTIALS_PATH", creds.to_str().unwrap());
+        }
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer custom-grok-key",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "model": "grok-4.3",
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = GrokProvider::new(None)
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_custom_auth(Some("custom-grok-key".into()), None, vec![]);
+        let response = provider
+            .send(CanonicalRequest {
+                model: "grok-4.3".into(),
+                messages: vec![CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Text("hi".into()),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.content, "ok");
+
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("XAI_CREDENTIALS_PATH", v),
+                None => std::env::remove_var("XAI_CREDENTIALS_PATH"),
+            }
+        }
+        let _ = std::fs::remove_file(creds);
     }
 
     #[test]

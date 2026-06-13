@@ -973,6 +973,7 @@ dependencies = [
  "omni-common",
  "omni-core",
  "provider-claude",
+ "provider-codex",
  "provider-grok",
  "serde",
  "serde_json",
@@ -1134,6 +1135,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "provider-codex"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "dirs",
+ "futures-util",
+ "omni-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "provider-grok"
 version = "1.0.0"
 dependencies = [
@@ -1150,6 +1172,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
  "wiremock",
 ]
 

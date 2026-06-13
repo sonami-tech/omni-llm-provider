@@ -1,17 +1,18 @@
 //! Omni multi-provider server binary.
 //!
 //! This is the only server binary. Provider-specific protocol, credential, and
-//! fingerprint logic stays in `provider-claude` and `provider-grok`; this binary
+//! fingerprint logic stays in `provider-claude`, `provider-grok`, and
+//! `provider-codex`; this binary
 //! owns HTTP routing, auth, stats, and OpenAI-compatible response framing.
 //!
 //! ## Supported configuration (per task)
-//! - --providers claude,grok   or   OMNI_PROVIDERS=claude,grok (comma sep, order preserved)
+//! - --providers claude,grok,codex   or   OMNI_PROVIDERS=... (comma sep, order preserved)
 //! - --bind 127.0.0.1 by default, or --public as shorthand for --bind 0.0.0.0
 //! - Canonical model routing: real model ids (e.g. "claude-sonnet-4-6", "grok-4.3")
 //!   route directly when they uniquely identify an enabled provider.
 //! - Alias routing: "fable", "opus", "sonnet", "haiku", "grok", and "composer"
 //!   resolve to current provider-owned model ids when unique.
-//! - Optional prefix routing remains an escape hatch: "grok:foo" or "claude:bar".
+//! - Optional prefix routing remains an escape hatch: "grok:foo", "claude:bar", or "codex:bar".
 //!
 //! ## Surfaces (unified OpenAI-compatible)
 //! - POST /v1/chat/completions  (text + sampling; non-stream JSON and stream SSE)
@@ -25,16 +26,17 @@
 //! - omni-common: auth_layer + AppError (OAI-shaped errors) + the shared http
 //!   layer (to_canonical/from_canonical + the SSE stream framer).
 //! - omni-core: CanonicalRequest/Response + LlmProvider trait for the delegation contract.
-//! - Depends on provider-claude (full fingerprint provider) + provider-grok (full).
+//! - Depends on provider-claude (full fingerprint provider), provider-grok, and provider-codex.
 //!
 //! ## Routing implementation (pure, unit-testable)
 //! See `resolve_provider_and_model` below. Pure function; no side effects.
-//! Prefix takes precedence. Provider keys in the map and for prefixes are "claude" / "grok".
+//! Prefix takes precedence. Provider keys in the map and for prefixes are "claude", "grok", "codex".
 //!
 //! ## Boundaries
 //! - Claude fingerprint logic, cch, betas, preamble, and fresh credential reads
 //!   stay in `provider-claude`.
 //! - Grok wire mapping and fresh xAI credential reads stay in `provider-grok`.
+//! - Codex config/auth and Responses wire mapping stay in `provider-codex`.
 //! - Auth and stats are server concerns handled here with `omni-common`.
 //! - Empty key set (via --no-auth or no OMNI_API_KEYS) means "allow all".
 //!
@@ -79,6 +81,7 @@ use omni_core::{
 
 // Re-export the concrete providers so main can construct them by name.
 use provider_claude::ClaudeProvider;
+use provider_codex::CodexProvider;
 use provider_grok::GrokProvider;
 
 const OMNI_ASCII_BANNER: &str = r#"
@@ -96,10 +99,10 @@ const OMNI_ASCII_BANNER: &str = r#"
 #[command(
     name = "omni",
     version,
-    about = "Omni LLM server (claude + grok backends)"
+    about = "Omni LLM server (claude + grok + codex backends)"
 )]
 struct Cli {
-    /// Comma-separated list of providers to enable (claude,grok). Prefix routing uses these names.
+    /// Comma-separated list of providers to enable (claude,grok,codex). Prefix routing uses these names.
     #[arg(
         long,
         env = "OMNI_PROVIDERS",
@@ -173,7 +176,7 @@ struct ModelCatalog {
 
 #[derive(Clone)]
 struct AppState {
-    /// Map from provider key ("claude" | "grok") to live provider + catalog.
+    /// Map from provider key ("claude" | "grok" | "codex") to live provider + catalog.
     providers: HashMap<String, ProviderEntry>,
     stats: Option<Arc<Stats>>,
     conversation_log: Option<Arc<ConversationLog>>,
@@ -182,7 +185,9 @@ struct AppState {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter("info,omni=debug,provider_claude=debug,provider_grok=debug")
+        .with_env_filter(
+            "info,omni=debug,provider_claude=debug,provider_grok=debug,provider_codex=debug",
+        )
         .init();
 
     let cli = Cli::parse();
@@ -196,8 +201,7 @@ async fn main() -> anyhow::Result<()> {
     for name in &enabled {
         let entry = match name.as_str() {
             "claude" => {
-                info!("initializing claude provider");
-                let provider = ClaudeProvider::new()
+                let provider = init_claude_provider()
                     .context("failed to initialize claude provider (fingerprint profile)")?;
                 let models = provider_model_values("claude", provider.profile().models_list())?;
                 let catalog = claude_model_catalog(provider.profile());
@@ -210,12 +214,21 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             "grok" => {
-                info!(
-                    "initializing grok provider (key read per request from ~/.xai/.credentials.json)"
-                );
-                let p = GrokProvider::new(None).context("failed to init grok provider")?;
+                let p = init_grok_provider().context("failed to init grok provider")?;
                 let models = provider_model_values("grok", GrokProvider::models_list())?;
                 let catalog = grok_model_catalog();
+                ProviderEntry {
+                    provider: Arc::new(p),
+                    claude_native: None,
+                    models,
+                    catalog,
+                }
+            }
+            "codex" => {
+                info!("initializing codex provider (config read from CODEX_HOME or ~/.codex)");
+                let p = CodexProvider::new().context("failed to init codex provider")?;
+                let models = provider_model_values("codex", p.models_list())?;
+                let catalog = codex_model_catalog(&p);
                 ProviderEntry {
                     provider: Arc::new(p),
                     claude_native: None,
@@ -274,7 +287,7 @@ async fn main() -> anyhow::Result<()> {
     info!("  try: curl http://{}/health", addr);
     info!("  models:  curl http://{}/v1/models", addr);
     info!("  stats:   curl http://{}/stats", addr);
-    info!("  completions example: model=grok or claude-sonnet-4-6");
+    info!("  completions example: model=grok, codex, or claude-sonnet-4-6");
     info!("  aliases: {}", alias_text);
 
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app)
@@ -290,6 +303,68 @@ fn log_startup_banner() {
         OMNI_ASCII_BANNER.trim_matches('\n'),
         env!("CARGO_PKG_VERSION")
     );
+}
+
+fn init_claude_provider() -> anyhow::Result<ClaudeProvider> {
+    if let Some(base_url) = env_nonempty("ANTHROPIC_BASE_URL") {
+        let authorization_bearer = std::env::var_os("ANTHROPIC_AUTH_TOKEN")
+            .is_some()
+            .then(|| "ANTHROPIC_AUTH_TOKEN".to_string());
+        let api_key = std::env::var_os("ANTHROPIC_API_KEY")
+            .is_some()
+            .then(|| "ANTHROPIC_API_KEY".to_string());
+        let custom_headers = std::env::var_os("ANTHROPIC_CUSTOM_HEADERS")
+            .is_some()
+            .then(|| "ANTHROPIC_CUSTOM_HEADERS".to_string());
+        info!(
+            base_url = %base_url,
+            auth = if authorization_bearer.is_some() {
+                "bearer"
+            } else if api_key.is_some() {
+                "x-api-key"
+            } else {
+                "custom-headers-or-no-auth"
+            },
+            "initializing claude provider with ANTHROPIC_BASE_URL custom gateway"
+        );
+        return ClaudeProvider::new_for_custom_gateway_env(
+            provider_claude::default_profile(),
+            base_url,
+            authorization_bearer,
+            api_key,
+            custom_headers,
+        )
+        .map_err(anyhow::Error::from);
+    }
+
+    info!("initializing claude provider");
+    ClaudeProvider::new().map_err(anyhow::Error::from)
+}
+
+fn init_grok_provider() -> anyhow::Result<GrokProvider> {
+    let provider = GrokProvider::new(None).map_err(anyhow::Error::from)?;
+    if let Some(base_url) = env_nonempty("GROK_MODELS_BASE_URL") {
+        info!(
+            base_url = %base_url,
+            auth = if std::env::var_os("XAI_API_KEY").is_some() { "bearer" } else { "no-auth" },
+            "initializing grok provider with GROK_MODELS_BASE_URL custom endpoint"
+        );
+        return Ok(provider.with_base_url(base_url).with_custom_auth(
+            None,
+            Some("XAI_API_KEY".into()),
+            vec![],
+        ));
+    }
+
+    info!("initializing grok provider (key read per request from ~/.xai/.credentials.json)");
+    Ok(provider)
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn build_router(state: Arc<AppState>, auth_keys: Arc<HashSet<String>>) -> Router {
@@ -431,6 +506,14 @@ fn grok_model_catalog() -> ModelCatalog {
     catalog
 }
 
+fn codex_model_catalog(provider: &CodexProvider) -> ModelCatalog {
+    let mut catalog = ModelCatalog::default();
+    for (alias, canonical) in provider.model_aliases() {
+        catalog.insert(&alias, &canonical);
+    }
+    catalog
+}
+
 impl ModelCatalog {
     fn insert(&mut self, alias: &str, canonical: &str) {
         if let Some(existing) = self.aliases.get(alias) {
@@ -452,7 +535,9 @@ impl ModelCatalog {
 fn format_aliases_for_log(providers: &HashMap<String, ProviderEntry>) -> Option<String> {
     let catalogs = provider_catalogs(providers);
     let mut pairs = Vec::new();
-    for alias in ["sonnet", "opus", "haiku", "fable", "grok", "composer"] {
+    for alias in [
+        "sonnet", "opus", "haiku", "fable", "grok", "composer", "codex",
+    ] {
         let matches = model_matches(alias, &catalogs);
         if matches.len() == 1 {
             pairs.push(format!("{}={}", alias, matches[0].1));
@@ -479,7 +564,7 @@ fn resolve_bind_host(public: bool, bind: Option<&str>) -> anyhow::Result<String>
 }
 
 /// Normalize/validate the providers CLI/env list.
-/// Accepts "claude,grok", trims, lowercases, dedups in order, rejects unknowns.
+/// Accepts "claude,grok,codex", trims, lowercases, dedups in order, rejects unknowns.
 fn normalize_providers(raw: &[String]) -> anyhow::Result<Vec<String>> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -488,15 +573,15 @@ fn normalize_providers(raw: &[String]) -> anyhow::Result<Vec<String>> {
         if p.is_empty() {
             continue;
         }
-        if p != "claude" && p != "grok" {
-            anyhow::bail!("unknown provider {:?}; supported: claude,grok", r);
+        if p != "claude" && p != "grok" && p != "codex" {
+            anyhow::bail!("unknown provider {:?}; supported: claude,grok,codex", r);
         }
         if seen.insert(p.clone()) {
             out.push(p);
         }
     }
     if out.is_empty() {
-        anyhow::bail!("at least one provider required (claude and/or grok)");
+        anyhow::bail!("at least one provider required (claude, grok, and/or codex)");
     }
     Ok(out)
 }
@@ -597,7 +682,7 @@ async fn health_handler() -> impl IntoResponse {
 
 /// Handler: GET /
 async fn root_handler() -> impl IntoResponse {
-    "omni - multi-backend OpenAI-compatible server (claude + grok via canonical model ids, aliases, or provider prefixes)"
+    "omni - multi-backend OpenAI-compatible server (claude + grok + codex via canonical model ids, aliases, or provider prefixes)"
 }
 
 /// Handler: GET /v1/models (and /models)
@@ -1473,6 +1558,13 @@ mod tests {
         ])
     }
 
+    fn catalogs_claude_grok_codex() -> HashMap<String, ModelCatalog> {
+        let codex = CodexProvider::new().expect("codex provider");
+        let mut catalogs = catalogs_claude_grok();
+        catalogs.insert("codex".to_string(), codex_model_catalog(&codex));
+        catalogs
+    }
+
     fn catalogs_only_claude() -> HashMap<String, ModelCatalog> {
         HashMap::from([(
             "claude".to_string(),
@@ -1514,7 +1606,7 @@ mod tests {
 
     #[test]
     fn test_resolve_bare_canonical_and_aliases_when_unique() {
-        let catalogs = catalogs_claude_grok();
+        let catalogs = catalogs_claude_grok_codex();
         let (k, m) = resolve_provider_and_model("claude-sonnet-4-6", &catalogs).unwrap();
         assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-sonnet-4-6"));
 
@@ -1538,6 +1630,10 @@ mod tests {
 
         let (k, m) = resolve_provider_and_model("composer", &catalogs).unwrap();
         assert_eq!((k.as_str(), m.as_str()), ("grok", "grok-composer-2.5-fast"));
+
+        let (k, m) = resolve_provider_and_model("codex", &catalogs).unwrap();
+        assert_eq!(k.as_str(), "codex");
+        assert!(!m.is_empty());
     }
 
     #[test]
@@ -1545,6 +1641,7 @@ mod tests {
         let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
         providers.insert("claude".into(), claude_entry());
         providers.insert("grok".into(), grok_entry("http://127.0.0.1:1"));
+        providers.insert("codex".into(), codex_entry());
 
         let text = format_aliases_for_log(&providers).expect("aliases format");
         for expected in [
@@ -1554,6 +1651,7 @@ mod tests {
             "fable=claude-fable-5",
             "grok=grok-4.3",
             "composer=grok-composer-2.5-fast",
+            "codex=",
         ] {
             assert!(
                 text.contains(expected),
@@ -1594,9 +1692,29 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_prefix_codex_when_enabled() {
+        let catalogs = catalogs_claude_grok_codex();
+        let (k, m) = resolve_provider_and_model("CODEX:gpt-5.5", &catalogs).unwrap();
+        assert_eq!((k.as_str(), m.as_str()), ("codex", "gpt-5.5"));
+    }
+
+    #[test]
     fn test_normalize_providers() {
-        let n = normalize_providers(&[" claude ".into(), "GROK".into(), "claude".into()]).unwrap();
-        assert_eq!(n, vec!["claude".to_string(), "grok".to_string()]);
+        let n = normalize_providers(&[
+            " claude ".into(),
+            "GROK".into(),
+            "codex".into(),
+            "claude".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            n,
+            vec![
+                "claude".to_string(),
+                "grok".to_string(),
+                "codex".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -1715,6 +1833,7 @@ mod tests {
     use omni_core::CanonicalResponse;
     use serde_json::Value;
     use std::collections::HashSet;
+    use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::Arc;
@@ -1723,7 +1842,42 @@ mod tests {
     use wiremock::matchers::{body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    static CLAUDE_CREDS_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+    static PROVIDER_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct TempEnvVars {
+        old: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl TempEnvVars {
+        fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+            let old = vars
+                .iter()
+                .map(|(name, _)| (*name, std::env::var_os(name)))
+                .collect();
+            for (name, value) in vars {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+            Self { old }
+        }
+    }
+
+    impl Drop for TempEnvVars {
+        fn drop(&mut self) {
+            for (name, value) in &self.old {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
 
     struct TempClaudeCreds {
         path: PathBuf,
@@ -1847,6 +2001,63 @@ mod tests {
             models: provider_model_values("grok", GrokProvider::models_list())
                 .expect("grok model catalog serializes"),
             catalog: grok_model_catalog(),
+        }
+    }
+
+    fn codex_entry() -> ProviderEntry {
+        let provider = CodexProvider::new().expect("codex provider");
+        ProviderEntry {
+            provider: Arc::new(provider.clone()),
+            claude_native: None,
+            models: provider_model_values("codex", provider.models_list())
+                .expect("codex model catalog serializes"),
+            catalog: codex_model_catalog(&provider),
+        }
+    }
+
+    struct TempCodexHome {
+        path: PathBuf,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl TempCodexHome {
+        fn install_for_mock(base_url: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("omni-codex-home-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("create codex test home");
+            std::fs::write(
+                dir.join("config.toml"),
+                format!(
+                    r#"
+model = "gpt-codex-test"
+model_provider = "proxy"
+[model_providers.proxy]
+base_url = "{base_url}"
+wire_api = "responses"
+requires_openai_auth = false
+"#
+                ),
+            )
+            .expect("write codex config");
+            let old = std::env::var_os("CODEX_HOME");
+            unsafe {
+                std::env::set_var("CODEX_HOME", &dir);
+            }
+            Self {
+                path: dir,
+                prev: old,
+            }
+        }
+    }
+
+    impl Drop for TempCodexHome {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(value) => std::env::set_var("CODEX_HOME", value),
+                    None => std::env::remove_var("CODEX_HOME"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 
@@ -2105,6 +2316,535 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_init_claude_custom_gateway_uses_anthropic_auth_token() {
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let creds = TempClaudeCreds::install("omni-claude-env-token");
+        let server = MockServer::start().await;
+        let _env = TempEnvVars::set(&[
+            ("ANTHROPIC_BASE_URL", Some(&server.uri())),
+            ("ANTHROPIC_AUTH_TOKEN", Some("custom-claude-token")),
+            ("ANTHROPIC_API_KEY", Some("must-not-win")),
+            ("ANTHROPIC_CUSTOM_HEADERS", Some("X-Test-Gateway: yes")),
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(query_param("beta", "true"))
+            .and(header("authorization", "Bearer custom-claude-token"))
+            .and(header("x-test-gateway", "yes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_env",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type":"text","text":"env ok"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = init_claude_provider().expect("custom Claude provider from env");
+        drop(creds);
+        let response = provider
+            .send(omni_core::CanonicalRequest {
+                model: "sonnet".into(),
+                messages: vec![omni_core::CanonicalMessage {
+                    role: "user".into(),
+                    content: omni_core::CanonicalContent::Text("hi".into()),
+                }],
+                ..Default::default()
+            })
+            .await
+            .expect("custom Claude send");
+
+        assert_eq!(response.content, "env ok");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let auth = requests[0]
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(auth, "Bearer custom-claude-token");
+        assert!(
+            !auth.contains(TempClaudeCreds::dummy_token()),
+            "custom Claude gateway must not receive default OAuth token"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_init_claude_custom_gateway_uses_api_key_for_anthropic_native() {
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let creds = TempClaudeCreds::install("omni-claude-env-api-key");
+        let server = MockServer::start().await;
+        let _env = TempEnvVars::set(&[
+            ("ANTHROPIC_BASE_URL", Some(&server.uri())),
+            ("ANTHROPIC_AUTH_TOKEN", None),
+            ("ANTHROPIC_API_KEY", Some("custom-api-key")),
+            ("ANTHROPIC_CUSTOM_HEADERS", None),
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(query_param("beta", "true"))
+            .and(header("x-api-key", "custom-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_native_custom",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type":"text","text":"native ok"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = init_claude_provider().expect("custom Claude provider from env");
+        drop(creds);
+        let models = provider_model_values("claude", provider.profile().models_list()).unwrap();
+        let catalog = claude_model_catalog(provider.profile());
+        let provider = Arc::new(provider);
+        let mut providers = HashMap::new();
+        providers.insert(
+            "claude".into(),
+            ProviderEntry {
+                provider: provider.clone(),
+                claude_native: Some(provider),
+                models,
+                catalog,
+            },
+        );
+
+        let resp = call_anthropic_messages_handler(
+            state_with(providers),
+            r#"{"model":"sonnet","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["content"][0]["text"], "native ok");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].headers.contains_key("authorization"),
+            "x-api-key custom Claude gateway must not receive default OAuth Authorization"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_init_claude_custom_gateway_reads_auth_env_per_request() {
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let creds = TempClaudeCreds::install("omni-claude-env-rotate");
+        let server = MockServer::start().await;
+        let _env = TempEnvVars::set(&[
+            ("ANTHROPIC_BASE_URL", Some(&server.uri())),
+            ("ANTHROPIC_AUTH_TOKEN", Some("first-claude-token")),
+            ("ANTHROPIC_API_KEY", None),
+            ("ANTHROPIC_CUSTOM_HEADERS", Some("X-Rotate: first")),
+        ]);
+        for (token, marker, text) in [
+            ("first-claude-token", "first", "first ok"),
+            ("second-claude-token", "second", "second ok"),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .and(query_param("beta", "true"))
+                .and(header("authorization", format!("Bearer {token}").as_str()))
+                .and(header("x-rotate", marker))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "msg_rotate",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type":"text","text": text}],
+                    "stop_reason": "end_turn",
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let provider = init_claude_provider().expect("custom Claude provider from env");
+        drop(creds);
+        let request = || omni_core::CanonicalRequest {
+            model: "sonnet".into(),
+            messages: vec![omni_core::CanonicalMessage {
+                role: "user".into(),
+                content: omni_core::CanonicalContent::Text("hi".into()),
+            }],
+            ..Default::default()
+        };
+
+        let first = provider.send(request()).await.expect("first send");
+        assert_eq!(first.content, "first ok");
+        unsafe {
+            std::env::set_var("ANTHROPIC_AUTH_TOKEN", "second-claude-token");
+            std::env::set_var("ANTHROPIC_CUSTOM_HEADERS", "X-Rotate: second");
+        }
+        let second = provider.send(request()).await.expect("second send");
+        assert_eq!(second.content, "second ok");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_init_claude_custom_gateway_rejects_invalid_custom_headers_per_request() {
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let server = MockServer::start().await;
+        let _env = TempEnvVars::set(&[
+            ("ANTHROPIC_BASE_URL", Some(&server.uri())),
+            ("ANTHROPIC_AUTH_TOKEN", Some("custom-claude-token")),
+            ("ANTHROPIC_API_KEY", None),
+            ("ANTHROPIC_CUSTOM_HEADERS", Some("X-Valid: yes")),
+        ]);
+        let provider = init_claude_provider().expect("custom Claude provider from env");
+        unsafe {
+            std::env::set_var("ANTHROPIC_CUSTOM_HEADERS", "bad header");
+        }
+        let err = provider
+            .send(omni_core::CanonicalRequest {
+                model: "sonnet".into(),
+                messages: vec![omni_core::CanonicalMessage {
+                    role: "user".into(),
+                    content: omni_core::CanonicalContent::Text("hi".into()),
+                }],
+                ..Default::default()
+            })
+            .await
+            .expect_err("invalid custom header env must fail loudly");
+        assert!(
+            err.to_string().contains("custom header"),
+            "invalid ANTHROPIC_CUSTOM_HEADERS must not be silently ignored: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_init_grok_custom_endpoint_uses_xai_api_key_not_default_credentials() {
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let creds =
+            std::env::temp_dir().join(format!("omni-grok-omni-env-{}.json", Uuid::new_v4()));
+        std::fs::write(&creds, r#"{"apiKey":"xai-must-not-leak"}"#).expect("write temp xAI creds");
+        let server = MockServer::start().await;
+        let _env = TempEnvVars::set(&[
+            ("GROK_MODELS_BASE_URL", Some(&server.uri())),
+            ("XAI_API_KEY", Some("custom-grok-key")),
+            ("XAI_CREDENTIALS_PATH", Some(creds.to_str().unwrap())),
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer custom-grok-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "grok-4.3",
+                "choices": [{"message": {"content": "grok ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = init_grok_provider().expect("custom Grok provider from env");
+        let response = provider
+            .send(omni_core::CanonicalRequest {
+                model: "grok".into(),
+                messages: vec![omni_core::CanonicalMessage {
+                    role: "user".into(),
+                    content: omni_core::CanonicalContent::Text("hi".into()),
+                }],
+                ..Default::default()
+            })
+            .await
+            .expect("custom Grok send");
+
+        assert_eq!(response.content, "grok ok");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let auth = requests[0]
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(auth, "Bearer custom-grok-key");
+        assert!(
+            !auth.contains("xai-must-not-leak"),
+            "custom Grok endpoint must not receive default xAI credential"
+        );
+        let _ = std::fs::remove_file(creds);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_init_grok_custom_endpoint_reads_xai_api_key_per_request() {
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let creds =
+            std::env::temp_dir().join(format!("omni-grok-omni-rotate-{}.json", Uuid::new_v4()));
+        std::fs::write(&creds, r#"{"apiKey":"xai-must-not-leak"}"#).expect("write temp xAI creds");
+        let server = MockServer::start().await;
+        let _env = TempEnvVars::set(&[
+            ("GROK_MODELS_BASE_URL", Some(&server.uri())),
+            ("XAI_API_KEY", Some("first-grok-key")),
+            ("XAI_CREDENTIALS_PATH", Some(creds.to_str().unwrap())),
+        ]);
+        for (token, text) in [
+            ("first-grok-key", "first grok ok"),
+            ("second-grok-key", "second grok ok"),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .and(header("authorization", format!("Bearer {token}").as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "grok-4.3",
+                    "choices": [{"message": {"content": text}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let provider = init_grok_provider().expect("custom Grok provider from env");
+        let request = || omni_core::CanonicalRequest {
+            model: "grok".into(),
+            messages: vec![omni_core::CanonicalMessage {
+                role: "user".into(),
+                content: omni_core::CanonicalContent::Text("hi".into()),
+            }],
+            ..Default::default()
+        };
+
+        let first = provider.send(request()).await.expect("first send");
+        assert_eq!(first.content, "first grok ok");
+        unsafe {
+            std::env::set_var("XAI_API_KEY", "second-grok-key");
+        }
+        let second = provider.send(request()).await.expect("second send");
+        assert_eq!(second.content, "second grok ok");
+        let _ = std::fs::remove_file(creds);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_init_grok_custom_endpoint_without_key_sends_no_authorization() {
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let creds =
+            std::env::temp_dir().join(format!("omni-grok-omni-noauth-{}.json", Uuid::new_v4()));
+        std::fs::write(&creds, r#"{"apiKey":"xai-must-not-leak"}"#).expect("write temp xAI creds");
+        let server = MockServer::start().await;
+        let _env = TempEnvVars::set(&[
+            ("GROK_MODELS_BASE_URL", Some(&server.uri())),
+            ("XAI_API_KEY", None),
+            ("XAI_CREDENTIALS_PATH", Some(creds.to_str().unwrap())),
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "grok-4.3",
+                "choices": [{"message": {"content": "grok no auth ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = init_grok_provider().expect("custom Grok provider from env");
+        let response = provider
+            .send(omni_core::CanonicalRequest {
+                model: "grok".into(),
+                messages: vec![omni_core::CanonicalMessage {
+                    role: "user".into(),
+                    content: omni_core::CanonicalContent::Text("hi".into()),
+                }],
+                ..Default::default()
+            })
+            .await
+            .expect("custom Grok send");
+
+        assert_eq!(response.content, "grok no auth ok");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].headers.contains_key("authorization"),
+            "custom Grok no-auth endpoint must not receive ambient xAI Authorization"
+        );
+        let _ = std::fs::remove_file(creds);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_chat_completions_routes_to_codex_provider() {
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let server = MockServer::start().await;
+        let _codex_home = TempCodexHome::install_for_mock(&server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(body_partial_json(serde_json::json!({
+                "model": "gpt-5.5",
+                "input": [{"type":"message","role":"user","content":"hi"}],
+                "stream": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "gpt-5.5",
+                "status": "completed",
+                "output": [{"type":"message","content":[{"type":"output_text","text":"codex ok"}]}],
+                "usage": {"input_tokens": 2, "output_tokens": 3}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut map = HashMap::new();
+        map.insert("codex".into(), codex_entry());
+        let req = ChatCompletionRequest {
+            model: "codex:gpt-5.5".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: false,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            extras: serde_json::Value::Null,
+        };
+        let resp = call_chat_handler(state_with(map), req)
+            .await
+            .expect("chat routed to codex");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "codex ok");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].headers.contains_key("authorization"),
+            "codex no-auth custom provider must not receive default Authorization"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_responses_routes_to_codex_provider() {
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let server = MockServer::start().await;
+        let _codex_home = TempCodexHome::install_for_mock(&server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "gpt-5.5",
+                "status": "completed",
+                "output": [{"type":"message","content":[{"type":"output_text","text":"response ok"}]}],
+                "usage": {"input_tokens": 2, "output_tokens": 3}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut map = HashMap::new();
+        map.insert("codex".into(), codex_entry());
+        let req: omni_common::ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "codex:gpt-5.5",
+            "input": "hi",
+            "store": false
+        }))
+        .unwrap();
+        let resp = call_responses_handler(state_with(map), req)
+            .await
+            .expect("responses routed to codex");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["output"][0]["content"][0]["text"], "response ok");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].headers.contains_key("authorization"),
+            "codex no-auth custom provider must not receive default Authorization"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_chat_completions_codex_stream_rejects_until_native_streaming_exists() {
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _codex_home = TempCodexHome::install_for_mock("http://127.0.0.1:9");
+        let mut map = HashMap::new();
+        map.insert("codex".into(), codex_entry());
+        let req = ChatCompletionRequest {
+            model: "codex:gpt-5.5".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: true,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            extras: serde_json::Value::Null,
+        };
+
+        let err = call_chat_handler(state_with(map), req)
+            .await
+            .expect_err("Codex stream:true must fail loudly");
+        match err {
+            AppError::ServerError(message) => assert!(
+                message.contains("streaming is not implemented"),
+                "Codex stream:true should name the unsupported streaming mode: {message}"
+            ),
+            other => panic!("expected Codex stream unsupported server error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_responses_codex_stream_rejects_until_native_streaming_exists() {
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _codex_home = TempCodexHome::install_for_mock("http://127.0.0.1:9");
+        let mut map = HashMap::new();
+        map.insert("codex".into(), codex_entry());
+        let req: omni_common::ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "codex:gpt-5.5",
+            "input": "hi",
+            "stream": true
+        }))
+        .unwrap();
+
+        let err = call_responses_handler(state_with(map), req)
+            .await
+            .expect_err("Codex Responses stream:true must fail loudly");
+        match err {
+            AppError::ServerError(message) => assert!(
+                message.contains("streaming is not implemented"),
+                "Codex Responses stream:true should name the unsupported streaming mode: {message}"
+            ),
+            other => panic!("expected Codex stream unsupported server error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_models_handler_uses_real_canonical_provider_catalogs() {
         // WHY: omni is the only server binary, so /v1/models must expose the
         // provider-owned upstream ids, not aliases or prefixed routing ids.
@@ -2198,9 +2938,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_anthropic_messages_nonstream_passthrough_and_prefix_strip() {
-        let _guard = CLAUDE_CREDS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _creds = TempClaudeCreds::install("anth-nonstream");
 
         let server = MockServer::start().await;
@@ -2262,9 +3000,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_anthropic_count_tokens_proxies_native_shape() {
-        let _guard = CLAUDE_CREDS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _creds = TempClaudeCreds::install("anth-count");
 
         let server = MockServer::start().await;
@@ -2304,9 +3040,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_anthropic_messages_stream_preserves_raw_events() {
-        let _guard = CLAUDE_CREDS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _creds = TempClaudeCreds::install("anth-stream");
 
         let sse_body = concat!(

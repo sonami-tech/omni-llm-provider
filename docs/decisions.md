@@ -6,6 +6,7 @@
 - Rationale:
   - Claude fingerprint logic is isolated in `provider-claude`.
   - Grok wire logic is isolated in `provider-grok`.
+  - Codex config and Responses wire logic is isolated in `provider-codex`.
   - Shared HTTP conversion, Responses conversion, auth, stats, replacements,
     session derivation, conversation logging, and error envelopes live in
     `omni-common`.
@@ -14,9 +15,11 @@
 
 ## Routing
 
-- Prefix routing selects the backend: `claude:<model>` or `grok:<model>`.
+- Prefix routing selects the backend: `claude:<model>`, `grok:<model>`, or
+  `codex:<model>`.
 - With exactly one provider enabled, bare model names are accepted.
-- With multiple providers enabled, bare model names are rejected.
+- With multiple providers enabled, bare model names are accepted only when the
+  model id or alias uniquely matches one provider catalog.
 - Anthropic inbound (`/v1/messages` and `/v1/messages/count_tokens`) is
   Claude-only. Non-Claude prefixes or models return an Anthropic-shaped request
   error instead of falling back to another provider.
@@ -29,10 +32,10 @@
   shaping also stay there.
 - Grok: xAI request/response mapping, streaming parsing, credential resolution,
   and model catalog stay in `provider-grok`.
-- Planned Codex/OpenAI backend: Codex config discovery, auth parsing, provider
-  override handling, and OpenAI-compatible wire mapping stay in a provider crate.
+- Codex: Codex config discovery, auth parsing, provider override handling, and
+  OpenAI-compatible Responses wire mapping stay in `provider-codex`.
 - Server concerns: auth, stats, bind/public flags, route registration, and model
-  prefixing stay in `omni`.
+  routing stay in `omni`.
 
 ## Current Surfaces
 
@@ -51,6 +54,23 @@ Credentials are read fresh per request.
 - Claude: `$CLAUDE_CREDENTIALS_PATH` or `~/.claude/.credentials.json`
 - Grok: `$XAI_CREDENTIALS_PATH`, `~/.xai/.credentials.json`, or
   `~/.grok/auth.json`
+- Codex: `$CODEX_HOME` or `~/.codex` config and auth state.
+
+Custom upstream endpoint configuration owns provider auth and must not fall
+back to default credentials:
+
+- Claude: `ANTHROPIC_BASE_URL` enables custom gateway mode using
+  `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, and `ANTHROPIC_CUSTOM_HEADERS`
+  only, resolved per request.
+- Grok: `GROK_MODELS_BASE_URL` enables custom endpoint mode using
+  `XAI_API_KEY` per request only; if it is absent, no Authorization header is
+  sent.
+- Codex: Codex custom provider config uses
+  `[model_providers.<name>.auth] command`, `experimental_bearer_token`, or
+  `env_key`; it uses OpenAI auth only when `requires_openai_auth = true`.
+
+Codex OpenAI inbound support is non-streaming for now. Codex `stream:true`
+requests fail loudly until native Responses SSE is implemented.
 
 ## Tests
 

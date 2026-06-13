@@ -12,6 +12,7 @@ path = "src/main.rs"
 omni-common = { path = "../../omni-common" }
 omni-core = { path = "../../omni-core" }
 provider-claude = { path = "../../provider-claude" }
+provider-codex = { path = "../../provider-codex" }
 provider-grok = { path = "../../provider-grok" }
 
 axum.workspace = true

@@ -3,6 +3,7 @@ members = [
   "crates/omni-common",
   "crates/omni-core",
   "crates/provider-claude",
+  "crates/provider-codex",
   "crates/provider-grok",
   "crates/bin/omni",
 ]

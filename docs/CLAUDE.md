@@ -26,7 +26,7 @@ suffixes, or Claude Code header values, belongs in `omni`.
 
 ```bash
 cargo run -p omni -- --providers claude --no-auth --port 18321
-cargo run -p omni -- --providers claude,grok --no-auth --port 18321
+cargo run -p omni -- --providers claude,grok,codex --no-auth --port 18321
 ```
 
 With both providers enabled, canonical ids such as `claude-sonnet-4-6` and
@@ -48,6 +48,11 @@ Omni's `/v1/messages` and `/v1/messages/count_tokens` routes are native
 Anthropic inbound routes for Claude only. They do not use canonical OpenAI
 framing, but they still run through the same Claude provider fingerprint,
 credential, retry, identity, and cch machinery before reaching Anthropic.
+
+`ANTHROPIC_BASE_URL` switches Claude to a custom Anthropic-compatible gateway.
+In that mode, gateway auth is taken from `ANTHROPIC_AUTH_TOKEN`,
+`ANTHROPIC_API_KEY`, and `ANTHROPIC_CUSTOM_HEADERS` only; local Claude OAuth
+credentials are not read or sent to the custom host.
 
 Rebaseline procedure and tooling are documented at
 `docs/providers/claude/REBASELINE.md` and

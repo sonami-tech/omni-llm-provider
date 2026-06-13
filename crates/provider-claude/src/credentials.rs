@@ -39,6 +39,14 @@ pub struct Credentials {
 }
 
 impl Credentials {
+    pub(crate) fn placeholder_for_custom_gateway() -> Self {
+        Self {
+            access_token: "custom-gateway-placeholder".into(),
+            expires_at_ms: None,
+            subscription_type: None,
+        }
+    }
+
     /// Default location: `~/.claude/.credentials.json`. Override via $CLAUDE_CREDENTIALS_PATH.
     pub fn default_path() -> PathBuf {
         if let Ok(p) = std::env::var("CLAUDE_CREDENTIALS_PATH") {

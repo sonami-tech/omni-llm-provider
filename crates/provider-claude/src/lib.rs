@@ -223,6 +223,57 @@ impl ClaudeProvider {
         Ok(Self { profile, client })
     }
 
+    /// Construct a Claude provider for an explicit custom Anthropic-compatible
+    /// gateway. The gateway auth configuration replaces the default Claude Code
+    /// OAuth Authorization header so a local `~/.claude/.credentials.json` token
+    /// cannot be leaked to the custom endpoint.
+    pub fn new_for_custom_gateway(
+        profile: &'static FingerprintProfile,
+        base_url: impl Into<String>,
+        authorization_bearer: Option<String>,
+        headers: Vec<(String, String)>,
+    ) -> Result<Self, ProviderError> {
+        let client = UpstreamClient::new_with_profile_base_and_auth(
+            profile,
+            base_url,
+            upstream::ClaudeAuthConfig::Custom {
+                authorization_bearer,
+                headers,
+                authorization_bearer_env: None,
+                api_key_env: None,
+                custom_headers_env: None,
+            },
+        )
+        .map_err(|e| ProviderError::Other(anyhow::Error::msg(format!("upstream client: {e}"))))?;
+        Ok(Self { profile, client })
+    }
+
+    /// Construct a custom gateway provider whose auth material is read from env
+    /// on each request. This is the Omni runtime path: rotating
+    /// `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, or `ANTHROPIC_CUSTOM_HEADERS`
+    /// does not require rebuilding the provider.
+    pub fn new_for_custom_gateway_env(
+        profile: &'static FingerprintProfile,
+        base_url: impl Into<String>,
+        authorization_bearer_env: Option<String>,
+        api_key_env: Option<String>,
+        custom_headers_env: Option<String>,
+    ) -> Result<Self, ProviderError> {
+        let client = UpstreamClient::new_with_profile_base_and_auth(
+            profile,
+            base_url,
+            upstream::ClaudeAuthConfig::Custom {
+                authorization_bearer: None,
+                headers: Vec::new(),
+                authorization_bearer_env,
+                api_key_env,
+                custom_headers_env,
+            },
+        )
+        .map_err(|e| ProviderError::Other(anyhow::Error::msg(format!("upstream client: {e}"))))?;
+        Ok(Self { profile, client })
+    }
+
     /// For tests / alternate profiles (e.g. pinned older for rebaseline).
     #[cfg(test)]
     pub fn new_for_test(profile: &'static FingerprintProfile) -> Self {
@@ -235,6 +286,18 @@ impl ClaudeProvider {
 
     pub fn profile(&self) -> &'static FingerprintProfile {
         self.profile
+    }
+
+    pub(crate) async fn credentials_for_request(
+        &self,
+    ) -> Result<credentials::Credentials, ProviderError> {
+        if self.client.uses_custom_auth() {
+            Ok(credentials::Credentials::placeholder_for_custom_gateway())
+        } else {
+            credentials::Credentials::load_fresh_async(&credentials::Credentials::default_path())
+                .await
+                .map_err(map_upstream_err)
+        }
     }
 }
 
@@ -300,11 +363,9 @@ impl LlmProvider for ClaudeProvider {
 
         let ctx = RequestContext::new_reply().with_model(anth_req.model.clone());
 
-        // Fresh creds read (the design: never cached in this process).
-        let creds =
-            credentials::Credentials::load_fresh_async(&credentials::Credentials::default_path())
-                .await
-                .map_err(map_upstream_err)?;
+        // Fresh creds read for the default Claude Code path. Custom gateways
+        // own auth and must not require or leak the local OAuth file.
+        let creds = self.credentials_for_request().await?;
 
         // 4. Send (this does finalize_body_json which patches the 5-hex cch,
         //    builds the full header set with per-profile betas / stainless / ua,
@@ -351,10 +412,7 @@ impl LlmProvider for ClaudeProvider {
 
         let ctx = RequestContext::new_reply().with_model(anth_req.model.clone());
 
-        let creds =
-            credentials::Credentials::load_fresh_async(&credentials::Credentials::default_path())
-                .await
-                .map_err(map_upstream_err)?;
+        let creds = self.credentials_for_request().await?;
 
         // Open the upstream SSE stream (full retry / 401-refresh semantics live
         // in send_messages_stream). Yields typed Anthropic StreamEvents.
@@ -930,6 +988,111 @@ mod tests {
         assert_eq!(resp.usage.input_tokens, 10);
         assert_eq!(resp.usage.output_tokens, 2);
         assert!(resp.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn claude_custom_gateway_without_auth_does_not_use_default_oauth_token() {
+        // WHY: custom Anthropic-compatible gateways can be arbitrary URLs. A
+        // local Claude Code OAuth token must not be sent there unless custom
+        // gateway auth explicitly says so, and a no-auth gateway must not need
+        // the local OAuth file to exist.
+        let _guard = CREDS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let creds = TempCreds::install("custom-no-auth");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(query_param("beta", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anth_text_response_json()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let p =
+            ClaudeProvider::new_for_custom_gateway(default_profile(), server.uri(), None, vec![])
+                .expect("custom gateway provider");
+        drop(creds);
+        let resp = p
+            .send(sample_req("custom no auth"))
+            .await
+            .expect("custom gateway send");
+
+        assert_eq!(resp.content, "Hello");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].headers.contains_key("authorization"),
+            "custom Claude gateway no-auth must not receive Claude OAuth Authorization"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn claude_custom_gateway_auth_overrides_default_oauth_token() {
+        // WHY: explicit gateway auth owns the upstream Authorization header and
+        // must replace the Claude Code bearer read from CLAUDE_CREDENTIALS_PATH.
+        let _guard = CREDS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _creds = TempCreds::install("custom-auth");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(query_param("beta", "true"))
+            .and(header("authorization", "Bearer custom-claude-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anth_text_response_json()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let p = ClaudeProvider::new_for_custom_gateway(
+            default_profile(),
+            server.uri(),
+            Some("custom-claude-token".into()),
+            vec![],
+        )
+        .expect("custom gateway provider");
+        let resp = p
+            .send(sample_req("custom auth"))
+            .await
+            .expect("custom gateway send");
+
+        assert_eq!(resp.content, "Hello");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn claude_custom_gateway_x_api_key_header_does_not_need_oauth_file() {
+        // WHY: Claude Code gateways may use ANTHROPIC_API_KEY-style x-api-key
+        // auth. Custom headers must be enough, without falling back to the
+        // subscription OAuth file.
+        let _guard = CREDS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let creds = TempCreds::install("custom-api-key");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(query_param("beta", "true"))
+            .and(header("x-api-key", "custom-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anth_text_response_json()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let p = ClaudeProvider::new_for_custom_gateway(
+            default_profile(),
+            server.uri(),
+            None,
+            vec![("x-api-key".into(), "custom-api-key".into())],
+        )
+        .expect("custom gateway provider");
+        drop(creds);
+        let resp = p
+            .send(sample_req("custom x-api-key"))
+            .await
+            .expect("custom gateway send");
+
+        assert_eq!(resp.content, "Hello");
     }
 
     #[tokio::test]

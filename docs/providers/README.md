@@ -4,6 +4,7 @@ Omni has one server binary, but provider maintenance stays provider-specific.
 
 - Claude: `docs/providers/claude/README.md`
 - Grok: `docs/providers/grok/README.md`
+- Codex: `docs/providers/codex/README.md`
 
 Default tests are hermetic. Any test or tool that calls a live provider, spends
 quota, or captures credentials must be explicitly opted into and run by an

@@ -39,7 +39,10 @@ Grok uses the same fresh credential read contract as the Claude provider:
 - **Never cache** the key in memory for the lifetime of the process.
 - **Always re-read fresh per request** (via `load_resolved_async`, layered on `load_fresh` / `load_fresh_async`).
 - This lets any background refresh (the Grok CLI refreshing its login, rotating a console key, etc.) be picked up without restarting the server.
-- **File-only, no env-var key.** There is no `XAI_API_KEY`-as-key path. Just as the Claude provider reads the Claude CLI's own `~/.claude/.credentials.json`, the Grok provider reads the Grok CLI's own login file, so an existing `grok` login Just Works.
+- **Default mode is file-only, no env-var key.** There is no `XAI_API_KEY` key
+  path for the normal xAI endpoint. Just as the Claude provider reads the
+  Claude CLI's own `~/.claude/.credentials.json`, the Grok provider reads the
+  Grok CLI's own login file, so an existing `grok` login Just Works.
 - **Source precedence (highest first):**
   1. `$XAI_CREDENTIALS_PATH` (if set) → use exactly that file. A failure here is loud (we do not silently fall through a deliberately-pointed path).
   2. `~/.xai/.credentials.json` → a simple static key you created on purpose. Explicit beats ambient, so this wins over the CLI login.
@@ -63,6 +66,20 @@ The loader lives in `omni-common::credentials::GrokCredentials` and keeps the sa
 In `provider-grok` the key is obtained inside the `send` / `send_stream` path (fresh resolution through the source chain) and used only for that request's `Authorization: Bearer ...` header. The `GrokProvider` struct no longer holds a long-lived key (except in test helpers).
 
 This is the "same technique for omni and for grok" as requested: read the CLI's own login file, fresh, every request.
+
+## Custom Endpoint Override
+
+`GROK_MODELS_BASE_URL` switches Omni's Grok provider to a custom
+OpenAI-compatible endpoint. In that mode, custom provider auth owns the request:
+
+- `XAI_API_KEY` sends `Authorization: Bearer ...`.
+- If `XAI_API_KEY` is absent, Omni sends no Authorization header.
+- `$XAI_CREDENTIALS_PATH`, `~/.xai/.credentials.json`, and `~/.grok/auth.json`
+  are not read for the custom endpoint.
+
+This exception mirrors Grok CLI custom-model behavior, where explicit model
+configuration overrides the ambient xAI login and prevents signed-in xAI tokens
+from leaking to arbitrary hosts.
 
 ## Relationship to the Rest of Omni
 - The "grok gate" logic (headers + fresh creds) lives only inside the Grok provider (or the thin common credentials loader it uses). It does not leak into `omni-common` policy or the Claude path.
