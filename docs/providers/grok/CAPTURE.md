@@ -50,7 +50,7 @@ shape, or credential behavior.
 5. Update code/tests:
 
    - `crates/provider-grok/src/lib.rs` for request/response mapping.
-   - `crates/omni-common/src/credentials.rs` for credential file changes.
+   - `crates/provider-grok/src/credentials.rs` for credential file changes.
    - Wiremock tests for auth, body shape, errors, and streaming frames.
    - `docs/grok-gate.md` if gate behavior changes.
 

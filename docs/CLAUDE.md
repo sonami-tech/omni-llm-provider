@@ -25,6 +25,7 @@ suffixes, or Claude Code header values, belongs in `omni`.
 ## Run
 
 ```bash
+cargo run -p omni -- --no-auth --port 18321
 cargo run -p omni -- --providers claude --no-auth --port 18321
 cargo run -p omni -- --providers claude,grok,codex --no-auth --port 18321
 ```

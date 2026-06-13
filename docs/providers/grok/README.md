@@ -5,7 +5,7 @@ Grok-specific behavior lives in `crates/provider-grok`.
 ## Source Of Truth
 
 - xAI mapping and streaming parser: `crates/provider-grok/src/lib.rs`
-- Credential loader: `crates/omni-common/src/credentials.rs`
+- Credential loader: `crates/provider-grok/src/credentials.rs`
 - Gate notes: `docs/grok-gate.md`
 - Capture procedure: `docs/providers/grok/CAPTURE.md`
 - Capture tooling: `tools/providers/grok/capture/`
@@ -21,10 +21,12 @@ billing cch, or injected identity preambles. The maintained contract is:
 - correct non-stream and stream decoding,
 - model catalog kept current.
 
-Default Grok mode resolves credentials from `$XAI_CREDENTIALS_PATH`,
-`~/.xai/.credentials.json`, then `~/.grok/auth.json`. Custom endpoint mode is
-different by design: `GROK_MODELS_BASE_URL` switches the provider to use
-`XAI_API_KEY` per request only, or no Authorization header if it is unset. The
-default xAI credential files must not be sent to a custom endpoint.
+Default Grok mode resolves credentials from `$XAI_CREDENTIALS_PATH`, then a
+usable `~/.xai/.credentials.json`, then `~/.grok/auth.json`. Custom endpoint mode is
+different by design. `OMNI_GROK_BASE_URL` is Omni's forced override and uses
+only `OMNI_GROK_AUTH_TOKEN`, `OMNI_GROK_API_KEY`, and
+`OMNI_GROK_CUSTOM_HEADERS`. Legacy `GROK_MODELS_BASE_URL` remains supported and
+uses `XAI_API_KEY` per request only, or no Authorization header if it is unset.
+The default xAI credential files must not be sent to a custom endpoint.
 
 Default tests use wiremock. Live xAI calls require `OMNI_LIVE_TESTS=1`.

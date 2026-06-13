@@ -662,9 +662,11 @@ pub fn build_canonical_response(
     CanonicalResponse {
         model: requested_model.to_string(),
         content,
+        refusal: None,
         tool_calls,
         finish_reason: Some(finish_reason.to_string()),
         usage,
+        id: Some(resp.id.clone()),
     }
 }
 
@@ -886,6 +888,7 @@ mod tests {
             },
         };
         let canon = build_canonical_response(&resp, "haiku", &empty_repl());
+        assert_eq!(canon.id.as_deref(), Some("msg_1"));
         assert_eq!(canon.model, "haiku");
         assert_eq!(canon.content, "hi there");
         assert_eq!(canon.usage.input_tokens, 5);
@@ -1176,6 +1179,7 @@ mod tests {
             },
         };
         let canon = build_canonical_response(&resp, "haiku", &empty_repl());
+        assert_eq!(canon.id.as_deref(), Some("m"));
         assert_eq!(canon.finish_reason.as_deref(), Some("tool_calls"));
         assert_eq!(canon.tool_calls.len(), 1);
         assert_eq!(canon.tool_calls[0].name, "do");

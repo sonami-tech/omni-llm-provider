@@ -123,10 +123,15 @@ pub struct CanonicalUsage {
 pub struct CanonicalResponse {
     pub model: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
     pub tool_calls: Vec<CanonicalToolCall>,
     pub finish_reason: Option<String>,
     pub usage: CanonicalUsage,
-    // provider_extras for citations, fingerprints (for debugging), etc.
+    /// Native provider response id when the upstream has one. Responses-native
+    /// backends need this for stateful continuation via previous_response_id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +139,12 @@ pub struct CanonicalToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct CanonicalResponseMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 /// One normalized event in a streaming response.
@@ -150,8 +161,13 @@ pub struct CanonicalToolCall {
 /// should precede or accompany it so the framing layer can emit token counts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum CanonicalStreamEvent {
+    /// Native provider response metadata, emitted before content when present.
+    ResponseMetadata(CanonicalResponseMetadata),
     /// Incremental assistant text. Concatenate in order to reconstruct content.
     TextDelta(String),
+    /// Incremental refusal text. Responses-native clients receive refusal
+    /// events; Chat-compatible clients degrade this to text deltas.
+    RefusalDelta(String),
     /// Incremental tool-call data. `index` identifies which tool call this delta
     /// belongs to (parallel tool calls share the stream). On the first delta for
     /// an index, `id` and `name` are set; subsequent deltas carry only
@@ -208,6 +224,8 @@ mod tests {
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: CanonicalUsage::default(),
+                refusal: None,
+                id: None,
             })
         }
     }
@@ -263,6 +281,8 @@ mod tests {
                 cache_read: 0,
                 cache_creation: 0,
             },
+            refusal: None,
+            id: None,
         };
         let j = serde_json::to_string(&resp).unwrap();
         let back: CanonicalResponse = serde_json::from_str(&j).unwrap();
@@ -275,9 +295,9 @@ mod tests {
     async fn trait_parity_via_mocks() {
         // Demonstrates shared trait surface works for "both backends" (different ids)
         let p_g = MockProvider("grok");
-        let p_c = MockProvider("claude-code");
+        let p_c = MockProvider("claude");
         assert_eq!(p_g.id(), "grok");
-        assert_eq!(p_c.id(), "claude-code");
+        assert_eq!(p_c.id(), "claude");
 
         let req = sample_req();
         let rg = p_g.send(req.clone()).await.unwrap();
@@ -285,7 +305,7 @@ mod tests {
         assert_eq!(rg.model, "test-model");
         assert_eq!(rc.model, "test-model");
         assert!(rg.content.contains("grok"));
-        assert!(rc.content.contains("claude-code"));
+        assert!(rc.content.contains("claude"));
     }
 
     #[tokio::test]
@@ -470,6 +490,8 @@ mod tests {
                 cache_read: 15,
                 cache_creation: 0,
             },
+            refusal: None,
+            id: None,
         };
         let j = serde_json::to_string(&resp).unwrap();
         let back: CanonicalResponse = serde_json::from_str(&j).unwrap();
@@ -510,6 +532,8 @@ mod tests {
                     cache_read: 0,
                     cache_creation: 0,
                 },
+                refusal: None,
+                id: None,
             })
         }
     }
@@ -518,7 +542,7 @@ mod tests {
     #[async_trait]
     impl LlmProvider for ClaudeMock {
         fn id(&self) -> &'static str {
-            "claude-code"
+            "claude"
         }
         async fn send(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError> {
             let stripped = if let Some((_, r)) = req.model.split_once(':') {
@@ -540,6 +564,8 @@ mod tests {
                 },
                 finish_reason: Some("stop".into()),
                 usage: CanonicalUsage::default(),
+                refusal: None,
+                id: None,
             })
         }
     }
@@ -550,7 +576,7 @@ mod tests {
         let g = GrokMock;
         let c = ClaudeMock;
         assert_eq!(g.id(), "grok");
-        assert_eq!(c.id(), "claude-code");
+        assert_eq!(c.id(), "claude");
         // also exercise the original MockProvider still works
         let m = MockProvider("grok");
         assert_eq!(m.id(), "grok");
@@ -765,6 +791,8 @@ mod tests {
             ],
             finish_reason: Some("tool_calls".into()),
             usage: CanonicalUsage::default(),
+            refusal: None,
+            id: None,
         };
         let j = serde_json::to_string(&resp).unwrap();
         let back: CanonicalResponse = serde_json::from_str(&j).unwrap();
@@ -1008,6 +1036,8 @@ mod tests {
             }],
             finish_reason: Some("stop".into()),
             usage: u,
+            refusal: None,
+            id: None,
         };
         let j = serde_json::to_string(&resp).unwrap();
         let back: CanonicalResponse = serde_json::from_str(&j).unwrap();

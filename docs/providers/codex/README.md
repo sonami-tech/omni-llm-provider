@@ -8,19 +8,20 @@ Codex-specific behavior lives in `crates/provider-codex`.
   `crates/provider-codex/src/lib.rs`
 - Codex configuration source: `$CODEX_HOME/config.toml` or
   `~/.codex/config.toml`
-- Codex auth source: `$CODEX_HOME/auth.json`, `~/.codex/auth.json`, configured
-  env vars, or configured auth commands
+- Codex auth source: `CODEX_API_KEY`, `OPENAI_API_KEY`,
+  `CODEX_ACCESS_TOKEN`, `$CODEX_HOME/auth.json`, `~/.codex/auth.json`,
+  configured env vars, or configured auth commands
 - Omni routing and model catalog aggregation: `crates/bin/omni/src/main.rs`
 
 ## Invariant
 
 Codex is an OpenAI-compatible backend for Omni's OpenAI inbound surfaces:
 
-- `/v1/chat/completions` non-streaming
-- `/v1/responses` non-streaming
+- `/v1/chat/completions` non-streaming and `stream:true`
+- `/v1/responses` non-streaming and `stream:true`
 
-Codex `stream:true` requests fail loudly until native Responses SSE parsing is
-implemented in `provider-codex`. They do not use buffered pseudo-streaming.
+Codex streaming uses native Responses SSE parsing in `provider-codex`; it does
+not use buffered pseudo-streaming.
 
 Anthropic inbound stays Claude-only. Codex does not attempt Anthropic wire
 fidelity.
@@ -30,6 +31,10 @@ fidelity.
 The provider reads Codex config fresh per request. The current model comes from
 `model`, and custom provider selection comes from `model_provider` plus
 `[model_providers.<name>]`.
+
+Default auto-detection enables Codex when `OMNI_CODEX_BASE_URL`, a non-empty
+`CODEX_API_KEY`, `OPENAI_API_KEY`, `CODEX_ACCESS_TOKEN`, or Codex config/auth
+files are present.
 
 Supported custom-provider fields:
 

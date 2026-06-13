@@ -4,7 +4,6 @@
 
 pub mod auth;
 pub mod conversation_log;
-pub mod credentials;
 pub mod error;
 pub mod http;
 pub mod replacements;
@@ -17,7 +16,6 @@ pub mod time_util;
 
 pub use auth::{ApiKeyId, auth_layer};
 pub use conversation_log::{ConversationLog, DEFAULT_LOG_BACKUPS, DEFAULT_LOG_MAX_BYTES};
-pub use credentials::GrokCredentials;
 pub use error::AppError;
 pub use http::{
     ChatCompletionRequest, ChatCompletionResponse, ChatMessage, from_canonical,

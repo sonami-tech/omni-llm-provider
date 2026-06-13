@@ -11,8 +11,10 @@
 //!    auto-detect path: just as omni reads `~/.claude/.credentials.json` (the Claude
 //!    CLI's file), it reads the Grok CLI's file so an existing `grok` login Just Works.
 //!
-//! Explicit beats ambient: a static-key file you created on purpose wins over the
-//! CLI's auto-managed OIDC login.
+//! Explicit beats ambient: a usable static-key file you created on purpose wins over
+//! the CLI's auto-managed OIDC login. If the ambient static-key file exists but has
+//! no usable key, we fall through to the CLI login instead of letting a stale file
+//! break an otherwise valid `grok` login.
 //!
 //! ## On-disk shapes
 //! Static key (`~/.xai/.credentials.json` or `$XAI_CREDENTIALS_PATH`):
@@ -112,10 +114,17 @@ impl GrokCredentials {
             return Self::load_fresh_async(Path::new(&p)).await;
         }
 
+        let mut ambient_static_error = None;
         if let Some(home) = dirs::home_dir() {
             let static_path = home.join(".xai").join(".credentials.json");
             if tokio::fs::try_exists(&static_path).await.unwrap_or(false) {
-                return Self::load_fresh_async(&static_path).await;
+                match Self::load_fresh_async(&static_path).await {
+                    Ok(creds) => return Ok(creds),
+                    Err(GrokCredentialsError::MissingToken) => {
+                        ambient_static_error = Some(GrokCredentialsError::MissingToken);
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         }
 
@@ -125,7 +134,7 @@ impl GrokCredentials {
             return Self::load_fresh_async(&cli_path).await;
         }
 
-        Err(GrokCredentialsError::NoSource)
+        Err(ambient_static_error.unwrap_or(GrokCredentialsError::NoSource))
     }
 
     /// Read and parse a specific credentials file synchronously. Never cached.
@@ -215,10 +224,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// Serializes tests that mutate `XAI_CREDENTIALS_PATH`, so the env-reading resolution
-    /// path (`load_resolved_async`) and the `default_path` override tests cannot race when
-    /// cargo runs tests in parallel threads within one binary.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::GROK_ENV_LOCK as ENV_LOCK;
 
     fn temp_credentials_path() -> PathBuf {
         std::env::temp_dir().join(format!("omni-creds-test-{}.json", uuid::Uuid::new_v4()))
@@ -545,5 +551,46 @@ mod tests {
             }
         }
         assert!(matches!(res.unwrap_err(), GrokCredentialsError::Read(_)));
+    }
+
+    #[tokio::test]
+    // See resolved_honors_explicit_env_override_first: env lock held across await is safe
+    // on the current-thread test runtime.
+    #[allow(clippy::await_holding_lock)]
+    async fn ambient_static_missing_token_falls_through_to_grok_cli_login() {
+        // WHY: a stale ~/.xai/.credentials.json from an abandoned static-key attempt must
+        // not break the common path where the user has a valid Grok CLI login in
+        // ~/.grok/auth.json. Only the explicit XAI_CREDENTIALS_PATH override remains hard.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!("omni-grok-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(home.join(".xai")).unwrap();
+        std::fs::create_dir_all(home.join(".grok")).unwrap();
+        write_temp_creds(&home.join(".xai/.credentials.json"), r#"{"apiKey":" "}"#);
+        write_temp_creds(
+            &home.join(".grok/auth.json"),
+            &grok_cli_json("jwt-from-cli", "2999-01-01T00:00:00Z"),
+        );
+
+        let old_home = std::env::var("HOME").ok();
+        let old_path = std::env::var("XAI_CREDENTIALS_PATH").ok();
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("XAI_CREDENTIALS_PATH");
+        }
+        let res = GrokCredentials::load_resolved_async().await;
+        unsafe {
+            match old_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match old_path {
+                Some(v) => std::env::set_var("XAI_CREDENTIALS_PATH", v),
+                None => std::env::remove_var("XAI_CREDENTIALS_PATH"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+
+        let creds = res.expect("stale ambient static file must fall through to CLI login");
+        assert_eq!(creds.api_key, "jwt-from-cli");
     }
 }

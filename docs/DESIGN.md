@@ -28,6 +28,8 @@ Provider implementations remain separate crates:
 - Model routing uses provider-owned catalogs. Bare canonical ids and documented
   aliases route when they uniquely match an enabled provider. `claude:`,
   `grok:`, and `codex:` prefixes remain as an explicit provider escape hatch.
+- When no provider list is configured, startup enables all locally detected
+  providers. `--providers` / `OMNI_PROVIDERS` remains an explicit override.
 
 ## HTTP Surface
 
@@ -45,9 +47,9 @@ routes only to Claude. The Claude provider owns the closed Anthropic allowlist,
 model resolution, identity injection, cch finalization, raw JSON response path,
 raw SSE forwarding, and `count_tokens` body shaping.
 
-Codex currently supports the non-streaming OpenAI inbound path. Codex
-`stream:true` requests fail loudly until `provider-codex` implements native
-Responses SSE parsing.
+Codex supports OpenAI inbound non-streaming and streaming paths by posting to
+the Codex Responses API and translating native Responses SSE events into
+canonical stream events.
 
 `LlmProvider` remains canonical-only. Native Anthropic methods are not on the
 shared trait because Grok and Codex cannot preserve Anthropic wire fidelity.
@@ -57,7 +59,7 @@ shared trait because Grok and Codex cannot preserve Anthropic wire fidelity.
 ```bash
 cargo build -p omni
 cargo run -p omni -- --version
-cargo run -p omni -- --providers claude,grok,codex --port 18321
+cargo run -p omni -- --port 18321
 ```
 
 ## Non-Goals
@@ -84,13 +86,23 @@ Claude-only.
 When a provider is pointed at a custom upstream endpoint, that custom
 configuration owns auth for that provider and default credentials must not leak:
 
+- Claude forced override: `OMNI_CLAUDE_BASE_URL` wins over
+  `ANTHROPIC_BASE_URL` and uses only `OMNI_CLAUDE_AUTH_TOKEN`,
+  `OMNI_CLAUDE_API_KEY`, and `OMNI_CLAUDE_CUSTOM_HEADERS`.
 - Claude: `ANTHROPIC_BASE_URL` activates custom gateway mode. Omni uses
   `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, and `ANTHROPIC_CUSTOM_HEADERS`
   only, reads them per request, and does not read local Claude OAuth credentials
   for that gateway.
+- Grok forced override: `OMNI_GROK_BASE_URL` wins over `GROK_MODELS_BASE_URL`
+  and uses only `OMNI_GROK_AUTH_TOKEN`, `OMNI_GROK_API_KEY`, and
+  `OMNI_GROK_CUSTOM_HEADERS`.
 - Grok: `GROK_MODELS_BASE_URL` activates custom endpoint mode. Omni uses
   `XAI_API_KEY` per request if present, otherwise no Authorization header, and
   does not read the default xAI/Grok credential files.
+- Codex forced override: `OMNI_CODEX_BASE_URL` is resolved inside
+  `provider-codex`; it feeds detection, catalog, aliases, and request config,
+  and uses only `OMNI_CODEX_AUTH_TOKEN`, `OMNI_CODEX_API_KEY`,
+  `OMNI_CODEX_CUSTOM_HEADERS`, `OMNI_CODEX_MODEL`, and `OMNI_CODEX_WIRE_API`.
 - Codex: Codex config controls custom-provider auth.
   `[model_providers.<name>.auth] command`, `experimental_bearer_token`, and
   `env_key` do not fall back to OpenAI auth unless

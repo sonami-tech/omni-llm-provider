@@ -9,7 +9,7 @@ fingerprint logic remains isolated in provider crates.
 - `omni` - the only server binary. Routes by canonical upstream model id
   (`claude-sonnet-4-6`, `grok-4.3`, or the configured Codex model),
   documented shorthand alias (`sonnet`, `opus`, `haiku`, `fable`, `grok`,
-  `composer`, `codex`), or optional provider prefix (`claude:...`,
+  `composer`, `codex`, `gpt`), or optional provider prefix (`claude:...`,
   `grok:...`, `codex:...`) when a caller needs to force a provider.
 
 ## Crates
@@ -31,11 +31,9 @@ fingerprint logic remains isolated in provider crates.
 ## HTTP Surface
 
 - `POST /v1/chat/completions` - non-stream JSON or `stream:true` OpenAI SSE
-  chunks terminated by `data: [DONE]`. Codex supports non-streaming on this
-  route; Codex `stream:true` is rejected until native Responses SSE is added.
+  chunks terminated by `data: [DONE]`.
 - `POST /v1/responses` - supported OpenAI Responses subset, non-stream JSON or
-  Responses SSE events. Codex supports non-streaming on this route; Codex
-  `stream:true` is rejected until native Responses SSE is added.
+  Responses SSE events.
 - `POST /v1/messages` - native Anthropic Messages inbound for Claude models
   only. This bypasses canonical OpenAI framing and forwards Anthropic JSON/SSE
   through the Claude provider's fingerprint path.
@@ -51,14 +49,14 @@ fingerprint logic remains isolated in provider crates.
 ```bash
 cargo build --workspace
 cargo run -p omni -- --version
-cargo run -p omni -- --providers claude,grok,codex --no-auth --port 18321
+cargo run -p omni -- --no-auth --port 18321
 cargo test --workspace
 ```
 
 Useful server flags:
 
 - `--version` prints the Omni binary version and exits.
-- `--providers claude,grok,codex` / `OMNI_PROVIDERS`
+- `--providers claude,grok,codex` / `OMNI_PROVIDERS` overrides auto-detection
 - `--port 18321` / `OMNI_PORT`
 - `--bind 127.0.0.1` / `OMNI_BIND`
 - `--public` / `OMNI_PUBLIC` for `0.0.0.0`
@@ -78,6 +76,13 @@ stats or when running more than one server instance.
 On startup, Omni logs its banner and current package version before serving
 requests.
 
+When `--providers` / `OMNI_PROVIDERS` is omitted or empty, Omni enables all
+locally detected providers. Detection checks Claude credentials,
+`OMNI_CLAUDE_BASE_URL`, or `ANTHROPIC_BASE_URL`; Grok credentials,
+`OMNI_GROK_BASE_URL`, or `GROK_MODELS_BASE_URL`; and Codex config/auth under
+`$CODEX_HOME` / `~/.codex`, `CODEX_API_KEY`, `OPENAI_API_KEY`,
+`CODEX_ACCESS_TOKEN`, or `OMNI_CODEX_BASE_URL`.
+
 Current shorthand aliases are resolved from provider-owned catalogs at startup:
 
 - `sonnet` -> `claude-sonnet-4-6`
@@ -88,25 +93,48 @@ Current shorthand aliases are resolved from provider-owned catalogs at startup:
 - `composer` -> `grok-composer-2.5-fast`
 - `codex` -> the current Codex model from `$CODEX_HOME/config.toml` or
   `~/.codex/config.toml`, falling back to the provider default
+- `gpt` -> the same current Codex model as `codex`
 
 Credentials are read fresh per request, never cached. Claude reads
 `~/.claude/.credentials.json` or `$CLAUDE_CREDENTIALS_PATH`. Grok resolves
-`$XAI_CREDENTIALS_PATH`, then `~/.xai/.credentials.json`, then
-`~/.grok/auth.json`. Codex reads `$CODEX_HOME` or `~/.codex` config and auth
-state per request.
+`$XAI_CREDENTIALS_PATH`, then a usable `~/.xai/.credentials.json`, then
+`~/.grok/auth.json`. Codex reads `CODEX_API_KEY`, `OPENAI_API_KEY`,
+`CODEX_ACCESS_TOKEN`, or `$CODEX_HOME` / `~/.codex` config and auth state per
+request.
 
 Custom upstream endpoint overrides are explicit and isolated from default
 credentials:
 
+- Claude forced override: `OMNI_CLAUDE_BASE_URL` switches Claude to a custom
+  Anthropic-compatible gateway and wins over `ANTHROPIC_BASE_URL`.
+  `OMNI_CLAUDE_AUTH_TOKEN` sends `Authorization: Bearer ...`; otherwise
+  `OMNI_CLAUDE_API_KEY` sends `x-api-key`. `OMNI_CLAUDE_CUSTOM_HEADERS`
+  accepts one `Name: value` header per line. In this mode Omni does not read or
+  send the local Claude OAuth token or any `ANTHROPIC_*` auth variables.
 - Claude: `ANTHROPIC_BASE_URL` switches Claude to a custom Anthropic-compatible
   gateway. `ANTHROPIC_AUTH_TOKEN` sends `Authorization: Bearer ...`; otherwise
   `ANTHROPIC_API_KEY` sends `x-api-key`. `ANTHROPIC_CUSTOM_HEADERS` accepts one
   `Name: value` header per line. In this mode Omni does not read or send the
   local Claude OAuth token.
+- Grok forced override: `OMNI_GROK_BASE_URL` switches Grok to a custom
+  OpenAI-compatible endpoint and wins over `GROK_MODELS_BASE_URL`.
+  `OMNI_GROK_AUTH_TOKEN` sends `Authorization: Bearer ...`; otherwise
+  `OMNI_GROK_API_KEY` sends `Authorization: Bearer ...`.
+  `OMNI_GROK_CUSTOM_HEADERS` accepts one `Name: value` header per line. In this
+  mode Omni does not read or send `XAI_API_KEY`, `$XAI_CREDENTIALS_PATH`,
+  `~/.xai`, or `~/.grok` credentials.
 - Grok: `GROK_MODELS_BASE_URL` switches Grok to a custom OpenAI-compatible
   endpoint. `XAI_API_KEY` sends `Authorization: Bearer ...`; if it is unset,
   no Authorization header is sent. In this mode Omni does not read or send
   `$XAI_CREDENTIALS_PATH`, `~/.xai`, or `~/.grok` credentials.
+- Codex forced override: `OMNI_CODEX_BASE_URL` switches Codex to a custom
+  Responses-compatible endpoint and wins over Codex config base URLs.
+  `OMNI_CODEX_MODEL` controls the catalog and `codex` / `gpt` aliases, falling
+  back to the Codex config model or provider default. `OMNI_CODEX_AUTH_TOKEN`
+  sends `Authorization: Bearer ...`; otherwise `OMNI_CODEX_API_KEY` does.
+  `OMNI_CODEX_CUSTOM_HEADERS` accepts one `Name: value` header per line.
+  `OMNI_CODEX_WIRE_API` currently supports `responses`. In this mode Omni does
+  not read or send Codex/OpenAI native auth.
 - Codex: Codex custom providers come from Codex config. A custom provider's
   `[model_providers.<name>.auth] command`, `experimental_bearer_token`, or
   `env_key` owns auth for that provider and does not fall back to OpenAI auth
@@ -116,8 +144,8 @@ Inbound compatibility:
 
 | Inbound API surface | Claude backend | Grok backend | Codex backend |
 |---|---:|---:|---:|
-| OpenAI `/v1/chat/completions` | Yes | Yes | Non-stream |
-| OpenAI `/v1/responses` | Yes | Yes | Non-stream |
+| OpenAI `/v1/chat/completions` | Yes | Yes | Yes |
+| OpenAI `/v1/responses` | Yes | Yes | Yes |
 | Anthropic `/v1/messages` | Yes | No | No |
 | Anthropic `/v1/messages/count_tokens` | Yes | No | No |
 

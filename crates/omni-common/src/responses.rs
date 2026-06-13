@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
-    CanonicalResponse, CanonicalStream, CanonicalStreamEvent, CanonicalTool, CanonicalToolChoice,
+    CanonicalResponse, CanonicalResponseMetadata, CanonicalStream, CanonicalStreamEvent,
+    CanonicalTool, CanonicalToolChoice,
 };
 
 /// The boxed SSE event stream produced by the Responses framer. Boxed so the
@@ -162,6 +163,8 @@ pub struct ResponsesResponse {
     pub output: Vec<ResponsesOutputItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incomplete_details: Option<IncompleteDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ResponsesError>,
     pub usage: ResponsesUsage,
 }
 
@@ -186,14 +189,25 @@ pub enum ResponsesOutputItem {
 #[derive(Debug, Serialize)]
 pub struct ResponsesOutputContent {
     #[serde(rename = "type")]
-    pub kind: &'static str, // "output_text"
-    pub text: String,
+    pub kind: &'static str, // "output_text" | "refusal"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
     pub annotations: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct IncompleteDetails {
     pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResponsesError {
+    pub message: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub code: Option<String>,
 }
 
 /// Responses usage uses input/output naming (NOT prompt/completion like Chat).
@@ -218,6 +232,8 @@ pub struct ResponsesUsage {
 ///   (both keyed by `call_id`), so multi-turn tool loops round-trip
 /// - `max_output_tokens`/`temperature`/`top_p` -> canonical sampling
 /// - `reasoning.effort` -> canonical reasoning effort
+/// - unknown top-level Responses fields -> canonical provider_extras, where
+///   each backend can allowlist the fields it natively supports
 /// - flattened function tools -> canonical tools; `tool_choice` "auto" ->
 ///   Auto, "required" -> Required, "none" -> None (tools stay visible, model
 ///   must not call), `{type:"function",name}` -> Specific
@@ -359,6 +375,14 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
         budget_tokens: None,
     });
 
+    let provider_extras = req.extras.as_object().and_then(|extras| {
+        if extras.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(extras.clone()))
+        }
+    });
+
     Ok(CanonicalRequest {
         model: req.model.clone(),
         messages,
@@ -369,7 +393,7 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
         top_p: req.top_p,
         reasoning,
         metadata: Default::default(),
-        provider_extras: None,
+        provider_extras,
     })
 }
 
@@ -378,40 +402,65 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
 /// Contract (pinned by tests): one assistant Message item (output_text part)
 /// when content is non-empty, then one FunctionCall item per canonical tool
 /// call (call_id = canonical id, ids prefixed "msg_"/"fc_"); finish_reason
-/// "length" -> status "incomplete" with incomplete_details.reason
-/// "max_output_tokens", everything else -> "completed"; usage totals filled.
+/// "length" -> incomplete/max_output_tokens, "content_filter" ->
+/// incomplete/content_filter, everything else -> completed; usage totals filled.
 pub fn responses_from_canonical(
     canon: CanonicalResponse,
     requested_model: String,
     response_id: String,
     created_at: u64,
 ) -> ResponsesResponse {
-    let length_finish = canon.finish_reason.as_deref() == Some("length");
-    let (status, incomplete_details) = if length_finish {
-        (
-            "incomplete".to_string(),
-            Some(IncompleteDetails {
-                reason: "max_output_tokens".into(),
-            }),
-        )
-    } else {
-        ("completed".to_string(), None)
-    };
+    let response_id = canon.id.clone().unwrap_or(response_id);
+    let (status, incomplete_details, error) =
+        if responses_error_reason(canon.finish_reason.as_deref()).is_some() {
+            (
+                "failed".to_string(),
+                None,
+                Some(ResponsesError {
+                    message: "canonical response error".into(),
+                    kind: "server_error",
+                    code: None,
+                }),
+            )
+        } else if let Some(reason) = responses_incomplete_reason(canon.finish_reason.as_deref()) {
+            (
+                "incomplete".to_string(),
+                Some(IncompleteDetails {
+                    reason: reason.into(),
+                }),
+                None,
+            )
+        } else {
+            ("completed".to_string(), None, None)
+        };
 
     let mut output: Vec<ResponsesOutputItem> = Vec::new();
 
     // A message item is emitted only when there is assistant text; a tool-only
     // turn carries no empty message (mirrors Chat's null-content contract).
-    if !canon.content.is_empty() {
+    if !canon.content.is_empty() || canon.refusal.is_some() {
+        let mut content = Vec::new();
+        if !canon.content.is_empty() {
+            content.push(ResponsesOutputContent {
+                kind: "output_text",
+                text: Some(canon.content),
+                refusal: None,
+                annotations: Vec::new(),
+            });
+        }
+        if let Some(refusal) = canon.refusal {
+            content.push(ResponsesOutputContent {
+                kind: "refusal",
+                text: None,
+                refusal: Some(refusal),
+                annotations: Vec::new(),
+            });
+        }
         output.push(ResponsesOutputItem::Message {
             id: format!("msg_{response_id}"),
             status: status.clone(),
             role: "assistant",
-            content: vec![ResponsesOutputContent {
-                kind: "output_text",
-                text: canon.content,
-                annotations: Vec::new(),
-            }],
+            content,
         });
     }
 
@@ -435,6 +484,7 @@ pub fn responses_from_canonical(
         model: requested_model,
         output,
         incomplete_details,
+        error,
         usage: ResponsesUsage {
             input_tokens: canon.usage.input_tokens,
             output_tokens: canon.usage.output_tokens,
@@ -447,13 +497,13 @@ pub fn responses_from_canonical(
 ///
 /// Contract (pinned by tests): every SSE event has an `event:` name matching
 /// the JSON `type` and a strictly-increasing `sequence_number`. Sequence:
-/// `response.created` first; `response.output_item.added` (message) before the
-/// first `response.output_text.delta`; tool calls open with
-/// `response.output_item.added` (function_call, carrying the name) followed by
-/// `response.function_call_arguments.delta` events; terminal event is
-/// `response.completed` (carrying the aggregated output + usage + status
-/// "completed"), or `response.incomplete` on a "length" finish, or
-/// `response.failed` on a stream error. NO `data: [DONE]` sentinel.
+/// `response.created` first; each output item gets one stable `output_index`
+/// when first seen; text items are announced before their first text delta;
+/// tool calls open with `response.output_item.added` (function_call, carrying
+/// the name) followed by `response.function_call_arguments.delta` events;
+/// terminal event is `response.completed` (carrying the aggregated output +
+/// usage + status "completed"), or `response.incomplete` on a "length" finish,
+/// or `response.failed` on a stream error. NO `data: [DONE]` sentinel.
 pub fn sse_from_canonical_stream_responses(
     stream: CanonicalStream,
     requested_model: String,
@@ -477,10 +527,32 @@ fn responses_event(seq: &mut u64, name: &str, mut payload: serde_json::Value) ->
 /// Stream-wide constants shared by every Responses SSE event (the response id,
 /// the creation timestamp, and the echoed model). Built once per stream and
 /// threaded by reference so the envelope/event helpers stay small.
+#[derive(Clone)]
 struct StreamMeta {
     response_id: String,
     created_at: u64,
     model: String,
+}
+
+enum ResponsesStreamOutputItem {
+    Message,
+    Tool(u32),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResponsesContentChannel {
+    Text,
+    Refusal,
+}
+
+struct ResponsesStreamToolCall {
+    canonical_index: u32,
+    output_index: u32,
+    call_id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+    emitted_open: bool,
+    emitted_arguments_len: usize,
 }
 
 /// Build the terminal response envelope embedded in `response.completed` /
@@ -490,29 +562,44 @@ fn responses_stream_envelope(
     meta: &StreamMeta,
     status: &str,
     text: &str,
-    tool_calls: &[(String, String, String)], // (call_id, name, arguments)
+    refusal: &str,
+    message_content_order: &[ResponsesContentChannel],
+    tool_calls: &[ResponsesStreamToolCall],
+    output_order: &[ResponsesStreamOutputItem],
     usage: &CanonicalUsageAccum,
     incomplete_reason: Option<&str>,
 ) -> serde_json::Value {
     let mut output: Vec<serde_json::Value> = Vec::new();
-    if !text.is_empty() {
-        output.push(serde_json::json!({
-            "type": "message",
-            "id": format!("msg_{}", meta.response_id),
-            "status": status,
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": text, "annotations": []}],
-        }));
-    }
-    for (call_id, name, arguments) in tool_calls {
-        output.push(serde_json::json!({
-            "type": "function_call",
-            "id": format!("fc_{call_id}"),
-            "call_id": call_id,
-            "name": name,
-            "arguments": arguments,
-            "status": status,
-        }));
+    for item in output_order {
+        match item {
+            ResponsesStreamOutputItem::Message if !text.is_empty() || !refusal.is_empty() => {
+                let content = responses_message_content_json(text, refusal, message_content_order);
+                output.push(serde_json::json!({
+                    "type": "message",
+                    "id": format!("msg_{}", meta.response_id),
+                    "status": status,
+                    "role": "assistant",
+                    "content": content,
+                }));
+            }
+            ResponsesStreamOutputItem::Tool(canonical_index) => {
+                if let Some(call) = tool_calls
+                    .iter()
+                    .find(|call| call.canonical_index == *canonical_index)
+                    && let (Some(call_id), Some(name)) = (&call.call_id, &call.name)
+                {
+                    output.push(serde_json::json!({
+                        "type": "function_call",
+                        "id": format!("fc_{call_id}"),
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": call.arguments,
+                        "status": status,
+                    }));
+                }
+            }
+            ResponsesStreamOutputItem::Message => {}
+        }
     }
     let mut envelope = serde_json::json!({
         "id": meta.response_id,
@@ -546,13 +633,28 @@ fn responses_sse_events(
     created_at: u64,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     use futures_util::StreamExt;
-    let meta = StreamMeta {
+    let mut meta = StreamMeta {
         response_id,
         created_at,
         model: requested_model,
     };
     async_stream::stream! {
         let mut seq: u64 = 0;
+        let mut pending_item = None;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(CanonicalStreamEvent::ResponseMetadata(CanonicalResponseMetadata { id })) => {
+                    if let Some(id) = id {
+                        meta.response_id = id;
+                    }
+                }
+                other => {
+                    pending_item = Some(other);
+                    break;
+                }
+            }
+        }
 
         // response.created opens the stream (status in_progress, empty output).
         let created_env = serde_json::json!({
@@ -569,18 +671,43 @@ fn responses_sse_events(
 
         // Aggregated state for the terminal envelope.
         let mut text = String::new();
-        let mut message_added = false;
+        let mut refusal = String::new();
+        let mut next_output_index: u32 = 0;
+        let mut message_output_index: Option<u32> = None;
+        let mut message_content_order: Vec<ResponsesContentChannel> = Vec::new();
+        let mut output_order: Vec<ResponsesStreamOutputItem> = Vec::new();
         // Tool calls in arrival order, indexed by their canonical stream index.
-        let mut tool_calls: Vec<(u32, String, String, String)> = Vec::new(); // (index, call_id, name, args)
+        let mut tool_calls: Vec<ResponsesStreamToolCall> = Vec::new();
         let mut usage = CanonicalUsageAccum::default();
         let mut finish_reason: Option<String> = None;
-        let mut errored = false;
+        let mut error_message: Option<String> = None;
+        let mut saw_finish = false;
 
-        while let Some(item) = stream.next().await {
+        loop {
+            let item = if let Some(item) = pending_item.take() {
+                item
+            } else if let Some(item) = stream.next().await {
+                item
+            } else {
+                break;
+            };
             match item {
+                Ok(CanonicalStreamEvent::ResponseMetadata(CanonicalResponseMetadata { id })) => {
+                    if let Some(id) = id {
+                        meta.response_id = id;
+                    }
+                }
                 Ok(CanonicalStreamEvent::TextDelta(delta)) => {
-                    if !message_added {
-                        message_added = true;
+                    if delta.is_empty() {
+                        continue;
+                    }
+                    let output_index = if let Some(output_index) = message_output_index {
+                        output_index
+                    } else {
+                        let output_index = next_output_index;
+                        next_output_index += 1;
+                        message_output_index = Some(output_index);
+                        output_order.push(ResponsesStreamOutputItem::Message);
                         let item = serde_json::json!({
                             "type": "message",
                             "id": format!("msg_{}", meta.response_id),
@@ -589,20 +716,114 @@ fn responses_sse_events(
                             "content": [],
                         });
                         yield Ok(responses_event(&mut seq, "response.output_item.added", serde_json::json!({
+                            "output_index": output_index,
                             "item": item,
+                        })));
+                        output_index
+                    };
+                    let (content_index, content_added) = content_index_for(
+                        &mut message_content_order,
+                        ResponsesContentChannel::Text,
+                    );
+                    if content_added {
+                        yield Ok(responses_event(&mut seq, "response.content_part.added", serde_json::json!({
+                            "output_index": output_index,
+                            "content_index": content_index,
+                            "item_id": format!("msg_{}", meta.response_id),
+                            "part": responses_content_part_json(ResponsesContentChannel::Text, ""),
                         })));
                     }
                     text.push_str(&delta);
                     yield Ok(responses_event(&mut seq, "response.output_text.delta", serde_json::json!({
+                        "output_index": output_index,
+                        "content_index": content_index,
+                        "item_id": format!("msg_{}", meta.response_id),
+                        "delta": delta,
+                    })));
+                }
+                Ok(CanonicalStreamEvent::RefusalDelta(delta)) => {
+                    if delta.is_empty() {
+                        continue;
+                    }
+                    let output_index = if let Some(output_index) = message_output_index {
+                        output_index
+                    } else {
+                        let output_index = next_output_index;
+                        next_output_index += 1;
+                        message_output_index = Some(output_index);
+                        output_order.push(ResponsesStreamOutputItem::Message);
+                        let item = serde_json::json!({
+                            "type": "message",
+                            "id": format!("msg_{}", meta.response_id),
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        });
+                        yield Ok(responses_event(&mut seq, "response.output_item.added", serde_json::json!({
+                            "output_index": output_index,
+                            "item": item,
+                        })));
+                        output_index
+                    };
+                    let (content_index, content_added) = content_index_for(
+                        &mut message_content_order,
+                        ResponsesContentChannel::Refusal,
+                    );
+                    if content_added {
+                        yield Ok(responses_event(&mut seq, "response.content_part.added", serde_json::json!({
+                            "output_index": output_index,
+                            "content_index": content_index,
+                            "item_id": format!("msg_{}", meta.response_id),
+                            "part": responses_content_part_json(ResponsesContentChannel::Refusal, ""),
+                        })));
+                    }
+                    refusal.push_str(&delta);
+                    yield Ok(responses_event(&mut seq, "response.refusal.delta", serde_json::json!({
+                        "output_index": output_index,
+                        "content_index": content_index,
+                        "item_id": format!("msg_{}", meta.response_id),
                         "delta": delta,
                     })));
                 }
                 Ok(CanonicalStreamEvent::ToolCallDelta { index, id, name, arguments_delta }) => {
-                    // First delta for an index opens the function_call item.
-                    if !tool_calls.iter().any(|(i, ..)| *i == index) {
-                        let call_id = id.clone().unwrap_or_else(|| format!("call_{index}"));
-                        let call_name = name.clone().unwrap_or_default();
-                        tool_calls.push((index, call_id.clone(), call_name.clone(), String::new()));
+                    let call_pos = if let Some(pos) = tool_calls
+                        .iter_mut()
+                        .position(|call| call.canonical_index == index)
+                    {
+                        let slot = &mut tool_calls[pos];
+                        if slot.call_id.is_none() && let Some(id) = id {
+                            slot.call_id = Some(id);
+                        }
+                        if slot.name.is_none() && let Some(name) = name {
+                            slot.name = Some(name);
+                        }
+                        pos
+                    } else {
+                        let output_index = next_output_index;
+                        next_output_index += 1;
+                        tool_calls.push(ResponsesStreamToolCall {
+                            canonical_index: index,
+                            output_index,
+                            call_id: id,
+                            name,
+                            arguments: String::new(),
+                            emitted_open: false,
+                            emitted_arguments_len: 0,
+                        });
+                        output_order.push(ResponsesStreamOutputItem::Tool(index));
+                        tool_calls.len() - 1
+                    };
+                    if !arguments_delta.is_empty() {
+                        tool_calls[call_pos].arguments.push_str(&arguments_delta);
+                    }
+                    if !tool_calls[call_pos].emitted_open
+                        && let (Some(call_id), Some(call_name)) = (
+                            tool_calls[call_pos].call_id.clone(),
+                            tool_calls[call_pos].name.clone(),
+                        )
+                    {
+                        tool_calls[call_pos].emitted_open = true;
+                        let output_index = tool_calls[call_pos].output_index;
                         let item = serde_json::json!({
                             "type": "function_call",
                             "id": format!("fc_{call_id}"),
@@ -612,15 +833,19 @@ fn responses_sse_events(
                             "status": "in_progress",
                         });
                         yield Ok(responses_event(&mut seq, "response.output_item.added", serde_json::json!({
+                            "output_index": output_index,
                             "item": item,
                         })));
                     }
-                    if !arguments_delta.is_empty() {
-                        if let Some(slot) = tool_calls.iter_mut().find(|(i, ..)| *i == index) {
-                            slot.3.push_str(&arguments_delta);
-                        }
+                    let slot = &mut tool_calls[call_pos];
+                    if slot.emitted_open && slot.emitted_arguments_len < slot.arguments.len() {
+                        let delta = slot.arguments[slot.emitted_arguments_len..].to_string();
+                        slot.emitted_arguments_len = slot.arguments.len();
+                        let item_id = format!("fc_{}", slot.call_id.as_deref().unwrap_or("call_unknown"));
                         yield Ok(responses_event(&mut seq, "response.function_call_arguments.delta", serde_json::json!({
-                            "delta": arguments_delta,
+                            "output_index": slot.output_index,
+                            "item_id": item_id,
+                            "delta": delta,
                         })));
                     }
                 }
@@ -630,37 +855,101 @@ fn responses_sse_events(
                 }
                 Ok(CanonicalStreamEvent::Finish { finish_reason: fr }) => {
                     finish_reason = fr;
+                    saw_finish = true;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "canonical stream error mid-flight (responses)");
-                    errored = true;
+                    error_message = Some(e.to_string());
                     break;
                 }
             }
         }
 
-        let calls: Vec<(String, String, String)> = tool_calls
-            .into_iter()
-            .map(|(_, call_id, name, args)| (call_id, name, args))
-            .collect();
+        if !saw_finish && error_message.is_none() {
+            error_message = Some("canonical stream ended before Finish event".into());
+        }
 
-        if errored {
+        if let Some(message) = error_message {
+            tracing::warn!(error = %message, "canonical stream error mid-flight (responses)");
+            if let Some(output_index) = message_output_index {
+                for event in emit_responses_text_done_events(&mut seq, &meta, output_index, &text, &refusal, &message_content_order) {
+                    yield Ok(event);
+                }
+            }
+            for event in emit_responses_tool_done_events(&mut seq, &tool_calls) {
+                yield Ok(event);
+            }
+            yield Ok(emit_responses_failed_event(
+                &mut seq,
+                &meta,
+                &text,
+                &refusal,
+                &message_content_order,
+                &tool_calls,
+                &output_order,
+                &usage,
+            ));
+        } else if responses_error_reason(finish_reason.as_deref()).is_some() {
+            if let Some(output_index) = message_output_index {
+                for event in emit_responses_text_done_events(&mut seq, &meta, output_index, &text, &refusal, &message_content_order) {
+                    yield Ok(event);
+                }
+            }
+            for event in emit_responses_tool_done_events(&mut seq, &tool_calls) {
+                yield Ok(event);
+            }
+            yield Ok(emit_responses_failed_event(
+                &mut seq,
+                &meta,
+                &text,
+                &refusal,
+                &message_content_order,
+                &tool_calls,
+                &output_order,
+                &usage,
+            ));
+        } else if let Some(reason) = responses_incomplete_reason(finish_reason.as_deref()) {
+            if let Some(output_index) = message_output_index {
+                for event in emit_responses_text_done_events(&mut seq, &meta, output_index, &text, &refusal, &message_content_order) {
+                    yield Ok(event);
+                }
+            }
+            for event in emit_responses_tool_done_events(&mut seq, &tool_calls) {
+                yield Ok(event);
+            }
             let env = responses_stream_envelope(
-                &meta, "failed", &text, &calls, &usage, None,
-            );
-            yield Ok(responses_event(&mut seq, "response.failed", serde_json::json!({
-                "response": env,
-            })));
-        } else if finish_reason.as_deref() == Some("length") {
-            let env = responses_stream_envelope(
-                &meta, "incomplete", &text, &calls, &usage, Some("max_output_tokens"),
+                &meta,
+                "incomplete",
+                &text,
+                &refusal,
+                &message_content_order,
+                &tool_calls,
+                &output_order,
+                &usage,
+                Some(reason),
             );
             yield Ok(responses_event(&mut seq, "response.incomplete", serde_json::json!({
                 "response": env,
             })));
         } else {
+            if let Some(output_index) = message_output_index {
+                for event in emit_responses_text_done_events(&mut seq, &meta, output_index, &text, &refusal, &message_content_order) {
+                    yield Ok(event);
+                }
+            }
+            for event in emit_responses_tool_done_events(&mut seq, &tool_calls) {
+                yield Ok(event);
+            }
             let env = responses_stream_envelope(
-                &meta, "completed", &text, &calls, &usage, None,
+                &meta,
+                "completed",
+                &text,
+                &refusal,
+                &message_content_order,
+                &tool_calls,
+                &output_order,
+                &usage,
+                None,
             );
             yield Ok(responses_event(&mut seq, "response.completed", serde_json::json!({
                 "response": env,
@@ -670,12 +959,251 @@ fn responses_sse_events(
     }
 }
 
+fn emit_responses_text_done_events(
+    seq: &mut u64,
+    meta: &StreamMeta,
+    output_index: u32,
+    text: &str,
+    refusal: &str,
+    message_content_order: &[ResponsesContentChannel],
+) -> Vec<Event> {
+    let mut events = Vec::new();
+    if !text.is_empty() {
+        let content_index =
+            content_index(message_content_order, ResponsesContentChannel::Text).unwrap_or(0);
+        events.push(responses_event(
+            seq,
+            "response.output_text.done",
+            serde_json::json!({
+                "output_index": output_index,
+                "content_index": content_index,
+                "item_id": format!("msg_{}", meta.response_id),
+                "text": text,
+            }),
+        ));
+        events.push(responses_event(
+            seq,
+            "response.content_part.done",
+            serde_json::json!({
+                "output_index": output_index,
+                "content_index": content_index,
+                "item_id": format!("msg_{}", meta.response_id),
+                "part": responses_content_part_json(ResponsesContentChannel::Text, text),
+            }),
+        ));
+    }
+    if !refusal.is_empty() {
+        let content_index =
+            content_index(message_content_order, ResponsesContentChannel::Refusal).unwrap_or(0);
+        events.push(responses_event(
+            seq,
+            "response.refusal.done",
+            serde_json::json!({
+                "output_index": output_index,
+                "content_index": content_index,
+                "item_id": format!("msg_{}", meta.response_id),
+                "refusal": refusal,
+            }),
+        ));
+        events.push(responses_event(
+            seq,
+            "response.content_part.done",
+            serde_json::json!({
+                "output_index": output_index,
+                "content_index": content_index,
+                "item_id": format!("msg_{}", meta.response_id),
+                "part": responses_content_part_json(ResponsesContentChannel::Refusal, refusal),
+            }),
+        ));
+    }
+    if !text.is_empty() || !refusal.is_empty() {
+        events.push(responses_event(
+            seq,
+            "response.output_item.done",
+            serde_json::json!({
+                "output_index": output_index,
+                "item": {
+                    "type": "message",
+                    "id": format!("msg_{}", meta.response_id),
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": responses_message_content_json(text, refusal, message_content_order),
+                },
+            }),
+        ));
+    }
+    events
+}
+
+fn emit_responses_tool_done_events(
+    seq: &mut u64,
+    tool_calls: &[ResponsesStreamToolCall],
+) -> Vec<Event> {
+    let mut events = Vec::new();
+    for call in tool_calls.iter().filter(|call| call.emitted_open) {
+        let Some(call_id) = call.call_id.as_deref() else {
+            continue;
+        };
+        let Some(name) = call.name.as_deref() else {
+            continue;
+        };
+        events.push(responses_event(
+            seq,
+            "response.function_call_arguments.done",
+            serde_json::json!({
+                "output_index": call.output_index,
+                "item_id": format!("fc_{call_id}"),
+                "arguments": call.arguments,
+            }),
+        ));
+        events.push(responses_event(
+            seq,
+            "response.output_item.done",
+            serde_json::json!({
+                "output_index": call.output_index,
+                "item": {
+                    "type": "function_call",
+                    "id": format!("fc_{call_id}"),
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": call.arguments,
+                    "status": "completed",
+                },
+            }),
+        ));
+    }
+    events
+}
+
+fn responses_message_content_json(
+    text: &str,
+    refusal: &str,
+    message_content_order: &[ResponsesContentChannel],
+) -> Vec<serde_json::Value> {
+    let mut content = Vec::new();
+    let mut content_order = message_content_order.to_vec();
+    if !text.is_empty() && !content_order.contains(&ResponsesContentChannel::Text) {
+        content_order.push(ResponsesContentChannel::Text);
+    }
+    if !refusal.is_empty() && !content_order.contains(&ResponsesContentChannel::Refusal) {
+        content_order.push(ResponsesContentChannel::Refusal);
+    }
+    for channel in content_order {
+        match channel {
+            ResponsesContentChannel::Text if !text.is_empty() => {
+                content.push(serde_json::json!({
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": [],
+                }));
+            }
+            ResponsesContentChannel::Refusal if !refusal.is_empty() => {
+                content.push(serde_json::json!({
+                    "type": "refusal",
+                    "refusal": refusal,
+                    "annotations": [],
+                }));
+            }
+            _ => {}
+        }
+    }
+    content
+}
+
+fn responses_content_part_json(channel: ResponsesContentChannel, value: &str) -> serde_json::Value {
+    match channel {
+        ResponsesContentChannel::Text => serde_json::json!({
+            "type": "output_text",
+            "text": value,
+            "annotations": [],
+        }),
+        ResponsesContentChannel::Refusal => serde_json::json!({
+            "type": "refusal",
+            "refusal": value,
+            "annotations": [],
+        }),
+    }
+}
+
+fn emit_responses_failed_event(
+    seq: &mut u64,
+    meta: &StreamMeta,
+    text: &str,
+    refusal: &str,
+    message_content_order: &[ResponsesContentChannel],
+    tool_calls: &[ResponsesStreamToolCall],
+    output_order: &[ResponsesStreamOutputItem],
+    usage: &CanonicalUsageAccum,
+) -> Event {
+    let mut env = responses_stream_envelope(
+        meta,
+        "failed",
+        text,
+        refusal,
+        message_content_order,
+        tool_calls,
+        output_order,
+        usage,
+        None,
+    );
+    let error = serde_json::json!({
+        "message": "canonical stream error",
+        "type": "server_error",
+        "code": serde_json::Value::Null,
+    });
+    env["error"] = error.clone();
+    responses_event(
+        seq,
+        "response.failed",
+        serde_json::json!({
+            "response": env,
+            "error": error,
+        }),
+    )
+}
+
+fn content_index_for(
+    order: &mut Vec<ResponsesContentChannel>,
+    channel: ResponsesContentChannel,
+) -> (u32, bool) {
+    if let Some(index) = content_index(order, channel) {
+        return (index, false);
+    }
+    order.push(channel);
+    ((order.len() - 1) as u32, true)
+}
+
+fn content_index(
+    order: &[ResponsesContentChannel],
+    channel: ResponsesContentChannel,
+) -> Option<u32> {
+    order
+        .iter()
+        .position(|existing| *existing == channel)
+        .map(|index| index as u32)
+}
+
+fn responses_incomplete_reason(finish_reason: Option<&str>) -> Option<&str> {
+    match finish_reason {
+        Some("length") => Some("max_output_tokens"),
+        Some("content_filter") => Some("content_filter"),
+        _ => None,
+    }
+}
+
+fn responses_error_reason(finish_reason: Option<&str>) -> Option<&str> {
+    match finish_reason {
+        Some(reason) if reason == "error" || reason.starts_with("error:") => Some(reason),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use omni_core::{
-        CanonicalContent, CanonicalStreamEvent, CanonicalToolCall, CanonicalToolChoice,
-        CanonicalUsage, ProviderError,
+        CanonicalContent, CanonicalResponseMetadata, CanonicalStreamEvent, CanonicalToolCall,
+        CanonicalToolChoice, CanonicalUsage, ProviderError,
     };
 
     // ---- helpers ----
@@ -842,6 +1370,26 @@ mod tests {
             canon.reasoning.expect("reasoning mapped").effort.as_deref(),
             Some("high")
         );
+    }
+
+    #[test]
+    fn to_canonical_preserves_top_level_extras_for_provider() {
+        // WHY: Responses-native Codex features such as previous_response_id are
+        // top-level fields with no canonical equivalent. The inbound adapter
+        // must preserve them so each provider can forward its supported subset.
+        let req = parse(
+            r#"{"model":"m","input":"q","previous_response_id":"resp_prev","store":false,
+                "metadata":{"trace":"abc"},"parallel_tool_calls":true,"service_tier":"priority"}"#,
+        );
+        let canon = responses_to_canonical(&req).unwrap();
+        let extras = canon
+            .provider_extras
+            .expect("responses extras should survive conversion");
+        assert_eq!(extras["previous_response_id"], "resp_prev");
+        assert_eq!(extras["store"], false);
+        assert_eq!(extras["metadata"]["trace"], "abc");
+        assert_eq!(extras["parallel_tool_calls"], true);
+        assert_eq!(extras["service_tier"], "priority");
     }
 
     #[test]
@@ -1022,6 +1570,8 @@ mod tests {
                 output_tokens: 7,
                 ..Default::default()
             },
+            id: None,
+            refusal: None,
         }
     }
 
@@ -1125,6 +1675,47 @@ mod tests {
         assert_eq!(v["incomplete_details"]["reason"], "max_output_tokens");
     }
 
+    #[test]
+    fn from_canonical_content_filter_marks_incomplete() {
+        // WHY: policy stops are incomplete for Responses clients, but distinct
+        // from max-token truncation.
+        let mut canon = canon_resp("blocked", vec![]);
+        canon.finish_reason = Some("content_filter".into());
+        let resp = responses_from_canonical(canon, "m".into(), "r".into(), 0);
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["status"], "incomplete");
+        assert_eq!(v["incomplete_details"]["reason"], "content_filter");
+    }
+
+    #[test]
+    fn from_canonical_error_finish_marks_failed() {
+        // WHY: provider adapters may encode native errors as finish reasons.
+        // Responses clients must receive a failed envelope, not completed.
+        let mut canon = canon_resp("partial", vec![]);
+        canon.finish_reason = Some("error: overloaded_error: retry".into());
+        let resp = responses_from_canonical(canon, "m".into(), "r".into(), 0);
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"]["type"], "server_error");
+        assert_eq!(v["error"]["message"], "canonical response error");
+    }
+
+    #[test]
+    fn from_canonical_preserves_native_response_id_and_refusal_part() {
+        // WHY: Codex Responses continuations use the backend response id, and
+        // refusal is a distinct Responses content part rather than output_text.
+        let mut canon = canon_resp("", vec![]);
+        canon.id = Some("resp_backend".into());
+        canon.refusal = Some("No thanks".into());
+        let resp = responses_from_canonical(canon, "m".into(), "resp_synth".into(), 0);
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["id"], "resp_backend");
+        assert_eq!(v["output"][0]["id"], "msg_resp_backend");
+        assert_eq!(v["output"][0]["content"][0]["type"], "refusal");
+        assert_eq!(v["output"][0]["content"][0]["refusal"], "No thanks");
+        assert!(v["output"][0]["content"][0].get("text").is_none());
+    }
+
     // ---- SSE streaming framing ----
 
     fn canonical_stream(
@@ -1182,8 +1773,13 @@ mod tests {
             "stream must open with response.created: {body}"
         );
         assert!(body.contains("event: response.output_item.added"));
+        assert!(body.contains("event: response.content_part.added"));
         assert!(body.contains("event: response.output_text.delta"));
+        assert!(body.contains("event: response.output_text.done"));
+        assert!(body.contains("event: response.content_part.done"));
+        assert!(body.contains("event: response.output_item.done"));
         assert!(body.contains("event: response.function_call_arguments.delta"));
+        assert!(body.contains("event: response.function_call_arguments.done"));
         assert!(body.contains("event: response.completed"));
         assert!(
             !body.contains("[DONE]"),
@@ -1223,6 +1819,10 @@ mod tests {
                 p["type"] == "response.output_item.added" && p["item"]["type"] == "message"
             })
             .expect("message output_item.added present");
+        let content_added = payloads
+            .iter()
+            .position(|p| p["type"] == "response.content_part.added")
+            .expect("content_part.added present");
         let first_text_delta = payloads
             .iter()
             .position(|p| p["type"] == "response.output_text.delta")
@@ -1244,6 +1844,10 @@ mod tests {
             "message announced before delta"
         );
         assert!(
+            msg_added < content_added && content_added < first_text_delta,
+            "content part announced between message item and text delta"
+        );
+        assert!(
             fc_added < first_args_delta,
             "call announced before arguments"
         );
@@ -1255,6 +1859,153 @@ mod tests {
             .map(|p| p["delta"].as_str().expect("delta string"))
             .collect();
         assert_eq!(deltas, vec!["Hel", "lo"]);
+        let text_done = payloads
+            .iter()
+            .find(|p| p["type"] == "response.output_text.done")
+            .expect("output_text done");
+        assert_eq!(text_done["text"], "Hello");
+        let text_part_done = payloads
+            .iter()
+            .find(|p| {
+                p["type"] == "response.content_part.done" && p["part"]["type"] == "output_text"
+            })
+            .expect("output_text content part done");
+        assert_eq!(text_part_done["part"]["text"], "Hello");
+        let args_done = payloads
+            .iter()
+            .find(|p| p["type"] == "response.function_call_arguments.done")
+            .expect("function arguments done");
+        assert_eq!(args_done["arguments"], r#"{"city":"SF"}"#);
+        let done_items: Vec<&serde_json::Value> = payloads
+            .iter()
+            .filter(|p| p["type"] == "response.output_item.done")
+            .collect();
+        assert_eq!(done_items.len(), 2);
+        assert_eq!(done_items[0]["item"]["type"], "message");
+        assert_eq!(done_items[1]["item"]["type"], "function_call");
+        let last_done = payloads
+            .iter()
+            .rposition(|p| p["type"] == "response.output_item.done")
+            .expect("last done event");
+        let completed = payloads
+            .iter()
+            .position(|p| p["type"] == "response.completed")
+            .expect("completed event");
+        assert!(last_done < completed, "item done events precede completed");
+    }
+
+    #[tokio::test]
+    async fn sse_responses_tool_first_keeps_stable_output_indexes() {
+        // WHY: upstream providers may emit tool calls before text. Responses
+        // clients key deltas by output_index, so indexes must be reserved once
+        // and never recomputed from later text state.
+        let stream = canonical_stream(vec![
+            Ok(CanonicalStreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_first".into()),
+                name: Some("lookup".into()),
+                arguments_delta: String::new(),
+            }),
+            Ok(CanonicalStreamEvent::ToolCallDelta {
+                index: 0,
+                id: None,
+                name: None,
+                arguments_delta: r#"{"q":"sf"}"#.into(),
+            }),
+            Ok(CanonicalStreamEvent::TextDelta("done".into())),
+            Ok(CanonicalStreamEvent::ToolCallDelta {
+                index: 0,
+                id: None,
+                name: None,
+                arguments_delta: r#","unit":"f"}"#.into(),
+            }),
+            Ok(CanonicalStreamEvent::Finish {
+                finish_reason: Some("tool_calls".into()),
+            }),
+        ]);
+        let sse = sse_from_canonical_stream_responses(stream, "m".into(), "resp_tf".into(), 0);
+        let payloads = data_payloads(&sse_body_to_string(sse).await);
+
+        let tool_added = payloads
+            .iter()
+            .find(|p| {
+                p["type"] == "response.output_item.added" && p["item"]["type"] == "function_call"
+            })
+            .expect("tool added");
+        assert_eq!(tool_added["output_index"], 0);
+        let text_added = payloads
+            .iter()
+            .find(|p| p["type"] == "response.output_item.added" && p["item"]["type"] == "message")
+            .expect("message added");
+        assert_eq!(text_added["output_index"], 1);
+        let arg_indexes: Vec<u64> = payloads
+            .iter()
+            .filter(|p| p["type"] == "response.function_call_arguments.delta")
+            .map(|p| p["output_index"].as_u64().expect("arg output_index"))
+            .collect();
+        assert_eq!(arg_indexes, vec![0, 0]);
+        let text_delta = payloads
+            .iter()
+            .find(|p| p["type"] == "response.output_text.delta")
+            .expect("text delta");
+        assert_eq!(text_delta["output_index"], 1);
+
+        let last = payloads.last().unwrap();
+        assert_eq!(last["response"]["output"][0]["type"], "function_call");
+        assert_eq!(last["response"]["output"][1]["type"], "message");
+    }
+
+    #[tokio::test]
+    async fn sse_responses_late_tool_metadata_opens_once_with_stable_item_id() {
+        // WHY: provider streams should open tool calls with metadata, but this
+        // framer is shared. If late metadata reaches it, live SSE must not emit
+        // a placeholder function_call item or switch item_id mid-stream.
+        let stream = canonical_stream(vec![
+            Ok(CanonicalStreamEvent::ToolCallDelta {
+                index: 0,
+                id: None,
+                name: None,
+                arguments_delta: String::new(),
+            }),
+            Ok(CanonicalStreamEvent::ToolCallDelta {
+                index: 0,
+                id: None,
+                name: None,
+                arguments_delta: r#"{"q":"sf"}"#.into(),
+            }),
+            Ok(CanonicalStreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_real".into()),
+                name: Some("lookup".into()),
+                arguments_delta: String::new(),
+            }),
+            Ok(CanonicalStreamEvent::Finish {
+                finish_reason: Some("tool_calls".into()),
+            }),
+        ]);
+        let sse = sse_from_canonical_stream_responses(stream, "m".into(), "resp_late".into(), 0);
+        let payloads = data_payloads(&sse_body_to_string(sse).await);
+        let tool_added = payloads
+            .iter()
+            .filter(|p| {
+                p["type"] == "response.output_item.added" && p["item"]["type"] == "function_call"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_added.len(), 1);
+        assert_eq!(tool_added[0]["item"]["id"], "fc_call_real");
+        assert_eq!(tool_added[0]["item"]["call_id"], "call_real");
+        assert_eq!(tool_added[0]["item"]["name"], "lookup");
+        let arg_deltas = payloads
+            .iter()
+            .filter(|p| p["type"] == "response.function_call_arguments.delta")
+            .collect::<Vec<_>>();
+        assert_eq!(arg_deltas.len(), 1);
+        assert_eq!(arg_deltas[0]["item_id"], "fc_call_real");
+        assert_eq!(arg_deltas[0]["delta"], r#"{"q":"sf"}"#);
+        let last = payloads.last().unwrap();
+        assert_eq!(last["response"]["output"][0]["call_id"], "call_real");
+        assert_eq!(last["response"]["output"][0]["name"], "lookup");
+        assert_eq!(last["response"]["output"][0]["arguments"], r#"{"q":"sf"}"#);
     }
 
     #[tokio::test]
@@ -1283,6 +2034,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sse_responses_uses_provider_response_id_before_created() {
+        // WHY: stateful Responses clients pass the returned id as
+        // previous_response_id, so native provider ids must replace Omni's
+        // synthetic id before response.created.
+        let stream = canonical_stream(vec![
+            Ok(CanonicalStreamEvent::ResponseMetadata(
+                CanonicalResponseMetadata {
+                    id: Some("resp_backend".into()),
+                },
+            )),
+            Ok(CanonicalStreamEvent::TextDelta("ok".into())),
+            Ok(CanonicalStreamEvent::Finish {
+                finish_reason: Some("stop".into()),
+            }),
+        ]);
+        let sse = sse_from_canonical_stream_responses(stream, "m".into(), "resp_synth".into(), 0);
+        let payloads = data_payloads(&sse_body_to_string(sse).await);
+        assert_eq!(payloads[0]["type"], "response.created");
+        assert_eq!(payloads[0]["response"]["id"], "resp_backend");
+        let text_delta = payloads
+            .iter()
+            .find(|p| p["type"] == "response.output_text.delta")
+            .expect("text delta");
+        assert_eq!(text_delta["item_id"], "msg_resp_backend");
+        assert_eq!(payloads.last().unwrap()["response"]["id"], "resp_backend");
+    }
+
+    #[tokio::test]
+    async fn sse_responses_refusal_delta_remains_refusal_in_terminal_envelope() {
+        // WHY: Responses-native clients need refusal semantics on the stream
+        // and in the final envelope, not only flattened text.
+        let stream = canonical_stream(vec![
+            Ok(CanonicalStreamEvent::RefusalDelta("No".into())),
+            Ok(CanonicalStreamEvent::RefusalDelta(" thanks".into())),
+            Ok(CanonicalStreamEvent::Finish {
+                finish_reason: Some("content_filter".into()),
+            }),
+        ]);
+        let sse = sse_from_canonical_stream_responses(stream, "m".into(), "resp_ref".into(), 0);
+        let payloads = data_payloads(&sse_body_to_string(sse).await);
+        let refusal_deltas: Vec<&str> = payloads
+            .iter()
+            .filter(|p| p["type"] == "response.refusal.delta")
+            .map(|p| p["delta"].as_str().expect("refusal delta"))
+            .collect();
+        assert_eq!(refusal_deltas, vec!["No", " thanks"]);
+        let refusal_done = payloads
+            .iter()
+            .find(|p| p["type"] == "response.refusal.done")
+            .expect("refusal done");
+        assert_eq!(refusal_done["content_index"], 0);
+        assert_eq!(refusal_done["refusal"], "No thanks");
+        let last = payloads.last().unwrap();
+        assert_eq!(last["type"], "response.incomplete");
+        assert_eq!(
+            last["response"]["output"][0]["content"][0]["type"],
+            "refusal"
+        );
+        assert_eq!(
+            last["response"]["output"][0]["content"][0]["refusal"],
+            "No thanks"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_responses_text_and_refusal_use_distinct_content_indexes() {
+        // WHY: Responses message content parts are separately indexed. If text
+        // and refusal both use content_index 0, clients cannot reconcile the
+        // delta/done events with the terminal message content array.
+        let stream = canonical_stream(vec![
+            Ok(CanonicalStreamEvent::TextDelta("Allowed".into())),
+            Ok(CanonicalStreamEvent::RefusalDelta("Nope".into())),
+            Ok(CanonicalStreamEvent::Finish {
+                finish_reason: Some("content_filter".into()),
+            }),
+        ]);
+        let sse = sse_from_canonical_stream_responses(stream, "m".into(), "resp_mix".into(), 0);
+        let payloads = data_payloads(&sse_body_to_string(sse).await);
+
+        let text_delta = payloads
+            .iter()
+            .find(|p| p["type"] == "response.output_text.delta")
+            .expect("text delta");
+        assert_eq!(text_delta["content_index"], 0);
+        let text_part_added = payloads
+            .iter()
+            .find(|p| {
+                p["type"] == "response.content_part.added" && p["part"]["type"] == "output_text"
+            })
+            .expect("text part added");
+        assert_eq!(text_part_added["content_index"], 0);
+        let refusal_delta = payloads
+            .iter()
+            .find(|p| p["type"] == "response.refusal.delta")
+            .expect("refusal delta");
+        assert_eq!(refusal_delta["content_index"], 1);
+        let refusal_part_added = payloads
+            .iter()
+            .find(|p| p["type"] == "response.content_part.added" && p["part"]["type"] == "refusal")
+            .expect("refusal part added");
+        assert_eq!(refusal_part_added["content_index"], 1);
+        let text_done = payloads
+            .iter()
+            .find(|p| p["type"] == "response.output_text.done")
+            .expect("text done");
+        assert_eq!(text_done["content_index"], 0);
+        let refusal_done = payloads
+            .iter()
+            .find(|p| p["type"] == "response.refusal.done")
+            .expect("refusal done");
+        assert_eq!(refusal_done["content_index"], 1);
+        let refusal_part_done = payloads
+            .iter()
+            .find(|p| p["type"] == "response.content_part.done" && p["part"]["type"] == "refusal")
+            .expect("refusal part done");
+        assert_eq!(refusal_part_done["content_index"], 1);
+
+        let content = payloads.last().unwrap()["response"]["output"][0]["content"]
+            .as_array()
+            .expect("terminal message content");
+        assert_eq!(content[0]["type"], "output_text");
+        assert_eq!(content[0]["text"], "Allowed");
+        assert_eq!(content[1]["type"], "refusal");
+        assert_eq!(content[1]["refusal"], "Nope");
+    }
+
+    #[tokio::test]
     async fn sse_responses_error_midstream_emits_failed() {
         // WHY: a client must learn the stream died; a silent hang or a fake
         // completed status would corrupt downstream state. The terminal event
@@ -1301,7 +2179,63 @@ mod tests {
         let last = payloads.last().unwrap();
         assert_eq!(last["type"], "response.failed");
         assert_eq!(last["response"]["status"], "failed");
+        assert_eq!(
+            last["response"]["error"]["message"],
+            "canonical stream error"
+        );
+        assert_eq!(last["response"]["error"]["type"], "server_error");
         assert!(!body.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn sse_responses_missing_finish_emits_failed() {
+        // WHY: the canonical streaming contract requires an explicit Finish.
+        // EOF without it is a truncated upstream stream, not a successful
+        // Responses completion.
+        let stream = canonical_stream(vec![Ok(CanonicalStreamEvent::TextDelta("partial".into()))]);
+        let sse = sse_from_canonical_stream_responses(stream, "m".into(), "resp_eof".into(), 0);
+        let payloads = data_payloads(&sse_body_to_string(sse).await);
+        let last = payloads.last().unwrap();
+        assert_eq!(last["type"], "response.failed");
+        assert_eq!(last["response"]["status"], "failed");
+        assert_eq!(
+            last["response"]["error"]["message"],
+            "canonical stream error"
+        );
+        assert!(
+            last["response"]["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("canonical stream error"),
+            "client-visible error should be generic: {last}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_responses_error_finish_emits_failed_not_completed() {
+        // WHY: some provider adapters encode native stream error events as a
+        // terminal Finish reason. Responses clients must see failure, not a
+        // successful completion with partial text.
+        let stream = canonical_stream(vec![
+            Ok(CanonicalStreamEvent::TextDelta("partial".into())),
+            Ok(CanonicalStreamEvent::Finish {
+                finish_reason: Some("error: overloaded_error: retry".into()),
+            }),
+        ]);
+        let sse = sse_from_canonical_stream_responses(stream, "m".into(), "resp_err".into(), 0);
+        let body = sse_body_to_string(sse).await;
+        assert!(
+            !body.contains("event: response.completed"),
+            "error finish must not emit completed: {body}"
+        );
+        let payloads = data_payloads(&body);
+        let last = payloads.last().unwrap();
+        assert_eq!(last["type"], "response.failed");
+        assert_eq!(last["response"]["status"], "failed");
+        assert_eq!(
+            last["response"]["error"]["message"],
+            "canonical stream error"
+        );
     }
 
     #[tokio::test]
@@ -1333,6 +2267,27 @@ mod tests {
         assert_eq!(
             last["response"]["incomplete_details"]["reason"],
             "max_output_tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_responses_content_filter_finish_emits_incomplete_reason() {
+        // WHY: not every incomplete stream is a max-token truncation; preserving
+        // content_filter lets clients distinguish policy stop from length stop.
+        let stream = canonical_stream(vec![
+            Ok(CanonicalStreamEvent::TextDelta("blocked".into())),
+            Ok(CanonicalStreamEvent::Finish {
+                finish_reason: Some("content_filter".into()),
+            }),
+        ]);
+        let sse = sse_from_canonical_stream_responses(stream, "m".into(), "resp_cf".into(), 0);
+        let payloads = data_payloads(&sse_body_to_string(sse).await);
+        let last = payloads.last().unwrap();
+        assert_eq!(last["type"], "response.incomplete");
+        assert_eq!(last["response"]["status"], "incomplete");
+        assert_eq!(
+            last["response"]["incomplete_details"]["reason"],
+            "content_filter"
         );
     }
 }

@@ -52,13 +52,23 @@
 Credentials are read fresh per request.
 
 - Claude: `$CLAUDE_CREDENTIALS_PATH` or `~/.claude/.credentials.json`
-- Grok: `$XAI_CREDENTIALS_PATH`, `~/.xai/.credentials.json`, or
+- Grok: `$XAI_CREDENTIALS_PATH`, a usable `~/.xai/.credentials.json`, or
   `~/.grok/auth.json`
-- Codex: `$CODEX_HOME` or `~/.codex` config and auth state.
+- Codex: `CODEX_API_KEY`, `OPENAI_API_KEY`, `CODEX_ACCESS_TOKEN`, or
+  `$CODEX_HOME` / `~/.codex` config and auth state.
 
 Custom upstream endpoint configuration owns provider auth and must not fall
 back to default credentials:
 
+- Omni forced overrides are highest precedence:
+  - Claude: `OMNI_CLAUDE_BASE_URL` uses only `OMNI_CLAUDE_AUTH_TOKEN`,
+    `OMNI_CLAUDE_API_KEY`, and `OMNI_CLAUDE_CUSTOM_HEADERS`.
+  - Grok: `OMNI_GROK_BASE_URL` uses only `OMNI_GROK_AUTH_TOKEN`,
+    `OMNI_GROK_API_KEY`, and `OMNI_GROK_CUSTOM_HEADERS`.
+  - Codex: `OMNI_CODEX_BASE_URL` is owned by `provider-codex` and uses only
+    `OMNI_CODEX_AUTH_TOKEN`, `OMNI_CODEX_API_KEY`,
+    `OMNI_CODEX_CUSTOM_HEADERS`, `OMNI_CODEX_MODEL`, and
+    `OMNI_CODEX_WIRE_API`.
 - Claude: `ANTHROPIC_BASE_URL` enables custom gateway mode using
   `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, and `ANTHROPIC_CUSTOM_HEADERS`
   only, resolved per request.
@@ -69,8 +79,9 @@ back to default credentials:
   `[model_providers.<name>.auth] command`, `experimental_bearer_token`, or
   `env_key`; it uses OpenAI auth only when `requires_openai_auth = true`.
 
-Codex OpenAI inbound support is non-streaming for now. Codex `stream:true`
-requests fail loudly until native Responses SSE is implemented.
+Codex OpenAI inbound supports non-streaming and `stream:true` paths. Streaming
+uses native Responses SSE parsing in `provider-codex`, not buffered
+pseudo-streaming.
 
 ## Tests
 

@@ -17,10 +17,12 @@ async-trait = "0.1"
 anyhow.workspace = true
 futures-util.workspace = true
 async-stream.workspace = true
+chrono.workspace = true
+dirs = "6"
+tokio.workspace = true
 
 [dev-dependencies]
 omni-common = { path = "../omni-common", features = ["test-support"] }
 tokio = { version = "1", features = ["rt", "macros"] }
-chrono.workspace = true
 wiremock = "0.6.5"
 uuid.workspace = true

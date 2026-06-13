@@ -6,11 +6,11 @@
 //! Makes real HTTP calls to https://api.x.ai/v1/chat/completions (primary OpenAI-compatible surface).
 //! Auth: default xAI mode resolves a bearer key fresh per request from files,
 //! mirroring the Claude provider. Precedence: `$XAI_CREDENTIALS_PATH`,
-//! `~/.xai/.credentials.json` (static key), then `~/.grok/auth.json` (the Grok
-//! CLI's OIDC login, auto-detected). Custom endpoint mode is explicit and uses
+//! a usable `~/.xai/.credentials.json` static key, then `~/.grok/auth.json` (the
+//! Grok CLI's OIDC login, auto-detected). Custom endpoint mode is explicit and uses
 //! only its configured custom auth, so default xAI credentials cannot leak to an
-//! arbitrary base URL. See `omni_common::credentials::GrokCredentials` for the
-//! default source chain and on-disk shapes.
+//! arbitrary base URL. See [`credentials::GrokCredentials`] for the default
+//! source chain and on-disk shapes.
 //!
 //! ## Headers / wire notes (research findings, 2026-06)
 //! - **Standard, no special gates**: `Authorization: Bearer <api key>`, `Content-Type: application/json`.
@@ -56,7 +56,7 @@
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use omni_common::{GrokCredentials, Replacements};
+use omni_common::Replacements;
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalReasoning, CanonicalRequest, CanonicalResponse,
     CanonicalStream, CanonicalStreamEvent, CanonicalToolCall, CanonicalToolChoice, CanonicalUsage,
@@ -66,6 +66,13 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, error, warn};
+
+pub mod credentials;
+
+use credentials::GrokCredentials;
+
+#[cfg(test)]
+static GROK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
 
@@ -117,13 +124,13 @@ pub struct GrokModelInfo {
 
 /// The Grok / xAI provider. Holds a reqwest client.
 /// Credentials are loaded fresh per request using the same technique as the
-/// Claude provider (see omni-common::credentials::GrokCredentials and
+/// Claude provider (see [`credentials::GrokCredentials`] and
 /// docs/grok-gate.md).
 ///
-/// The loader looks for $XAI_CREDENTIALS_PATH or ~/.xai/.credentials.json and
-/// re-reads on every send (never cached). This picks up key rotations or
-/// refreshes without restarting the process - exactly like Claude does for
-/// ~/.claude/.credentials.json.
+/// The loader looks for $XAI_CREDENTIALS_PATH, a usable ~/.xai/.credentials.json,
+/// or ~/.grok/auth.json and re-reads on every send (never cached). This picks up
+/// key rotations or refreshes without restarting the process - exactly like
+/// Claude does for ~/.claude/.credentials.json.
 #[derive(Debug)]
 pub struct GrokProvider {
     client: Client,
@@ -140,6 +147,8 @@ enum GrokAuthConfig {
         api_key: Option<String>,
         env_key: Option<String>,
         extra_headers: Vec<(String, String)>,
+        token_env_key: Option<String>,
+        custom_headers_env: Option<String>,
     },
 }
 
@@ -173,6 +182,28 @@ impl GrokProvider {
         })
     }
 
+    pub fn detected() -> bool {
+        if env_nonempty("OMNI_GROK_BASE_URL").is_some()
+            || env_nonempty("GROK_MODELS_BASE_URL").is_some()
+        {
+            return true;
+        }
+        if let Some(path) = std::env::var_os("XAI_CREDENTIALS_PATH") {
+            return std::path::PathBuf::from(path).is_file();
+        }
+        let static_path = GrokCredentials::default_path();
+        if static_path.is_file() {
+            match GrokCredentials::load_fresh(&static_path) {
+                Ok(_) => return true,
+                Err(credentials::GrokCredentialsError::MissingToken) => {}
+                Err(_) => return false,
+            }
+        }
+        GrokCredentials::grok_cli_path()
+            .as_deref()
+            .is_some_and(|path| path.is_file() && GrokCredentials::load_fresh(path).is_ok())
+    }
+
     /// Override the base URL (useful for tests or proxies). Chainable.
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into().trim_end_matches('/').to_string();
@@ -196,6 +227,26 @@ impl GrokProvider {
             api_key,
             env_key,
             extra_headers,
+            token_env_key: None,
+            custom_headers_env: None,
+        };
+        self
+    }
+
+    pub fn with_custom_auth_env(
+        mut self,
+        base_url: impl Into<String>,
+        token_env_key: Option<String>,
+        api_key_env_key: Option<String>,
+        custom_headers_env: Option<String>,
+    ) -> Self {
+        self.base_url = base_url.into().trim_end_matches('/').to_string();
+        self.auth = GrokAuthConfig::Custom {
+            api_key: None,
+            env_key: api_key_env_key,
+            extra_headers: Vec::new(),
+            token_env_key,
+            custom_headers_env,
         };
         self
     }
@@ -243,9 +294,10 @@ impl GrokProvider {
     }
 
     /// Resolve the effective bearer key the same way for every request: load the operator's
-    /// credentials fresh ($XAI_CREDENTIALS_PATH -> ~/.xai/.credentials.json -> ~/.grok/auth.json),
-    /// never cached so a CLI re-login or key rotation is picked up, warning-but-continuing if the
-    /// token reports expired. Shared by `send` and `send_stream` so the two paths cannot drift.
+    /// credentials fresh ($XAI_CREDENTIALS_PATH -> usable ~/.xai/.credentials.json ->
+    /// ~/.grok/auth.json), never cached so a CLI re-login or key rotation is picked up,
+    /// warning-but-continuing if the token reports expired. Shared by `send` and `send_stream`
+    /// so the two paths cannot drift.
     ///
     /// If no source yields a key, fall back to an explicit ctor key (set only by `new(Some(..))` /
     /// `new_for_test`; production `new(None)` never sets one), and otherwise return a clear `Auth`
@@ -290,12 +342,23 @@ impl GrokProvider {
                 api_key,
                 env_key,
                 extra_headers,
+                token_env_key,
+                custom_headers_env,
             } => {
                 let mut headers = extra_headers.clone();
-                let token = api_key
+                if let Some(env_name) = custom_headers_env {
+                    headers.extend(headers_from_env(env_name)?);
+                }
+                let token = token_env_key
                     .as_ref()
+                    .and_then(|key| std::env::var(key).ok())
                     .filter(|value| !value.trim().is_empty())
-                    .cloned()
+                    .or_else(|| {
+                        api_key
+                            .as_ref()
+                            .filter(|value| !value.trim().is_empty())
+                            .cloned()
+                    })
                     .or_else(|| {
                         env_key
                             .as_ref()
@@ -310,6 +373,58 @@ impl GrokProvider {
             }
         }
     }
+}
+
+fn headers_from_env(env_name: &str) -> Result<Vec<(String, String)>, ProviderError> {
+    let Some(raw) = std::env::var(env_name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+    parse_custom_headers(&raw).map_err(ProviderError::Auth)
+}
+
+fn parse_custom_headers(raw: &str) -> Result<Vec<(String, String)>, String> {
+    let mut headers = Vec::new();
+    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| "custom header must be formatted as `Name: value`".to_string())?;
+        let name = name.trim();
+        let value = value.trim();
+        if name.is_empty() || value.is_empty() {
+            return Err("custom header name and value must both be non-empty".into());
+        }
+        reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| format!("invalid custom header name `{name}`"))?;
+        reqwest::header::HeaderValue::from_str(value)
+            .map_err(|_| format!("invalid custom header value for `{name}`"))?;
+        headers.push((name.to_string(), value.to_string()));
+    }
+    Ok(headers)
+}
+
+fn redact(input: &str) -> String {
+    let mut out = input.to_string();
+    for marker in ["sk-", "xai-", "eyJ"] {
+        while let Some(pos) = out.find(marker) {
+            let end = out[pos..]
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',')
+                .map(|i| pos + i)
+                .unwrap_or(out.len());
+            out.replace_range(pos..end, "<redacted>");
+        }
+    }
+    out
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// Map a CanonicalRequest (after light replacements hook) to the JSON body for xAI /v1/chat/completions.
@@ -443,13 +558,15 @@ fn to_xai_chat_request(req: &CanonicalRequest, repl: &Replacements) -> Value {
         body["reasoning_effort"] = json!(eff);
     }
 
-    // Passthrough any xAI-specific (search_parameters, service_tier, response_format, parallel_tool_calls, etc.)
-    // Extras win on collision (caller responsibility).
+    // Passthrough xAI chat-completions extensions only. Responses-native fields
+    // such as previous_response_id are intentionally not sent to chat upstreams.
     if let Some(extras) = &req.provider_extras
         && let Some(obj) = extras.as_object()
     {
         for (k, v) in obj {
-            body[k] = v.clone();
+            if grok_extra_allowed(k) {
+                body[k] = v.clone();
+            }
         }
     }
 
@@ -457,6 +574,21 @@ fn to_xai_chat_request(req: &CanonicalRequest, repl: &Replacements) -> Value {
     // (Real rules for tool names etc. are typically applied by the frontend before producing CanonicalRequest,
     // or the provider ctor would be given a live Replacements instance instead of always empty().)
     body
+}
+
+fn grok_extra_allowed(key: &str) -> bool {
+    matches!(
+        key,
+        "service_tier"
+            | "search_parameters"
+            | "response_format"
+            | "parallel_tool_calls"
+            | "user"
+            | "seed"
+            | "stop"
+            | "n"
+            | "tools"
+    )
 }
 
 fn resolve_model_alias(model: &str) -> Option<&'static str> {
@@ -563,13 +695,18 @@ struct XaiCompletionDetails {
 
 /// Map xAI chat completion JSON response to canonical form. Applies inbound replacements hook on text + tool surfaces.
 fn from_xai_chat_response(raw: XaiChatCompletion, repl: &Replacements) -> CanonicalResponse {
+    let response_id = raw.id;
     let model = raw.model.unwrap_or_else(|| "unknown".to_string());
 
-    let (content, tool_calls, finish_reason) =
+    let (content, refusal, tool_calls, finish_reason) =
         if let Some(ch) = raw.choices.and_then(|mut c| c.drain(..).next()) {
             let msg = ch.message.unwrap_or_default();
             let raw_content = msg.content.unwrap_or_default();
             let content = repl.apply_response(&raw_content);
+            let refusal = msg
+                .refusal
+                .and_then(|value| value.as_str().map(str::to_string))
+                .map(|value| repl.apply_response(&value));
 
             let tcs: Vec<CanonicalToolCall> = msg
                 .tool_calls
@@ -589,9 +726,9 @@ fn from_xai_chat_response(raw: XaiChatCompletion, repl: &Replacements) -> Canoni
                 })
                 .collect();
 
-            (content, tcs, ch.finish_reason)
+            (content, refusal, tcs, ch.finish_reason)
         } else {
-            (String::new(), vec![], None)
+            (String::new(), None, vec![], None)
         };
 
     let usage = if let Some(u) = raw.usage {
@@ -611,10 +748,11 @@ fn from_xai_chat_response(raw: XaiChatCompletion, repl: &Replacements) -> Canoni
     CanonicalResponse {
         model,
         content,
+        refusal,
         tool_calls,
         finish_reason,
         usage,
-        // (no provider_extras field on CanonicalResponse today; system_fingerprint etc. logged at debug if needed)
+        id: response_id,
     }
 }
 
@@ -636,6 +774,7 @@ fn from_xai_chat_response(raw: XaiChatCompletion, repl: &Replacements) -> Canoni
 
 #[derive(Debug, Deserialize)]
 struct XaiStreamChunk {
+    id: Option<String>,
     choices: Option<Vec<XaiStreamChoice>>,
     usage: Option<XaiUsage>,
 }
@@ -649,6 +788,7 @@ struct XaiStreamChoice {
 #[derive(Debug, Deserialize, Default)]
 struct XaiStreamDelta {
     content: Option<String>,
+    refusal: Option<Value>,
     tool_calls: Option<Vec<XaiStreamToolCall>>,
 }
 
@@ -688,6 +828,11 @@ fn parse_grok_sse_frame(data: &str) -> Vec<Result<CanonicalStreamEvent, Provider
     };
 
     let mut events: Vec<Result<CanonicalStreamEvent, ProviderError>> = Vec::new();
+    if let Some(id) = chunk.id {
+        events.push(Ok(CanonicalStreamEvent::ResponseMetadata(
+            omni_core::CanonicalResponseMetadata { id: Some(id) },
+        )));
+    }
 
     if let Some(choice) = chunk.choices.and_then(|mut c| c.drain(..).next()) {
         if let Some(delta) = choice.delta {
@@ -695,6 +840,14 @@ fn parse_grok_sse_frame(data: &str) -> Vec<Result<CanonicalStreamEvent, Provider
                 && !text.is_empty()
             {
                 events.push(Ok(CanonicalStreamEvent::TextDelta(text)));
+            }
+            if let Some(refusal) = delta.refusal.and_then(|value| {
+                value
+                    .as_str()
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_string)
+            }) {
+                events.push(Ok(CanonicalStreamEvent::RefusalDelta(refusal)));
             }
             if let Some(tcs) = delta.tool_calls {
                 for tc in tcs {
@@ -824,10 +977,12 @@ impl LlmProvider for GrokProvider {
 
         let status = http_resp.status();
         if !status.is_success() {
-            let err_body = http_resp
-                .text()
-                .await
-                .unwrap_or_else(|_| "<no body>".to_string());
+            let err_body = redact(
+                &http_resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<no body>".to_string()),
+            );
             error!(%status, body = %err_body, "xAI upstream error");
             return Err(ProviderError::Upstream(format!(
                 "xAI {}: {}",
@@ -901,10 +1056,12 @@ impl LlmProvider for GrokProvider {
             let status = http_resp.status();
             if !status.is_success() {
                 // Read the error body first, same as the non-stream path.
-                let err_body = http_resp
+                let err_body = redact(
+                    &http_resp
                     .text()
                     .await
-                    .unwrap_or_else(|_| "<no body>".to_string());
+                        .unwrap_or_else(|_| "<no body>".to_string()),
+                );
                 error!(%status, body = %err_body, "xAI upstream stream error");
                 yield Err(ProviderError::Upstream(format!("xAI {}: {}", status, err_body)));
                 return;
@@ -956,8 +1113,12 @@ impl LlmProvider for GrokProvider {
                 }
             }
 
-            // Terminal Finish (exactly one), carrying the remembered finish_reason. Emitted even if
-            // the upstream closed without an explicit `[DONE]` so consumers always see a terminator.
+            if !done {
+                yield Err(ProviderError::Upstream("xAI stream ended before [DONE]".into()));
+                return;
+            }
+
+            // Terminal Finish (exactly one), carrying the remembered finish_reason.
             yield Ok(CanonicalStreamEvent::Finish { finish_reason });
         };
 
@@ -982,9 +1143,7 @@ mod tests {
         Replacements::empty()
     }
 
-    // Serialize credential tests that mutate process env (XAI_CREDENTIALS_PATH) to avoid
-    // races when cargo runs tests in parallel (default >1 threads). Other tests unaffected.
-    static CRED_ENV_LOCK: ::std::sync::Mutex<()> = ::std::sync::Mutex::new(());
+    use crate::GROK_ENV_LOCK as CRED_ENV_LOCK;
 
     #[test]
     fn test_to_xai_basic() {
@@ -1053,6 +1212,160 @@ mod tests {
         };
         let body = to_xai_chat_request(&req, &empty_repl());
         assert_eq!(body["model"], "grok-composer-2.5-fast");
+    }
+
+    #[test]
+    fn detected_accepts_omni_base_url_without_native_creds() {
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let old_omni = std::env::var_os("OMNI_GROK_BASE_URL");
+        let old_legacy = std::env::var_os("GROK_MODELS_BASE_URL");
+        let old_path = std::env::var_os("XAI_CREDENTIALS_PATH");
+        unsafe {
+            std::env::set_var("OMNI_GROK_BASE_URL", "https://grok-proxy.example.com");
+            std::env::remove_var("GROK_MODELS_BASE_URL");
+            std::env::remove_var("XAI_CREDENTIALS_PATH");
+        }
+        let detected = GrokProvider::detected();
+        restore_env("OMNI_GROK_BASE_URL", old_omni);
+        restore_env("GROK_MODELS_BASE_URL", old_legacy);
+        restore_env("XAI_CREDENTIALS_PATH", old_path);
+        assert!(detected);
+    }
+
+    #[test]
+    fn detected_rejects_stale_only_ambient_static_grok_credentials() {
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!("omni-grok-detect-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(home.join(".xai")).unwrap();
+        std::fs::write(home.join(".xai/.credentials.json"), r#"{"apiKey":" "}"#).unwrap();
+
+        let old_home = std::env::var_os("HOME");
+        let old_path = std::env::var_os("XAI_CREDENTIALS_PATH");
+        let old_omni = std::env::var_os("OMNI_GROK_BASE_URL");
+        let old_legacy = std::env::var_os("GROK_MODELS_BASE_URL");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("XAI_CREDENTIALS_PATH");
+            std::env::remove_var("OMNI_GROK_BASE_URL");
+            std::env::remove_var("GROK_MODELS_BASE_URL");
+        }
+        let detected = GrokProvider::detected();
+        restore_env("HOME", old_home);
+        restore_env("XAI_CREDENTIALS_PATH", old_path);
+        restore_env("OMNI_GROK_BASE_URL", old_omni);
+        restore_env("GROK_MODELS_BASE_URL", old_legacy);
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert!(!detected);
+    }
+
+    #[test]
+    fn detected_accepts_grok_cli_login_when_ambient_static_file_is_stale() {
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!("omni-grok-detect-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(home.join(".xai")).unwrap();
+        std::fs::create_dir_all(home.join(".grok")).unwrap();
+        std::fs::write(home.join(".xai/.credentials.json"), r#"{"apiKey":" "}"#).unwrap();
+        std::fs::write(
+            home.join(".grok/auth.json"),
+            r#"{"https://auth.x.ai::client":{"key":"jwt-detected","auth_mode":"oidc","expires_at":"2999-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+
+        let old_home = std::env::var_os("HOME");
+        let old_path = std::env::var_os("XAI_CREDENTIALS_PATH");
+        let old_omni = std::env::var_os("OMNI_GROK_BASE_URL");
+        let old_legacy = std::env::var_os("GROK_MODELS_BASE_URL");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("XAI_CREDENTIALS_PATH");
+            std::env::remove_var("OMNI_GROK_BASE_URL");
+            std::env::remove_var("GROK_MODELS_BASE_URL");
+        }
+        let detected = GrokProvider::detected();
+        restore_env("HOME", old_home);
+        restore_env("XAI_CREDENTIALS_PATH", old_path);
+        restore_env("OMNI_GROK_BASE_URL", old_omni);
+        restore_env("GROK_MODELS_BASE_URL", old_legacy);
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert!(detected);
+    }
+
+    #[test]
+    fn detected_rejects_corrupt_ambient_static_file_even_with_grok_cli_login() {
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!("omni-grok-detect-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(home.join(".xai")).unwrap();
+        std::fs::create_dir_all(home.join(".grok")).unwrap();
+        std::fs::write(home.join(".xai/.credentials.json"), "{ not json }").unwrap();
+        std::fs::write(
+            home.join(".grok/auth.json"),
+            r#"{"https://auth.x.ai::client":{"key":"jwt-detected","auth_mode":"oidc","expires_at":"2999-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+
+        let old_home = std::env::var_os("HOME");
+        let old_path = std::env::var_os("XAI_CREDENTIALS_PATH");
+        let old_omni = std::env::var_os("OMNI_GROK_BASE_URL");
+        let old_legacy = std::env::var_os("GROK_MODELS_BASE_URL");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("XAI_CREDENTIALS_PATH");
+            std::env::remove_var("OMNI_GROK_BASE_URL");
+            std::env::remove_var("GROK_MODELS_BASE_URL");
+        }
+        let detected = GrokProvider::detected();
+        restore_env("HOME", old_home);
+        restore_env("XAI_CREDENTIALS_PATH", old_path);
+        restore_env("OMNI_GROK_BASE_URL", old_omni);
+        restore_env("GROK_MODELS_BASE_URL", old_legacy);
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert!(!detected);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn omni_custom_auth_env_token_wins_over_api_key_and_header_authorization() {
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let old_token = std::env::var_os("OMNI_GROK_AUTH_TOKEN");
+        let old_api = std::env::var_os("OMNI_GROK_API_KEY");
+        let old_headers = std::env::var_os("OMNI_GROK_CUSTOM_HEADERS");
+        unsafe {
+            std::env::set_var("OMNI_GROK_AUTH_TOKEN", "token-wins");
+            std::env::set_var("OMNI_GROK_API_KEY", "api-loses");
+            std::env::set_var(
+                "OMNI_GROK_CUSTOM_HEADERS",
+                "X-Omni: yes\nAuthorization: Bearer header-loses",
+            );
+        }
+        let provider = GrokProvider::new(None).unwrap().with_custom_auth_env(
+            "https://grok-proxy.example.com",
+            Some("OMNI_GROK_AUTH_TOKEN".into()),
+            Some("OMNI_GROK_API_KEY".into()),
+            Some("OMNI_GROK_CUSTOM_HEADERS".into()),
+        );
+        let headers = provider.auth_headers().await.unwrap();
+        restore_env("OMNI_GROK_AUTH_TOKEN", old_token);
+        restore_env("OMNI_GROK_API_KEY", old_api);
+        restore_env("OMNI_GROK_CUSTOM_HEADERS", old_headers);
+        assert!(headers.contains(&("X-Omni".into(), "yes".into())));
+        assert!(headers.contains(&("Authorization".into(), "Bearer token-wins".into())));
+        assert!(
+            !headers
+                .iter()
+                .any(|(_, value)| value.contains("api-loses") || value.contains("header-loses"))
+        );
+    }
+
+    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
     }
 
     #[tokio::test]
@@ -1482,6 +1795,7 @@ mod tests {
     #[test]
     fn test_from_xai_with_details_and_refusal() {
         let raw = XaiChatCompletion {
+            id: Some("chatcmpl_grok".into()),
             model: Some("grok-4.3".into()),
             choices: Some(vec![XaiChoice {
                 message: Some(XaiAssistantMessage {
@@ -1509,9 +1823,23 @@ mod tests {
             ..Default::default()
         };
         let canon = from_xai_chat_response(raw, &empty_repl());
+        assert_eq!(canon.id.as_deref(), Some("chatcmpl_grok"));
         assert_eq!(canon.content, "ok");
+        assert_eq!(canon.refusal.as_deref(), Some("policy"));
         assert_eq!(canon.usage.input_tokens, 2);
         // note: reasoning_tokens not mapped into core usage yet
+    }
+
+    #[test]
+    fn upstream_error_redaction_removes_repeated_secret_markers() {
+        let redacted = redact(r#"{"error":"bad xai-one xai-two sk-one sk-two eyJone eyJtwo"}"#);
+        for secret in ["xai-one", "xai-two", "sk-one", "sk-two", "eyJone", "eyJtwo"] {
+            assert!(
+                !redacted.contains(secret),
+                "redacted body leaked {secret}: {redacted}"
+            );
+        }
+        assert!(redacted.contains("<redacted>"));
     }
 
     #[tokio::test]
@@ -1676,6 +2004,32 @@ mod tests {
     }
 
     #[test]
+    fn test_to_xai_drops_responses_native_extras() {
+        // WHY: Grok currently speaks xAI chat/completions upstream. Responses
+        // fields preserved by the inbound adapter must not be forwarded as
+        // invalid chat-completion fields.
+        let req = CanonicalRequest {
+            model: "grok-4.3".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("x".into()),
+            }],
+            provider_extras: Some(json!({
+                "previous_response_id": "resp_prev",
+                "store": false,
+                "metadata": {"trace": "abc"},
+                "service_tier": "standard"
+            })),
+            ..Default::default()
+        };
+        let body = to_xai_chat_request(&req, &empty_repl());
+        assert_eq!(body["service_tier"], "standard");
+        assert!(body.get("previous_response_id").is_none());
+        assert!(body.get("store").is_none());
+        assert!(body.get("metadata").is_none());
+    }
+
+    #[test]
     fn test_to_xai_responses_shape_not_used() {
         // deliberate: we target chat/completions (messages+stream), not /responses (input+reasoning.effort)
         let req = CanonicalRequest {
@@ -1816,7 +2170,8 @@ mod tests {
                 usage: None,
                 ..Default::default()
             };
-            let _ = from_xai_chat_response(raw, &empty_repl());
+            let canon = from_xai_chat_response(raw, &empty_repl());
+            assert_eq!(canon.refusal.as_deref(), Some("policy violation"));
         }
         {
             let raw = XaiChatCompletion {
@@ -1834,7 +2189,8 @@ mod tests {
                 usage: None,
                 ..Default::default()
             };
-            let _ = from_xai_chat_response(raw, &empty_repl());
+            let canon = from_xai_chat_response(raw, &empty_repl());
+            assert!(canon.refusal.is_none());
         }
         {
             let raw = XaiChatCompletion {
@@ -1852,7 +2208,8 @@ mod tests {
                 usage: None,
                 ..Default::default()
             };
-            let _ = from_xai_chat_response(raw, &empty_repl());
+            let canon = from_xai_chat_response(raw, &empty_repl());
+            assert!(canon.refusal.is_none());
         }
     }
 
@@ -2584,6 +2941,37 @@ mod tests {
     }
 
     #[test]
+    fn test_sse_parser_maps_stream_id_and_refusal_delta() {
+        // WHY: Responses streaming needs native response ids and refusal
+        // deltas when xAI includes them in OpenAI-compatible stream chunks.
+        let events = drive_sse(&[
+            b"data: {\"id\":\"chatcmpl_stream\",\"choices\":[{\"delta\":{\"refusal\":\"blocked\"}}]}\n\n",
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n",
+            b"data: [DONE]\n\n",
+        ]);
+        let events: Vec<CanonicalStreamEvent> = events
+            .into_iter()
+            .map(|r| r.expect("well-formed refusal stream"))
+            .collect();
+        assert_eq!(
+            events[0],
+            CanonicalStreamEvent::ResponseMetadata(omni_core::CanonicalResponseMetadata {
+                id: Some("chatcmpl_stream".into())
+            })
+        );
+        assert_eq!(
+            events[1],
+            CanonicalStreamEvent::RefusalDelta("blocked".into())
+        );
+        assert_eq!(
+            events[2],
+            CanonicalStreamEvent::Finish {
+                finish_reason: Some("content_filter".into())
+            }
+        );
+    }
+
+    #[test]
     fn test_sse_parser_malformed_frame_yields_upstream_error() {
         // WHY: a corrupt frame must fail loud (Err) so the stream surfaces the problem rather than
         // silently swallowing data the consumer is counting on. The driver stops the stream on the
@@ -2886,7 +3274,8 @@ mod tests {
 
         // OpenAI-style SSE chunks, terminated by `data: [DONE]`.
         let sse_body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_stream\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"refusal\":\"No\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_s\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"SF\\\"}\"}}]}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n",
@@ -2931,7 +3320,11 @@ mod tests {
         assert_eq!(
             events,
             vec![
+                CanonicalStreamEvent::ResponseMetadata(omni_core::CanonicalResponseMetadata {
+                    id: Some("chatcmpl_stream".into()),
+                }),
                 CanonicalStreamEvent::TextDelta("Hello".into()),
+                CanonicalStreamEvent::RefusalDelta("No".into()),
                 CanonicalStreamEvent::ToolCallDelta {
                     index: 0,
                     id: Some("call_s".into()),
@@ -2949,6 +3342,53 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn grok_streaming_errors_when_upstream_omits_done() {
+        // WHY: OpenAI-compatible xAI streams require the [DONE] sentinel. EOF
+        // without it is a truncated upstream stream, not a successful stop.
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _creds = DummyXaiCreds::install("stream-truncated");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header(
+                "authorization",
+                format!("Bearer {}", DummyXaiCreds::KEY).as_str(),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let p = GrokProvider::new_for_test(DummyXaiCreds::WRONG_CTOR_KEY, server.uri());
+        let req = CanonicalRequest {
+            model: "grok-4.3".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            ..Default::default()
+        };
+        let mut stream = p.send_stream(req).await.expect("stream opens");
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            CanonicalStreamEvent::TextDelta("partial".into())
+        );
+        let err = stream.next().await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("[DONE]"), "{err}");
     }
 
     /// Read a real xAI key for a live test from the SAME home sources production auto-detects:

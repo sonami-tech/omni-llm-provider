@@ -77,17 +77,21 @@ impl ClaudeStreamConverter {
     fn on_event(&mut self, event: StreamEvent) -> Vec<CanonicalStreamEvent> {
         match event {
             StreamEvent::MessageStart {
+                id,
                 input_tokens,
                 output_tokens,
                 ..
             } => {
+                let out = vec![CanonicalStreamEvent::ResponseMetadata(
+                    omni_core::CanonicalResponseMetadata { id: Some(id) },
+                )];
                 if input_tokens.is_some() {
                     self.input_tokens = input_tokens;
                 }
                 if output_tokens.is_some() {
                     self.output_tokens = output_tokens;
                 }
-                vec![]
+                out
             }
             StreamEvent::ContentBlockStart {
                 index,
@@ -199,6 +203,12 @@ impl ClaudeProvider {
         Self::new_with_profile(default_profile())
     }
 
+    pub fn detected() -> bool {
+        env_nonempty("OMNI_CLAUDE_BASE_URL").is_some()
+            || env_nonempty("ANTHROPIC_BASE_URL").is_some()
+            || credentials::Credentials::default_path().is_file()
+    }
+
     pub fn new_with_profile(profile: &'static FingerprintProfile) -> Result<Self, ProviderError> {
         let client = UpstreamClient::new_with_profile(profile).map_err(|e| {
             ProviderError::Other(anyhow::Error::msg(format!("upstream client: {e}")))
@@ -301,6 +311,13 @@ impl ClaudeProvider {
     }
 }
 
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 impl Default for ClaudeProvider {
     fn default() -> Self {
         Self::new().expect("default claude profile must be usable at construction")
@@ -327,12 +344,12 @@ fn map_upstream_err(e: UpstreamError) -> ProviderError {
 #[async_trait]
 impl LlmProvider for ClaudeProvider {
     fn id(&self) -> &'static str {
-        "claude-code"
+        "claude"
     }
 
     async fn send(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError> {
         debug!(
-            provider = "claude-code",
+            provider = "claude",
             model = %req.model,
             n_msgs = req.messages.len(),
             n_tools = req.tools.as_ref().map(|t| t.len()).unwrap_or(0),
@@ -390,7 +407,7 @@ impl LlmProvider for ClaudeProvider {
 
     async fn send_stream(&self, req: CanonicalRequest) -> Result<CanonicalStream, ProviderError> {
         debug!(
-            provider = "claude-code",
+            provider = "claude",
             model = %req.model,
             n_msgs = req.messages.len(),
             "streaming via claude (fingerprint profile {})",
@@ -452,7 +469,7 @@ impl LlmProvider for ClaudeProvider {
 
 // Free fn for any legacy direct use (matches provider-grok).
 pub fn provider_id() -> &'static str {
-    "claude-code"
+    "claude"
 }
 
 #[cfg(test)]
@@ -462,10 +479,32 @@ mod tests {
 
     #[test]
     fn provider_id_and_construction() {
-        assert_eq!(provider_id(), "claude-code");
+        assert_eq!(provider_id(), "claude");
         let p = ClaudeProvider::new().expect("default profile constructs");
-        assert_eq!(p.id(), "claude-code");
+        assert_eq!(p.id(), "claude");
         assert_eq!(p.profile().name, "cc-2.1.175-sdk-cli");
+    }
+
+    #[test]
+    fn detected_accepts_omni_base_url_without_native_creds() {
+        let old_omni = std::env::var_os("OMNI_CLAUDE_BASE_URL");
+        let old_legacy = std::env::var_os("ANTHROPIC_BASE_URL");
+        unsafe {
+            std::env::set_var("OMNI_CLAUDE_BASE_URL", "https://claude-proxy.example.com");
+            std::env::remove_var("ANTHROPIC_BASE_URL");
+        }
+        let detected = ClaudeProvider::detected();
+        unsafe {
+            match old_omni {
+                Some(value) => std::env::set_var("OMNI_CLAUDE_BASE_URL", value),
+                None => std::env::remove_var("OMNI_CLAUDE_BASE_URL"),
+            }
+            match old_legacy {
+                Some(value) => std::env::set_var("ANTHROPIC_BASE_URL", value),
+                None => std::env::remove_var("ANTHROPIC_BASE_URL"),
+            }
+        }
+        assert!(detected);
     }
 
     #[test]
@@ -523,6 +562,7 @@ mod tests {
         });
         let resp: translate::MessagesResponse = serde_json::from_value(raw).unwrap();
         let canon = translate::build_canonical_response(&resp, "haiku", &Replacements::empty());
+        assert_eq!(canon.id.as_deref(), Some("msg_abc"));
         assert_eq!(canon.content, "ok");
         assert_eq!(canon.finish_reason.as_deref(), Some("stop"));
         assert_eq!(canon.usage.input_tokens, 3);
@@ -595,12 +635,18 @@ mod tests {
         }));
         out.extend(conv.on_event(StreamEvent::MessageStop));
 
+        assert_eq!(
+            out[0],
+            CanonicalStreamEvent::ResponseMetadata(omni_core::CanonicalResponseMetadata {
+                id: Some("msg_1".into())
+            })
+        );
         // Text deltas, in order.
-        assert_eq!(out[0], CanonicalStreamEvent::TextDelta("Hello".into()));
-        assert_eq!(out[1], CanonicalStreamEvent::TextDelta(" world".into()));
+        assert_eq!(out[1], CanonicalStreamEvent::TextDelta("Hello".into()));
+        assert_eq!(out[2], CanonicalStreamEvent::TextDelta(" world".into()));
         // Tool-call open carries id+name at canonical index 0.
         assert_eq!(
-            out[2],
+            out[3],
             CanonicalStreamEvent::ToolCallDelta {
                 index: 0,
                 id: Some("toolu_9".into()),
@@ -610,7 +656,7 @@ mod tests {
         );
         // Argument fragments append under the SAME index, id/name now None.
         assert_eq!(
-            out[3],
+            out[4],
             CanonicalStreamEvent::ToolCallDelta {
                 index: 0,
                 id: None,
@@ -619,7 +665,7 @@ mod tests {
             }
         );
         assert_eq!(
-            out[4],
+            out[5],
             CanonicalStreamEvent::ToolCallDelta {
                 index: 0,
                 id: None,
@@ -629,7 +675,7 @@ mod tests {
         );
         // Usage then terminal Finish with mapped reason (tool_use -> tool_calls).
         assert_eq!(
-            out[5],
+            out[6],
             CanonicalStreamEvent::Usage(CanonicalUsage {
                 input_tokens: 11,
                 output_tokens: 7,
@@ -637,12 +683,12 @@ mod tests {
             })
         );
         assert_eq!(
-            out[6],
+            out[7],
             CanonicalStreamEvent::Finish {
                 finish_reason: Some("tool_calls".into())
             }
         );
-        assert_eq!(out.len(), 7, "no extra events emitted");
+        assert_eq!(out.len(), 8, "no extra events emitted");
     }
 
     #[test]
@@ -685,7 +731,7 @@ mod tests {
     #[test]
     fn claude_additional_ctors_and_shared_repl() {
         let p = ClaudeProvider::new().expect("ctor");
-        assert_eq!(p.id(), "claude-code");
+        assert_eq!(p.id(), "claude");
         let repl =
             Replacements::parse(r#"rule = [ { scope = "prompt", search = "x", replace = "y" } ]"#)
                 .unwrap();
@@ -854,6 +900,7 @@ mod tests {
         });
         let resp: translate::MessagesResponse = serde_json::from_value(raw).unwrap();
         let canon = translate::build_canonical_response(&resp, "haiku", &Replacements::empty());
+        assert_eq!(canon.id.as_deref(), Some("m"));
         assert_eq!(canon.usage.input_tokens, 7);
         assert_eq!(canon.usage.cache_creation, 1);
         assert_eq!(canon.usage.cache_read, 3);
@@ -1207,11 +1254,16 @@ mod tests {
         let events: Vec<CanonicalStreamEvent> =
             stream.map(|r| r.expect("no stream error")).collect().await;
 
-        // Text delta first.
-        assert_eq!(events[0], CanonicalStreamEvent::TextDelta("Hello".into()));
+        assert_eq!(
+            events[0],
+            CanonicalStreamEvent::ResponseMetadata(omni_core::CanonicalResponseMetadata {
+                id: Some("msg_s".into())
+            })
+        );
+        assert_eq!(events[1], CanonicalStreamEvent::TextDelta("Hello".into()));
         // Usage carries the input tokens from message_start and output from message_delta.
         assert_eq!(
-            events[1],
+            events[2],
             CanonicalStreamEvent::Usage(CanonicalUsage {
                 input_tokens: 10,
                 output_tokens: 3,
@@ -1220,7 +1272,7 @@ mod tests {
         );
         // Exactly ONE terminal Finish (the dup-Finish fix). end_turn -> stop.
         assert_eq!(
-            events[2],
+            events[3],
             CanonicalStreamEvent::Finish {
                 finish_reason: Some("stop".into())
             }
@@ -1230,7 +1282,7 @@ mod tests {
             .filter(|e| matches!(e, CanonicalStreamEvent::Finish { .. }))
             .count();
         assert_eq!(finishes, 1, "exactly one terminal Finish, got {finishes}");
-        assert_eq!(events.len(), 3, "no extra events: {events:?}");
+        assert_eq!(events.len(), 4, "no extra events: {events:?}");
     }
 
     #[tokio::test]
@@ -1283,7 +1335,13 @@ mod tests {
         let events: Vec<CanonicalStreamEvent> =
             stream.map(|r| r.expect("no stream error")).collect().await;
 
-        assert_eq!(events[0], CanonicalStreamEvent::TextDelta("Hi".into()));
+        assert_eq!(
+            events[0],
+            CanonicalStreamEvent::ResponseMetadata(omni_core::CanonicalResponseMetadata {
+                id: Some("msg_e".into())
+            })
+        );
+        assert_eq!(events[1], CanonicalStreamEvent::TextDelta("Hi".into()));
         // EOF guard synthesizes Usage (tokens were seen) + exactly one Finish.
         let finishes = events
             .iter()

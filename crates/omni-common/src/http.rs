@@ -123,6 +123,8 @@ pub struct ChatChoice {
 pub struct AssistantMessage {
     pub role: &'static str,
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ChatToolCall>,
 }
@@ -352,6 +354,7 @@ pub fn from_canonical(
             message: AssistantMessage {
                 role: "assistant",
                 content,
+                refusal: canon.refusal,
                 tool_calls,
             },
             finish_reason: finish,
@@ -477,6 +480,10 @@ fn async_stream_chunks(
                     let v = chunk_content(&chat_id, created, &requested_model, &text);
                     yield Ok(Event::default().data(v.to_string()));
                 }
+                Ok(CanonicalStreamEvent::RefusalDelta(text)) => {
+                    let v = chunk_content(&chat_id, created, &requested_model, &text);
+                    yield Ok(Event::default().data(v.to_string()));
+                }
                 Ok(CanonicalStreamEvent::ToolCallDelta { index, id, name, arguments_delta }) => {
                     let v = chunk_tool_call(
                         &chat_id, created, &requested_model,
@@ -487,6 +494,9 @@ fn async_stream_chunks(
                 Ok(CanonicalStreamEvent::Usage(_)) => {
                     // OpenAI streams omit usage unless stream_options.include_usage;
                     // not requested at this layer, so usage events are dropped.
+                }
+                Ok(CanonicalStreamEvent::ResponseMetadata(_)) => {
+                    // Chat Completions has no response-id metadata event.
                 }
                 Ok(CanonicalStreamEvent::Finish { finish_reason }) => {
                     finished = true;
@@ -776,6 +786,8 @@ mod tests {
                 output_tokens: 4,
                 ..Default::default()
             },
+            id: None,
+            refusal: None,
         };
         let oai = from_canonical(
             canon,
@@ -793,6 +805,26 @@ mod tests {
     }
 
     #[test]
+    fn from_canonical_preserves_refusal_field() {
+        // WHY: OpenAI-compatible chat responses can carry refusal separately
+        // from text. Providers that expose canonical refusal must not lose it
+        // when served through the Chat Completions surface.
+        let canon = CanonicalResponse {
+            model: "backend-model".into(),
+            content: String::new(),
+            refusal: Some("policy".into()),
+            tool_calls: vec![],
+            finish_reason: Some("content_filter".into()),
+            usage: CanonicalUsage::default(),
+            id: None,
+        };
+        let oai = from_canonical(canon, "m".into(), "id".into(), 0);
+        let v = serde_json::to_value(&oai).unwrap();
+        assert_eq!(v["choices"][0]["message"]["refusal"], "policy");
+        assert_eq!(v["choices"][0]["finish_reason"], "content_filter");
+    }
+
+    #[test]
     fn from_canonical_tool_calls_finish_reason() {
         // WHY: when the model returns tool calls and no text, content must be
         // null and finish_reason must be tool_calls per the OpenAI contract.
@@ -806,6 +838,8 @@ mod tests {
             }],
             finish_reason: None,
             usage: CanonicalUsage::default(),
+            id: None,
+            refusal: None,
         };
         let oai = from_canonical(canon, "m".into(), "id".into(), 0);
         assert!(oai.choices[0].message.content.is_none());

@@ -24,4 +24,3 @@ toml.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 async-stream.workspace = true
-dirs = "6"

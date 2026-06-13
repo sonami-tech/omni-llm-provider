@@ -45,7 +45,7 @@ Grok uses the same fresh credential read contract as the Claude provider:
   Grok CLI's own login file, so an existing `grok` login Just Works.
 - **Source precedence (highest first):**
   1. `$XAI_CREDENTIALS_PATH` (if set) → use exactly that file. A failure here is loud (we do not silently fall through a deliberately-pointed path).
-  2. `~/.xai/.credentials.json` → a simple static key you created on purpose. Explicit beats ambient, so this wins over the CLI login.
+  2. `~/.xai/.credentials.json` → a simple static key you created on purpose. A usable static key wins over the CLI login; if the file is present but has no usable key, Omni falls through to the CLI login.
   3. `~/.grok/auth.json` → the Grok CLI's own OIDC login file (auto-detected).
 - **Two on-disk shapes** (either may sit behind `$XAI_CREDENTIALS_PATH`):
   - Static key (`~/.xai/.credentials.json`):
@@ -61,7 +61,7 @@ Grok uses the same fresh credential read contract as the Claude provider:
     The `key` JWT is a Bearer that authenticates `api.x.ai/v1` directly.
 - **OIDC tokens are read READ-ONLY.** We never write `~/.grok/auth.json` or consume its single-use `refresh_token`. The parsed `expires_at` drives a non-fatal expiry warning; on a genuinely dead token the upstream 401s and the user re-runs the Grok CLI login. Static keys carry no expiry and never warn.
 
-The loader lives in `omni-common::credentials::GrokCredentials` and keeps the same "fresh per request" contract, plus a real expiry check for OIDC tokens.
+The loader lives in `provider-grok::credentials::GrokCredentials` and keeps the same "fresh per request" contract, plus a real expiry check for OIDC tokens.
 
 In `provider-grok` the key is obtained inside the `send` / `send_stream` path (fresh resolution through the source chain) and used only for that request's `Authorization: Bearer ...` header. The `GrokProvider` struct no longer holds a long-lived key (except in test helpers).
 
@@ -69,8 +69,15 @@ This is the "same technique for omni and for grok" as requested: read the CLI's 
 
 ## Custom Endpoint Override
 
-`GROK_MODELS_BASE_URL` switches Omni's Grok provider to a custom
-OpenAI-compatible endpoint. In that mode, custom provider auth owns the request:
+`OMNI_GROK_BASE_URL` is the forced Omni override for Grok and wins over
+`GROK_MODELS_BASE_URL`. In that mode, custom provider auth owns the request:
+
+- `OMNI_GROK_AUTH_TOKEN` sends `Authorization: Bearer ...`.
+- If that is empty, `OMNI_GROK_API_KEY` sends `Authorization: Bearer ...`.
+- `OMNI_GROK_CUSTOM_HEADERS` accepts one `Name: value` header per line.
+- No default xAI credential file or `XAI_API_KEY` is read for this endpoint.
+
+The legacy `GROK_MODELS_BASE_URL` path remains supported:
 
 - `XAI_API_KEY` sends `Authorization: Bearer ...`.
 - If `XAI_API_KEY` is absent, Omni sends no Authorization header.
@@ -82,7 +89,7 @@ configuration overrides the ambient xAI login and prevents signed-in xAI tokens
 from leaking to arbitrary hosts.
 
 ## Relationship to the Rest of Omni
-- The "grok gate" logic (headers + fresh creds) lives only inside the Grok provider (or the thin common credentials loader it uses). It does not leak into `omni-common` policy or the Claude path.
+- The "grok gate" logic (headers + fresh creds) lives inside the Grok provider. It does not leak into `omni-common` policy or the Claude path.
 - Replacements (from omni-common) are still applied at the prompt/response boundaries around the gate, exactly as for Claude.
 - The Omni server can enable "grok" (and/or "claude") via `--providers` /
   `OMNI_PROVIDERS` and route by canonical model id, documented alias, or
@@ -92,8 +99,8 @@ from leaking to arbitrary hosts.
 ## References
 - Official xAI docs (quickstart, /v1/chat/completions, /v1/responses, tools).
 - Prior art in the investigation (how other proxies handle optional X-Title/Referer for xAI).
-- The actual loader implementation in `crates/omni-common/src/credentials.rs`.
+- The actual loader implementation in `crates/provider-grok/src/credentials.rs`.
 - `provider-grok` usage of the loader (fresh read inside send).
 - `docs/providers/grok/CAPTURE.md` for the Grok capture/update workflow.
 
-If xAI ever publishes an official credentials file format or additional mandatory headers for their "gate", this document and the common loader can be updated in one place while keeping the same "look for the file, read fresh" contract.
+If xAI ever publishes an official credentials file format or additional mandatory headers for their "gate", this document and the provider-owned loader can be updated in one place while keeping the same "look for the file, read fresh" contract.

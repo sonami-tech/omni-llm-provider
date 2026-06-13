@@ -6,11 +6,13 @@
 //! owns HTTP routing, auth, stats, and OpenAI-compatible response framing.
 //!
 //! ## Supported configuration (per task)
-//! - --providers claude,grok,codex   or   OMNI_PROVIDERS=... (comma sep, order preserved)
+//! - --providers claude,grok,codex   or   OMNI_PROVIDERS=... (comma sep, order preserved).
+//!   When omitted, Omni enables all locally detected providers.
 //! - --bind 127.0.0.1 by default, or --public as shorthand for --bind 0.0.0.0
 //! - Canonical model routing: real model ids (e.g. "claude-sonnet-4-6", "grok-4.3")
 //!   route directly when they uniquely identify an enabled provider.
-//! - Alias routing: "fable", "opus", "sonnet", "haiku", "grok", and "composer"
+//! - Alias routing: "fable", "opus", "sonnet", "haiku", "grok", "composer",
+//!   "codex", and "gpt"
 //!   resolve to current provider-owned model ids when unique.
 //! - Optional prefix routing remains an escape hatch: "grok:foo", "claude:bar", or "codex:bar".
 //!
@@ -102,13 +104,8 @@ const OMNI_ASCII_BANNER: &str = r#"
     about = "Omni LLM server (claude + grok + codex backends)"
 )]
 struct Cli {
-    /// Comma-separated list of providers to enable (claude,grok,codex). Prefix routing uses these names.
-    #[arg(
-        long,
-        env = "OMNI_PROVIDERS",
-        default_value = "claude,grok",
-        value_delimiter = ','
-    )]
+    /// Comma-separated list of providers to enable (claude,grok,codex). If omitted, all detected providers are enabled.
+    #[arg(long, env = "OMNI_PROVIDERS", value_delimiter = ',')]
     providers: Vec<String>,
 
     /// Listen port.
@@ -193,9 +190,8 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     log_startup_banner();
 
-    // Normalize + validate providers list (unique, known names only).
-    let enabled: Vec<String> = normalize_providers(&cli.providers)?;
-    info!(?enabled, "omni enabled providers");
+    let (enabled, provider_source) = select_enabled_providers(&cli.providers)?;
+    info!(?enabled, source = provider_source, "omni enabled providers");
 
     let mut providers_map: HashMap<String, ProviderEntry> = HashMap::new();
     for name in &enabled {
@@ -261,8 +257,6 @@ async fn main() -> anyhow::Result<()> {
         stats,
         conversation_log: build_conversation_log(&cli)?,
     };
-    let alias_text = format_aliases_for_log(&state.providers).unwrap_or_else(|| "none".into());
-
     // Auth keys: empty set => allow-all (see omni-common::auth_layer).
     // Support OMNI_API_KEYS= k1,k2,... for a non-empty set when !--no-auth.
     let auth_keys: Arc<HashSet<String>> = if cli.no_auth {
@@ -278,17 +272,14 @@ async fn main() -> anyhow::Result<()> {
     };
     info!(no_auth_effective = auth_keys.is_empty(), "auth layer ready");
 
-    let app = build_router(Arc::new(state), auth_keys);
-
     let bind_host = resolve_bind_host(cli.public, cli.bind.as_deref())?;
     let addr: SocketAddr = format!("{}:{}", bind_host, cli.port).parse()?;
-    info!("omni listening on http://{}", addr);
-    info!("  providers: {}", enabled.join(","));
-    info!("  try: curl http://{}/health", addr);
-    info!("  models:  curl http://{}/v1/models", addr);
-    info!("  stats:   curl http://{}/stats", addr);
-    info!("  completions example: model=grok, codex, or claude-sonnet-4-6");
-    info!("  aliases: {}", alias_text);
+    let startup_lines = startup_summary_lines(&state.providers, &enabled, addr);
+    let app = build_router(Arc::new(state), auth_keys);
+
+    for line in startup_lines {
+        info!("{}", line);
+    }
 
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app)
         .await
@@ -306,11 +297,42 @@ fn log_startup_banner() {
 }
 
 fn init_claude_provider() -> anyhow::Result<ClaudeProvider> {
+    if let Some(base_url) = env_nonempty("OMNI_CLAUDE_BASE_URL") {
+        let authorization_bearer = env_nonempty("OMNI_CLAUDE_AUTH_TOKEN")
+            .is_some()
+            .then(|| "OMNI_CLAUDE_AUTH_TOKEN".to_string());
+        let api_key = env_nonempty("OMNI_CLAUDE_API_KEY")
+            .is_some()
+            .then(|| "OMNI_CLAUDE_API_KEY".to_string());
+        let custom_headers = std::env::var_os("OMNI_CLAUDE_CUSTOM_HEADERS")
+            .is_some()
+            .then(|| "OMNI_CLAUDE_CUSTOM_HEADERS".to_string());
+        info!(
+            base_url = %base_url,
+            auth = if authorization_bearer.is_some() {
+                "bearer"
+            } else if api_key.is_some() {
+                "x-api-key"
+            } else {
+                "custom-headers-or-no-auth"
+            },
+            "initializing claude provider with OMNI_CLAUDE_BASE_URL custom gateway"
+        );
+        return ClaudeProvider::new_for_custom_gateway_env(
+            provider_claude::default_profile(),
+            base_url,
+            authorization_bearer,
+            api_key,
+            custom_headers,
+        )
+        .map_err(anyhow::Error::from);
+    }
+
     if let Some(base_url) = env_nonempty("ANTHROPIC_BASE_URL") {
-        let authorization_bearer = std::env::var_os("ANTHROPIC_AUTH_TOKEN")
+        let authorization_bearer = env_nonempty("ANTHROPIC_AUTH_TOKEN")
             .is_some()
             .then(|| "ANTHROPIC_AUTH_TOKEN".to_string());
-        let api_key = std::env::var_os("ANTHROPIC_API_KEY")
+        let api_key = env_nonempty("ANTHROPIC_API_KEY")
             .is_some()
             .then(|| "ANTHROPIC_API_KEY".to_string());
         let custom_headers = std::env::var_os("ANTHROPIC_CUSTOM_HEADERS")
@@ -343,10 +365,30 @@ fn init_claude_provider() -> anyhow::Result<ClaudeProvider> {
 
 fn init_grok_provider() -> anyhow::Result<GrokProvider> {
     let provider = GrokProvider::new(None).map_err(anyhow::Error::from)?;
+    if let Some(base_url) = env_nonempty("OMNI_GROK_BASE_URL") {
+        info!(
+            base_url = %base_url,
+            auth = if env_nonempty("OMNI_GROK_AUTH_TOKEN").is_some() {
+                "bearer-token"
+            } else if env_nonempty("OMNI_GROK_API_KEY").is_some() {
+                "api-key"
+            } else {
+                "custom-headers-or-no-auth"
+            },
+            "initializing grok provider with OMNI_GROK_BASE_URL custom endpoint"
+        );
+        return Ok(provider.with_custom_auth_env(
+            base_url,
+            Some("OMNI_GROK_AUTH_TOKEN".into()),
+            Some("OMNI_GROK_API_KEY".into()),
+            Some("OMNI_GROK_CUSTOM_HEADERS".into()),
+        ));
+    }
+
     if let Some(base_url) = env_nonempty("GROK_MODELS_BASE_URL") {
         info!(
             base_url = %base_url,
-            auth = if std::env::var_os("XAI_API_KEY").is_some() { "bearer" } else { "no-auth" },
+            auth = if env_nonempty("XAI_API_KEY").is_some() { "bearer" } else { "no-auth" },
             "initializing grok provider with GROK_MODELS_BASE_URL custom endpoint"
         );
         return Ok(provider.with_base_url(base_url).with_custom_auth(
@@ -356,7 +398,9 @@ fn init_grok_provider() -> anyhow::Result<GrokProvider> {
         ));
     }
 
-    info!("initializing grok provider (key read per request from ~/.xai/.credentials.json)");
+    info!(
+        "initializing grok provider (key read per request from XAI_CREDENTIALS_PATH, ~/.xai/.credentials.json, or ~/.grok/auth.json)"
+    );
     Ok(provider)
 }
 
@@ -536,7 +580,7 @@ fn format_aliases_for_log(providers: &HashMap<String, ProviderEntry>) -> Option<
     let catalogs = provider_catalogs(providers);
     let mut pairs = Vec::new();
     for alias in [
-        "sonnet", "opus", "haiku", "fable", "grok", "composer", "codex",
+        "sonnet", "opus", "haiku", "fable", "grok", "composer", "codex", "gpt",
     ] {
         let matches = model_matches(alias, &catalogs);
         if matches.len() == 1 {
@@ -548,6 +592,52 @@ fn format_aliases_for_log(providers: &HashMap<String, ProviderEntry>) -> Option<
     } else {
         Some(pairs.join(", "))
     }
+}
+
+fn format_models_for_log(providers: &HashMap<String, ProviderEntry>) -> Option<String> {
+    let mut provider_keys = providers.keys().cloned().collect::<Vec<_>>();
+    provider_keys.sort();
+    let mut groups = Vec::new();
+    for provider in provider_keys {
+        let Some(entry) = providers.get(&provider) else {
+            continue;
+        };
+        let mut model_ids = entry
+            .models
+            .iter()
+            .filter_map(|model| model.get("id").and_then(|id| id.as_str()))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        model_ids.sort();
+        model_ids.dedup();
+        if !model_ids.is_empty() {
+            groups.push(format!("{}=[{}]", provider, model_ids.join(",")));
+        }
+    }
+    if groups.is_empty() {
+        None
+    } else {
+        Some(groups.join("; "))
+    }
+}
+
+fn startup_summary_lines(
+    providers: &HashMap<String, ProviderEntry>,
+    enabled: &[String],
+    addr: SocketAddr,
+) -> Vec<String> {
+    let model_text = format_models_for_log(providers).unwrap_or_else(|| "none".into());
+    let alias_text = format_aliases_for_log(providers).unwrap_or_else(|| "none".into());
+    vec![
+        format!("omni listening on http://{addr}"),
+        format!("providers: {}", enabled.join(",")),
+        format!("models: {model_text}"),
+        format!("aliases: {alias_text}"),
+        format!("try: curl http://{addr}/health"),
+        format!("models endpoint: curl http://{addr}/v1/models"),
+        format!("stats endpoint: curl http://{addr}/stats"),
+        "completions example: model=grok, codex, or claude-sonnet-4-6".to_string(),
+    ]
 }
 
 /// Resolve the configured listen host. `--public` is intentional shorthand for
@@ -563,9 +653,24 @@ fn resolve_bind_host(public: bool, bind: Option<&str>) -> anyhow::Result<String>
     Ok(bind.unwrap_or("127.0.0.1").to_string())
 }
 
-/// Normalize/validate the providers CLI/env list.
+fn select_enabled_providers(raw: &[String]) -> anyhow::Result<(Vec<String>, &'static str)> {
+    let configured = normalize_provider_list(raw)?;
+    if !configured.is_empty() {
+        return Ok((configured, "configured"));
+    }
+
+    let detected = detect_available_providers();
+    if detected.is_empty() {
+        anyhow::bail!(
+            "no providers detected; configure Claude, Grok, or Codex credentials/custom endpoints, or pass --providers/OMNI_PROVIDERS explicitly"
+        );
+    }
+    Ok((detected, "auto-detected"))
+}
+
+/// Normalize/validate a providers CLI/env list.
 /// Accepts "claude,grok,codex", trims, lowercases, dedups in order, rejects unknowns.
-fn normalize_providers(raw: &[String]) -> anyhow::Result<Vec<String>> {
+fn normalize_provider_list(raw: &[String]) -> anyhow::Result<Vec<String>> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for r in raw {
@@ -580,10 +685,30 @@ fn normalize_providers(raw: &[String]) -> anyhow::Result<Vec<String>> {
             out.push(p);
         }
     }
+    Ok(out)
+}
+
+#[cfg(test)]
+fn normalize_providers(raw: &[String]) -> anyhow::Result<Vec<String>> {
+    let out = normalize_provider_list(raw)?;
     if out.is_empty() {
         anyhow::bail!("at least one provider required (claude, grok, and/or codex)");
     }
     Ok(out)
+}
+
+fn detect_available_providers() -> Vec<String> {
+    let mut out = Vec::new();
+    if ClaudeProvider::detected() {
+        out.push("claude".to_string());
+    }
+    if GrokProvider::detected() {
+        out.push("grok".to_string());
+    }
+    if CodexProvider::detected() {
+        out.push("codex".to_string());
+    }
+    out
 }
 
 /// Pure routing function. Extracted for easy unit testing of the core logic.
@@ -843,6 +968,10 @@ fn record_response_stats(
     stats.record_response(model, usage, None, dur_ms);
 }
 
+fn is_error_finish_reason(finish_reason: Option<&str>) -> bool {
+    matches!(finish_reason, Some("error")) || finish_reason.is_some_and(|r| r.starts_with("error:"))
+}
+
 fn wrap_stream_for_stats(
     mut stream: CanonicalStream,
     stats: Option<Arc<Stats>>,
@@ -856,7 +985,6 @@ fn wrap_stream_for_stats(
         let _active = stats.as_deref().map(ActiveRequestGuard::new);
         let started = Instant::now();
         let mut usage = TokenUsage::default();
-        let mut saw_usage = false;
         let mut finished = false;
 
         while let Some(item) = futures_util::StreamExt::next(&mut stream).await {
@@ -868,13 +996,21 @@ fn wrap_stream_for_stats(
                         cache_read_input_tokens: u.cache_read,
                         cache_creation_input_tokens: u.cache_creation,
                     };
-                    saw_usage = true;
                     yield Ok(CanonicalStreamEvent::Usage(u));
                 }
                 Ok(CanonicalStreamEvent::Finish { finish_reason }) => {
                     finished = true;
                     let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
-                    if let Some(stats) = stats.as_ref() {
+                    if is_error_finish_reason(finish_reason.as_deref()) {
+                        if let Some(stats) = stats.as_ref() {
+                            let msg = finish_reason
+                                .as_deref()
+                                .unwrap_or("error")
+                                .trim_start_matches("error:")
+                                .trim();
+                            stats.record_error(&model, msg);
+                        }
+                    } else if let Some(stats) = stats.as_ref() {
                         stats.record_response(
                             &model,
                             usage,
@@ -897,6 +1033,7 @@ fn wrap_stream_for_stats(
                     yield Ok(other);
                 }
                 Err(e) => {
+                    finished = true;
                     if let Some(stats) = stats.as_ref() {
                         stats.record_error(&model, &e.to_string());
                     }
@@ -909,10 +1046,8 @@ fn wrap_stream_for_stats(
         }
 
         if !finished {
-            let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
-            let usage = if saw_usage { usage } else { TokenUsage::default() };
             if let Some(stats) = stats.as_ref() {
-                stats.record_response(&model, usage, None, dur_ms);
+                stats.record_error(&model, "stream ended without Finish event");
             }
             if let Some(log) = conversation_log.as_ref() {
                 log.log(
@@ -920,7 +1055,7 @@ fn wrap_stream_for_stats(
                     &request_id,
                     "<<<",
                     label,
-                    &format!("stream ended without finish duration_ms={dur_ms:.1}"),
+                    "stream ended without finish",
                 );
             }
         }
@@ -1304,6 +1439,8 @@ fn anthropic_sse_response(
         let started = Instant::now();
         let mut usage = TokenUsage::default();
         let mut ttft_ms: Option<f64> = None;
+        let mut stream_failed = false;
+        let mut saw_message_stop = false;
         let mut repl_state = provider_claude::anthropic_passthrough::RawSseReplState::new(&replacements);
 
         yield Ok::<Event, Infallible>(Event::default().comment("ok"));
@@ -1317,10 +1454,37 @@ fn anthropic_sse_response(
                     {
                         ttft_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
                     }
+                    let upstream_error_message = if frame.event == "error"
+                        || frame.data.get("type").and_then(|v| v.as_str()) == Some("error")
+                    {
+                        Some(
+                            frame
+                                .data
+                                .pointer("/error/message")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| frame.data.get("message").and_then(|v| v.as_str()))
+                                .unwrap_or("anthropic stream error")
+                                .to_string(),
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(message) = upstream_error_message {
+                        stream_failed = true;
+                        if let Some(stats) = stats.as_ref() {
+                            stats.record_error(&model, &message);
+                        }
+                    }
+                    if frame.event == "message_stop"
+                        || frame.data.get("type").and_then(|v| v.as_str()) == Some("message_stop")
+                    {
+                        saw_message_stop = true;
+                    }
                     for (event, data) in repl_state.on_frame(&frame.event, frame.data, &replacements) {
                         match anthropic_sse_event(&event, &data) {
                             Ok(event) => yield Ok(event),
                             Err(error) => {
+                                stream_failed = true;
                                 if let Some(stats) = stats.as_ref() {
                                     stats.record_error(&model, &error);
                                 }
@@ -1332,6 +1496,7 @@ fn anthropic_sse_response(
                 }
                 Err(error) => {
                     let message = truncate_for_sse(&error.to_string());
+                    stream_failed = true;
                     if let Some(stats) = stats.as_ref() {
                         stats.record_error(&model, &message);
                     }
@@ -1351,13 +1516,23 @@ fn anthropic_sse_response(
                 yield Ok(event);
             }
         }
-        if let Some(stats) = stats.as_ref() {
-            stats.record_response(
-                &model,
-                usage,
-                ttft_ms,
-                started.elapsed().as_secs_f64() * 1000.0,
-            );
+        if !stream_failed && !saw_message_stop {
+            stream_failed = true;
+            let message = "anthropic stream ended before message_stop";
+            if let Some(stats) = stats.as_ref() {
+                stats.record_error(&model, message);
+            }
+            yield Ok(anthropic_error_event(message));
+        }
+        if !stream_failed {
+            if let Some(stats) = stats.as_ref() {
+                stats.record_response(
+                    &model,
+                    usage,
+                    ttft_ms,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
         }
         if let Some(log) = conversation_log.as_ref() {
             log.log(
@@ -1634,6 +1809,10 @@ mod tests {
         let (k, m) = resolve_provider_and_model("codex", &catalogs).unwrap();
         assert_eq!(k.as_str(), "codex");
         assert!(!m.is_empty());
+
+        let (k, m) = resolve_provider_and_model("gpt", &catalogs).unwrap();
+        assert_eq!(k.as_str(), "codex");
+        assert!(!m.is_empty());
     }
 
     #[test]
@@ -1652,12 +1831,59 @@ mod tests {
             "grok=grok-4.3",
             "composer=grok-composer-2.5-fast",
             "codex=",
+            "gpt=",
         ] {
             assert!(
                 text.contains(expected),
                 "startup alias log missing {expected}: {text}"
             );
         }
+    }
+
+    #[test]
+    fn test_startup_model_log_lists_active_provider_models() {
+        // WHY: startup should show the real model ids exposed by active
+        // providers before it shows shorthand aliases.
+        let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
+        providers.insert("claude".into(), claude_entry());
+        providers.insert("grok".into(), grok_entry("http://127.0.0.1:1"));
+
+        let text = format_models_for_log(&providers).expect("models format");
+        assert!(text.contains("claude=["));
+        assert!(text.contains("claude-sonnet-4-6"));
+        assert!(text.contains("grok=["));
+        assert!(text.contains("grok-4.3"));
+        assert!(text.contains("grok-composer-2.5-fast"));
+        assert!(
+            !text.contains("sonnet=") && !text.contains("composer="),
+            "model log must list model ids, not alias mappings: {text}"
+        );
+    }
+
+    #[test]
+    fn test_startup_summary_lists_models_before_aliases_left_aligned() {
+        // WHY: the launch screen is operator-facing. Active provider models
+        // must appear before aliases, and summary lines must not be padded with
+        // leading spaces.
+        let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
+        providers.insert("claude".into(), claude_entry());
+        providers.insert("grok".into(), grok_entry("http://127.0.0.1:1"));
+        let addr: SocketAddr = "127.0.0.1:18321".parse().unwrap();
+        let lines = startup_summary_lines(&providers, &["claude".into(), "grok".into()], addr);
+
+        let models_pos = lines
+            .iter()
+            .position(|line| line.starts_with("models: "))
+            .expect("models line present");
+        let aliases_pos = lines
+            .iter()
+            .position(|line| line.starts_with("aliases: "))
+            .expect("aliases line present");
+        assert!(models_pos < aliases_pos, "models line must precede aliases");
+        assert!(
+            lines.iter().all(|line| !line.starts_with(' ')),
+            "startup summary lines must be left-aligned: {lines:?}"
+        );
     }
 
     #[test]
@@ -1715,6 +1941,14 @@ mod tests {
                 "codex".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_select_enabled_providers_configured_list_wins() {
+        let (providers, source) =
+            select_enabled_providers(&[" grok ".into(), "codex".into()]).unwrap();
+        assert_eq!(providers, vec!["grok".to_string(), "codex".to_string()]);
+        assert_eq!(source, "configured");
     }
 
     #[test]
@@ -2061,6 +2295,95 @@ requires_openai_auth = false
         }
     }
 
+    struct TempDetectedProviderHomes {
+        root: PathBuf,
+    }
+
+    impl TempDetectedProviderHomes {
+        fn install() -> Self {
+            let root = std::env::temp_dir().join(format!("omni-detected-homes-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(root.join(".claude")).expect("create claude dir");
+            std::fs::create_dir_all(root.join(".xai")).expect("create xai dir");
+            std::fs::create_dir_all(root.join(".codex")).expect("create codex dir");
+            std::fs::write(
+                root.join(".claude/.credentials.json"),
+                r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-detected","expiresAt":3000000000000,"subscriptionType":"max"}}"#,
+            )
+            .expect("write claude creds");
+            std::fs::write(
+                root.join(".xai/.credentials.json"),
+                r#"{"apiKey":"xai-detected"}"#,
+            )
+            .expect("write grok creds");
+            std::fs::write(root.join(".codex/config.toml"), r#"model = "gpt-detected""#)
+                .expect("write codex config");
+
+            Self { root }
+        }
+
+        fn child_env(&self) -> Vec<(String, Option<String>)> {
+            let mut envs = vec![
+                (
+                    "CLAUDE_CREDENTIALS_PATH".to_string(),
+                    Some(
+                        self.root
+                            .join(".claude/.credentials.json")
+                            .display()
+                            .to_string(),
+                    ),
+                ),
+                (
+                    "XAI_CREDENTIALS_PATH".to_string(),
+                    Some(
+                        self.root
+                            .join(".xai/.credentials.json")
+                            .display()
+                            .to_string(),
+                    ),
+                ),
+                (
+                    "CODEX_HOME".to_string(),
+                    Some(self.root.join(".codex").display().to_string()),
+                ),
+                ("OMNI_PROVIDERS".to_string(), Some(String::new())),
+            ];
+            for key in [
+                "OMNI_CLAUDE_BASE_URL",
+                "OMNI_CLAUDE_AUTH_TOKEN",
+                "OMNI_CLAUDE_API_KEY",
+                "OMNI_CLAUDE_CUSTOM_HEADERS",
+                "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_CUSTOM_HEADERS",
+                "OMNI_GROK_BASE_URL",
+                "OMNI_GROK_AUTH_TOKEN",
+                "OMNI_GROK_API_KEY",
+                "OMNI_GROK_CUSTOM_HEADERS",
+                "GROK_MODELS_BASE_URL",
+                "XAI_API_KEY",
+                "OMNI_CODEX_BASE_URL",
+                "OMNI_CODEX_MODEL",
+                "OMNI_CODEX_WIRE_API",
+                "OMNI_CODEX_AUTH_TOKEN",
+                "OMNI_CODEX_API_KEY",
+                "OMNI_CODEX_CUSTOM_HEADERS",
+                "CODEX_API_KEY",
+                "OPENAI_API_KEY",
+                "CODEX_ACCESS_TOKEN",
+            ] {
+                envs.push((key.to_string(), None));
+            }
+            envs
+        }
+    }
+
+    impl Drop for TempDetectedProviderHomes {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     fn live_grok_entry() -> ProviderEntry {
         ProviderEntry {
             provider: Arc::new(GrokProvider::new(None).expect("grok provider with creds")),
@@ -2148,10 +2471,29 @@ requires_openai_auth = false
     }
 
     fn spawn_omni(args: &[&str], envs: &[(&str, &str)]) -> omni_common::test_support::ChildGuard {
+        spawn_omni_owned(
+            args,
+            envs.iter()
+                .map(|(key, value)| ((*key).to_string(), Some((*value).to_string())))
+                .collect(),
+        )
+    }
+
+    fn spawn_omni_owned(
+        args: &[&str],
+        envs: Vec<(String, Option<String>)>,
+    ) -> omni_common::test_support::ChildGuard {
         let mut cmd = Command::new(omni_bin_path());
         cmd.args(args).stdout(Stdio::null()).stderr(Stdio::null());
         for (key, value) in envs {
-            cmd.env(key, value);
+            match value {
+                Some(value) => {
+                    cmd.env(key, value);
+                }
+                None => {
+                    cmd.env_remove(key);
+                }
+            }
         }
         omni_common::test_support::ChildGuard::new(cmd.spawn().expect("spawn omni"))
     }
@@ -2532,6 +2874,65 @@ requires_openai_auth = false
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    async fn test_init_claude_omni_custom_gateway_wins_over_anthropic_env() {
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let creds = TempClaudeCreds::install("omni-claude-override");
+        let omni_server = MockServer::start().await;
+        let legacy_server = MockServer::start().await;
+        let _env = TempEnvVars::set(&[
+            ("OMNI_CLAUDE_BASE_URL", Some(&omni_server.uri())),
+            ("OMNI_CLAUDE_AUTH_TOKEN", Some("omni-claude-token")),
+            ("OMNI_CLAUDE_API_KEY", Some("omni-api-key-must-not-win")),
+            ("OMNI_CLAUDE_CUSTOM_HEADERS", Some("X-Omni-Claude: yes")),
+            ("ANTHROPIC_BASE_URL", Some(&legacy_server.uri())),
+            ("ANTHROPIC_AUTH_TOKEN", Some("legacy-token-must-not-win")),
+            ("ANTHROPIC_API_KEY", Some("legacy-api-key-must-not-win")),
+            ("ANTHROPIC_CUSTOM_HEADERS", Some("X-Legacy: no")),
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(query_param("beta", "true"))
+            .and(header("authorization", "Bearer omni-claude-token"))
+            .and(header("x-omni-claude", "yes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_omni",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type":"text","text":"omni claude ok"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&omni_server)
+            .await;
+
+        let provider = init_claude_provider().expect("OMNI Claude provider from env");
+        drop(creds);
+        let response = provider
+            .send(omni_core::CanonicalRequest {
+                model: "sonnet".into(),
+                messages: vec![omni_core::CanonicalMessage {
+                    role: "user".into(),
+                    content: omni_core::CanonicalContent::Text("hi".into()),
+                }],
+                ..Default::default()
+            })
+            .await
+            .expect("OMNI Claude send");
+
+        assert_eq!(response.content, "omni claude ok");
+        assert_eq!(omni_server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(
+            legacy_server.received_requests().await.unwrap().len(),
+            0,
+            "OMNI_CLAUDE_BASE_URL must win over ANTHROPIC_BASE_URL"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_init_grok_custom_endpoint_uses_xai_api_key_not_default_credentials() {
         let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let creds =
@@ -2580,6 +2981,60 @@ requires_openai_auth = false
         assert!(
             !auth.contains("xai-must-not-leak"),
             "custom Grok endpoint must not receive default xAI credential"
+        );
+        let _ = std::fs::remove_file(creds);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_init_grok_omni_custom_endpoint_wins_over_legacy_env() {
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let creds =
+            std::env::temp_dir().join(format!("omni-grok-omni-precedence-{}.json", Uuid::new_v4()));
+        std::fs::write(&creds, r#"{"apiKey":"xai-must-not-leak"}"#).expect("write temp xAI creds");
+        let omni_server = MockServer::start().await;
+        let legacy_server = MockServer::start().await;
+        let _env = TempEnvVars::set(&[
+            ("OMNI_GROK_BASE_URL", Some(&omni_server.uri())),
+            ("OMNI_GROK_AUTH_TOKEN", Some("omni-grok-token")),
+            ("OMNI_GROK_API_KEY", Some("omni-api-key-must-not-win")),
+            ("OMNI_GROK_CUSTOM_HEADERS", Some("X-Omni-Grok: yes")),
+            ("GROK_MODELS_BASE_URL", Some(&legacy_server.uri())),
+            ("XAI_API_KEY", Some("legacy-grok-token-must-not-win")),
+            ("XAI_CREDENTIALS_PATH", Some(creds.to_str().unwrap())),
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer omni-grok-token"))
+            .and(header("x-omni-grok", "yes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "grok-4.3",
+                "choices": [{"message": {"content": "omni grok ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&omni_server)
+            .await;
+
+        let provider = init_grok_provider().expect("OMNI Grok provider from env");
+        let response = provider
+            .send(omni_core::CanonicalRequest {
+                model: "grok".into(),
+                messages: vec![omni_core::CanonicalMessage {
+                    role: "user".into(),
+                    content: omni_core::CanonicalContent::Text("hi".into()),
+                }],
+                ..Default::default()
+            })
+            .await
+            .expect("OMNI Grok send");
+
+        assert_eq!(response.content, "omni grok ok");
+        assert_eq!(omni_server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(
+            legacy_server.received_requests().await.unwrap().len(),
+            0,
+            "OMNI_GROK_BASE_URL must win over GROK_MODELS_BASE_URL"
         );
         let _ = std::fs::remove_file(creds);
     }
@@ -2783,9 +3238,30 @@ requires_openai_auth = false
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn test_chat_completions_codex_stream_rejects_until_native_streaming_exists() {
+    async fn test_chat_completions_codex_stream_routes_to_native_sse() {
         let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let _codex_home = TempCodexHome::install_for_mock("http://127.0.0.1:9");
+        let server = MockServer::start().await;
+        let _codex_home = TempCodexHome::install_for_mock(&server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(body_partial_json(serde_json::json!({
+                "model": "gpt-5.5",
+                "stream": true
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(
+                    "event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"Codex\"}\n\n\
+event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\" stream\"}\n\n\
+event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":3}}}\n\n",
+                    "text/event-stream",
+                ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
         let mut map = HashMap::new();
         map.insert("codex".into(), codex_entry());
         let req = ChatCompletionRequest {
@@ -2806,23 +3282,47 @@ requires_openai_auth = false
             extras: serde_json::Value::Null,
         };
 
-        let err = call_chat_handler(state_with(map), req)
+        let resp = call_chat_handler(state_with(map), req)
             .await
-            .expect_err("Codex stream:true must fail loudly");
-        match err {
-            AppError::ServerError(message) => assert!(
-                message.contains("streaming is not implemented"),
-                "Codex stream:true should name the unsupported streaming mode: {message}"
-            ),
-            other => panic!("expected Codex stream unsupported server error, got {other:?}"),
-        }
+            .expect("Codex stream:true should route to native SSE");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains(r#""object":"chat.completion.chunk""#),
+            "{body}"
+        );
+        assert!(body.contains(r#""content":"Codex""#), "{body}");
+        assert!(body.contains(r#""content":" stream""#), "{body}");
+        assert!(body.contains(r#""finish_reason":"stop""#), "{body}");
+        assert!(body.contains("data: [DONE]"), "{body}");
     }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn test_responses_codex_stream_rejects_until_native_streaming_exists() {
+    async fn test_responses_codex_stream_routes_to_native_sse() {
         let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let _codex_home = TempCodexHome::install_for_mock("http://127.0.0.1:9");
+        let server = MockServer::start().await;
+        let _codex_home = TempCodexHome::install_for_mock(&server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(body_partial_json(serde_json::json!({
+                "model": "gpt-5.5",
+                "stream": true
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(
+                    "event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"Response\"}\n\n\
+event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":5}}}\n\n",
+                    "text/event-stream",
+                ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
         let mut map = HashMap::new();
         map.insert("codex".into(), codex_entry());
         let req: omni_common::ResponsesRequest = serde_json::from_value(serde_json::json!({
@@ -2832,16 +3332,19 @@ requires_openai_auth = false
         }))
         .unwrap();
 
-        let err = call_responses_handler(state_with(map), req)
+        let resp = call_responses_handler(state_with(map), req)
             .await
-            .expect_err("Codex Responses stream:true must fail loudly");
-        match err {
-            AppError::ServerError(message) => assert!(
-                message.contains("streaming is not implemented"),
-                "Codex Responses stream:true should name the unsupported streaming mode: {message}"
-            ),
-            other => panic!("expected Codex stream unsupported server error, got {other:?}"),
-        }
+            .expect("Codex Responses stream:true should route to native SSE");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("event: response.created"), "{body}");
+        assert!(body.contains("event: response.output_text.delta"), "{body}");
+        assert!(body.contains(r#""delta":"Response""#), "{body}");
+        assert!(body.contains("event: response.completed"), "{body}");
+        assert!(body.contains(r#""input_tokens":4"#), "{body}");
+        assert!(!body.contains("[DONE]"), "{body}");
     }
 
     #[tokio::test]
@@ -3097,6 +3600,182 @@ requires_openai_auth = false
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_anthropic_messages_stream_error_does_not_record_success_response() {
+        // WHY: the Anthropic passthrough stream is raw SSE, but its stats must
+        // still agree with canonical stream stats: an upstream body error is an
+        // error only, not also a successful response sample.
+        let stats_path = temp_stats_path();
+        let _stats_guard = TempStats(stats_path.clone());
+        let stats = Arc::new(Stats::open(&stats_path).unwrap());
+        stats.record_request("claude:claude-sonnet-4-6", None);
+        let upstream =
+            futures_util::stream::iter(vec![Err(ProviderError::Upstream("raw boom".into()))]);
+        let resp = anthropic_sse_response(
+            Box::pin(upstream),
+            Some(stats.clone()),
+            None,
+            "claude:claude-sonnet-4-6".into(),
+            "sess".into(),
+            "req".into(),
+            Replacements::empty(),
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("event: error"), "{text}");
+
+        let snap = stats.snapshot();
+        let model = &snap.models["claude:claude-sonnet-4-6"];
+        assert_eq!(model.requests, 1);
+        assert_eq!(model.input_tokens, 0);
+        assert_eq!(model.output_tokens, 0);
+        assert_eq!(model.avg_duration_ms, 0.0);
+        assert_eq!(snap.errors, 1);
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_messages_stream_error_frame_does_not_record_success_response() {
+        // WHY: Anthropic reports some upstream streaming failures as valid SSE
+        // `event: error` frames. Those must still block success stats.
+        let stats_path = temp_stats_path();
+        let _stats_guard = TempStats(stats_path.clone());
+        let stats = Arc::new(Stats::open(&stats_path).unwrap());
+        stats.record_request("claude:claude-sonnet-4-6", None);
+        let upstream = futures_util::stream::iter(vec![
+            Ok(provider_claude::upstream::RawFrame {
+                event: "message_start".into(),
+                data: serde_json::json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_s",
+                        "model": "claude-sonnet-4-6",
+                        "usage": {"input_tokens": 5, "output_tokens": 0}
+                    }
+                }),
+            }),
+            Ok(provider_claude::upstream::RawFrame {
+                event: "content_block_delta".into(),
+                data: serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "partial"}
+                }),
+            }),
+            Ok(provider_claude::upstream::RawFrame {
+                event: "message_delta".into(),
+                data: serde_json::json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": null},
+                    "usage": {"output_tokens": 7}
+                }),
+            }),
+            Ok(provider_claude::upstream::RawFrame {
+                event: "error".into(),
+                data: serde_json::json!({
+                    "type": "error",
+                    "error": {"type": "overloaded_error", "message": "try later"}
+                }),
+            }),
+        ]);
+        let resp = anthropic_sse_response(
+            Box::pin(upstream),
+            Some(stats.clone()),
+            None,
+            "claude:claude-sonnet-4-6".into(),
+            "sess".into(),
+            "req".into(),
+            Replacements::empty(),
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("event: error"), "{text}");
+
+        let snap = stats.snapshot();
+        let model = &snap.models["claude:claude-sonnet-4-6"];
+        assert_eq!(model.requests, 1);
+        assert_eq!(model.input_tokens, 0);
+        assert_eq!(model.output_tokens, 0);
+        assert_eq!(model.avg_duration_ms, 0.0);
+        assert_eq!(snap.errors, 1);
+        assert_eq!(snap.recent_errors.len(), 1);
+        assert!(snap.recent_errors[0].message.contains("try later"));
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_messages_stream_missing_stop_records_error_not_success_response() {
+        // WHY: a raw Anthropic stream that ends before message_stop is
+        // truncated. It must not record accumulated tokens as a success.
+        let stats_path = temp_stats_path();
+        let _stats_guard = TempStats(stats_path.clone());
+        let stats = Arc::new(Stats::open(&stats_path).unwrap());
+        stats.record_request("claude:claude-sonnet-4-6", None);
+        let upstream = futures_util::stream::iter(vec![
+            Ok(provider_claude::upstream::RawFrame {
+                event: "message_start".into(),
+                data: serde_json::json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_s",
+                        "model": "claude-sonnet-4-6",
+                        "usage": {"input_tokens": 5, "output_tokens": 0}
+                    }
+                }),
+            }),
+            Ok(provider_claude::upstream::RawFrame {
+                event: "content_block_delta".into(),
+                data: serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "partial"}
+                }),
+            }),
+            Ok(provider_claude::upstream::RawFrame {
+                event: "message_delta".into(),
+                data: serde_json::json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": null},
+                    "usage": {"output_tokens": 7}
+                }),
+            }),
+        ]);
+        let resp = anthropic_sse_response(
+            Box::pin(upstream),
+            Some(stats.clone()),
+            None,
+            "claude:claude-sonnet-4-6".into(),
+            "sess".into(),
+            "req".into(),
+            Replacements::empty(),
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("event: error"), "{text}");
+        assert!(text.contains("message_stop"), "{text}");
+
+        let snap = stats.snapshot();
+        let model = &snap.models["claude:claude-sonnet-4-6"];
+        assert_eq!(model.requests, 1);
+        assert_eq!(model.input_tokens, 0);
+        assert_eq!(model.output_tokens, 0);
+        assert_eq!(model.avg_duration_ms, 0.0);
+        assert_eq!(snap.errors, 1);
+        assert!(
+            snap.recent_errors[0]
+                .message
+                .contains("before message_stop")
+        );
+    }
+
+    #[tokio::test]
     async fn test_stats_records_request_response_and_error() {
         // WHY: /stats replaces the provider-specific binary stats endpoints.
         // It must count routed requests, token usage on successful non-stream
@@ -3124,6 +3803,8 @@ requires_openai_auth = false
                         cache_read: 1,
                         cache_creation: 0,
                     },
+                    id: None,
+                    refusal: None,
                 })
             }
         }
@@ -3216,6 +3897,8 @@ requires_openai_auth = false
                     tool_calls: vec![],
                     finish_reason: Some("stop".into()),
                     usage: Default::default(),
+                    id: None,
+                    refusal: None,
                 })
             }
         }
@@ -3352,6 +4035,264 @@ requires_openai_auth = false
         assert_eq!(snap.models["grok:grok-4.3"].output_tokens, 7);
         assert_eq!(snap.models["grok:grok-4.3"].cache_read_input_tokens, 3);
         assert_eq!(snap.models["grok:grok-4.3"].cache_creation_input_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn test_stats_failed_stream_does_not_record_success_response() {
+        // WHY: a stream that errors after emitting partial data must count as
+        // an error only. Recording both error and response corrupts /stats.
+        #[derive(Debug)]
+        struct FailingStreamProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for FailingStreamProvider {
+            fn id(&self) -> &'static str {
+                "failing-stream"
+            }
+
+            async fn send(
+                &self,
+                _req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalResponse, ProviderError> {
+                unreachable!("stream test uses send_stream")
+            }
+
+            async fn send_stream(
+                &self,
+                _req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalStream, ProviderError> {
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(CanonicalStreamEvent::TextDelta("partial".into())),
+                    Err(ProviderError::Upstream("boom".into())),
+                ])))
+            }
+        }
+
+        let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
+        providers.insert(
+            "grok".into(),
+            ProviderEntry {
+                provider: Arc::new(FailingStreamProvider),
+                claude_native: None,
+                models: provider_model_values("grok", GrokProvider::models_list()).unwrap(),
+                catalog: grok_model_catalog(),
+            },
+        );
+        let (state, _guard) = state_with_stats(providers);
+        let req = ChatCompletionRequest {
+            model: "grok:grok-4.3".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: true,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            extras: serde_json::Value::Null,
+        };
+        let resp = call_chat_handler(state.clone(), req)
+            .await
+            .expect("stream opens");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let sse_body = String::from_utf8_lossy(&body);
+        assert!(sse_body.contains("finish_reason\":\"error"), "{sse_body}");
+
+        let snap = state.stats.as_ref().unwrap().snapshot();
+        let model = &snap.models["grok:grok-4.3"];
+        assert_eq!(model.requests, 1);
+        assert_eq!(model.output_tokens, 0);
+        assert_eq!(model.avg_duration_ms, 0.0);
+        assert_eq!(snap.total_requests, 1);
+        assert_eq!(snap.errors, 1);
+        assert_eq!(snap.recent_errors.len(), 1);
+        assert!(snap.recent_errors[0].message.contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn test_stats_error_finish_stream_does_not_record_success_response() {
+        // WHY: some provider adapters encode upstream stream errors as a
+        // terminal Finish reason instead of an Err item. Stats must classify
+        // those the same way clients do.
+        #[derive(Debug)]
+        struct ErrorFinishStreamProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for ErrorFinishStreamProvider {
+            fn id(&self) -> &'static str {
+                "error-finish-stream"
+            }
+
+            async fn send(
+                &self,
+                _req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalResponse, ProviderError> {
+                unreachable!("stream test uses send_stream")
+            }
+
+            async fn send_stream(
+                &self,
+                _req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalStream, ProviderError> {
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(CanonicalStreamEvent::TextDelta("partial".into())),
+                    Ok(CanonicalStreamEvent::Usage(omni_core::CanonicalUsage {
+                        input_tokens: 11,
+                        output_tokens: 7,
+                        cache_read: 0,
+                        cache_creation: 0,
+                    })),
+                    Ok(CanonicalStreamEvent::Finish {
+                        finish_reason: Some("error: overloaded".into()),
+                    }),
+                ])))
+            }
+        }
+
+        let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
+        providers.insert(
+            "grok".into(),
+            ProviderEntry {
+                provider: Arc::new(ErrorFinishStreamProvider),
+                claude_native: None,
+                models: provider_model_values("grok", GrokProvider::models_list()).unwrap(),
+                catalog: grok_model_catalog(),
+            },
+        );
+        let (state, _guard) = state_with_stats(providers);
+        let req = ChatCompletionRequest {
+            model: "grok:grok-4.3".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: true,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            extras: serde_json::Value::Null,
+        };
+        let resp = call_chat_handler(state.clone(), req)
+            .await
+            .expect("stream opens");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let sse_body = String::from_utf8_lossy(&body);
+        assert!(
+            sse_body.contains("finish_reason\":\"error: overloaded"),
+            "{sse_body}"
+        );
+
+        let snap = state.stats.as_ref().unwrap().snapshot();
+        let model = &snap.models["grok:grok-4.3"];
+        assert_eq!(model.requests, 1);
+        assert_eq!(model.input_tokens, 0);
+        assert_eq!(model.output_tokens, 0);
+        assert_eq!(model.avg_duration_ms, 0.0);
+        assert_eq!(snap.total_requests, 1);
+        assert_eq!(snap.errors, 1);
+        assert_eq!(snap.recent_errors.len(), 1);
+        assert!(snap.recent_errors[0].message.contains("overloaded"));
+    }
+
+    #[tokio::test]
+    async fn test_stats_missing_finish_stream_records_error_not_success_response() {
+        // WHY: a canonical stream without Finish is malformed. The SSE framer
+        // may synthesize a client terminal for compatibility, but stats must
+        // not record that provider stream as a successful response.
+        #[derive(Debug)]
+        struct MissingFinishStreamProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for MissingFinishStreamProvider {
+            fn id(&self) -> &'static str {
+                "missing-finish-stream"
+            }
+
+            async fn send(
+                &self,
+                _req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalResponse, ProviderError> {
+                unreachable!("stream test uses send_stream")
+            }
+
+            async fn send_stream(
+                &self,
+                _req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalStream, ProviderError> {
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(CanonicalStreamEvent::TextDelta("partial".into())),
+                    Ok(CanonicalStreamEvent::Usage(omni_core::CanonicalUsage {
+                        input_tokens: 11,
+                        output_tokens: 7,
+                        cache_read: 0,
+                        cache_creation: 0,
+                    })),
+                ])))
+            }
+        }
+
+        let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
+        providers.insert(
+            "grok".into(),
+            ProviderEntry {
+                provider: Arc::new(MissingFinishStreamProvider),
+                claude_native: None,
+                models: provider_model_values("grok", GrokProvider::models_list()).unwrap(),
+                catalog: grok_model_catalog(),
+            },
+        );
+        let (state, _guard) = state_with_stats(providers);
+        let req = ChatCompletionRequest {
+            model: "grok:grok-4.3".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: true,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            extras: serde_json::Value::Null,
+        };
+        let resp = call_chat_handler(state.clone(), req)
+            .await
+            .expect("stream opens");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let sse_body = String::from_utf8_lossy(&body);
+        assert!(sse_body.contains("finish_reason\":\"stop"), "{sse_body}");
+
+        let snap = state.stats.as_ref().unwrap().snapshot();
+        let model = &snap.models["grok:grok-4.3"];
+        assert_eq!(model.requests, 1);
+        assert_eq!(model.input_tokens, 0);
+        assert_eq!(model.output_tokens, 0);
+        assert_eq!(model.avg_duration_ms, 0.0);
+        assert_eq!(snap.total_requests, 1);
+        assert_eq!(snap.errors, 1);
+        assert_eq!(snap.recent_errors.len(), 1);
+        assert!(
+            snap.recent_errors[0]
+                .message
+                .contains("without Finish event")
+        );
     }
 
     #[tokio::test]
@@ -3608,6 +4549,8 @@ requires_openai_auth = false
                     tool_calls: vec![],
                     finish_reason: Some("stop".into()),
                     usage: Default::default(),
+                    id: None,
+                    refusal: None,
                 })
             }
         }
@@ -3672,6 +4615,8 @@ requires_openai_auth = false
                     tool_calls: vec![],
                     finish_reason: Some("stop".into()),
                     usage: Default::default(),
+                    id: None,
+                    refusal: None,
                 })
             }
         }
@@ -3806,6 +4751,8 @@ requires_openai_auth = false
                 cache_read: 0,
                 cache_creation: 0,
             },
+            id: None,
+            refusal: None,
         };
         let oai = from_canonical(canon, "grok:grok-4.3".into(), "chatcmpl-xyz".into(), 123);
         assert_eq!(oai.id, "chatcmpl-xyz");
@@ -3858,13 +4805,15 @@ rule = [
         assert_eq!(pg.id(), "grok");
         // claude path
         let pc = ClaudeProvider::new().expect("claude");
-        assert_eq!(pc.id(), "claude-code");
+        assert_eq!(pc.id(), "claude");
         let canon = omni_core::CanonicalResponse {
             model: "m".into(),
             content: "c".into(),
             tool_calls: vec![],
             finish_reason: None,
             usage: Default::default(),
+            id: None,
+            refusal: None,
         };
         let oai = from_canonical(canon, "grok:m".into(), "chatcmpl-test".into(), 1);
         assert_eq!(oai.choices[0].message.content.as_deref(), Some("c"));
@@ -3930,7 +4879,10 @@ rule = [
     #[test]
     fn test_subprocess_omni_binary_health_and_root() {
         let port = free_port();
-        let _child = spawn_omni(&["--no-auth", "--port", &port.to_string()], &[]);
+        let _child = spawn_omni(
+            &["--no-auth", "--port", &port.to_string()],
+            &[("OMNI_PROVIDERS", "claude")],
+        );
         assert!(
             wait_for_200_health(port, Duration::from_secs(6)),
             "omni did not become healthy on {}",
@@ -3944,7 +4896,10 @@ rule = [
     #[test]
     fn test_subprocess_omni_binary_models() {
         let port = free_port();
-        let _child = spawn_omni(&["--no-auth", "--port", &port.to_string()], &[]);
+        let _child = spawn_omni(
+            &["--no-auth", "--port", &port.to_string()],
+            &[("OMNI_PROVIDERS", "claude,grok")],
+        );
         assert!(wait_for_200_health(port, Duration::from_secs(6)));
         let resp = get(port, "/v1/models");
         assert_eq!(resp.status, 200);
@@ -3966,6 +4921,26 @@ rule = [
     }
 
     #[test]
+    fn test_subprocess_default_providers_are_all_detected() {
+        // WHY: with no explicit --providers/OMNI_PROVIDERS, Omni should enable
+        // every locally detected provider, not a hard-coded subset.
+        let homes = TempDetectedProviderHomes::install();
+        let port = free_port();
+        let _child = spawn_omni_owned(
+            &["--no-auth", "--port", &port.to_string()],
+            homes.child_env(),
+        );
+        assert!(wait_for_200_health(port, Duration::from_secs(6)));
+        let resp = get(port, "/v1/models");
+        assert_eq!(resp.status, 200);
+        let v = omni_common::test_support::parse_json(&resp.body);
+        let ids = omni_common::test_support::model_ids(&v);
+        assert!(ids.iter().any(|id| id.starts_with("claude-")), "{ids:?}");
+        assert!(ids.iter().any(|id| id.starts_with("grok-")), "{ids:?}");
+        assert!(ids.iter().any(|id| id == "gpt-detected"), "{ids:?}");
+    }
+
+    #[test]
     fn test_subprocess_omni_binary_stats_route_exists() {
         // WHY: /stats is the replacement for the removed provider-specific
         // binaries' stats endpoints; the production router must expose JSON.
@@ -3980,7 +4955,7 @@ rule = [
                 "--stats-db",
                 stats_path.to_str().unwrap(),
             ],
-            &[],
+            &[("OMNI_PROVIDERS", "claude")],
         );
         assert!(wait_for_200_health(port, Duration::from_secs(6)));
         let resp = get(port, "/stats");
@@ -3997,7 +4972,10 @@ rule = [
         // with keys set (no --no-auth): unauthed requests 401, authed 200. Wait must auth.
         let child = spawn_omni(
             &["--port", &port.to_string()],
-            &[("OMNI_API_KEYS", "secret123,other")],
+            &[
+                ("OMNI_API_KEYS", "secret123,other"),
+                ("OMNI_PROVIDERS", "claude"),
+            ],
         );
         // wait using proper header (keys case requires it for any surface incl health)
         let start = Instant::now();
@@ -4042,7 +5020,10 @@ rule = [
 
         // without keys (empty or --no-auth) -> 200 even no header
         let port2 = free_port();
-        let _child2 = spawn_omni(&["--no-auth", "--port", &port2.to_string()], &[]);
+        let _child2 = spawn_omni(
+            &["--no-auth", "--port", &port2.to_string()],
+            &[("OMNI_PROVIDERS", "claude")],
+        );
         assert!(wait_for_200_health(port2, Duration::from_secs(6)));
         let out4 = get(port2, "/health");
         assert_eq!(out4.status, 200);
@@ -4052,7 +5033,10 @@ rule = [
     fn test_subprocess_omni_binary_completions_routing_errors() {
         // errors (unknown provider, disabled, bad model) via full http
         let port = free_port();
-        let _child = spawn_omni(&["--no-auth", "--port", &port.to_string()], &[]);
+        let _child = spawn_omni(
+            &["--no-auth", "--port", &port.to_string()],
+            &[("OMNI_PROVIDERS", "claude,grok")],
+        );
         assert!(wait_for_200_health(port, Duration::from_secs(6)));
         // unknown prefix
         let out = post_json(
@@ -4092,7 +5076,10 @@ rule = [
             return;
         }
         let port = free_port();
-        let _child = spawn_omni(&["--no-auth", "--port", &port.to_string()], &[]);
+        let _child = spawn_omni(
+            &["--no-auth", "--port", &port.to_string()],
+            &[("OMNI_PROVIDERS", "claude,grok")],
+        );
         assert!(wait_for_200_health(port, Duration::from_secs(6)));
         if has_grok_creds() {
             let out = post_json(
@@ -4286,6 +5273,43 @@ rule = [
             !body.contains("[DONE]"),
             "Responses SSE has no [DONE] sentinel"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_responses_codex_nonstream_preserves_native_response_id() {
+        // WHY: Codex Responses continuations use previous_response_id. Omni must
+        // return Codex's native response id, not a synthetic gateway id.
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let server = MockServer::start().await;
+        let _codex_home = TempCodexHome::install_for_mock(&server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_backend",
+                "model": "gpt-5.5",
+                "status": "completed",
+                "output": [
+                    {"type":"message","content":[{"type":"output_text","text":"ok"}]}
+                ],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut map = HashMap::new();
+        map.insert("codex".into(), codex_entry());
+        let req = responses_req(r#"{"model":"codex:gpt-5.5","input":"hi"}"#);
+        let resp = call_responses_handler(state_with(map), req)
+            .await
+            .expect("Codex non-stream response should route");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["id"], "resp_backend");
+        assert_eq!(v["output"][0]["id"], "msg_resp_backend");
     }
 
     #[test]
