@@ -30,3 +30,19 @@ uses `XAI_API_KEY` per request only, or no Authorization header if it is unset.
 The default xAI credential files must not be sent to a custom endpoint.
 
 Default tests use wiremock. Live xAI calls require `OMNI_LIVE_TESTS=1`.
+
+## Provider Extras
+
+Grok accepts these provider extras on OpenAI-compatible inbound surfaces:
+
+- `service_tier`
+- `search_parameters`
+- `response_format`
+- `parallel_tool_calls`
+- `seed`
+- `stop`
+- `n`
+- `tools`
+
+Unsupported extras fail loudly. `previous_response_id` is not forwarded to Grok
+chat completions.

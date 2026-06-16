@@ -429,7 +429,10 @@ fn env_nonempty(name: &str) -> Option<String> {
 
 /// Map a CanonicalRequest (after light replacements hook) to the JSON body for xAI /v1/chat/completions.
 /// OpenAI-compatible shape + xAI extensions (reasoning_effort, provider_extras passthrough).
-fn to_xai_chat_request(req: &CanonicalRequest, repl: &Replacements) -> Value {
+fn to_xai_chat_request(
+    req: &CanonicalRequest,
+    repl: &Replacements,
+) -> Result<Value, ProviderError> {
     let mut messages: Vec<Value> = Vec::new();
     for m in &req.messages {
         match &m.content {
@@ -564,26 +567,28 @@ fn to_xai_chat_request(req: &CanonicalRequest, repl: &Replacements) -> Value {
         && let Some(obj) = extras.as_object()
     {
         for (k, v) in obj {
-            if grok_extra_allowed(k) {
-                body[k] = v.clone();
+            if !grok_extra_allowed(k) {
+                return Err(ProviderError::Other(anyhow::anyhow!(
+                    "unsupported provider extra for grok: {k}"
+                )));
             }
+            body[k] = v.clone();
         }
     }
 
     // Light hook demonstration for omni-common replacements on the *structured* prompt surface.
     // (Real rules for tool names etc. are typically applied by the frontend before producing CanonicalRequest,
     // or the provider ctor would be given a live Replacements instance instead of always empty().)
-    body
+    Ok(body)
 }
 
-fn grok_extra_allowed(key: &str) -> bool {
+pub fn grok_extra_allowed(key: &str) -> bool {
     matches!(
         key,
         "service_tier"
             | "search_parameters"
             | "response_format"
             | "parallel_tool_calls"
-            | "user"
             | "seed"
             | "stop"
             | "n"
@@ -606,11 +611,14 @@ fn resolve_model_alias(model: &str) -> Option<&'static str> {
 /// then flips `stream` to true. `stream_options.include_usage` asks xAI to emit one final chunk
 /// carrying the `usage` object (otherwise streamed responses omit token accounting entirely), which
 /// the parser turns into a terminal `CanonicalStreamEvent::Usage`.
-fn to_xai_chat_stream_request(req: &CanonicalRequest, repl: &Replacements) -> Value {
-    let mut body = to_xai_chat_request(req, repl);
+fn to_xai_chat_stream_request(
+    req: &CanonicalRequest,
+    repl: &Replacements,
+) -> Result<Value, ProviderError> {
+    let mut body = to_xai_chat_request(req, repl)?;
     body["stream"] = json!(true);
     body["stream_options"] = json!({ "include_usage": true });
-    body
+    Ok(body)
 }
 
 /// Internal typed response shapes (subset of xAI chat.completions response for robust mapping).
@@ -957,7 +965,7 @@ impl LlmProvider for GrokProvider {
         // Hook point (using omni-common): replacements applied at prompt boundary inside the provider.
         // In real deployment the Replacements would be loaded once in the binary and injected here.
         let repl = Replacements::empty();
-        let body = to_xai_chat_request(&req, &repl);
+        let body = to_xai_chat_request(&req, &repl)?;
 
         let url = format!("{}/chat/completions", self.base_url);
         debug!(%url, "POST xAI chat completions");
@@ -1029,7 +1037,7 @@ impl LlmProvider for GrokProvider {
 
         // Same prompt-scope replacements seam as send() (Replacements::empty() hook).
         let repl = Replacements::empty();
-        let body = to_xai_chat_stream_request(&req, &repl);
+        let body = to_xai_chat_stream_request(&req, &repl)?;
         let url = format!("{}/chat/completions", self.base_url);
 
         let auth_headers = self.auth_headers().await?;
@@ -1172,7 +1180,7 @@ mod tests {
             provider_extras: Some(json!({"service_tier": "priority"})),
         };
 
-        let body = to_xai_chat_request(&req, &empty_repl());
+        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
         assert_eq!(body["model"], "grok-4.3");
         assert_eq!(body["messages"].as_array().unwrap().len(), 2);
         assert_eq!(body["max_completion_tokens"], 128);
@@ -1210,7 +1218,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl());
+        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
         assert_eq!(body["model"], "grok-composer-2.5-fast");
     }
 
@@ -1507,7 +1515,7 @@ mod tests {
             provider_extras: None,
         };
 
-        let body = to_xai_chat_request(&req, &empty_repl());
+        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "get_weather");
@@ -1547,7 +1555,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl());
+        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
         let messages = body["messages"].as_array().unwrap();
 
         // The assistant message keeps its Text sibling as `content` AND carries
@@ -1602,7 +1610,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl());
+        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
         let messages = body["messages"].as_array().unwrap();
         let asst_idx = messages.iter().position(|m| m["role"] == "assistant");
         let tool_idx = messages.iter().position(|m| m["role"] == "tool");
@@ -1630,7 +1638,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl());
+        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
         let messages = body["messages"].as_array().unwrap();
         let assistant = messages
             .iter()
@@ -1746,7 +1754,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &repl);
+        let body = to_xai_chat_request(&req, &repl).unwrap();
         let msg0 = &body["messages"][0];
         assert_eq!(msg0["content"], "tell REDACTED");
     }
@@ -1777,7 +1785,7 @@ mod tests {
             metadata: Default::default(),
             provider_extras: Some(serde_json::json!({"service_tier": "standard"})),
         };
-        let body = to_xai_chat_request(&req, &empty_repl());
+        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
         assert_eq!(body["model"], "grok-4.3");
         assert!(body.get("tools").is_some());
         assert_eq!(body["tool_choice"], "auto");
@@ -1937,7 +1945,7 @@ mod tests {
         let mut r = base.clone();
         r.temperature = Some(0.2);
         r.max_tokens = Some(64);
-        let b = to_xai_chat_request(&r, &empty_repl());
+        let b = to_xai_chat_request(&r, &empty_repl()).unwrap();
         let t = b["temperature"].as_f64().unwrap();
         assert!((t - 0.2).abs() < 1e-6, "temp float json: {}", t);
         assert_eq!(b["max_completion_tokens"], 64);
@@ -1945,7 +1953,7 @@ mod tests {
         // top_p only
         let mut r = base.clone();
         r.top_p = Some(0.95);
-        let b = to_xai_chat_request(&r, &empty_repl());
+        let b = to_xai_chat_request(&r, &empty_repl()).unwrap();
         let tp = b["top_p"].as_f64().unwrap();
         assert!((tp - 0.95).abs() < 1e-6, "top_p float json approx: {}", tp);
 
@@ -1955,7 +1963,7 @@ mod tests {
             effort: Some("low".into()),
             budget_tokens: Some(50),
         });
-        let b = to_xai_chat_request(&r, &empty_repl());
+        let b = to_xai_chat_request(&r, &empty_repl()).unwrap();
         assert_eq!(b["reasoning_effort"], "low");
 
         // all together
@@ -1968,7 +1976,7 @@ mod tests {
             budget_tokens: None,
         });
         r.provider_extras = Some(json!({"service_tier": "priority"}));
-        let b = to_xai_chat_request(&r, &empty_repl());
+        let b = to_xai_chat_request(&r, &empty_repl()).unwrap();
         assert_eq!(b["temperature"], 1.0);
         assert_eq!(b["max_completion_tokens"], 10);
         assert_eq!(b["reasoning_effort"], "high");
@@ -1976,7 +1984,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_xai_parallel_tool_calls_response_format_user_seed_stop_n() {
+    fn test_to_xai_parallel_tool_calls_response_format_seed_stop_n() {
         // these come via provider_extras passthrough (canonical has limited native sampling)
         let req = CanonicalRequest {
             model: "grok-4.3".into(),
@@ -1987,27 +1995,47 @@ mod tests {
             provider_extras: Some(json!({
                 "parallel_tool_calls": true,
                 "response_format": {"type": "json_object"},
-                "user": "u123",
                 "seed": 42,
                 "stop": ["END"],
                 "n": 2
             })),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl());
+        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
         assert_eq!(body["parallel_tool_calls"], true);
         assert_eq!(body["response_format"]["type"], "json_object");
-        assert_eq!(body["user"], "u123");
         assert_eq!(body["seed"], 42);
         assert_eq!(body["stop"][0], "END");
         assert_eq!(body["n"], 2);
     }
 
     #[test]
-    fn test_to_xai_drops_responses_native_extras() {
+    fn test_to_xai_rejects_gateway_user_as_provider_extra() {
+        // WHY: Omni consumes top-level `user` as gateway/session metadata.
+        // Direct canonical callers must not bypass that contract by forwarding
+        // `user` as a Grok provider extra.
+        let req = CanonicalRequest {
+            model: "grok-4.3".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("x".into()),
+            }],
+            provider_extras: Some(json!({"user": "u123"})),
+            ..Default::default()
+        };
+        let err = to_xai_chat_request(&req, &empty_repl())
+            .expect_err("gateway user must reject as provider extra");
+        assert!(
+            err.to_string().contains("user"),
+            "error must name the unsupported provider extra: {err}"
+        );
+    }
+
+    #[test]
+    fn test_to_xai_rejects_responses_native_extras() {
         // WHY: Grok currently speaks xAI chat/completions upstream. Responses
-        // fields preserved by the inbound adapter must not be forwarded as
-        // invalid chat-completion fields.
+        // fields preserved by the inbound adapter must fail loudly instead of
+        // disappearing as silent no-ops.
         let req = CanonicalRequest {
             model: "grok-4.3".into(),
             messages: vec![CanonicalMessage {
@@ -2022,11 +2050,16 @@ mod tests {
             })),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl());
-        assert_eq!(body["service_tier"], "standard");
-        assert!(body.get("previous_response_id").is_none());
-        assert!(body.get("store").is_none());
-        assert!(body.get("metadata").is_none());
+        let err = to_xai_chat_request(&req, &empty_repl())
+            .expect_err("unsupported Responses extras must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported provider extra for grok")
+                && (msg.contains("previous_response_id")
+                    || msg.contains("store")
+                    || msg.contains("metadata")),
+            "error must name an unsupported provider extra: {err}"
+        );
     }
 
     #[test]
@@ -2040,7 +2073,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl());
+        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
         assert!(body.get("input").is_none(), "no responses 'input' shape");
         assert!(body.get("messages").is_some());
         assert_eq!(body["stream"], false);
@@ -2068,7 +2101,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl());
+        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
         // extras "tools" wins (last write)
         let tools = &body["tools"];
         assert!(tools.is_array());
@@ -2092,7 +2125,7 @@ mod tests {
             tool_choice: Some(CanonicalToolChoice::Required),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl());
+        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
         assert_eq!(body["tool_choice"], "required");
     }
 
@@ -2118,7 +2151,7 @@ mod tests {
             }]),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &repl);
+        let body = to_xai_chat_request(&req, &repl).unwrap();
         assert_eq!(body["messages"][0]["content"], "tell REDACTED");
         // desc gets prompt apply (name currently does not per mapper)
         assert_eq!(
@@ -2618,7 +2651,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl());
+        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
         assert_eq!(body["tools"][0]["function"]["name"], "adder");
         assert_eq!(body["tool_choice"]["function"]["name"], "adder");
 
@@ -2659,7 +2692,7 @@ mod tests {
         // maps content/tool_call deltas to canonical events (see the dedicated
         // SSE parser test). Pin the builder flags here so the non-stream tool path
         // above and the stream path stay distinct.
-        let stream_body = to_xai_chat_stream_request(&req, &empty_repl());
+        let stream_body = to_xai_chat_stream_request(&req, &empty_repl()).unwrap();
         assert_eq!(stream_body["stream"], true);
         assert_eq!(stream_body["stream_options"]["include_usage"], true);
         assert_eq!(body["stream"], false);
@@ -2838,12 +2871,12 @@ mod tests {
             }],
             ..Default::default()
         };
-        let stream_body = to_xai_chat_stream_request(&req, &empty_repl());
+        let stream_body = to_xai_chat_stream_request(&req, &empty_repl()).unwrap();
         assert_eq!(stream_body["stream"], true);
         assert_eq!(stream_body["stream_options"]["include_usage"], true);
 
         // The non-stream builder is unchanged: still stream: false, no stream_options.
-        let plain_body = to_xai_chat_request(&req, &empty_repl());
+        let plain_body = to_xai_chat_request(&req, &empty_repl()).unwrap();
         assert_eq!(plain_body["stream"], false);
         assert!(plain_body.get("stream_options").is_none());
     }

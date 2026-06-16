@@ -10,6 +10,7 @@ use std::convert::Infallible;
 use axum::response::sse::{Event, Sse};
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalRequest, CanonicalResponse,
@@ -172,6 +173,30 @@ pub struct ChatUsage {
     pub total_tokens: u64,
 }
 
+const GATEWAY_ONLY_EXTRAS: &[&str] = &["user"];
+
+/// Top-level request fields that Omni consumes as gateway metadata rather than
+/// forwarding as provider extras.
+pub fn gateway_only_extra_keys() -> &'static [&'static str] {
+    GATEWAY_ONLY_EXTRAS
+}
+
+fn provider_extras_from_flattened(extras: &Value) -> Option<Value> {
+    let filtered = extras.as_object().and_then(|extras| {
+        let filtered = extras
+            .iter()
+            .filter(|(key, _)| !gateway_only_extra_keys().contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Map<_, _>>();
+        if filtered.is_empty() {
+            None
+        } else {
+            Some(filtered)
+        }
+    })?;
+    Some(Value::Object(filtered))
+}
+
 /// Convert an OpenAI request into a `CanonicalRequest`. The `model` field is the
 /// caller-supplied value; the `omni` router overwrites it with the
 /// prefix-stripped model before delegating when needed.
@@ -241,7 +266,7 @@ pub fn to_canonical(req: &ChatCompletionRequest) -> Result<CanonicalRequest, Str
         top_p: req.top_p,
         reasoning: None,
         metadata: Default::default(),
-        provider_extras: None,
+        provider_extras: provider_extras_from_flattened(&req.extras),
     })
 }
 
@@ -571,6 +596,24 @@ mod tests {
         req.max_tokens = Some(10);
         req.max_completion_tokens = Some(99);
         assert_eq!(to_canonical(&req).unwrap().max_tokens, Some(99));
+    }
+
+    #[test]
+    fn to_canonical_preserves_provider_extras_but_not_gateway_user() {
+        // WHY: OpenAI-compatible clients use top-level extension fields for
+        // provider features, but `user` is gateway/session metadata in Omni and
+        // must not be treated as a provider passthrough field.
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object"},"user":"session-user"}"#,
+        )
+        .unwrap();
+        let canon = to_canonical(&req).expect("chat request should convert");
+        let extras = canon
+            .provider_extras
+            .expect("provider extras should be preserved");
+        assert_eq!(extras["response_format"]["type"], "json_object");
+        assert!(extras.get("user").is_none());
     }
 
     fn req_from_json(json: &str) -> ChatCompletionRequest {

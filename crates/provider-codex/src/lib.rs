@@ -820,9 +820,12 @@ fn codex_responses_body(req: &CanonicalRequest, stream: bool) -> Result<Value, P
         && let Some(obj) = extras.as_object()
     {
         for (key, value) in obj {
-            if codex_extra_allowed(key) {
-                body[key] = value.clone();
+            if !codex_extra_allowed(key) {
+                return Err(ProviderError::Other(anyhow::anyhow!(
+                    "unsupported provider extra for codex: {key}"
+                )));
             }
+            body[key] = value.clone();
         }
     }
     Ok(body)
@@ -892,7 +895,7 @@ fn append_message_items(message: &CanonicalMessage, input: &mut Vec<Value>) {
     }
 }
 
-fn codex_extra_allowed(key: &str) -> bool {
+pub fn codex_extra_allowed(key: &str) -> bool {
     matches!(
         key,
         "store" | "previous_response_id" | "metadata" | "parallel_tool_calls" | "service_tier"
@@ -2313,8 +2316,7 @@ query_params = { api-version = "2026-01-01" }
             metadata: Default::default(),
             provider_extras: Some(json!({
                 "store": false,
-                "previous_response_id": "resp_1",
-                "not_allowed": "drop"
+                "previous_response_id": "resp_1"
             })),
         };
         let body = codex_responses_body(&req, false).unwrap();
@@ -2325,7 +2327,31 @@ query_params = { api-version = "2026-01-01" }
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["store"], false);
         assert_eq!(body["previous_response_id"], "resp_1");
-        assert!(body.get("not_allowed").is_none());
+    }
+
+    #[test]
+    fn canonical_rejects_unsupported_responses_extras() {
+        // WHY: provider extras that Codex cannot forward must fail loudly
+        // instead of being silently dropped and making client requests look
+        // accepted when they were not honored.
+        let req = CanonicalRequest {
+            model: "gpt-5.5".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            provider_extras: Some(json!({
+                "store": false,
+                "not_allowed": "drop"
+            })),
+            ..Default::default()
+        };
+        let err =
+            codex_responses_body(&req, false).expect_err("unsupported Codex extra must reject");
+        assert!(
+            err.to_string().contains("not_allowed"),
+            "error must name the unsupported provider extra: {err}"
+        );
     }
 
     #[test]

@@ -800,6 +800,33 @@ fn provider_catalogs(providers: &HashMap<String, ProviderEntry>) -> HashMap<Stri
         .collect()
 }
 
+fn validate_provider_extras(
+    provider: &str,
+    extras: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    let Some(obj) = extras.and_then(|value| value.as_object()) else {
+        return Ok(());
+    };
+    if obj.is_empty() {
+        return Ok(());
+    }
+
+    let unsupported = obj
+        .keys()
+        .find(|key| match provider {
+            "grok" => !provider_grok::grok_extra_allowed(key),
+            "codex" => !provider_codex::codex_extra_allowed(key),
+            "claude" => true,
+            _ => true,
+        })
+        .map(String::as_str);
+
+    if let Some(key) = unsupported {
+        return Err(format!("unsupported provider extra for {provider}: {key}"));
+    }
+    Ok(())
+}
+
 /// Handler: GET /health
 async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, "ok")
@@ -868,6 +895,8 @@ async fn chat_completions_handler(
     // Build canonical *with the stripped model* so the delegated provider sees the real model name.
     let mut canon = to_canonical(&body).map_err(|e| record_bad_request(&state, &stats_key, e))?;
     canon.model = stripped_model.clone();
+    validate_provider_extras(&prov_key, canon.provider_extras.as_ref())
+        .map_err(|e| record_bad_request(&state, &stats_key, e))?;
 
     if let Some(stats) = &state.stats {
         stats.record_request(&stats_key, None);
@@ -1651,6 +1680,8 @@ async fn responses_handler(
     let mut canon = omni_common::responses_to_canonical(&body)
         .map_err(|e| record_bad_request(&state, &stats_key, e))?;
     canon.model = stripped_model.clone();
+    validate_provider_extras(&prov_key, canon.provider_extras.as_ref())
+        .map_err(|e| record_bad_request(&state, &stats_key, e))?;
 
     if let Some(stats) = &state.stats {
         stats.record_request(&stats_key, None);
@@ -5177,6 +5208,146 @@ rule = [
 
     fn responses_req(body: &str) -> omni_common::ResponsesRequest {
         serde_json::from_str(body).expect("responses request json")
+    }
+
+    #[tokio::test]
+    async fn test_chat_provider_extras_reject_for_unsupported_provider() {
+        // WHY: OpenAI-compatible top-level provider extras must not disappear
+        // when the selected provider cannot forward them. The handler should
+        // reject before dispatch and name the unsupported field.
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("claude".into(), claude_entry());
+        let state = state_with(map);
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"claude:sonnet","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object"}}"#,
+        )
+        .unwrap();
+        let res = call_chat_handler(state, req).await;
+        match res {
+            Err(AppError::BadRequest(msg)) => assert!(
+                msg.contains("response_format") && msg.contains("claude"),
+                "400 must name provider and unsupported extra: {msg}"
+            ),
+            other => panic!("expected provider-extra BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_chat_provider_extras_forward_for_supported_provider() {
+        // WHY: supported provider extras should reach the selected provider, so
+        // clients can use provider-native request fields without a silent drop.
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "response_format": {"type": "json_object"}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "grok-4.3",
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("grok".into(), grok_entry(&server.uri()));
+        let state = state_with(map);
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"grok:grok-4.3","messages":[{"role":"user","content":"json"}],
+                "response_format":{"type":"json_object"}}"#,
+        )
+        .unwrap();
+        call_chat_handler(state, req)
+            .await
+            .expect("supported Grok extra should forward");
+    }
+
+    #[tokio::test]
+    async fn test_chat_user_extra_remains_gateway_metadata() {
+        // WHY: `user` feeds Omni session derivation. It must not start failing
+        // as an unsupported provider extra for providers that do not forward it.
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert(
+            "claude".into(),
+            claude_entry_with_base("http://127.0.0.1:1"),
+        );
+        let state = state_with(map);
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"claude:sonnet","messages":[{"role":"user","content":"hi"}],
+                "user":"session-user"}"#,
+        )
+        .unwrap();
+        let res = call_chat_handler(state, req).await;
+        match res {
+            Err(AppError::ServerError(_)) => {}
+            Err(AppError::BadRequest(msg)) => {
+                panic!("user must not be rejected as an extra: {msg}")
+            }
+            other => {
+                panic!("expected provider dispatch after gateway user filtering, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_responses_provider_extras_reject_for_grok() {
+        // WHY: Responses-native fields that Grok chat completions cannot
+        // forward must fail loudly instead of being silently filtered.
+        let mut map: HashMap<String, ProviderEntry> = HashMap::new();
+        map.insert("grok".into(), grok_entry("http://127.0.0.1:1"));
+        let state = state_with(map);
+        let req = responses_req(
+            r#"{"model":"grok:grok-4.3","input":"hi",
+                "previous_response_id":"resp_prev","service_tier":"priority"}"#,
+        );
+        let res = call_responses_handler(state, req).await;
+        match res {
+            Err(AppError::BadRequest(msg)) => assert!(
+                msg.contains("previous_response_id") && msg.contains("grok"),
+                "400 must name provider and unsupported extra: {msg}"
+            ),
+            other => panic!("expected provider-extra BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_responses_provider_extras_forward_for_codex() {
+        // WHY: Codex owns Responses-wire continuation fields. When supported,
+        // they must be forwarded to upstream rather than rejected or dropped.
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let server = MockServer::start().await;
+        let _codex_home = TempCodexHome::install_for_mock(&server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(body_partial_json(serde_json::json!({
+                "previous_response_id": "resp_prev",
+                "store": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "gpt-5.5",
+                "status": "completed",
+                "output": [{"type":"message","content":[{"type":"output_text","text":"ok"}]}],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut map = HashMap::new();
+        map.insert("codex".into(), codex_entry());
+        let req = responses_req(
+            r#"{"model":"codex:gpt-5.5","input":"hi",
+                "previous_response_id":"resp_prev","store":false}"#,
+        );
+        call_responses_handler(state_with(map), req)
+            .await
+            .expect("supported Codex extras should forward");
     }
 
     #[tokio::test]

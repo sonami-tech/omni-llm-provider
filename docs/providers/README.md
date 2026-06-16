@@ -26,3 +26,19 @@ OMNI_LIVE_TESTS=1 cargo test --workspace
 
 Do not set `OMNI_LIVE_TESTS=1` in CI or shared shell profiles. Live tests may
 spend quota and fail on provider rate limits, account state, or model access.
+
+## Provider Extras
+
+OpenAI-compatible inbound surfaces preserve top-level extension fields as
+provider extras, except gateway metadata such as `user`. The selected provider
+validates extras against its allowlist before dispatch. Unsupported extras fail
+loudly with a request error.
+
+Current allowlists:
+
+- Grok: `service_tier`, `search_parameters`, `response_format`,
+  `parallel_tool_calls`, `seed`, `stop`, `n`, `tools`
+- Codex: `store`, `previous_response_id`, `metadata`,
+  `parallel_tool_calls`, `service_tier`
+- Claude OpenAI-compatible path: no provider extras passthrough
+- Claude native: closed Anthropic request allowlist only

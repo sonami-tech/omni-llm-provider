@@ -44,6 +44,11 @@ fingerprint logic remains isolated in provider crates.
 - `GET /stats` - persistent request, token, and error counters.
 - `GET /health`, `GET /`.
 
+Current client compatibility gaps and priority notes are tracked in
+[`compatibility-gaps.md`](compatibility-gaps.md).
+The go-forward implementation tracker is
+[`compatibility-roadmap.md`](compatibility-roadmap.md).
+
 ## Build, Run, Test
 
 ```bash

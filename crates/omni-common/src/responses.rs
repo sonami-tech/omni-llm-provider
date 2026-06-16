@@ -25,6 +25,8 @@ use axum::response::sse::{Event, Sse};
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 
+use crate::http::gateway_only_extra_keys;
+
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
     CanonicalResponse, CanonicalResponseMetadata, CanonicalStream, CanonicalStreamEvent,
@@ -376,10 +378,15 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
     });
 
     let provider_extras = req.extras.as_object().and_then(|extras| {
-        if extras.is_empty() {
+        let filtered = extras
+            .iter()
+            .filter(|(key, _)| !gateway_only_extra_keys().contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        if filtered.is_empty() {
             None
         } else {
-            Some(serde_json::Value::Object(extras.clone()))
+            Some(serde_json::Value::Object(filtered))
         }
     });
 
@@ -555,25 +562,35 @@ struct ResponsesStreamToolCall {
     emitted_arguments_len: usize,
 }
 
+struct ResponsesStreamSnapshot<'a> {
+    text: &'a str,
+    refusal: &'a str,
+    message_content_order: &'a [ResponsesContentChannel],
+    tool_calls: &'a [ResponsesStreamToolCall],
+    output_order: &'a [ResponsesStreamOutputItem],
+    usage: &'a CanonicalUsageAccum,
+}
+
 /// Build the terminal response envelope embedded in `response.completed` /
 /// `response.incomplete` / `response.failed`, carrying the aggregated output
 /// and usage so a streaming client ends with the same shape as non-streaming.
 fn responses_stream_envelope(
     meta: &StreamMeta,
     status: &str,
-    text: &str,
-    refusal: &str,
-    message_content_order: &[ResponsesContentChannel],
-    tool_calls: &[ResponsesStreamToolCall],
-    output_order: &[ResponsesStreamOutputItem],
-    usage: &CanonicalUsageAccum,
+    snapshot: &ResponsesStreamSnapshot<'_>,
     incomplete_reason: Option<&str>,
 ) -> serde_json::Value {
     let mut output: Vec<serde_json::Value> = Vec::new();
-    for item in output_order {
+    for item in snapshot.output_order {
         match item {
-            ResponsesStreamOutputItem::Message if !text.is_empty() || !refusal.is_empty() => {
-                let content = responses_message_content_json(text, refusal, message_content_order);
+            ResponsesStreamOutputItem::Message
+                if !snapshot.text.is_empty() || !snapshot.refusal.is_empty() =>
+            {
+                let content = responses_message_content_json(
+                    snapshot.text,
+                    snapshot.refusal,
+                    snapshot.message_content_order,
+                );
                 output.push(serde_json::json!({
                     "type": "message",
                     "id": format!("msg_{}", meta.response_id),
@@ -583,7 +600,8 @@ fn responses_stream_envelope(
                 }));
             }
             ResponsesStreamOutputItem::Tool(canonical_index) => {
-                if let Some(call) = tool_calls
+                if let Some(call) = snapshot
+                    .tool_calls
                     .iter()
                     .find(|call| call.canonical_index == *canonical_index)
                     && let (Some(call_id), Some(name)) = (&call.call_id, &call.name)
@@ -609,9 +627,9 @@ fn responses_stream_envelope(
         "model": meta.model,
         "output": output,
         "usage": {
-            "input_tokens": usage.input_tokens,
-            "output_tokens": usage.output_tokens,
-            "total_tokens": usage.input_tokens + usage.output_tokens,
+            "input_tokens": snapshot.usage.input_tokens,
+            "output_tokens": snapshot.usage.output_tokens,
+            "total_tokens": snapshot.usage.input_tokens + snapshot.usage.output_tokens,
         },
     });
     if let Some(reason) = incomplete_reason {
@@ -869,91 +887,97 @@ fn responses_sse_events(
             error_message = Some("canonical stream ended before Finish event".into());
         }
 
+        let snapshot = ResponsesStreamSnapshot {
+            text: &text,
+            refusal: &refusal,
+            message_content_order: &message_content_order,
+            tool_calls: &tool_calls,
+            output_order: &output_order,
+            usage: &usage,
+        };
         if let Some(message) = error_message {
             tracing::warn!(error = %message, "canonical stream error mid-flight (responses)");
             if let Some(output_index) = message_output_index {
-                for event in emit_responses_text_done_events(&mut seq, &meta, output_index, &text, &refusal, &message_content_order) {
+                for event in emit_responses_text_done_events(
+                    &mut seq,
+                    &meta,
+                    output_index,
+                    &text,
+                    &refusal,
+                    &message_content_order,
+                ) {
                     yield Ok(event);
                 }
             }
             for event in emit_responses_tool_done_events(&mut seq, &tool_calls) {
                 yield Ok(event);
             }
-            yield Ok(emit_responses_failed_event(
-                &mut seq,
-                &meta,
-                &text,
-                &refusal,
-                &message_content_order,
-                &tool_calls,
-                &output_order,
-                &usage,
-            ));
+            yield Ok(emit_responses_failed_event(&mut seq, &meta, &snapshot));
         } else if responses_error_reason(finish_reason.as_deref()).is_some() {
             if let Some(output_index) = message_output_index {
-                for event in emit_responses_text_done_events(&mut seq, &meta, output_index, &text, &refusal, &message_content_order) {
+                for event in emit_responses_text_done_events(
+                    &mut seq,
+                    &meta,
+                    output_index,
+                    &text,
+                    &refusal,
+                    &message_content_order,
+                ) {
                     yield Ok(event);
                 }
             }
             for event in emit_responses_tool_done_events(&mut seq, &tool_calls) {
                 yield Ok(event);
             }
-            yield Ok(emit_responses_failed_event(
-                &mut seq,
-                &meta,
-                &text,
-                &refusal,
-                &message_content_order,
-                &tool_calls,
-                &output_order,
-                &usage,
-            ));
+            yield Ok(emit_responses_failed_event(&mut seq, &meta, &snapshot));
         } else if let Some(reason) = responses_incomplete_reason(finish_reason.as_deref()) {
             if let Some(output_index) = message_output_index {
-                for event in emit_responses_text_done_events(&mut seq, &meta, output_index, &text, &refusal, &message_content_order) {
+                for event in emit_responses_text_done_events(
+                    &mut seq,
+                    &meta,
+                    output_index,
+                    &text,
+                    &refusal,
+                    &message_content_order,
+                ) {
                     yield Ok(event);
                 }
             }
             for event in emit_responses_tool_done_events(&mut seq, &tool_calls) {
                 yield Ok(event);
             }
-            let env = responses_stream_envelope(
-                &meta,
-                "incomplete",
-                &text,
-                &refusal,
-                &message_content_order,
-                &tool_calls,
-                &output_order,
-                &usage,
-                Some(reason),
-            );
-            yield Ok(responses_event(&mut seq, "response.incomplete", serde_json::json!({
-                "response": env,
-            })));
+            let env = responses_stream_envelope(&meta, "incomplete", &snapshot, Some(reason));
+            yield Ok(responses_event(
+                &mut seq,
+                "response.incomplete",
+                serde_json::json!({
+                    "response": env,
+                }),
+            ));
         } else {
             if let Some(output_index) = message_output_index {
-                for event in emit_responses_text_done_events(&mut seq, &meta, output_index, &text, &refusal, &message_content_order) {
+                for event in emit_responses_text_done_events(
+                    &mut seq,
+                    &meta,
+                    output_index,
+                    &text,
+                    &refusal,
+                    &message_content_order,
+                ) {
                     yield Ok(event);
                 }
             }
             for event in emit_responses_tool_done_events(&mut seq, &tool_calls) {
                 yield Ok(event);
             }
-            let env = responses_stream_envelope(
-                &meta,
-                "completed",
-                &text,
-                &refusal,
-                &message_content_order,
-                &tool_calls,
-                &output_order,
-                &usage,
-                None,
-            );
-            yield Ok(responses_event(&mut seq, "response.completed", serde_json::json!({
-                "response": env,
-            })));
+            let env = responses_stream_envelope(&meta, "completed", &snapshot, None);
+            yield Ok(responses_event(
+                &mut seq,
+                "response.completed",
+                serde_json::json!({
+                    "response": env,
+                }),
+            ));
         }
         // NB: no [DONE] sentinel - that is Chat Completions framing only.
     }
@@ -1128,24 +1152,9 @@ fn responses_content_part_json(channel: ResponsesContentChannel, value: &str) ->
 fn emit_responses_failed_event(
     seq: &mut u64,
     meta: &StreamMeta,
-    text: &str,
-    refusal: &str,
-    message_content_order: &[ResponsesContentChannel],
-    tool_calls: &[ResponsesStreamToolCall],
-    output_order: &[ResponsesStreamOutputItem],
-    usage: &CanonicalUsageAccum,
+    snapshot: &ResponsesStreamSnapshot<'_>,
 ) -> Event {
-    let mut env = responses_stream_envelope(
-        meta,
-        "failed",
-        text,
-        refusal,
-        message_content_order,
-        tool_calls,
-        output_order,
-        usage,
-        None,
-    );
+    let mut env = responses_stream_envelope(meta, "failed", snapshot, None);
     let error = serde_json::json!({
         "message": "canonical stream error",
         "type": "server_error",
@@ -1377,9 +1386,11 @@ mod tests {
         // WHY: Responses-native Codex features such as previous_response_id are
         // top-level fields with no canonical equivalent. The inbound adapter
         // must preserve them so each provider can forward its supported subset.
+        // `user` is gateway/session metadata, not provider passthrough.
         let req = parse(
             r#"{"model":"m","input":"q","previous_response_id":"resp_prev","store":false,
-                "metadata":{"trace":"abc"},"parallel_tool_calls":true,"service_tier":"priority"}"#,
+                "metadata":{"trace":"abc"},"parallel_tool_calls":true,
+                "service_tier":"priority","user":"session-user"}"#,
         );
         let canon = responses_to_canonical(&req).unwrap();
         let extras = canon
@@ -1390,6 +1401,7 @@ mod tests {
         assert_eq!(extras["metadata"]["trace"], "abc");
         assert_eq!(extras["parallel_tool_calls"], true);
         assert_eq!(extras["service_tier"], "priority");
+        assert!(extras.get("user").is_none());
     }
 
     #[test]

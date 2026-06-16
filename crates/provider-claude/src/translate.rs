@@ -367,7 +367,7 @@ pub fn build_messages_request_from_canonical(
     let metadata = None;
 
     if req.provider_extras.is_some() {
-        // In real we could merge some, but for canonical contract we keep minimal.
+        return Err("unsupported provider extras for claude".into());
     }
 
     Ok(MessagesRequest {
@@ -1128,10 +1128,10 @@ mod tests {
     }
 
     #[test]
-    fn build_messages_drops_unsupported_canonical_fields() {
-        // Current canonical adapter intentionally drops provider_extras,
-        // some reasoning non-effort, etc. The wire shape for cch/identity
-        // must be minimal + our injected.
+    fn build_messages_rejects_unsupported_provider_extras() {
+        // WHY: Claude's OpenAI-compatible path has no provider-extra
+        // passthrough today. Unsupported extras must fail loudly instead of
+        // vanishing before the fingerprint-sensitive wire request is built.
         let mut canon = CanonicalRequest {
             model: "sonnet".into(),
             messages: vec![CanonicalMessage {
@@ -1143,11 +1143,12 @@ mod tests {
         canon.provider_extras = Some(serde_json::json!({"foo":"bar"}));
         let profile = crate::fingerprint::default_profile();
         let model_def = profile.resolve_model("sonnet");
-        let anth = build_messages_request_from_canonical(&canon, model_def, &empty_repl()).unwrap();
-        assert!(anth.metadata.is_none());
-        assert_eq!(anth.stream, Some(false));
-        // no output_config unless reasoning high-effort etc
-        assert!(anth.output_config.is_none());
+        let err = build_messages_request_from_canonical(&canon, model_def, &empty_repl())
+            .expect_err("provider extras must reject");
+        assert!(
+            err.contains("provider extras"),
+            "error must name provider extras: {err}"
+        );
     }
 
     #[test]

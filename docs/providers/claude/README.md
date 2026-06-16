@@ -21,3 +21,14 @@ billing suffix, system preamble, model catalog, and wire defaults.
 
 Offline tests pin the captured bytes. Live Anthropic calls are opt-in via
 `OMNI_LIVE_TESTS=1`.
+
+## Provider Extras
+
+Claude's OpenAI-compatible path has no provider extras passthrough today.
+Unsupported provider extras fail loudly before a fingerprint-sensitive wire
+request is built.
+
+Claude native `/v1/messages` uses a closed request allowlist. Fields such as
+`betas`, `metadata`, `service_tier`, `mcp_servers`, `container`, and
+`output_config` remain intentionally unsupported unless a fingerprint rebaseline
+proves they belong on the Claude Code path.
