@@ -842,21 +842,38 @@ fn append_message_items(message: &CanonicalMessage, input: &mut Vec<Value>) {
         }
         CanonicalContent::Blocks(blocks) => {
             let mut text = String::new();
+            let mut content_parts: Vec<Value> = Vec::new();
+            let mut has_image = false;
             for block in blocks {
                 match block {
-                    CanonicalBlock::Text(t) => text.push_str(t),
+                    CanonicalBlock::Text(t) => {
+                        text.push_str(t);
+                        if !t.is_empty() {
+                            content_parts.push(json!({
+                                "type": "input_text",
+                                "text": t,
+                            }));
+                        }
+                    }
+                    CanonicalBlock::Image { source } => {
+                        has_image = true;
+                        content_parts.push(json!({
+                            "type": "input_image",
+                            "image_url": source.as_image_url(),
+                        }));
+                    }
                     CanonicalBlock::ToolUse {
                         id,
                         name,
                         arguments,
                     } => {
-                        if !text.is_empty() {
-                            input.push(json!({
-                                "type": "message",
-                                "role": message.role,
-                                "content": std::mem::take(&mut text),
-                            }));
-                        }
+                        flush_codex_message(
+                            input,
+                            &message.role,
+                            &mut text,
+                            &mut content_parts,
+                            &mut has_image,
+                        );
                         input.push(json!({
                             "type": "function_call",
                             "call_id": id,
@@ -869,13 +886,13 @@ fn append_message_items(message: &CanonicalMessage, input: &mut Vec<Value>) {
                         content,
                         ..
                     } => {
-                        if !text.is_empty() {
-                            input.push(json!({
-                                "type": "message",
-                                "role": message.role,
-                                "content": std::mem::take(&mut text),
-                            }));
-                        }
+                        flush_codex_message(
+                            input,
+                            &message.role,
+                            &mut text,
+                            &mut content_parts,
+                            &mut has_image,
+                        );
                         input.push(json!({
                             "type": "function_call_output",
                             "call_id": tool_use_id,
@@ -884,21 +901,58 @@ fn append_message_items(message: &CanonicalMessage, input: &mut Vec<Value>) {
                     }
                 }
             }
-            if !text.is_empty() {
-                input.push(json!({
-                    "type": "message",
-                    "role": message.role,
-                    "content": text,
-                }));
-            }
+            flush_codex_message(
+                input,
+                &message.role,
+                &mut text,
+                &mut content_parts,
+                &mut has_image,
+            );
         }
     }
+}
+
+fn flush_codex_message(
+    input: &mut Vec<Value>,
+    role: &str,
+    text: &mut String,
+    content_parts: &mut Vec<Value>,
+    has_image: &mut bool,
+) {
+    if *has_image && content_parts.is_empty() {
+        text.clear();
+        *has_image = false;
+        return;
+    }
+    if !*has_image && text.is_empty() {
+        content_parts.clear();
+        return;
+    }
+    let content = if *has_image {
+        Value::Array(std::mem::take(content_parts))
+    } else {
+        content_parts.clear();
+        Value::String(std::mem::take(text))
+    };
+    input.push(json!({
+        "type": "message",
+        "role": role,
+        "content": content,
+    }));
+    text.clear();
+    *has_image = false;
 }
 
 pub fn codex_extra_allowed(key: &str) -> bool {
     matches!(
         key,
-        "store" | "previous_response_id" | "metadata" | "parallel_tool_calls" | "service_tier"
+        "store"
+            | "previous_response_id"
+            | "metadata"
+            | "parallel_tool_calls"
+            | "service_tier"
+            | "response_format"
+            | "text"
     )
 }
 
@@ -922,6 +976,7 @@ fn codex_response_to_canonical(
     let mut content = String::new();
     let mut refusal = String::new();
     let mut tool_calls = Vec::new();
+    let mut annotations = Vec::new();
     if let Some(items) = value.get("output").and_then(|v| v.as_array()) {
         for item in items {
             match item.get("type").and_then(|v| v.as_str()) {
@@ -930,6 +985,11 @@ fn codex_response_to_canonical(
                         for part in parts {
                             if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
                                 content.push_str(text);
+                                if let Some(part_annotations) =
+                                    part.get("annotations").and_then(|v| v.as_array())
+                                {
+                                    annotations.extend(part_annotations.iter().cloned());
+                                }
                             } else if let Some(refusal_text) =
                                 part.get("refusal").and_then(|v| v.as_str())
                             {
@@ -971,15 +1031,7 @@ fn codex_response_to_canonical(
         content.push_str(text);
     }
 
-    let usage = value.get("usage").unwrap_or(&Value::Null);
-    let input_tokens = usage
-        .get("input_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let output_tokens = usage
-        .get("output_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let usage = response_usage(value).unwrap_or_default();
     let finish_reason = match response_status(value) {
         Some("incomplete") => Some(response_incomplete_reason(value).to_string()),
         _ if !tool_calls.is_empty() => Some("tool_calls".to_string()),
@@ -996,13 +1048,23 @@ fn codex_response_to_canonical(
         },
         tool_calls,
         finish_reason,
-        usage: CanonicalUsage {
-            input_tokens,
-            output_tokens,
-            cache_read: 0,
-            cache_creation: 0,
-        },
-        id: response_id,
+        usage,
+        id: response_id.clone(),
+        annotations,
+        metadata: Some(CanonicalResponseMetadata {
+            id: response_id,
+            system_fingerprint: value
+                .get("system_fingerprint")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            service_tier: value
+                .get("service_tier")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            provider: Some("codex".into()),
+            raw: None,
+        }),
+        reasoning: Vec::new(),
     })
 }
 
@@ -1220,12 +1282,28 @@ impl ResponsesStreamParser {
             .or_else(|| value.get("id"))
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        id.map(|id| {
-            vec![Ok(CanonicalStreamEvent::ResponseMetadata(
-                CanonicalResponseMetadata { id: Some(id) },
-            ))]
-        })
-        .unwrap_or_default()
+        let response = response_payload(value);
+        let metadata = CanonicalResponseMetadata {
+            id,
+            system_fingerprint: response
+                .get("system_fingerprint")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            service_tier: response
+                .get("service_tier")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            provider: Some("codex".into()),
+            raw: None,
+        };
+        if metadata.id.is_none()
+            && metadata.system_fingerprint.is_none()
+            && metadata.service_tier.is_none()
+        {
+            Vec::new()
+        } else {
+            vec![Ok(CanonicalStreamEvent::ResponseMetadata(metadata))]
+        }
     }
 
     fn emit_text_delta(
@@ -1524,7 +1602,15 @@ impl ResponsesStreamParser {
                 .get("text")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            return self.emit_final_text(output_index, "text", final_text);
+            let mut events = self.emit_final_text(output_index, "text", final_text);
+            if let Some(annotations) = part.get("annotations").and_then(|v| v.as_array())
+                && !annotations.is_empty()
+            {
+                events.push(Ok(CanonicalStreamEvent::OutputAnnotations(
+                    annotations.to_vec(),
+                )));
+            }
+            return events;
         }
         Vec::new()
     }
@@ -1672,6 +1758,16 @@ fn response_usage(value: &Value) -> Option<CanonicalUsage> {
         .get("response")
         .and_then(|v| v.get("usage"))
         .or_else(|| value.get("usage"))?;
+    let input_audio_tokens = usage
+        .get("input_tokens_details")
+        .and_then(|v| v.get("audio_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let output_audio_tokens = usage
+        .get("output_tokens_details")
+        .and_then(|v| v.get("audio_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     Some(CanonicalUsage {
         input_tokens: usage
             .get("input_tokens")
@@ -1681,8 +1777,31 @@ fn response_usage(value: &Value) -> Option<CanonicalUsage> {
             .get("output_tokens")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
-        cache_read: 0,
+        cache_read: usage
+            .get("input_tokens_details")
+            .and_then(|v| v.get("cached_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
         cache_creation: 0,
+        reasoning_tokens: usage
+            .get("output_tokens_details")
+            .and_then(|v| v.get("reasoning_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        audio_tokens: input_audio_tokens + output_audio_tokens,
+        input_audio_tokens,
+        output_audio_tokens,
+        accepted_prediction_tokens: usage
+            .get("output_tokens_details")
+            .and_then(|v| v.get("accepted_prediction_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        rejected_prediction_tokens: usage
+            .get("output_tokens_details")
+            .and_then(|v| v.get("rejected_prediction_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        ..CanonicalUsage::default()
     })
 }
 
@@ -2316,7 +2435,9 @@ query_params = { api-version = "2026-01-01" }
             metadata: Default::default(),
             provider_extras: Some(json!({
                 "store": false,
-                "previous_response_id": "resp_1"
+                "previous_response_id": "resp_1",
+                "response_format": {"type": "json_schema", "json_schema": {"name": "out", "schema": {"type": "object"}}},
+                "text": {"format": {"type": "json_schema", "name": "out", "schema": {"type": "object"}}}
             })),
         };
         let body = codex_responses_body(&req, false).unwrap();
@@ -2327,6 +2448,42 @@ query_params = { api-version = "2026-01-01" }
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["store"], false);
         assert_eq!(body["previous_response_id"], "resp_1");
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["text"]["format"]["type"], "json_schema");
+    }
+
+    #[test]
+    fn canonical_image_blocks_map_to_responses_input_image_parts() {
+        // WHY: Codex/OpenAI Responses accepts image input as typed content
+        // parts; base64 canonical sources must reconstruct a data URL.
+        let req = CanonicalRequest {
+            model: "gpt-5.5".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Blocks(vec![
+                    CanonicalBlock::Text("look".into()),
+                    CanonicalBlock::Image {
+                        source: omni_core::CanonicalImageSource::Url {
+                            url: "https://example.com/a.png".into(),
+                        },
+                    },
+                    CanonicalBlock::Image {
+                        source: omni_core::CanonicalImageSource::Base64 {
+                            media_type: "image/png".into(),
+                            data: "abcd".into(),
+                        },
+                    },
+                ]),
+            }],
+            ..Default::default()
+        };
+        let body = codex_responses_body(&req, false).unwrap();
+        let content = body["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "look");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "https://example.com/a.png");
+        assert_eq!(content[2]["image_url"], "data:image/png;base64,abcd");
     }
 
     #[test]
@@ -2359,12 +2516,19 @@ query_params = { api-version = "2026-01-01" }
         let value = json!({
             "id": "resp_backend",
             "model": "gpt-5.5",
+            "service_tier": "default",
+            "system_fingerprint": "fp_codex",
             "status": "completed",
             "output": [
-                {"type":"message","content":[{"type":"output_text","text":"hello"}]},
+                {"type":"message","content":[{"type":"output_text","text":"hello","annotations":[{"type":"url_citation","url":"https://e.test"}]}]},
                 {"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}
             ],
-            "usage": {"input_tokens": 3, "output_tokens": 4}
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 4,
+                "input_tokens_details": {"cached_tokens": 1, "audio_tokens": 5},
+                "output_tokens_details": {"reasoning_tokens": 6, "audio_tokens": 7}
+            }
         });
         let resp = codex_response_to_canonical(&value, "fallback", &CodexErrorRedactor::default())
             .unwrap();
@@ -2377,6 +2541,24 @@ query_params = { api-version = "2026-01-01" }
         assert_eq!(resp.tool_calls[0].name, "lookup");
         assert_eq!(resp.tool_calls[0].arguments, "{}");
         assert_eq!(resp.usage.input_tokens, 3);
+        assert_eq!(resp.usage.cache_read, 1);
+        assert_eq!(resp.usage.reasoning_tokens, 6);
+        assert_eq!(resp.usage.audio_tokens, 12);
+        assert_eq!(resp.usage.input_audio_tokens, 5);
+        assert_eq!(resp.usage.output_audio_tokens, 7);
+        assert_eq!(resp.annotations[0]["url"], "https://e.test");
+        assert_eq!(
+            resp.metadata
+                .as_ref()
+                .and_then(|meta| meta.service_tier.as_deref()),
+            Some("default")
+        );
+        assert_eq!(
+            resp.metadata
+                .as_ref()
+                .and_then(|meta| meta.system_fingerprint.as_deref()),
+            Some("fp_codex")
+        );
         assert_eq!(resp.finish_reason.as_deref(), Some("tool_calls"));
     }
 
@@ -2564,6 +2746,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                     output_tokens: 4,
                     cache_read: 0,
                     cache_creation: 0,
+                    ..Default::default()
                 }),
                 CanonicalStreamEvent::Finish {
                     finish_reason: Some("stop".into())
@@ -2694,7 +2877,7 @@ requires_openai_auth = false
             .and(path("/v1/responses"))
             .respond_with(ResponseTemplate::new(200).set_body_raw(
                 "event: response.completed\n\
-data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_backend\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"terminal only\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n",
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_backend\",\"status\":\"completed\",\"service_tier\":\"default\",\"system_fingerprint\":\"fp_stream\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"terminal only\",\"annotations\":[{\"type\":\"url_citation\",\"url\":\"https://e.test\"}]}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n",
                 "text/event-stream",
             ))
             .expect(1)
@@ -2710,12 +2893,23 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_backend\",\"s
         assert_eq!(
             events[0],
             CanonicalStreamEvent::ResponseMetadata(CanonicalResponseMetadata {
-                id: Some("resp_backend".into())
+                id: Some("resp_backend".into()),
+                system_fingerprint: Some("fp_stream".into()),
+                service_tier: Some("default".into()),
+                provider: Some("codex".into()),
+                ..Default::default()
             })
         );
         assert_eq!(
             events[1],
             CanonicalStreamEvent::TextDelta("terminal only".into())
+        );
+        assert_eq!(
+            events[2],
+            CanonicalStreamEvent::OutputAnnotations(vec![json!({
+                "type": "url_citation",
+                "url": "https://e.test",
+            })])
         );
         assert_eq!(
             events.last().unwrap(),
@@ -3113,6 +3307,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                     output_tokens: 6,
                     cache_read: 0,
                     cache_creation: 0,
+                    ..Default::default()
                 }),
                 CanonicalStreamEvent::Finish {
                     finish_reason: Some("tool_calls".into())

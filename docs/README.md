@@ -48,6 +48,8 @@ Current client compatibility gaps and priority notes are tracked in
 [`compatibility-gaps.md`](compatibility-gaps.md).
 The go-forward implementation tracker is
 [`compatibility-roadmap.md`](compatibility-roadmap.md).
+Current per-provider support status is tracked in
+[`compatibility-matrix.md`](compatibility-matrix.md).
 
 ## Build, Run, Test
 

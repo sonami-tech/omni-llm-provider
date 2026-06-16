@@ -18,7 +18,8 @@ use serde_json::Value;
 
 use omni_common::Replacements;
 use omni_core::{
-    CanonicalBlock, CanonicalContent, CanonicalReasoning, CanonicalRequest, CanonicalResponse,
+    CanonicalBlock, CanonicalContent, CanonicalImageSource, CanonicalReasoning,
+    CanonicalReasoningBlock, CanonicalRequest, CanonicalResponse, CanonicalResponseMetadata,
     CanonicalTool, CanonicalToolCall, CanonicalToolChoice, CanonicalUsage,
 };
 
@@ -418,7 +419,23 @@ fn canonical_block_to_anthropic(
             content: Some(ToolResultContent::Text(repl.apply_prompt(content))),
             is_error: if *is_error { Some(true) } else { None },
         },
+        CanonicalBlock::Image { source } => ContentBlock::Image {
+            source: canonical_image_to_anthropic(source)?,
+        },
     })
+}
+
+fn canonical_image_to_anthropic(source: &CanonicalImageSource) -> Result<ImageSource, String> {
+    match source {
+        CanonicalImageSource::Url { url } if url.starts_with("https://") => {
+            Ok(ImageSource::Url { url: url.clone() })
+        }
+        CanonicalImageSource::Url { .. } => Err("Claude image URLs must use https://".into()),
+        CanonicalImageSource::Base64 { media_type, data } => Ok(ImageSource::Base64 {
+            media_type: media_type.clone(),
+            data: data.clone(),
+        }),
+    }
 }
 
 /// Parse a tool-call `arguments` string into the JSON object Anthropic expects
@@ -622,6 +639,7 @@ pub fn build_canonical_response(
 ) -> CanonicalResponse {
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<CanonicalToolCall> = Vec::new();
+    let mut reasoning: Vec<CanonicalReasoningBlock> = Vec::new();
 
     for block in resp.content.iter() {
         match block {
@@ -635,8 +653,14 @@ pub fn build_canonical_response(
                     arguments: serde_json::to_string(input).unwrap_or_else(|_| "{}".into()),
                 });
             }
-            ResponseContentBlock::Thinking { .. } => {
-                // For now, thinking is dropped from canonical text (future: provider_extras or extended content).
+            ResponseContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                reasoning.push(CanonicalReasoningBlock {
+                    text: thinking.clone(),
+                    signature: signature.clone(),
+                });
             }
             ResponseContentBlock::Other => {}
         }
@@ -657,6 +681,7 @@ pub fn build_canonical_response(
         output_tokens: resp.usage.output_tokens as u64,
         cache_read: resp.usage.cache_read_input_tokens.unwrap_or(0) as u64,
         cache_creation: resp.usage.cache_creation_input_tokens.unwrap_or(0) as u64,
+        ..Default::default()
     };
 
     CanonicalResponse {
@@ -667,6 +692,13 @@ pub fn build_canonical_response(
         finish_reason: Some(finish_reason.to_string()),
         usage,
         id: Some(resp.id.clone()),
+        annotations: Vec::new(),
+        metadata: Some(CanonicalResponseMetadata {
+            id: Some(resp.id.clone()),
+            provider: Some("claude".into()),
+            ..Default::default()
+        }),
+        reasoning,
     }
 }
 
@@ -993,6 +1025,72 @@ mod tests {
     }
 
     #[test]
+    fn canonical_image_blocks_map_to_anthropic_images() {
+        // WHY: Claude already has native image blocks; canonical image URL and
+        // base64 sources must reach that wire shape without text replacement.
+        use omni_core::{CanonicalBlock, CanonicalImageSource};
+        let req = CanonicalRequest {
+            model: "haiku".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Blocks(vec![
+                    CanonicalBlock::Text("see".into()),
+                    CanonicalBlock::Image {
+                        source: CanonicalImageSource::Url {
+                            url: "https://example.com/a.png".into(),
+                        },
+                    },
+                    CanonicalBlock::Image {
+                        source: CanonicalImageSource::Base64 {
+                            media_type: "image/png".into(),
+                            data: "abcd".into(),
+                        },
+                    },
+                ]),
+            }],
+            ..Default::default()
+        };
+        let profile = crate::fingerprint::default_profile();
+        let model_def = profile.resolve_model("haiku");
+        let anth = build_messages_request_from_canonical(&req, model_def, &empty_repl()).unwrap();
+        match &anth.messages[0].content {
+            MessageContent::Blocks(blocks) => {
+                assert!(matches!(&blocks[1], ContentBlock::Image {
+                    source: ImageSource::Url { url }
+                } if url == "https://example.com/a.png"));
+                assert!(matches!(&blocks[2], ContentBlock::Image {
+                    source: ImageSource::Base64 { media_type, data }
+                } if media_type == "image/png" && data == "abcd"));
+            }
+            other => panic!("expected blocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canonical_image_blocks_reject_non_https_urls_for_claude() {
+        // WHY: Anthropic rejects non-HTTPS image URLs upstream. Catch this in
+        // translation so unsupported image inputs fail before dispatch.
+        use omni_core::{CanonicalBlock, CanonicalImageSource};
+        let req = CanonicalRequest {
+            model: "haiku".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Blocks(vec![CanonicalBlock::Image {
+                    source: CanonicalImageSource::Url {
+                        url: "http://example.com/a.png".into(),
+                    },
+                }]),
+            }],
+            ..Default::default()
+        };
+        let profile = crate::fingerprint::default_profile();
+        let model_def = profile.resolve_model("haiku");
+        let err = build_messages_request_from_canonical(&req, model_def, &empty_repl())
+            .expect_err("Claude must reject non-HTTPS image URLs");
+        assert!(err.contains("https"), "error must mention HTTPS: {err}");
+    }
+
+    #[test]
     fn prepare_uses_post_repl_first_user_for_billing_suffix() {
         // Prompt-before-identity gate: repls (tool/prompt scope) run on texts
         // BEFORE billing_header_text is called, so suffix (and thus cch body)
@@ -1187,6 +1285,47 @@ mod tests {
         assert_eq!(canon.usage.cache_creation, 2);
         assert_eq!(canon.usage.cache_read, 1);
         assert!(canon.content.contains("done"));
+    }
+
+    #[test]
+    fn build_canonical_response_preserves_thinking_blocks() {
+        // WHY: Claude thinking was parsed but dropped. It must stay available
+        // as additive reasoning metadata without polluting assistant text.
+        let resp = MessagesResponse {
+            id: "m".into(),
+            kind: "message".into(),
+            role: "assistant".into(),
+            model: "claude-haiku-4-5-20251001".into(),
+            content: vec![
+                ResponseContentBlock::Thinking {
+                    thinking: "internal".into(),
+                    signature: Some("sig".into()),
+                },
+                ResponseContentBlock::Text {
+                    text: "visible".into(),
+                },
+            ],
+            stop_reason: Some("end_turn".into()),
+            stop_sequence: None,
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 2,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let canon = build_canonical_response(&resp, "haiku", &empty_repl());
+        assert_eq!(canon.content, "visible");
+        assert_eq!(canon.reasoning.len(), 1);
+        assert_eq!(canon.reasoning[0].text, "internal");
+        assert_eq!(canon.reasoning[0].signature.as_deref(), Some("sig"));
+        assert_eq!(
+            canon
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.provider.as_deref()),
+            Some("claude")
+        );
     }
 
     #[test]

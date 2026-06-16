@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use omni_core::{
-    CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalRequest, CanonicalResponse,
-    CanonicalStream, CanonicalStreamEvent, CanonicalTool, CanonicalToolCall, CanonicalToolChoice,
+    CanonicalBlock, CanonicalContent, CanonicalImageSource, CanonicalMessage, CanonicalRequest,
+    CanonicalResponse, CanonicalStream, CanonicalStreamEvent, CanonicalTool, CanonicalToolCall,
+    CanonicalToolChoice,
 };
 
 /// OpenAI-compatible chat completion request (text messages, tools, and core
@@ -54,7 +55,7 @@ pub struct ChatCompletionRequest {
 pub struct ChatMessage {
     pub role: String,
     #[serde(default)]
-    pub content: Option<String>,
+    pub content: Option<ChatMessageContent>,
     /// Present on assistant messages that called tools (OpenAI echoes these
     /// back into the next request's history).
     #[serde(default)]
@@ -63,6 +64,40 @@ pub struct ChatMessage {
     /// answers.
     #[serde(default)]
     pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ChatMessageContent {
+    Text(String),
+    Parts(Vec<ChatContentPart>),
+}
+
+impl From<&str> for ChatMessageContent {
+    fn from(value: &str) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
+impl From<String> for ChatMessageContent {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatContentPart {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub image_url: Option<ChatImageUrl>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatImageUrl {
+    pub url: String,
 }
 
 /// A tool definition in OpenAI's nested form. Only `function` tools are
@@ -111,6 +146,12 @@ pub struct ChatCompletionResponse {
     pub model: String,
     pub choices: Vec<ChatChoice>,
     pub usage: ChatUsage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_metadata: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -171,6 +212,10 @@ pub struct ChatUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<Value>,
 }
 
 const GATEWAY_ONLY_EXTRAS: &[&str] = &["user"];
@@ -296,7 +341,7 @@ fn chat_message_to_canonical(m: &ChatMessage) -> Result<CanonicalMessage, String
             role: "tool".into(),
             content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
                 tool_use_id: id,
-                content: m.content.clone().unwrap_or_default(),
+                content: chat_content_text(&m.content)?,
                 is_error: false,
             }]),
         });
@@ -305,8 +350,8 @@ fn chat_message_to_canonical(m: &ChatMessage) -> Result<CanonicalMessage, String
     // An assistant message may interleave text with tool calls.
     if let Some(tool_calls) = m.tool_calls.as_ref().filter(|tc| !tc.is_empty()) {
         let mut blocks: Vec<CanonicalBlock> = Vec::new();
-        if let Some(text) = m.content.as_ref().filter(|t| !t.is_empty()) {
-            blocks.push(CanonicalBlock::Text(text.clone()));
+        if let Some(text) = chat_content_optional_text(&m.content)? {
+            blocks.push(CanonicalBlock::Text(text));
         }
         for tc in tool_calls {
             if tc.kind != "function" {
@@ -326,8 +371,82 @@ fn chat_message_to_canonical(m: &ChatMessage) -> Result<CanonicalMessage, String
 
     Ok(CanonicalMessage {
         role: m.role.clone(),
-        content: CanonicalContent::Text(m.content.clone().unwrap_or_default()),
+        content: chat_content_to_canonical(&m.content)?,
     })
+}
+
+fn chat_content_text(content: &Option<ChatMessageContent>) -> Result<String, String> {
+    match content {
+        Some(ChatMessageContent::Text(text)) => Ok(text.clone()),
+        Some(ChatMessageContent::Parts(parts)) => {
+            let mut fragments = Vec::new();
+            for part in parts {
+                match part.kind.as_str() {
+                    "text" => fragments.push(part.text.clone().unwrap_or_default()),
+                    "image_url" => {
+                        return Err("image_url content is not supported on tool messages".into());
+                    }
+                    other => return Err(format!("unsupported content part type: {other}")),
+                }
+            }
+            Ok(fragments.join("\n"))
+        }
+        None => Ok(String::new()),
+    }
+}
+
+fn chat_content_optional_text(
+    content: &Option<ChatMessageContent>,
+) -> Result<Option<String>, String> {
+    let text = chat_content_text(content)?;
+    Ok((!text.is_empty()).then_some(text))
+}
+
+fn chat_content_to_canonical(
+    content: &Option<ChatMessageContent>,
+) -> Result<CanonicalContent, String> {
+    match content {
+        Some(ChatMessageContent::Text(text)) => Ok(CanonicalContent::Text(text.clone())),
+        Some(ChatMessageContent::Parts(parts)) => {
+            let mut blocks = Vec::with_capacity(parts.len());
+            let mut has_image = false;
+            for part in parts {
+                match part.kind.as_str() {
+                    "text" => {
+                        blocks.push(CanonicalBlock::Text(part.text.clone().unwrap_or_default()))
+                    }
+                    "image_url" => {
+                        let url = part
+                            .image_url
+                            .as_ref()
+                            .ok_or_else(|| "image_url content part missing image_url".to_string())?
+                            .url
+                            .as_str();
+                        blocks.push(CanonicalBlock::Image {
+                            source: CanonicalImageSource::from_image_url(url)?,
+                        });
+                        has_image = true;
+                    }
+                    other => return Err(format!("unsupported content part type: {other}")),
+                }
+            }
+            if has_image {
+                Ok(CanonicalContent::Blocks(blocks))
+            } else {
+                Ok(CanonicalContent::Text(
+                    blocks
+                        .into_iter()
+                        .filter_map(|block| match block {
+                            CanonicalBlock::Text(text) => Some(text),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ))
+            }
+        }
+        None => Ok(CanonicalContent::Text(String::new())),
+    }
 }
 
 /// Convert a `CanonicalResponse` into the OpenAI non-streaming response shape.
@@ -339,6 +458,8 @@ pub fn from_canonical(
     chat_id: String,
     created: u64,
 ) -> ChatCompletionResponse {
+    let metadata = canon.metadata.clone();
+    let provider_metadata = provider_metadata_json(&canon);
     let tool_calls: Vec<ChatToolCall> = canon
         .tool_calls
         .into_iter()
@@ -384,12 +505,86 @@ pub fn from_canonical(
             },
             finish_reason: finish,
         }],
-        usage: ChatUsage {
-            prompt_tokens: canon.usage.input_tokens,
-            completion_tokens: canon.usage.output_tokens,
-            total_tokens: total,
-        },
+        usage: chat_usage_from_canonical(&canon.usage, total),
+        system_fingerprint: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.system_fingerprint.clone()),
+        service_tier: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.service_tier.clone()),
+        provider_metadata,
     }
+}
+
+fn chat_usage_from_canonical(usage: &omni_core::CanonicalUsage, total: u64) -> ChatUsage {
+    let has_split_audio = usage.input_audio_tokens != 0 || usage.output_audio_tokens != 0;
+    let prompt_audio_tokens = if has_split_audio {
+        usage.input_audio_tokens
+    } else {
+        usage.audio_tokens
+    };
+    let prompt_details = usage_detail_json(&[
+        ("cached_tokens", usage.cache_read),
+        ("audio_tokens", prompt_audio_tokens),
+        ("image_tokens", usage.image_tokens),
+    ]);
+    let completion_details = usage_detail_json(&[
+        ("reasoning_tokens", usage.reasoning_tokens),
+        ("audio_tokens", usage.output_audio_tokens),
+        (
+            "accepted_prediction_tokens",
+            usage.accepted_prediction_tokens,
+        ),
+        (
+            "rejected_prediction_tokens",
+            usage.rejected_prediction_tokens,
+        ),
+    ]);
+    ChatUsage {
+        prompt_tokens: usage.input_tokens,
+        completion_tokens: usage.output_tokens,
+        total_tokens: total,
+        prompt_tokens_details: prompt_details,
+        completion_tokens_details: completion_details,
+    }
+}
+
+fn usage_detail_json(fields: &[(&str, u64)]) -> Option<Value> {
+    let mut details = Map::new();
+    for (key, value) in fields {
+        if *value != 0 {
+            details.insert((*key).to_string(), Value::from(*value));
+        }
+    }
+    (!details.is_empty()).then_some(Value::Object(details))
+}
+
+fn provider_metadata_json(canon: &CanonicalResponse) -> Option<Value> {
+    let mut metadata = Map::new();
+    if let Some(meta) = &canon.metadata {
+        if let Some(provider) = &meta.provider {
+            metadata.insert("provider".into(), Value::String(provider.clone()));
+        }
+        if let Some(raw) = &meta.raw {
+            metadata.insert("raw".into(), raw.clone());
+        }
+    }
+    if canon.usage.num_sources_used != 0 {
+        metadata.insert(
+            "num_sources_used".into(),
+            Value::from(canon.usage.num_sources_used),
+        );
+    }
+    if !canon.annotations.is_empty() {
+        metadata.insert(
+            "annotations".into(),
+            Value::Array(canon.annotations.clone()),
+        );
+    }
+    if !canon.reasoning.is_empty() {
+        metadata.insert("reasoning".into(), serde_json::json!(canon.reasoning));
+    }
+    (!metadata.is_empty()).then_some(Value::Object(metadata))
 }
 
 /// Seconds since the Unix epoch, for the `created` field. Falls back to 0 on a
@@ -509,6 +704,11 @@ fn async_stream_chunks(
                     let v = chunk_content(&chat_id, created, &requested_model, &text);
                     yield Ok(Event::default().data(v.to_string()));
                 }
+                Ok(CanonicalStreamEvent::ReasoningDelta(_)) |
+                Ok(CanonicalStreamEvent::ReasoningSignatureDelta(_)) |
+                Ok(CanonicalStreamEvent::OutputAnnotations(_)) => {
+                    // Chat Completions has no standard reasoning-delta field.
+                }
                 Ok(CanonicalStreamEvent::ToolCallDelta { index, id, name, arguments_delta }) => {
                     let v = chunk_tool_call(
                         &chat_id, created, &requested_model,
@@ -614,6 +814,55 @@ mod tests {
             .expect("provider extras should be preserved");
         assert_eq!(extras["response_format"]["type"], "json_object");
         assert!(extras.get("user").is_none());
+    }
+
+    #[test]
+    fn to_canonical_maps_chat_text_and_image_parts_in_order() {
+        // WHY: modern OpenAI-compatible clients send typed content arrays for
+        // multimodal prompts. Image URL and data URL parts must survive in the
+        // same order as adjacent text instead of flattening to plain text.
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":[
+                {"type":"text","text":"look"},
+                {"type":"image_url","image_url":{"url":"https://example.com/cat.png"}},
+                {"type":"text","text":"again"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}
+            ]}]}"#,
+        )
+        .unwrap();
+        let canon = to_canonical(&req).expect("multimodal chat content converts");
+        match &canon.messages[0].content {
+            CanonicalContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 4);
+                assert!(matches!(&blocks[0], CanonicalBlock::Text(text) if text == "look"));
+                assert!(matches!(
+                    &blocks[1],
+                    CanonicalBlock::Image {
+                        source: omni_core::CanonicalImageSource::Url { url }
+                    } if url == "https://example.com/cat.png"
+                ));
+                assert!(matches!(&blocks[2], CanonicalBlock::Text(text) if text == "again"));
+                assert!(matches!(
+                    &blocks[3],
+                    CanonicalBlock::Image {
+                        source: omni_core::CanonicalImageSource::Base64 { media_type, data }
+                    } if media_type == "image/png" && data == "aGVsbG8="
+                ));
+            }
+            CanonicalContent::Text(_) => panic!("image content must become blocks"),
+        }
+    }
+
+    #[test]
+    fn to_canonical_rejects_unknown_chat_content_part() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":[
+                {"type":"input_audio","audio":"..."}
+            ]}]}"#,
+        )
+        .unwrap();
+        let err = to_canonical(&req).expect_err("unsupported content part must reject");
+        assert!(err.contains("input_audio"), "error must name part: {err}");
     }
 
     fn req_from_json(json: &str) -> ChatCompletionRequest {
@@ -831,6 +1080,7 @@ mod tests {
             },
             id: None,
             refusal: None,
+            ..Default::default()
         };
         let oai = from_canonical(
             canon,
@@ -860,6 +1110,7 @@ mod tests {
             finish_reason: Some("content_filter".into()),
             usage: CanonicalUsage::default(),
             id: None,
+            ..Default::default()
         };
         let oai = from_canonical(canon, "m".into(), "id".into(), 0);
         let v = serde_json::to_value(&oai).unwrap();
@@ -883,11 +1134,56 @@ mod tests {
             usage: CanonicalUsage::default(),
             id: None,
             refusal: None,
+            ..Default::default()
         };
         let oai = from_canonical(canon, "m".into(), "id".into(), 0);
         assert!(oai.choices[0].message.content.is_none());
         assert_eq!(oai.choices[0].finish_reason.as_deref(), Some("tool_calls"));
         assert_eq!(oai.choices[0].message.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn from_canonical_emits_rich_usage_and_provider_metadata_when_present() {
+        // WHY: rich provider details are opt-in extension fields. They should be
+        // visible when available without changing minimal responses.
+        let canon = CanonicalResponse {
+            model: "m".into(),
+            content: "ok".into(),
+            usage: CanonicalUsage {
+                input_tokens: 5,
+                output_tokens: 2,
+                cache_read: 1,
+                reasoning_tokens: 9,
+                input_audio_tokens: 5,
+                output_audio_tokens: 6,
+                num_sources_used: 3,
+                ..Default::default()
+            },
+            metadata: Some(omni_core::CanonicalResponseMetadata {
+                system_fingerprint: Some("fp_1".into()),
+                service_tier: Some("priority".into()),
+                provider: Some("grok".into()),
+                ..Default::default()
+            }),
+            annotations: vec![serde_json::json!({"type":"url_citation","url":"https://e.test"})],
+            ..Default::default()
+        };
+        let v = serde_json::to_value(from_canonical(canon, "m".into(), "id".into(), 1)).unwrap();
+        assert_eq!(v["system_fingerprint"], "fp_1");
+        assert_eq!(v["service_tier"], "priority");
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 1);
+        assert_eq!(v["usage"]["prompt_tokens_details"]["audio_tokens"], 5);
+        assert_eq!(
+            v["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            9
+        );
+        assert_eq!(v["usage"]["completion_tokens_details"]["audio_tokens"], 6);
+        assert_eq!(v["provider_metadata"]["provider"], "grok");
+        assert_eq!(v["provider_metadata"]["num_sources_used"], 3);
+        assert_eq!(
+            v["provider_metadata"]["annotations"][0]["url"],
+            "https://e.test"
+        );
     }
 
     #[tokio::test]

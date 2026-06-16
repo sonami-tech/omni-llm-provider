@@ -29,26 +29,27 @@ pub struct CanonicalMessage {
 /// Message content in a backend-neutral form.
 ///
 /// `Text` is the common case (a plain string). `Blocks` carries an ordered
-/// sequence of content blocks, used when a turn mixes text with tool-call /
-/// tool-result data - i.e. multi-turn tool loops. Keeping `Text` as its own
-/// variant means every plain-text producer stays valid; only tool turns need
-/// `Blocks`.
+/// sequence of content blocks, used when a turn mixes text with tool-call,
+/// tool-result, or image data. Keeping `Text` as its own variant means every
+/// plain-text producer stays valid; only mixed-content turns need `Blocks`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CanonicalContent {
     Text(String),
     Blocks(Vec<CanonicalBlock>),
-    // Future: an Image block can join CanonicalBlock without touching this enum.
 }
 
 /// One block inside a [`CanonicalContent::Blocks`] sequence.
 ///
 /// These map 1:1 onto each backend's native content blocks:
-/// - Anthropic `ContentBlock::{Text, ToolUse, ToolResult}`
+/// - Anthropic `ContentBlock::{Text, ToolUse, ToolResult, Image}`
 /// - OpenAI/xAI assistant `tool_calls` + `role:"tool"` result messages
+/// - OpenAI/xAI typed content parts for images
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum CanonicalBlock {
     /// Plain text within a multi-block message.
     Text(String),
+    /// Image input ordered with surrounding text.
+    Image { source: CanonicalImageSource },
     /// An assistant request to call a tool (the model's tool-call). `arguments`
     /// is the raw JSON arguments string, as both wire formats carry it.
     ToolUse {
@@ -63,6 +64,48 @@ pub enum CanonicalBlock {
         #[serde(default)]
         is_error: bool,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CanonicalImageSource {
+    Url { url: String },
+    Base64 { media_type: String, data: String },
+}
+
+impl CanonicalImageSource {
+    pub fn from_image_url(value: &str) -> Result<Self, String> {
+        if let Some(rest) = value.strip_prefix("data:") {
+            let (media_type, data) = rest
+                .split_once(";base64,")
+                .ok_or_else(|| "data image URL must be base64 encoded".to_string())?;
+            if media_type.trim().is_empty() {
+                return Err("data image URL missing media type".into());
+            }
+            if data.trim().is_empty() {
+                return Err("data image URL missing base64 data".into());
+            }
+            return Ok(Self::Base64 {
+                media_type: media_type.to_string(),
+                data: data.to_string(),
+            });
+        }
+        if value.trim().is_empty() {
+            return Err("image URL must not be empty".into());
+        }
+        Ok(Self::Url {
+            url: value.to_string(),
+        })
+    }
+
+    pub fn as_image_url(&self) -> String {
+        match self {
+            Self::Url { url } => url.clone(),
+            Self::Base64 { media_type, data } => {
+                format!("data:{media_type};base64,{data}")
+            }
+        }
+    }
 }
 
 impl CanonicalContent {
@@ -116,10 +159,29 @@ pub struct CanonicalUsage {
     pub output_tokens: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
-    // extensible: reasoning_tokens, etc.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reasoning_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub audio_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub input_audio_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub output_audio_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub image_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub accepted_prediction_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rejected_prediction_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub num_sources_used: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CanonicalResponse {
     pub model: String,
     pub content: String,
@@ -132,6 +194,19 @@ pub struct CanonicalResponse {
     /// backends need this for stateful continuation via previous_response_id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<CanonicalResponseMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning: Vec<CanonicalReasoningBlock>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CanonicalReasoningBlock {
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,10 +216,18 @@ pub struct CanonicalToolCall {
     pub arguments: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct CanonicalResponseMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw: Option<serde_json::Value>,
 }
 
 /// One normalized event in a streaming response.
@@ -168,6 +251,12 @@ pub enum CanonicalStreamEvent {
     /// Incremental refusal text. Responses-native clients receive refusal
     /// events; Chat-compatible clients degrade this to text deltas.
     RefusalDelta(String),
+    /// Incremental provider reasoning/thinking text.
+    ReasoningDelta(String),
+    /// Incremental provider reasoning signature data.
+    ReasoningSignatureDelta(String),
+    /// Output text annotations/citations discovered while parsing a stream.
+    OutputAnnotations(Vec<serde_json::Value>),
     /// Incremental tool-call data. `index` identifies which tool call this delta
     /// belongs to (parallel tool calls share the stream). On the first delta for
     /// an index, `id` and `name` are set; subsequent deltas carry only
@@ -226,6 +315,7 @@ mod tests {
                 usage: CanonicalUsage::default(),
                 refusal: None,
                 id: None,
+                ..Default::default()
             })
         }
     }
@@ -280,9 +370,11 @@ mod tests {
                 output_tokens: 7,
                 cache_read: 0,
                 cache_creation: 0,
+                ..Default::default()
             },
             refusal: None,
             id: None,
+            ..Default::default()
         };
         let j = serde_json::to_string(&resp).unwrap();
         let back: CanonicalResponse = serde_json::from_str(&j).unwrap();
@@ -465,6 +557,7 @@ mod tests {
             output_tokens: 45,
             cache_read: 10,
             cache_creation: 5,
+            ..Default::default()
         };
         let j = serde_json::to_string(&u).unwrap();
         let back: CanonicalUsage = serde_json::from_str(&j).unwrap();
@@ -489,9 +582,11 @@ mod tests {
                 output_tokens: 20,
                 cache_read: 15,
                 cache_creation: 0,
+                ..Default::default()
             },
             refusal: None,
             id: None,
+            ..Default::default()
         };
         let j = serde_json::to_string(&resp).unwrap();
         let back: CanonicalResponse = serde_json::from_str(&j).unwrap();
@@ -531,9 +626,11 @@ mod tests {
                     output_tokens: 3,
                     cache_read: 0,
                     cache_creation: 0,
+                    ..Default::default()
                 },
                 refusal: None,
                 id: None,
+                ..Default::default()
             })
         }
     }
@@ -566,6 +663,7 @@ mod tests {
                 usage: CanonicalUsage::default(),
                 refusal: None,
                 id: None,
+                ..Default::default()
             })
         }
     }
@@ -753,6 +851,29 @@ mod tests {
     }
 
     #[test]
+    fn canonical_image_blocks_roundtrip_and_do_not_affect_as_text() {
+        // WHY: multimodal clients depend on image ordering, while legacy
+        // billing/replacement paths must still see only human-readable text.
+        let content = CanonicalContent::Blocks(vec![
+            CanonicalBlock::Text("before".into()),
+            CanonicalBlock::Image {
+                source: CanonicalImageSource::from_image_url("data:image/png;base64,aGVsbG8=")
+                    .unwrap(),
+            },
+            CanonicalBlock::Text("after".into()),
+        ]);
+        assert_eq!(content.as_text(), "beforeafter");
+        let back: CanonicalContent =
+            serde_json::from_str(&serde_json::to_string(&content).unwrap()).unwrap();
+        match back {
+            CanonicalContent::Blocks(blocks) => {
+                assert!(matches!(blocks[1], CanonicalBlock::Image { .. }));
+            }
+            CanonicalContent::Text(_) => panic!("image content must stay block content"),
+        }
+    }
+
+    #[test]
     fn canonical_usage_caches_and_reasoning_context() {
         // covers usage with cache_read/creation ; reasoning via dedicated type in req
         let u = CanonicalUsage {
@@ -760,6 +881,7 @@ mod tests {
             output_tokens: 20,
             cache_read: 30,
             cache_creation: 5,
+            ..Default::default()
         };
         let j = serde_json::to_string(&u).unwrap();
         let back: CanonicalUsage = serde_json::from_str(&j).unwrap();
@@ -793,6 +915,7 @@ mod tests {
             usage: CanonicalUsage::default(),
             refusal: None,
             id: None,
+            ..Default::default()
         };
         let j = serde_json::to_string(&resp).unwrap();
         let back: CanonicalResponse = serde_json::from_str(&j).unwrap();
@@ -1025,6 +1148,7 @@ mod tests {
             output_tokens: 5,
             cache_read: 2,
             cache_creation: 1,
+            ..Default::default()
         };
         let resp = CanonicalResponse {
             model: "g".into(),
@@ -1038,6 +1162,7 @@ mod tests {
             usage: u,
             refusal: None,
             id: None,
+            ..Default::default()
         };
         let j = serde_json::to_string(&resp).unwrap();
         let back: CanonicalResponse = serde_json::from_str(&j).unwrap();

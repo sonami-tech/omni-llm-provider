@@ -2259,6 +2259,26 @@ mod tests {
         }
     }
 
+    fn claude_custom_entry_with_base(base_url: &str) -> ProviderEntry {
+        let provider = ClaudeProvider::new_for_custom_gateway(
+            provider_claude::default_profile(),
+            base_url,
+            Some("test-token".into()),
+            Vec::new(),
+        )
+        .expect("claude test provider");
+        let models = provider_model_values("claude", provider.profile().models_list())
+            .expect("claude model catalog serializes");
+        let catalog = claude_model_catalog(provider.profile());
+        let provider = Arc::new(provider);
+        ProviderEntry {
+            provider: provider.clone(),
+            claude_native: Some(provider),
+            models,
+            catalog,
+        }
+    }
+
     fn grok_entry(base_url: &str) -> ProviderEntry {
         ProviderEntry {
             provider: Arc::new(GrokProvider::new_for_test("k", base_url)),
@@ -3833,9 +3853,11 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                         output_tokens: 2,
                         cache_read: 1,
                         cache_creation: 0,
+                        ..Default::default()
                     },
                     id: None,
                     refusal: None,
+                    ..Default::default()
                 })
             }
         }
@@ -3930,6 +3952,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                     usage: Default::default(),
                     id: None,
                     refusal: None,
+                    ..Default::default()
                 })
             }
         }
@@ -4008,6 +4031,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                         output_tokens: 7,
                         cache_read: 3,
                         cache_creation: 2,
+                        ..Default::default()
                     })),
                     Ok(CanonicalStreamEvent::Finish {
                         finish_reason: Some("stop".into()),
@@ -4177,6 +4201,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                         output_tokens: 7,
                         cache_read: 0,
                         cache_creation: 0,
+                        ..Default::default()
                     })),
                     Ok(CanonicalStreamEvent::Finish {
                         finish_reason: Some("error: overloaded".into()),
@@ -4268,6 +4293,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                         output_tokens: 7,
                         cache_read: 0,
                         cache_creation: 0,
+                        ..Default::default()
                     })),
                 ])))
             }
@@ -4425,7 +4451,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         let mut map: HashMap<String, ProviderEntry> = HashMap::new();
         map.insert(
             "claude".into(),
-            claude_entry_with_base("http://127.0.0.1:1"),
+            claude_custom_entry_with_base("http://127.0.0.1:1"),
         );
         let state = state_with(map);
         let req = ChatCompletionRequest {
@@ -4582,6 +4608,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                     usage: Default::default(),
                     id: None,
                     refusal: None,
+                    ..Default::default()
                 })
             }
         }
@@ -4648,6 +4675,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                     usage: Default::default(),
                     id: None,
                     refusal: None,
+                    ..Default::default()
                 })
             }
         }
@@ -4781,9 +4809,11 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                 output_tokens: 2,
                 cache_read: 0,
                 cache_creation: 0,
+                ..Default::default()
             },
             id: None,
             refusal: None,
+            ..Default::default()
         };
         let oai = from_canonical(canon, "grok:grok-4.3".into(), "chatcmpl-xyz".into(), 123);
         assert_eq!(oai.id, "chatcmpl-xyz");
@@ -4845,6 +4875,7 @@ rule = [
             usage: Default::default(),
             id: None,
             refusal: None,
+            ..Default::default()
         };
         let oai = from_canonical(canon, "grok:m".into(), "chatcmpl-test".into(), 1);
         assert_eq!(oai.choices[0].message.content.as_deref(), Some("c"));
@@ -5353,7 +5384,7 @@ rule = [
     #[tokio::test]
     async fn test_responses_unsupported_input_is_bad_request() {
         // WHY: input shapes the canonical layer still cannot represent (an
-        // `input_image` content part) are rejected LOUDLY as an OAI-shaped 400
+        // `input_audio` content part) are rejected LOUDLY as an OAI-shaped 400
         // naming the offender, BEFORE any provider call; a 500 or silent
         // mangling would corrupt the request. (Tool-conversation items like
         // function_call / function_call_output ARE now supported and round-trip
@@ -5362,12 +5393,12 @@ rule = [
         map.insert("claude".into(), claude_entry());
         let state = state_with(map);
         let req = responses_req(
-            r#"{"model":"claude:sonnet","input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":"x"}]}]}"#,
+            r#"{"model":"claude:sonnet","input":[{"type":"message","role":"user","content":[{"type":"input_audio","input_audio":{"data":"x"}}]}]}"#,
         );
         let res = call_responses_handler(state, req).await;
         match res {
             Err(AppError::BadRequest(msg)) => assert!(
-                msg.contains("input_image"),
+                msg.contains("input_audio"),
                 "400 must name the unsupported content part type: {msg}"
             ),
             other => panic!("expected BadRequest for unsupported input, got {other:?}"),
@@ -5498,7 +5529,7 @@ rule = [
         let out = post_json(
             port,
             "/v1/responses",
-            r#"{"model":"claude:sonnet","input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":"x"}]}]}"#,
+            r#"{"model":"claude:sonnet","input":[{"type":"message","role":"user","content":[{"type":"input_audio","input_audio":{"data":"x"}}]}]}"#,
         );
         assert_eq!(
             out.status, 400,

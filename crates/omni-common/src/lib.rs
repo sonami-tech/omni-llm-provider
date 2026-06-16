@@ -18,8 +18,8 @@ pub use auth::{ApiKeyId, auth_layer};
 pub use conversation_log::{ConversationLog, DEFAULT_LOG_BACKUPS, DEFAULT_LOG_MAX_BYTES};
 pub use error::AppError;
 pub use http::{
-    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, from_canonical,
-    sse_from_canonical_stream, to_canonical, unix_now_secs,
+    ChatCompletionRequest, ChatCompletionResponse, ChatContentPart, ChatImageUrl, ChatMessage,
+    ChatMessageContent, from_canonical, sse_from_canonical_stream, to_canonical, unix_now_secs,
 };
 pub use replacements::{Replacements, ReplacementsError};
 pub use responses::{

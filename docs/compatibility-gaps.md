@@ -4,67 +4,42 @@ This document tracks current functionality gaps that affect general client
 compatibility. It is intentionally concise; provider-specific invariants remain
 in `docs/providers/`.
 
-Last reviewed: 2026-06-15.
+Last reviewed: 2026-06-16.
 
 Implementation phases and status are tracked in
 `docs/compatibility-roadmap.md`.
 
 ## Priority Order
 
-1. Multimodal request support.
-   - Impact: high. Many modern OpenAI and Responses clients send content arrays,
-     images, files, audio, or typed input parts.
-   - Current state: OpenAI chat input is text-only, and Responses rejects
-     non-text parts such as `input_image`.
-   - Likely scope: add canonical media blocks, then map OpenAI Chat,
-     Responses, Claude, Grok, and Codex request shapes.
-   - Effort: high.
+No high-priority compatibility gap from the June roadmap remains open.
 
-2. Broader Responses API support.
-   - Impact: high. Newer OpenAI-compatible clients increasingly use
-     `/v1/responses`.
-   - Current state: Omni supports text input, function tools, reasoning effort,
-     basic tool loops, non-streaming responses, and Responses SSE. Other item
-     and tool types are rejected.
-   - Likely scope: expand supported input/output item types, structured output,
-     metadata, stateful continuation, and provider-specific equivalents.
-   - Effort: medium to high.
+Implemented support now covers:
 
-3. Richer provider output preservation.
-   - Impact: medium. Search, agent, and observability clients benefit from
-     citations, annotations, reasoning token counts, service tier, response ids,
-     and provider metadata.
-   - Current state: canonical responses preserve text, refusal, function calls,
-     finish reason, basic usage, cache usage, and response id. Several provider
-     details are parsed or available but not surfaced.
-   - Likely scope: add additive canonical metadata fields and map provider
-     outputs into OpenAI Chat and Responses envelopes.
-   - Effort: medium.
+1. Multimodal request support for image URL and base64 image inputs.
+2. Broader Responses passthrough for Codex state, metadata, service tier, and
+   structured-output controls.
+3. Richer provider output preservation for usage details, annotations, provider
+   metadata, service tier, system fingerprint, and non-stream Claude reasoning
+   blocks.
 
 ## Implementation Readiness
 
-1. Multimodal request support.
-   - Needs a canonical content decision before implementation.
-   - Recommended first scope: image URL and base64 blocks, ordered with text and
-     tool blocks. Defer audio and files until the image path is proven.
+1. Audio and file input support.
+   - Needs explicit canonical media shape and provider mapping decisions.
+   - Defer until concrete client need exists.
 
-2. Broader Responses API support.
-   - Needs a bounded v1 scope before implementation.
-   - Recommended first scope: `previous_response_id`, metadata/service tier,
-     structured output, and common output items. Defer non-function tools until
-     provider mappings are explicit.
+2. Non-function hosted tools.
+   - Needs provider-specific mappings and compatibility tests.
+   - Defer until provider semantics are explicit.
 
-3. Richer provider output preservation.
-   - Needs a response schema decision before implementation.
-   - Recommended shape: additive usage-details and provider-namespaced
-     extensions for annotations, citations, reasoning tokens, service tier,
-     system fingerprint, and search/source metadata.
+3. Live-provider compatibility smoke checks.
+   - Requires explicit operator approval because they may spend quota.
 
 ## Easiest First
 
-1. Preserve richer provider outputs.
-2. Broaden the Responses subset.
-3. Add multimodal support.
+1. Add optional live-provider smoke checks.
+2. Add hosted-tool mappings for one provider at a time.
+3. Add audio/file input support once provider behavior is chosen.
 
 ## Resolved
 
@@ -76,6 +51,22 @@ Implementation phases and status are tracked in
      such as `user`. The selected provider validates extras against its
      allowlist before dispatch.
    - Provider allowlists are documented in `docs/providers/`.
+
+2. Image multimodal request support.
+   - Resolved: image URL and base64 image inputs are accepted for OpenAI Chat
+     content arrays and Responses `input_image` parts, then mapped to Claude,
+     Grok, and Codex.
+
+3. Broader Responses API support.
+   - Resolved: Codex forwards Responses state, metadata, service tier, and
+     structured-output extras. Unsupported provider extras still fail loudly.
+
+4. Rich provider output preservation.
+   - Resolved: optional canonical extension fields preserve usage details,
+     provider metadata, annotations, and non-stream reasoning blocks.
+
+5. Compatibility matrix.
+   - Resolved: `docs/compatibility-matrix.md` tracks current support status.
 
 ## Notes
 

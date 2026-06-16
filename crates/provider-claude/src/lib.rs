@@ -83,7 +83,10 @@ impl ClaudeStreamConverter {
                 ..
             } => {
                 let out = vec![CanonicalStreamEvent::ResponseMetadata(
-                    omni_core::CanonicalResponseMetadata { id: Some(id) },
+                    omni_core::CanonicalResponseMetadata {
+                        id: Some(id),
+                        ..Default::default()
+                    },
                 )];
                 if input_tokens.is_some() {
                     self.input_tokens = input_tokens;
@@ -123,8 +126,11 @@ impl ClaudeStreamConverter {
                         None => vec![],
                     }
                 }
-                // Thinking deltas are not surfaced in the canonical text stream today.
-                _ => vec![],
+                BlockDelta::Thinking(s) => vec![CanonicalStreamEvent::ReasoningDelta(s)],
+                BlockDelta::ThinkingSignature(s) => {
+                    vec![CanonicalStreamEvent::ReasoningSignatureDelta(s)]
+                }
+                BlockDelta::Other => vec![],
             },
             StreamEvent::MessageDelta {
                 stop_reason,
@@ -638,7 +644,8 @@ mod tests {
         assert_eq!(
             out[0],
             CanonicalStreamEvent::ResponseMetadata(omni_core::CanonicalResponseMetadata {
-                id: Some("msg_1".into())
+                id: Some("msg_1".into()),
+                ..Default::default()
             })
         );
         // Text deltas, in order.
@@ -1257,7 +1264,8 @@ mod tests {
         assert_eq!(
             events[0],
             CanonicalStreamEvent::ResponseMetadata(omni_core::CanonicalResponseMetadata {
-                id: Some("msg_s".into())
+                id: Some("msg_s".into()),
+                ..Default::default()
             })
         );
         assert_eq!(events[1], CanonicalStreamEvent::TextDelta("Hello".into()));
@@ -1338,7 +1346,8 @@ mod tests {
         assert_eq!(
             events[0],
             CanonicalStreamEvent::ResponseMetadata(omni_core::CanonicalResponseMetadata {
-                id: Some("msg_e".into())
+                id: Some("msg_e".into()),
+                ..Default::default()
             })
         );
         assert_eq!(events[1], CanonicalStreamEvent::TextDelta("Hi".into()));
@@ -1357,6 +1366,30 @@ mod tests {
             Some(&CanonicalStreamEvent::Finish {
                 finish_reason: Some("stop".into())
             })
+        );
+    }
+
+    #[test]
+    fn stream_converter_surfaces_thinking_deltas() {
+        // WHY: Claude streaming thinking data should be preserved in canonical
+        // reasoning events rather than silently dropped.
+        let mut conv = ClaudeStreamConverter::default();
+        let out = conv.on_event(StreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: BlockDelta::Thinking("think".into()),
+        });
+        assert_eq!(
+            out,
+            vec![CanonicalStreamEvent::ReasoningDelta("think".into())]
+        );
+
+        let out = conv.on_event(StreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: BlockDelta::ThinkingSignature("sig".into()),
+        });
+        assert_eq!(
+            out,
+            vec![CanonicalStreamEvent::ReasoningSignatureDelta("sig".into())]
         );
     }
 }

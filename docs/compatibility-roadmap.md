@@ -3,7 +3,7 @@
 This document tracks go-forward compatibility work across sessions. It covers
 the active compatibility plan only.
 
-Last updated: 2026-06-15.
+Last updated: 2026-06-16.
 
 ## Current Status
 
@@ -11,10 +11,10 @@ Last updated: 2026-06-15.
 |---|---|---|
 | 0. Baseline | Done | Compatibility gaps are documented in `docs/compatibility-gaps.md`; this roadmap now tracks the active go-forward phases. |
 | 1. Extras Contract | Done | Unsupported provider extras now fail loudly, supported extras forward by provider allowlist, and docs list allowlists. |
-| 2. Multimodal Request Core | Next | Highest strategic compatibility priority. Needs canonical media-block design before implementation. |
-| 3. Responses API V1 Expansion | Not started | Needs bounded first scope before implementation. |
-| 4. Rich Output Preservation | Not started | Needs additive response metadata schema before implementation. |
-| 5. Compatibility Matrix | Not started | Cross-cutting verification and docs pass after phases 1 through 4. |
+| 2. Multimodal Request Core | Done | Image URL and base64 image inputs are canonicalized and mapped to Claude, Grok, and Codex. |
+| 3. Responses API V1 Expansion | Done | Codex forwards state, metadata, service tier, response format, and text format; unsupported provider extras still fail loudly. |
+| 4. Rich Output Preservation | Done | Usage details, provider metadata, annotations, response metadata, and non-stream Claude reasoning blocks are additive canonical fields. |
+| 5. Compatibility Matrix | Done | `docs/compatibility-matrix.md` tracks supported request, Responses, and rich-output behavior. |
 
 ## Phase 1: Extras Contract
 
@@ -79,14 +79,11 @@ Done when:
 - Tests cover request parsing, canonical conversion, provider mapping, and
   unsupported cases.
 
-Open decisions:
-
-- Exact canonical media-block shape.
-- Whether to store image bytes, data URLs, or decoded metadata in canonical
-  request types.
-
-Recommendation: first support image URL and base64 only. Defer files and audio
-until image handling is proven.
+Result: `CanonicalBlock::Image` carries either a URL or base64 media type/data.
+OpenAI Chat content arrays and Responses `input_image` parts preserve ordering
+with adjacent text. Claude receives native image blocks, Grok receives
+OpenAI-compatible `image_url` content parts, and Codex receives Responses
+`input_image` parts. Audio and files remain unsupported and fail loudly.
 
 ## Phase 3: Responses API V1 Expansion
 
@@ -106,14 +103,14 @@ Done when:
 - Unsupported Responses tools and item types fail clearly.
 - Responses streaming and non-streaming tests cover new fields.
 
-Open decisions:
+Result: Codex forwards `previous_response_id`, `metadata`, `service_tier`,
+`response_format`, `text`, and `parallel_tool_calls`. Grok continues to forward
+its chat-compatible extras such as `service_tier`, `response_format`, and
+`parallel_tool_calls`; Responses-native state fields remain unsupported for
+Grok. Claude OpenAI-compatible provider extras remain unsupported.
 
-- Which output item types are in the v1 expansion.
-- Which provider-specific fields stay as extras versus canonical fields.
-
-Recommendation: include state, metadata, service tier, structured output, and
-common message/function-call output items first. Defer non-function hosted tools
-until each provider mapping is explicit.
+Deferred: non-function hosted tools and additional provider-specific output item
+types.
 
 ## Phase 4: Rich Output Preservation
 
@@ -133,14 +130,12 @@ Done when:
 - Rich fields are available to clients that opt into reading them.
 - Tests cover provider fields that were previously parsed or available but lost.
 
-Open decisions:
-
-- Exact extension schema.
-- Which fields should be canonical versus provider-namespaced.
-
-Recommendation: keep text, refusal, tool calls, finish reason, and basic usage
-as the stable core. Add usage-details and provider-namespaced extensions around
-that core.
+Result: text, refusal, tool calls, finish reason, and basic usage remain stable.
+Optional canonical fields now preserve usage details, response metadata,
+annotations, and non-stream reasoning blocks. Chat and Responses envelopes emit
+extension fields only when present. Claude streaming thinking deltas are
+canonical events, but public Chat/Responses SSE does not synthesize
+provider-specific reasoning events yet.
 
 ## Phase 5: Compatibility Matrix
 
@@ -159,16 +154,20 @@ Done when:
 - Compatibility fixtures cover the main supported and unsupported cases.
 - Normal test commands remain quota-free.
 
+Result: `docs/compatibility-matrix.md` states supported behavior by API surface
+and provider. Focused hermetic tests cover image inputs, Responses extras,
+rich-output details, and unsupported media errors.
+
 ## Recommended Next Phase
 
-Work on Phase 2 next.
+No remaining compatibility phase from this roadmap is open.
 
-Reason: multimodal request support is now the highest strategic compatibility
-gap. Start with a small canonical image-block design for image URL and base64
-inputs only.
+Recommended next work: run live-provider smoke checks manually with
+`OMNI_LIVE_TESTS=1` when quota and credentials are explicitly approved.
 
 ## Source Documents
 
 - Gap analysis: `docs/compatibility-gaps.md`
+- Compatibility matrix: `docs/compatibility-matrix.md`
 - Project overview: `docs/README.md`
 - Provider notes: `docs/providers/README.md`

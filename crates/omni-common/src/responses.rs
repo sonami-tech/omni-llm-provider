@@ -9,10 +9,11 @@
 //! convention only).
 //!
 //! Scope: text input (string or message items with `input_text`/`output_text`
-//! parts), function tools, and full multi-turn tool conversations
+//! parts), image input (`input_image` with URL or base64 data URL), function
+//! tools, and full multi-turn tool conversations
 //! (`function_call` / `function_call_output` items round-trip through canonical
 //! tool blocks), non-stream and stream. Input shapes the canonical layer still
-//! cannot represent (e.g. `input_image` parts, non-function tools) are rejected
+//! cannot represent (e.g. audio or file parts, non-function tools) are rejected
 //! loudly with a clear error instead of degraded silently.
 //!
 //! The types below are the wire contract. The conversion and SSE-framing
@@ -28,9 +29,9 @@ use serde::{Deserialize, Serialize};
 use crate::http::gateway_only_extra_keys;
 
 use omni_core::{
-    CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
-    CanonicalResponse, CanonicalResponseMetadata, CanonicalStream, CanonicalStreamEvent,
-    CanonicalTool, CanonicalToolChoice,
+    CanonicalBlock, CanonicalContent, CanonicalImageSource, CanonicalMessage, CanonicalReasoning,
+    CanonicalRequest, CanonicalResponse, CanonicalResponseMetadata, CanonicalStream,
+    CanonicalStreamEvent, CanonicalTool, CanonicalToolChoice,
 };
 
 /// The boxed SSE event stream produced by the Responses framer. Boxed so the
@@ -108,14 +109,16 @@ pub enum ResponsesInputContent {
     Parts(Vec<ResponsesContentPart>),
 }
 
-/// One typed content part. Only `input_text` / `output_text` are supported in
-/// v1; anything else (e.g. `input_image`) is rejected by name.
+/// One typed content part. Supports text plus `input_image` with `image_url`.
+/// Other media part types are rejected by name.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ResponsesContentPart {
     #[serde(rename = "type")]
     pub kind: String,
     #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
+    pub image_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -168,6 +171,12 @@ pub struct ResponsesResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ResponsesError>,
     pub usage: ResponsesUsage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -218,6 +227,10 @@ pub struct ResponsesUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens_details: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens_details: Option<serde_json::Value>,
 }
 
 // ── Conversions + SSE framing ─────────────────────────────────────
@@ -239,7 +252,7 @@ pub struct ResponsesUsage {
 /// - flattened function tools -> canonical tools; `tool_choice` "auto" ->
 ///   Auto, "required" -> Required, "none" -> None (tools stay visible, model
 ///   must not call), `{type:"function",name}` -> Specific
-/// - unsupported shapes (unknown item types, non-text parts like `input_image`,
+/// - unsupported shapes (unknown item types, unsupported media parts,
 ///   non-function tools, message items without a role) -> Err naming the offender
 pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest, String> {
     let mut messages: Vec<CanonicalMessage> = Vec::new();
@@ -302,26 +315,10 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
                             .as_deref()
                             .ok_or_else(|| "message input item missing role".to_string())?;
                         let role = if role == "developer" { "system" } else { role };
-                        let text = match item.content.as_ref() {
-                            Some(ResponsesInputContent::Text(t)) => t.clone(),
-                            Some(ResponsesInputContent::Parts(parts)) => {
-                                let mut fragments = Vec::with_capacity(parts.len());
-                                for part in parts {
-                                    if part.kind != "input_text" && part.kind != "output_text" {
-                                        return Err(format!(
-                                            "unsupported content part type: {}",
-                                            part.kind
-                                        ));
-                                    }
-                                    fragments.push(part.text.clone().unwrap_or_default());
-                                }
-                                fragments.join("\n")
-                            }
-                            None => String::new(),
-                        };
+                        let content = responses_content_to_canonical(item.content.as_ref())?;
                         messages.push(CanonicalMessage {
                             role: role.to_string(),
-                            content: CanonicalContent::Text(text),
+                            content,
                         });
                     }
                     Some(other) => {
@@ -404,6 +401,44 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
     })
 }
 
+fn responses_content_to_canonical(
+    content: Option<&ResponsesInputContent>,
+) -> Result<CanonicalContent, String> {
+    match content {
+        Some(ResponsesInputContent::Text(text)) => Ok(CanonicalContent::Text(text.clone())),
+        Some(ResponsesInputContent::Parts(parts)) => {
+            let mut text_fragments = Vec::new();
+            let mut blocks = Vec::with_capacity(parts.len());
+            let mut has_image = false;
+            for part in parts {
+                match part.kind.as_str() {
+                    "input_text" | "output_text" => {
+                        let text = part.text.clone().unwrap_or_default();
+                        text_fragments.push(text.clone());
+                        blocks.push(CanonicalBlock::Text(text));
+                    }
+                    "input_image" => {
+                        let image_url = part.image_url.as_deref().ok_or_else(|| {
+                            "input_image content part missing image_url".to_string()
+                        })?;
+                        blocks.push(CanonicalBlock::Image {
+                            source: CanonicalImageSource::from_image_url(image_url)?,
+                        });
+                        has_image = true;
+                    }
+                    other => return Err(format!("unsupported content part type: {other}")),
+                }
+            }
+            if has_image {
+                Ok(CanonicalContent::Blocks(blocks))
+            } else {
+                Ok(CanonicalContent::Text(text_fragments.join("\n")))
+            }
+        }
+        None => Ok(CanonicalContent::Text(String::new())),
+    }
+}
+
 /// Convert a `CanonicalResponse` into the Responses envelope.
 ///
 /// Contract (pinned by tests): one assistant Message item (output_text part)
@@ -418,6 +453,8 @@ pub fn responses_from_canonical(
     created_at: u64,
 ) -> ResponsesResponse {
     let response_id = canon.id.clone().unwrap_or(response_id);
+    let metadata = canon.metadata.clone();
+    let provider_metadata = responses_provider_metadata_json(&canon);
     let (status, incomplete_details, error) =
         if responses_error_reason(canon.finish_reason.as_deref()).is_some() {
             (
@@ -452,7 +489,7 @@ pub fn responses_from_canonical(
                 kind: "output_text",
                 text: Some(canon.content),
                 refusal: None,
-                annotations: Vec::new(),
+                annotations: canon.annotations.clone(),
             });
         }
         if let Some(refusal) = canon.refusal {
@@ -482,6 +519,7 @@ pub fn responses_from_canonical(
     }
 
     let total = canon.usage.input_tokens + canon.usage.output_tokens;
+    let usage = responses_usage_from_canonical(&canon.usage, total);
 
     ResponsesResponse {
         id: response_id,
@@ -492,12 +530,81 @@ pub fn responses_from_canonical(
         output,
         incomplete_details,
         error,
-        usage: ResponsesUsage {
-            input_tokens: canon.usage.input_tokens,
-            output_tokens: canon.usage.output_tokens,
-            total_tokens: total,
-        },
+        usage,
+        service_tier: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.service_tier.clone()),
+        system_fingerprint: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.system_fingerprint.clone()),
+        provider_metadata,
     }
+}
+
+fn responses_usage_from_canonical(usage: &omni_core::CanonicalUsage, total: u64) -> ResponsesUsage {
+    let has_split_audio = usage.input_audio_tokens != 0 || usage.output_audio_tokens != 0;
+    let input_audio_tokens = if has_split_audio {
+        usage.input_audio_tokens
+    } else {
+        usage.audio_tokens
+    };
+    ResponsesUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        total_tokens: total,
+        input_tokens_details: usage_detail_json(&[
+            ("cached_tokens", usage.cache_read),
+            ("audio_tokens", input_audio_tokens),
+            ("image_tokens", usage.image_tokens),
+        ]),
+        output_tokens_details: usage_detail_json(&[
+            ("reasoning_tokens", usage.reasoning_tokens),
+            ("audio_tokens", usage.output_audio_tokens),
+            (
+                "accepted_prediction_tokens",
+                usage.accepted_prediction_tokens,
+            ),
+            (
+                "rejected_prediction_tokens",
+                usage.rejected_prediction_tokens,
+            ),
+        ]),
+    }
+}
+
+fn usage_detail_json(fields: &[(&str, u64)]) -> Option<serde_json::Value> {
+    let mut details = serde_json::Map::new();
+    for (key, value) in fields {
+        if *value != 0 {
+            details.insert((*key).to_string(), serde_json::Value::from(*value));
+        }
+    }
+    (!details.is_empty()).then_some(serde_json::Value::Object(details))
+}
+
+fn responses_provider_metadata_json(canon: &CanonicalResponse) -> Option<serde_json::Value> {
+    let mut metadata = serde_json::Map::new();
+    if let Some(meta) = &canon.metadata {
+        if let Some(provider) = &meta.provider {
+            metadata.insert(
+                "provider".into(),
+                serde_json::Value::String(provider.clone()),
+            );
+        }
+        if let Some(raw) = &meta.raw {
+            metadata.insert("raw".into(), raw.clone());
+        }
+    }
+    if canon.usage.num_sources_used != 0 {
+        metadata.insert(
+            "num_sources_used".into(),
+            serde_json::Value::from(canon.usage.num_sources_used),
+        );
+    }
+    if !canon.reasoning.is_empty() {
+        metadata.insert("reasoning".into(), serde_json::json!(canon.reasoning));
+    }
+    (!metadata.is_empty()).then_some(serde_json::Value::Object(metadata))
 }
 
 /// Frame a canonical event stream as Responses SSE.
@@ -539,6 +646,37 @@ struct StreamMeta {
     response_id: String,
     created_at: u64,
     model: String,
+    system_fingerprint: Option<String>,
+    service_tier: Option<String>,
+    provider_metadata: Option<serde_json::Value>,
+}
+
+fn apply_stream_metadata(meta: &mut StreamMeta, metadata: CanonicalResponseMetadata) {
+    if let Some(id) = metadata.id {
+        meta.response_id = id;
+    }
+    if metadata.system_fingerprint.is_some() {
+        meta.system_fingerprint = metadata.system_fingerprint;
+    }
+    if metadata.service_tier.is_some() {
+        meta.service_tier = metadata.service_tier;
+    }
+    let mut provider_metadata = meta
+        .provider_metadata
+        .take()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    if let Some(provider) = metadata.provider {
+        provider_metadata.insert("provider".into(), serde_json::Value::String(provider));
+    }
+    if let Some(raw) = metadata.raw {
+        provider_metadata.insert("raw".into(), raw);
+    }
+    if provider_metadata.is_empty() {
+        meta.provider_metadata = None;
+    } else {
+        meta.provider_metadata = Some(serde_json::Value::Object(provider_metadata));
+    }
 }
 
 enum ResponsesStreamOutputItem {
@@ -568,7 +706,8 @@ struct ResponsesStreamSnapshot<'a> {
     message_content_order: &'a [ResponsesContentChannel],
     tool_calls: &'a [ResponsesStreamToolCall],
     output_order: &'a [ResponsesStreamOutputItem],
-    usage: &'a CanonicalUsageAccum,
+    usage: &'a omni_core::CanonicalUsage,
+    annotations: &'a [serde_json::Value],
 }
 
 /// Build the terminal response envelope embedded in `response.completed` /
@@ -590,6 +729,7 @@ fn responses_stream_envelope(
                     snapshot.text,
                     snapshot.refusal,
                     snapshot.message_content_order,
+                    snapshot.annotations,
                 );
                 output.push(serde_json::json!({
                     "type": "message",
@@ -619,6 +759,40 @@ fn responses_stream_envelope(
             ResponsesStreamOutputItem::Message => {}
         }
     }
+    let total = snapshot.usage.input_tokens + snapshot.usage.output_tokens;
+    let has_split_audio =
+        snapshot.usage.input_audio_tokens != 0 || snapshot.usage.output_audio_tokens != 0;
+    let input_audio_tokens = if has_split_audio {
+        snapshot.usage.input_audio_tokens
+    } else {
+        snapshot.usage.audio_tokens
+    };
+    let mut usage = serde_json::json!({
+        "input_tokens": snapshot.usage.input_tokens,
+        "output_tokens": snapshot.usage.output_tokens,
+        "total_tokens": total,
+    });
+    if let Some(details) = usage_detail_json(&[
+        ("cached_tokens", snapshot.usage.cache_read),
+        ("audio_tokens", input_audio_tokens),
+        ("image_tokens", snapshot.usage.image_tokens),
+    ]) {
+        usage["input_tokens_details"] = details;
+    }
+    if let Some(details) = usage_detail_json(&[
+        ("reasoning_tokens", snapshot.usage.reasoning_tokens),
+        ("audio_tokens", snapshot.usage.output_audio_tokens),
+        (
+            "accepted_prediction_tokens",
+            snapshot.usage.accepted_prediction_tokens,
+        ),
+        (
+            "rejected_prediction_tokens",
+            snapshot.usage.rejected_prediction_tokens,
+        ),
+    ]) {
+        usage["output_tokens_details"] = details;
+    }
     let mut envelope = serde_json::json!({
         "id": meta.response_id,
         "object": "response",
@@ -626,22 +800,21 @@ fn responses_stream_envelope(
         "status": status,
         "model": meta.model,
         "output": output,
-        "usage": {
-            "input_tokens": snapshot.usage.input_tokens,
-            "output_tokens": snapshot.usage.output_tokens,
-            "total_tokens": snapshot.usage.input_tokens + snapshot.usage.output_tokens,
-        },
+        "usage": usage,
     });
     if let Some(reason) = incomplete_reason {
         envelope["incomplete_details"] = serde_json::json!({ "reason": reason });
     }
+    if let Some(system_fingerprint) = &meta.system_fingerprint {
+        envelope["system_fingerprint"] = serde_json::json!(system_fingerprint);
+    }
+    if let Some(service_tier) = &meta.service_tier {
+        envelope["service_tier"] = serde_json::json!(service_tier);
+    }
+    if let Some(provider_metadata) = &meta.provider_metadata {
+        envelope["provider_metadata"] = provider_metadata.clone();
+    }
     envelope
-}
-
-#[derive(Default)]
-struct CanonicalUsageAccum {
-    input_tokens: u64,
-    output_tokens: u64,
 }
 
 fn responses_sse_events(
@@ -655,6 +828,9 @@ fn responses_sse_events(
         response_id,
         created_at,
         model: requested_model,
+        system_fingerprint: None,
+        service_tier: None,
+        provider_metadata: None,
     };
     async_stream::stream! {
         let mut seq: u64 = 0;
@@ -662,10 +838,8 @@ fn responses_sse_events(
 
         while let Some(item) = stream.next().await {
             match item {
-                Ok(CanonicalStreamEvent::ResponseMetadata(CanonicalResponseMetadata { id })) => {
-                    if let Some(id) = id {
-                        meta.response_id = id;
-                    }
+                Ok(CanonicalStreamEvent::ResponseMetadata(metadata)) => {
+                    apply_stream_metadata(&mut meta, metadata);
                 }
                 other => {
                     pending_item = Some(other);
@@ -675,7 +849,7 @@ fn responses_sse_events(
         }
 
         // response.created opens the stream (status in_progress, empty output).
-        let created_env = serde_json::json!({
+        let mut created_env = serde_json::json!({
             "id": meta.response_id,
             "object": "response",
             "created_at": meta.created_at,
@@ -683,6 +857,15 @@ fn responses_sse_events(
             "model": meta.model,
             "output": [],
         });
+        if let Some(system_fingerprint) = &meta.system_fingerprint {
+            created_env["system_fingerprint"] = serde_json::json!(system_fingerprint);
+        }
+        if let Some(service_tier) = &meta.service_tier {
+            created_env["service_tier"] = serde_json::json!(service_tier);
+        }
+        if let Some(provider_metadata) = &meta.provider_metadata {
+            created_env["provider_metadata"] = provider_metadata.clone();
+        }
         yield Ok(responses_event(&mut seq, "response.created", serde_json::json!({
             "response": created_env,
         })));
@@ -696,7 +879,8 @@ fn responses_sse_events(
         let mut output_order: Vec<ResponsesStreamOutputItem> = Vec::new();
         // Tool calls in arrival order, indexed by their canonical stream index.
         let mut tool_calls: Vec<ResponsesStreamToolCall> = Vec::new();
-        let mut usage = CanonicalUsageAccum::default();
+        let mut usage = omni_core::CanonicalUsage::default();
+        let mut annotations: Vec<serde_json::Value> = Vec::new();
         let mut finish_reason: Option<String> = None;
         let mut error_message: Option<String> = None;
         let mut saw_finish = false;
@@ -710,10 +894,8 @@ fn responses_sse_events(
                 break;
             };
             match item {
-                Ok(CanonicalStreamEvent::ResponseMetadata(CanonicalResponseMetadata { id })) => {
-                    if let Some(id) = id {
-                        meta.response_id = id;
-                    }
+                Ok(CanonicalStreamEvent::ResponseMetadata(metadata)) => {
+                    apply_stream_metadata(&mut meta, metadata);
                 }
                 Ok(CanonicalStreamEvent::TextDelta(delta)) => {
                     if delta.is_empty() {
@@ -748,7 +930,7 @@ fn responses_sse_events(
                             "output_index": output_index,
                             "content_index": content_index,
                             "item_id": format!("msg_{}", meta.response_id),
-                            "part": responses_content_part_json(ResponsesContentChannel::Text, ""),
+                            "part": responses_content_part_json(ResponsesContentChannel::Text, "", &[]),
                         })));
                     }
                     text.push_str(&delta);
@@ -792,7 +974,7 @@ fn responses_sse_events(
                             "output_index": output_index,
                             "content_index": content_index,
                             "item_id": format!("msg_{}", meta.response_id),
-                            "part": responses_content_part_json(ResponsesContentChannel::Refusal, ""),
+                            "part": responses_content_part_json(ResponsesContentChannel::Refusal, "", &[]),
                         })));
                     }
                     refusal.push_str(&delta);
@@ -802,6 +984,14 @@ fn responses_sse_events(
                         "item_id": format!("msg_{}", meta.response_id),
                         "delta": delta,
                     })));
+                }
+                Ok(CanonicalStreamEvent::ReasoningDelta(_)) |
+                Ok(CanonicalStreamEvent::ReasoningSignatureDelta(_)) => {
+                    // Responses SSE has model-specific reasoning events; Omni
+                    // does not synthesize them from provider-specific deltas yet.
+                }
+                Ok(CanonicalStreamEvent::OutputAnnotations(new_annotations)) => {
+                    annotations.extend(new_annotations);
                 }
                 Ok(CanonicalStreamEvent::ToolCallDelta { index, id, name, arguments_delta }) => {
                     let call_pos = if let Some(pos) = tool_calls
@@ -868,8 +1058,7 @@ fn responses_sse_events(
                     }
                 }
                 Ok(CanonicalStreamEvent::Usage(u)) => {
-                    usage.input_tokens = u.input_tokens;
-                    usage.output_tokens = u.output_tokens;
+                    usage = u;
                 }
                 Ok(CanonicalStreamEvent::Finish { finish_reason: fr }) => {
                     finish_reason = fr;
@@ -894,6 +1083,7 @@ fn responses_sse_events(
             tool_calls: &tool_calls,
             output_order: &output_order,
             usage: &usage,
+            annotations: &annotations,
         };
         if let Some(message) = error_message {
             tracing::warn!(error = %message, "canonical stream error mid-flight (responses)");
@@ -905,6 +1095,7 @@ fn responses_sse_events(
                     &text,
                     &refusal,
                     &message_content_order,
+                    &annotations,
                 ) {
                     yield Ok(event);
                 }
@@ -922,6 +1113,7 @@ fn responses_sse_events(
                     &text,
                     &refusal,
                     &message_content_order,
+                    &annotations,
                 ) {
                     yield Ok(event);
                 }
@@ -939,6 +1131,7 @@ fn responses_sse_events(
                     &text,
                     &refusal,
                     &message_content_order,
+                    &annotations,
                 ) {
                     yield Ok(event);
                 }
@@ -963,6 +1156,7 @@ fn responses_sse_events(
                     &text,
                     &refusal,
                     &message_content_order,
+                    &annotations,
                 ) {
                     yield Ok(event);
                 }
@@ -990,6 +1184,7 @@ fn emit_responses_text_done_events(
     text: &str,
     refusal: &str,
     message_content_order: &[ResponsesContentChannel],
+    annotations: &[serde_json::Value],
 ) -> Vec<Event> {
     let mut events = Vec::new();
     if !text.is_empty() {
@@ -1012,7 +1207,7 @@ fn emit_responses_text_done_events(
                 "output_index": output_index,
                 "content_index": content_index,
                 "item_id": format!("msg_{}", meta.response_id),
-                "part": responses_content_part_json(ResponsesContentChannel::Text, text),
+                "part": responses_content_part_json(ResponsesContentChannel::Text, text, annotations),
             }),
         ));
     }
@@ -1036,7 +1231,7 @@ fn emit_responses_text_done_events(
                 "output_index": output_index,
                 "content_index": content_index,
                 "item_id": format!("msg_{}", meta.response_id),
-                "part": responses_content_part_json(ResponsesContentChannel::Refusal, refusal),
+                "part": responses_content_part_json(ResponsesContentChannel::Refusal, refusal, &[]),
             }),
         ));
     }
@@ -1051,7 +1246,7 @@ fn emit_responses_text_done_events(
                     "id": format!("msg_{}", meta.response_id),
                     "status": "completed",
                     "role": "assistant",
-                    "content": responses_message_content_json(text, refusal, message_content_order),
+                    "content": responses_message_content_json(text, refusal, message_content_order, annotations),
                 },
             }),
         ));
@@ -1103,6 +1298,7 @@ fn responses_message_content_json(
     text: &str,
     refusal: &str,
     message_content_order: &[ResponsesContentChannel],
+    annotations: &[serde_json::Value],
 ) -> Vec<serde_json::Value> {
     let mut content = Vec::new();
     let mut content_order = message_content_order.to_vec();
@@ -1118,7 +1314,7 @@ fn responses_message_content_json(
                 content.push(serde_json::json!({
                     "type": "output_text",
                     "text": text,
-                    "annotations": [],
+                    "annotations": annotations,
                 }));
             }
             ResponsesContentChannel::Refusal if !refusal.is_empty() => {
@@ -1134,12 +1330,16 @@ fn responses_message_content_json(
     content
 }
 
-fn responses_content_part_json(channel: ResponsesContentChannel, value: &str) -> serde_json::Value {
+fn responses_content_part_json(
+    channel: ResponsesContentChannel,
+    value: &str,
+    annotations: &[serde_json::Value],
+) -> serde_json::Value {
     match channel {
         ResponsesContentChannel::Text => serde_json::json!({
             "type": "output_text",
             "text": value,
-            "annotations": [],
+            "annotations": annotations,
         }),
         ResponsesContentChannel::Refusal => serde_json::json!({
             "type": "refusal",
@@ -1211,8 +1411,8 @@ fn responses_error_reason(finish_reason: Option<&str>) -> Option<&str> {
 mod tests {
     use super::*;
     use omni_core::{
-        CanonicalContent, CanonicalResponseMetadata, CanonicalStreamEvent, CanonicalToolCall,
-        CanonicalToolChoice, CanonicalUsage, ProviderError,
+        CanonicalContent, CanonicalImageSource, CanonicalResponseMetadata, CanonicalStreamEvent,
+        CanonicalToolCall, CanonicalToolChoice, CanonicalUsage, ProviderError,
     };
 
     // ---- helpers ----
@@ -1356,6 +1556,51 @@ mod tests {
         );
         let canon = responses_to_canonical(&req).unwrap();
         assert_eq!(text_of(&canon.messages[0].content), "line one\nline two");
+    }
+
+    #[test]
+    fn to_canonical_preserves_input_image_parts_in_order() {
+        // WHY: Responses clients send `input_image` alongside text. Canonical
+        // must preserve the order so providers receive the intended prompt.
+        let req = parse(
+            r#"{"model":"m","input":[{"role":"user","content":[
+                {"type":"input_text","text":"first"},
+                {"type":"input_image","image_url":"https://example.com/a.png"},
+                {"type":"input_text","text":"second"},
+                {"type":"input_image","image_url":"data:image/jpeg;base64,abcd"}
+            ]}]}"#,
+        );
+        let canon = responses_to_canonical(&req).unwrap();
+        match &canon.messages[0].content {
+            CanonicalContent::Blocks(blocks) => {
+                assert!(matches!(&blocks[0], CanonicalBlock::Text(text) if text == "first"));
+                assert!(matches!(
+                    &blocks[1],
+                    CanonicalBlock::Image {
+                        source: CanonicalImageSource::Url { url }
+                    } if url == "https://example.com/a.png"
+                ));
+                assert!(matches!(&blocks[2], CanonicalBlock::Text(text) if text == "second"));
+                assert!(matches!(
+                    &blocks[3],
+                    CanonicalBlock::Image {
+                        source: CanonicalImageSource::Base64 { media_type, data }
+                    } if media_type == "image/jpeg" && data == "abcd"
+                ));
+            }
+            CanonicalContent::Text(_) => panic!("image parts must produce blocks"),
+        }
+    }
+
+    #[test]
+    fn to_canonical_rejects_unsupported_media_parts() {
+        let req = parse(
+            r#"{"model":"m","input":[{"role":"user","content":[
+                {"type":"input_audio","input_audio":{"data":"..."}}
+            ]}]}"#,
+        );
+        let err = responses_to_canonical(&req).expect_err("audio remains unsupported");
+        assert!(err.contains("input_audio"), "error must name part: {err}");
     }
 
     #[test]
@@ -1523,11 +1768,11 @@ mod tests {
     #[test]
     fn to_canonical_rejects_non_text_content_parts() {
         let req = parse(
-            r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_image","image_url":"http://x/y.png"}]}]}"#,
+            r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_file","file_id":"file_1"}]}]}"#,
         );
         let err = responses_to_canonical(&req).expect_err("must reject");
         assert!(
-            err.contains("input_image"),
+            err.contains("input_file"),
             "error must name the unsupported part type, got: {err}"
         );
     }
@@ -1584,6 +1829,7 @@ mod tests {
             },
             id: None,
             refusal: None,
+            ..Default::default()
         }
     }
 
@@ -1726,6 +1972,53 @@ mod tests {
         assert_eq!(v["output"][0]["content"][0]["type"], "refusal");
         assert_eq!(v["output"][0]["content"][0]["refusal"], "No thanks");
         assert!(v["output"][0]["content"][0].get("text").is_none());
+    }
+
+    #[test]
+    fn from_canonical_preserves_annotations_usage_details_and_metadata() {
+        // WHY: Responses clients consume citations/annotations and token-detail
+        // accounting from this envelope; these were previously dropped.
+        let canon = CanonicalResponse {
+            model: "m".into(),
+            content: "answer".into(),
+            usage: CanonicalUsage {
+                input_tokens: 10,
+                output_tokens: 4,
+                cache_read: 2,
+                reasoning_tokens: 8,
+                input_audio_tokens: 5,
+                output_audio_tokens: 6,
+                num_sources_used: 1,
+                ..Default::default()
+            },
+            annotations: vec![serde_json::json!({"type":"url_citation","url":"https://e.test"})],
+            metadata: Some(CanonicalResponseMetadata {
+                service_tier: Some("default".into()),
+                system_fingerprint: Some("fp_resp".into()),
+                provider: Some("codex".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(responses_from_canonical(
+            canon,
+            "m".into(),
+            "resp_x".into(),
+            0,
+        ))
+        .unwrap();
+        assert_eq!(
+            v["output"][0]["content"][0]["annotations"][0]["url"],
+            "https://e.test"
+        );
+        assert_eq!(v["usage"]["input_tokens_details"]["cached_tokens"], 2);
+        assert_eq!(v["usage"]["input_tokens_details"]["audio_tokens"], 5);
+        assert_eq!(v["usage"]["output_tokens_details"]["reasoning_tokens"], 8);
+        assert_eq!(v["usage"]["output_tokens_details"]["audio_tokens"], 6);
+        assert_eq!(v["service_tier"], "default");
+        assert_eq!(v["system_fingerprint"], "fp_resp");
+        assert_eq!(v["provider_metadata"]["provider"], "codex");
+        assert_eq!(v["provider_metadata"]["num_sources_used"], 1);
     }
 
     // ---- SSE streaming framing ----
@@ -1968,6 +2261,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sse_responses_preserves_metadata_annotations_and_usage_details() {
+        // WHY: streaming Responses terminal envelopes should expose the same
+        // additive rich fields as non-streaming responses when providers emit
+        // them during canonical stream parsing.
+        let stream = canonical_stream(vec![
+            Ok(CanonicalStreamEvent::ResponseMetadata(
+                CanonicalResponseMetadata {
+                    id: Some("resp_backend".into()),
+                    system_fingerprint: Some("fp_stream".into()),
+                    service_tier: Some("priority".into()),
+                    provider: Some("codex".into()),
+                    ..Default::default()
+                },
+            )),
+            Ok(CanonicalStreamEvent::TextDelta("Hello".into())),
+            Ok(CanonicalStreamEvent::OutputAnnotations(vec![
+                serde_json::json!({"type":"url_citation","url":"https://e.test"}),
+            ])),
+            Ok(CanonicalStreamEvent::Usage(CanonicalUsage {
+                input_tokens: 9,
+                output_tokens: 3,
+                cache_read: 2,
+                reasoning_tokens: 4,
+                input_audio_tokens: 5,
+                output_audio_tokens: 6,
+                ..Default::default()
+            })),
+            Ok(CanonicalStreamEvent::Finish {
+                finish_reason: Some("stop".into()),
+            }),
+        ]);
+        let sse = sse_from_canonical_stream_responses(stream, "m".into(), "resp_synth".into(), 0);
+        let payloads = data_payloads(&sse_body_to_string(sse).await);
+
+        let created = payloads
+            .iter()
+            .find(|p| p["type"] == "response.created")
+            .expect("created event");
+        assert_eq!(created["response"]["id"], "resp_backend");
+        assert_eq!(created["response"]["system_fingerprint"], "fp_stream");
+        assert_eq!(created["response"]["service_tier"], "priority");
+        assert_eq!(
+            created["response"]["provider_metadata"]["provider"],
+            "codex"
+        );
+
+        let text_part_done = payloads
+            .iter()
+            .find(|p| {
+                p["type"] == "response.content_part.done" && p["part"]["type"] == "output_text"
+            })
+            .expect("text content part done");
+        assert_eq!(
+            text_part_done["part"]["annotations"][0]["url"],
+            "https://e.test"
+        );
+
+        let completed = payloads
+            .iter()
+            .find(|p| p["type"] == "response.completed")
+            .expect("completed event");
+        assert_eq!(completed["response"]["system_fingerprint"], "fp_stream");
+        assert_eq!(completed["response"]["service_tier"], "priority");
+        assert_eq!(
+            completed["response"]["provider_metadata"]["provider"],
+            "codex"
+        );
+        assert_eq!(
+            completed["response"]["output"][0]["content"][0]["annotations"][0]["url"],
+            "https://e.test"
+        );
+        assert_eq!(
+            completed["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+            2
+        );
+        assert_eq!(
+            completed["response"]["usage"]["input_tokens_details"]["audio_tokens"],
+            5
+        );
+        assert_eq!(
+            completed["response"]["usage"]["output_tokens_details"]["reasoning_tokens"],
+            4
+        );
+        assert_eq!(
+            completed["response"]["usage"]["output_tokens_details"]["audio_tokens"],
+            6
+        );
+    }
+
+    #[tokio::test]
     async fn sse_responses_late_tool_metadata_opens_once_with_stable_item_id() {
         // WHY: provider streams should open tool calls with metadata, but this
         // framer is shared. If late metadata reaches it, live SSE must not emit
@@ -2054,6 +2437,7 @@ mod tests {
             Ok(CanonicalStreamEvent::ResponseMetadata(
                 CanonicalResponseMetadata {
                     id: Some("resp_backend".into()),
+                    ..Default::default()
                 },
             )),
             Ok(CanonicalStreamEvent::TextDelta("ok".into())),

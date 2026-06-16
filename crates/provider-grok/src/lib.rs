@@ -32,8 +32,8 @@
 //!   search_parameters (legacy) is deprecated in favor of tools.
 //! - Streaming: SSE on ?stream=true (or "stream":true in body), deltas for content + tool_calls (incremental args).
 //!   Exposed through `LlmProvider::send_stream`.
-//! - Usage: prompt_tokens / completion_tokens + details (cached_tokens in prompt, reasoning_tokens in completion).
-//!   We map the main counters; reasoning_tokens are part of billing but surfaced in provider_extras on future
+//! - Usage: prompt_tokens / completion_tokens + details (cached_tokens/images/audio in prompt,
+//!   reasoning/audio/prediction tokens in completion) map into canonical usage.
 //!   CanonicalResponse extensions if needed.
 //! - Other xAI extensions passed via CanonicalRequest.provider_extras (e.g. service_tier, search_parameters,
 //!   deferred, parallel_tool_calls, response_format for json_schema, etc.). Merged at top level of the wire body.
@@ -59,8 +59,8 @@ use futures_util::StreamExt;
 use omni_common::Replacements;
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalReasoning, CanonicalRequest, CanonicalResponse,
-    CanonicalStream, CanonicalStreamEvent, CanonicalToolCall, CanonicalToolChoice, CanonicalUsage,
-    LlmProvider, ProviderError,
+    CanonicalResponseMetadata, CanonicalStream, CanonicalStreamEvent, CanonicalToolCall,
+    CanonicalToolChoice, CanonicalUsage, LlmProvider, ProviderError,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -446,11 +446,27 @@ fn to_xai_chat_request(
                 // both (e.g. an assistant turn plus its results), so emit every
                 // block rather than dropping siblings.
                 let mut text = String::new();
+                let mut content_parts: Vec<Value> = Vec::new();
                 let mut tool_calls: Vec<Value> = Vec::new();
                 let mut tool_result_msgs: Vec<Value> = Vec::new();
                 for b in blocks {
                     match b {
-                        CanonicalBlock::Text(t) => text.push_str(&repl.apply_prompt(t)),
+                        CanonicalBlock::Text(t) => {
+                            let text_part = repl.apply_prompt(t);
+                            text.push_str(&text_part);
+                            if !text_part.is_empty() {
+                                content_parts.push(json!({
+                                    "type": "text",
+                                    "text": text_part,
+                                }));
+                            }
+                        }
+                        CanonicalBlock::Image { source } => {
+                            content_parts.push(json!({
+                                "type": "image_url",
+                                "image_url": { "url": source.as_image_url() },
+                            }));
+                        }
                         CanonicalBlock::ToolUse {
                             id,
                             name,
@@ -481,17 +497,17 @@ fn to_xai_chat_request(
                 // tool results adds no role message. When there are tool_calls
                 // but no text, content is null per the OpenAI contract; an empty
                 // tool_calls array is omitted.
-                if !text.is_empty() || !tool_calls.is_empty() {
+                if !text.is_empty() || !content_parts.is_empty() || !tool_calls.is_empty() {
                     let mut msg = serde_json::Map::new();
                     msg.insert("role".into(), json!(m.role));
-                    msg.insert(
-                        "content".into(),
-                        if text.is_empty() {
-                            Value::Null
-                        } else {
-                            json!(text)
-                        },
-                    );
+                    let content = if content_parts.iter().any(is_image_part) {
+                        Value::Array(content_parts)
+                    } else if text.is_empty() {
+                        Value::Null
+                    } else {
+                        json!(text)
+                    };
+                    msg.insert("content".into(), content);
                     if !tool_calls.is_empty() {
                         msg.insert("tool_calls".into(), json!(tool_calls));
                     }
@@ -580,6 +596,10 @@ fn to_xai_chat_request(
     // (Real rules for tool names etc. are typically applied by the frontend before producing CanonicalRequest,
     // or the provider ctor would be given a live Replacements instance instead of always empty().)
     Ok(body)
+}
+
+fn is_image_part(value: &Value) -> bool {
+    value.get("type").and_then(|v| v.as_str()) == Some("image_url")
 }
 
 pub fn grok_extra_allowed(key: &str) -> bool {
@@ -740,15 +760,7 @@ fn from_xai_chat_response(raw: XaiChatCompletion, repl: &Replacements) -> Canoni
         };
 
     let usage = if let Some(u) = raw.usage {
-        CanonicalUsage {
-            input_tokens: u.prompt_tokens.unwrap_or(0),
-            output_tokens: u.completion_tokens.unwrap_or(0),
-            cache_read: u
-                .prompt_tokens_details
-                .and_then(|d| d.cached_tokens)
-                .unwrap_or(0),
-            cache_creation: 0,
-        }
+        xai_usage_to_canonical(u)
     } else {
         CanonicalUsage::default()
     };
@@ -760,7 +772,37 @@ fn from_xai_chat_response(raw: XaiChatCompletion, repl: &Replacements) -> Canoni
         tool_calls,
         finish_reason,
         usage,
-        id: response_id,
+        id: response_id.clone(),
+        annotations: Vec::new(),
+        metadata: Some(CanonicalResponseMetadata {
+            id: response_id,
+            system_fingerprint: raw.system_fingerprint,
+            service_tier: raw.service_tier,
+            provider: Some("grok".into()),
+            raw: None,
+        }),
+        reasoning: Vec::new(),
+    }
+}
+
+fn xai_usage_to_canonical(u: XaiUsage) -> CanonicalUsage {
+    let prompt_details = u.prompt_tokens_details.unwrap_or_default();
+    let completion_details = u.completion_tokens_details.unwrap_or_default();
+    let input_audio_tokens = prompt_details.audio_tokens.unwrap_or(0);
+    let output_audio_tokens = completion_details.audio_tokens.unwrap_or(0);
+    CanonicalUsage {
+        input_tokens: u.prompt_tokens.unwrap_or(0),
+        output_tokens: u.completion_tokens.unwrap_or(0),
+        cache_read: prompt_details.cached_tokens.unwrap_or(0),
+        cache_creation: 0,
+        reasoning_tokens: completion_details.reasoning_tokens.unwrap_or(0),
+        audio_tokens: input_audio_tokens + output_audio_tokens,
+        input_audio_tokens,
+        output_audio_tokens,
+        image_tokens: prompt_details.image_tokens.unwrap_or(0),
+        accepted_prediction_tokens: completion_details.accepted_prediction_tokens.unwrap_or(0),
+        rejected_prediction_tokens: completion_details.rejected_prediction_tokens.unwrap_or(0),
+        num_sources_used: u.num_sources_used.unwrap_or(0),
     }
 }
 
@@ -785,6 +827,8 @@ struct XaiStreamChunk {
     id: Option<String>,
     choices: Option<Vec<XaiStreamChoice>>,
     usage: Option<XaiUsage>,
+    system_fingerprint: Option<String>,
+    service_tier: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -836,9 +880,15 @@ fn parse_grok_sse_frame(data: &str) -> Vec<Result<CanonicalStreamEvent, Provider
     };
 
     let mut events: Vec<Result<CanonicalStreamEvent, ProviderError>> = Vec::new();
-    if let Some(id) = chunk.id {
+    if chunk.id.is_some() || chunk.system_fingerprint.is_some() || chunk.service_tier.is_some() {
         events.push(Ok(CanonicalStreamEvent::ResponseMetadata(
-            omni_core::CanonicalResponseMetadata { id: Some(id) },
+            omni_core::CanonicalResponseMetadata {
+                id: chunk.id,
+                system_fingerprint: chunk.system_fingerprint,
+                service_tier: chunk.service_tier,
+                provider: Some("grok".into()),
+                raw: None,
+            },
         )));
     }
 
@@ -874,15 +924,7 @@ fn parse_grok_sse_frame(data: &str) -> Vec<Result<CanonicalStreamEvent, Provider
     }
 
     if let Some(u) = chunk.usage {
-        events.push(Ok(CanonicalStreamEvent::Usage(CanonicalUsage {
-            input_tokens: u.prompt_tokens.unwrap_or(0),
-            output_tokens: u.completion_tokens.unwrap_or(0),
-            cache_read: u
-                .prompt_tokens_details
-                .and_then(|d| d.cached_tokens)
-                .unwrap_or(0),
-            cache_creation: 0,
-        })));
+        events.push(Ok(CanonicalStreamEvent::Usage(xai_usage_to_canonical(u))));
     }
 
     events
@@ -1759,6 +1801,39 @@ mod tests {
         assert_eq!(msg0["content"], "tell REDACTED");
     }
 
+    #[test]
+    fn to_xai_maps_image_blocks_to_chat_content_parts() {
+        // WHY: xAI chat uses OpenAI-compatible image_url parts. Text-only
+        // prompts stay strings, but image prompts must become typed content.
+        let req = CanonicalRequest {
+            model: "grok-4.3".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Blocks(vec![
+                    CanonicalBlock::Text("look".into()),
+                    CanonicalBlock::Image {
+                        source: omni_core::CanonicalImageSource::Url {
+                            url: "https://example.com/a.png".into(),
+                        },
+                    },
+                    CanonicalBlock::Image {
+                        source: omni_core::CanonicalImageSource::Base64 {
+                            media_type: "image/png".into(),
+                            data: "abcd".into(),
+                        },
+                    },
+                ]),
+            }],
+            ..Default::default()
+        };
+        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "look");
+        assert_eq!(content[1]["image_url"]["url"], "https://example.com/a.png");
+        assert_eq!(content[2]["image_url"]["url"], "data:image/png;base64,abcd");
+    }
+
     // --- additional comprehensive mapper + integration coverage ---
 
     #[test]
@@ -1835,7 +1910,70 @@ mod tests {
         assert_eq!(canon.content, "ok");
         assert_eq!(canon.refusal.as_deref(), Some("policy"));
         assert_eq!(canon.usage.input_tokens, 2);
-        // note: reasoning_tokens not mapped into core usage yet
+        assert_eq!(canon.usage.reasoning_tokens, 10);
+    }
+
+    #[test]
+    fn from_xai_preserves_metadata_and_usage_details() {
+        // WHY: xAI exposes useful observability fields that were previously
+        // parsed and dropped.
+        let raw = XaiChatCompletion {
+            id: Some("chatcmpl_meta".into()),
+            model: Some("grok-4.3".into()),
+            system_fingerprint: Some("fp_x".into()),
+            service_tier: Some("priority".into()),
+            choices: Some(vec![XaiChoice {
+                message: Some(XaiAssistantMessage {
+                    content: Some("ok".into()),
+                    ..Default::default()
+                }),
+                finish_reason: Some("stop".into()),
+                ..Default::default()
+            }]),
+            usage: Some(XaiUsage {
+                prompt_tokens: Some(5),
+                completion_tokens: Some(2),
+                prompt_tokens_details: Some(XaiPromptDetails {
+                    cached_tokens: Some(1),
+                    audio_tokens: Some(5),
+                    image_tokens: Some(4),
+                    ..Default::default()
+                }),
+                completion_tokens_details: Some(XaiCompletionDetails {
+                    reasoning_tokens: Some(7),
+                    audio_tokens: Some(6),
+                    accepted_prediction_tokens: Some(8),
+                    rejected_prediction_tokens: Some(9),
+                }),
+                num_sources_used: Some(3),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let canon = from_xai_chat_response(raw, &empty_repl());
+        assert_eq!(
+            canon
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.system_fingerprint.as_deref()),
+            Some("fp_x")
+        );
+        assert_eq!(
+            canon
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.service_tier.as_deref()),
+            Some("priority")
+        );
+        assert_eq!(canon.usage.cache_read, 1);
+        assert_eq!(canon.usage.audio_tokens, 11);
+        assert_eq!(canon.usage.input_audio_tokens, 5);
+        assert_eq!(canon.usage.output_audio_tokens, 6);
+        assert_eq!(canon.usage.image_tokens, 4);
+        assert_eq!(canon.usage.reasoning_tokens, 7);
+        assert_eq!(canon.usage.accepted_prediction_tokens, 8);
+        assert_eq!(canon.usage.rejected_prediction_tokens, 9);
+        assert_eq!(canon.usage.num_sources_used, 3);
     }
 
     #[test]
@@ -2181,7 +2319,7 @@ mod tests {
         assert_eq!(canon.usage.input_tokens, 20);
         assert_eq!(canon.usage.output_tokens, 7);
         assert_eq!(canon.usage.cache_read, 5);
-        // citations / num_sources / reasoning_tokens not yet lifted into canonical; tolerated here
+        // citations stay provider-specific; usage details are lifted into canonical.
     }
 
     #[test]
@@ -2964,6 +3102,7 @@ mod tests {
                     output_tokens: 7,
                     cache_read: 0,
                     cache_creation: 0,
+                    ..Default::default()
                 }),
                 // exactly one terminal Finish, carrying the reason seen on the finish frame.
                 CanonicalStreamEvent::Finish {
@@ -2978,7 +3117,7 @@ mod tests {
         // WHY: Responses streaming needs native response ids and refusal
         // deltas when xAI includes them in OpenAI-compatible stream chunks.
         let events = drive_sse(&[
-            b"data: {\"id\":\"chatcmpl_stream\",\"choices\":[{\"delta\":{\"refusal\":\"blocked\"}}]}\n\n",
+            b"data: {\"id\":\"chatcmpl_stream\",\"system_fingerprint\":\"fp_stream\",\"service_tier\":\"priority\",\"choices\":[{\"delta\":{\"refusal\":\"blocked\"}}]}\n\n",
             b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n",
             b"data: [DONE]\n\n",
         ]);
@@ -2989,7 +3128,11 @@ mod tests {
         assert_eq!(
             events[0],
             CanonicalStreamEvent::ResponseMetadata(omni_core::CanonicalResponseMetadata {
-                id: Some("chatcmpl_stream".into())
+                id: Some("chatcmpl_stream".into()),
+                system_fingerprint: Some("fp_stream".into()),
+                service_tier: Some("priority".into()),
+                provider: Some("grok".into()),
+                ..Default::default()
             })
         );
         assert_eq!(
@@ -3355,6 +3498,8 @@ mod tests {
             vec![
                 CanonicalStreamEvent::ResponseMetadata(omni_core::CanonicalResponseMetadata {
                     id: Some("chatcmpl_stream".into()),
+                    provider: Some("grok".into()),
+                    ..Default::default()
                 }),
                 CanonicalStreamEvent::TextDelta("Hello".into()),
                 CanonicalStreamEvent::RefusalDelta("No".into()),
@@ -3369,6 +3514,7 @@ mod tests {
                     output_tokens: 7,
                     cache_read: 0,
                     cache_creation: 0,
+                    ..Default::default()
                 }),
                 CanonicalStreamEvent::Finish {
                     finish_reason: Some("tool_calls".into()),
