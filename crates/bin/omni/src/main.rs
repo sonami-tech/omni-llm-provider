@@ -633,6 +633,7 @@ fn startup_summary_lines(
         format!("providers: {}", enabled.join(",")),
         format!("models: {model_text}"),
         format!("aliases: {alias_text}"),
+        "endpoints: OpenAI Responses POST /v1/responses; OpenAI Chat Completions POST /v1/chat/completions; Anthropic Messages POST /v1/messages".to_string(),
         format!("try: curl http://{addr}/health"),
         format!("models endpoint: curl http://{addr}/v1/models"),
         format!("stats endpoint: curl http://{addr}/stats"),
@@ -1892,10 +1893,11 @@ mod tests {
     }
 
     #[test]
-    fn test_startup_summary_lists_models_before_aliases_left_aligned() {
+    fn test_startup_summary_lists_models_aliases_and_endpoints_left_aligned() {
         // WHY: the launch screen is operator-facing. Active provider models
-        // must appear before aliases, and summary lines must not be padded with
-        // leading spaces.
+        // must appear before aliases, the HTTP entrypoints should be visible in
+        // the same cluster, and summary lines must not be padded with leading
+        // spaces.
         let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
         providers.insert("claude".into(), claude_entry());
         providers.insert("grok".into(), grok_entry("http://127.0.0.1:1"));
@@ -1910,7 +1912,21 @@ mod tests {
             .iter()
             .position(|line| line.starts_with("aliases: "))
             .expect("aliases line present");
+        let endpoints_pos = lines
+            .iter()
+            .position(|line| line.starts_with("endpoints: "))
+            .expect("endpoints line present");
         assert!(models_pos < aliases_pos, "models line must precede aliases");
+        assert!(
+            aliases_pos < endpoints_pos,
+            "endpoints line must follow aliases"
+        );
+        let endpoints = &lines[endpoints_pos];
+        assert!(endpoints.contains("OpenAI Responses POST /v1/responses"));
+        assert!(endpoints.contains(
+            "OpenAI Chat Completions POST /v1/chat/completions"
+        ));
+        assert!(endpoints.contains("Anthropic Messages POST /v1/messages"));
         assert!(
             lines.iter().all(|line| !line.starts_with(' ')),
             "startup summary lines must be left-aligned: {lines:?}"
