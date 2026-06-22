@@ -1923,9 +1923,7 @@ mod tests {
         );
         let endpoints = &lines[endpoints_pos];
         assert!(endpoints.contains("OpenAI Responses POST /v1/responses"));
-        assert!(endpoints.contains(
-            "OpenAI Chat Completions POST /v1/chat/completions"
-        ));
+        assert!(endpoints.contains("OpenAI Chat Completions POST /v1/chat/completions"));
         assert!(endpoints.contains("Anthropic Messages POST /v1/messages"));
         assert!(
             lines.iter().all(|line| !line.starts_with(' ')),

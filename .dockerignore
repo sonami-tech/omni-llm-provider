@@ -1,0 +1,9 @@
+target/
+.git/
+.claude/
+.codex/
+.agents/
+research/
+design/
+*.md
+!README.md

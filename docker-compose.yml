@@ -1,0 +1,14 @@
+services:
+  omni:
+    image: ghcr.io/sonami-tech/omni-llm-provider:latest
+    container_name: omni
+    restart: unless-stopped
+    ports:
+      - "18321:18321"
+    volumes:
+      - ~/.claude:/root/.claude:ro
+      - ~/.xai:/root/.xai:ro
+      - ~/.codex:/root/.codex:ro
+    environment:
+      OMNI_API_KEYS: ${OMNI_API_KEYS:-}
+      # Same image is also published as ghcr.io/sonami-tech/claude-code-provider
