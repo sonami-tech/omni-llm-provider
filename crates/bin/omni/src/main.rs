@@ -4780,7 +4780,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         let mut map: HashMap<String, ProviderEntry> = HashMap::new();
         map.insert(
             "claude".into(),
-            claude_entry_with_base("http://127.0.0.1:1"),
+            claude_custom_entry_with_base("http://127.0.0.1:1"),
         );
         let state = state_with(map);
         let req = ChatCompletionRequest {
@@ -5319,7 +5319,7 @@ rule = [
         let mut map: HashMap<String, ProviderEntry> = HashMap::new();
         map.insert(
             "claude".into(),
-            claude_entry_with_base("http://127.0.0.1:1"),
+            claude_custom_entry_with_base("http://127.0.0.1:1"),
         );
         let state = state_with(map);
         let req: ChatCompletionRequest = serde_json::from_str(
