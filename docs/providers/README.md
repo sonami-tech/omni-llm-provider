@@ -5,10 +5,25 @@ Omni has one server binary, but provider maintenance stays provider-specific.
 - Claude: `docs/providers/claude/README.md`
 - Grok: `docs/providers/grok/README.md`
 - Codex: `docs/providers/codex/README.md`
+- Shared capture and refresh-capture tooling: `tools/capture/`
 
 Default tests are hermetic. Any test or tool that calls a live provider, spends
 quota, or captures credentials must be explicitly opted into and run by an
 operator.
+
+## Capture Policy
+
+Use the shared Python capture framework for provider wire baselines and OAuth
+refresh-capture work:
+
+```sh
+python3 -m tools.capture capture run --provider claude --mode general --dry-run
+python3 -m tools.capture capture run --provider grok --mode general --dry-run
+python3 -m tools.capture capture run --provider codex --mode general --dry-run
+```
+
+Live capture requires `--live-capture` or `OMNI_CAPTURE_LIVE=1`. Refresh capture
+also requires `--refresh-capture` or `OMNI_CAPTURE_REFRESH=1`.
 
 ## Live Test Policy
 

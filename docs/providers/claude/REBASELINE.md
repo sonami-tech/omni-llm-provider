@@ -12,12 +12,16 @@ upstream.
 - Use clean HOME/CWD captures so project or user instruction files are not
   copied into request bodies or reports.
 - Do not run live capture without explicit operator approval.
+- Refresh capture additionally mutates only the staged credential copy to force
+  expiry. Never edit the real credential file for capture.
 
 ## Tools
 
+- Shared capture CLI: `python3 -m tools.capture` (source of truth for live
+  capture, refresh capture, staging, MITM, extraction, and cleanup)
 - `tools/providers/claude/fingerprint/check_claude_code_drift.py`
-- `tools/providers/claude/fingerprint/capture_baseline.sh`
-- `tools/providers/claude/fingerprint/extract_flow.py`
+- `tools/providers/claude/fingerprint/capture_baseline.sh` (thin wrapper; prefer the shared CLI for new work)
+- `tools/providers/claude/fingerprint/extract_flow.py` (compatibility wrapper around `tools.capture extract flow`)
 - `tools/providers/claude/fingerprint/BASELINE_HEADERS.md`
 - `tools/providers/claude/fingerprint/CCH_ALGORITHM.md`
 - `tools/providers/claude/fingerprint/vectors/`
@@ -33,17 +37,37 @@ upstream.
    Continue only if `status` is not `ok`, or if a provider rejection requires a
    fresh capture despite a matching version.
 
-2. Capture live traffic on tmpfs:
+2. Capture live traffic on tmpfs (requires `OMNI_CAPTURE_LIVE=1` or `--live-capture`):
+
+   ```sh
+   python3 -m tools.capture capture run \
+     --provider claude --mode general --live-capture \
+     --models claude-fable-5 claude-haiku-4-5 claude-sonnet-4-6 claude-opus-4-8
+   ```
+
+   The legacy wrapper remains for compatibility:
 
    ```sh
    tools/providers/claude/fingerprint/capture_baseline.sh \
      claude-fable-5 claude-haiku-4-5 claude-sonnet-4-6 claude-opus-4-8
    ```
 
-   The helper starts mitmdump as a reverse proxy to `https://api.anthropic.com`,
-   copies only Claude credentials into a clean tmpfs HOME, drives the installed
+   Both helpers start mitmdump as a reverse proxy to `https://api.anthropic.com`,
+   copy only Claude credentials into a clean tmpfs HOME, drive the installed
    `claude` CLI from that clean HOME/CWD, extracts a redacted structural
-   Markdown report, and removes the token-bearing flow unless `KEEP_FLOW=1`.
+   Markdown report, and removes the tmpfs workdir (including staged credential
+   copies) unless `KEEP_FLOW=1`. `KEEP_FLOW=1` retains the workdir and raw flow
+   on tmpfs and prints warnings.
+
+   Refresh validation proves Anthropic API-host traffic through the reverse
+   proxy. Separate auth-host proof awaits a stable observed auth endpoint.
+
+   Refresh capture command:
+
+   ```sh
+   python3 -m tools.capture capture run \
+     --provider claude --mode refresh --live-capture --refresh-capture
+   ```
 
 3. Analyze the extract:
 
@@ -79,6 +103,7 @@ upstream.
 
    - `tools/providers/claude/fingerprint/BASELINE_HEADERS.md`
    - `docs/providers/claude/README.md` only if structure or invariant changed.
+   - `docs/providers/README.md` only if shared capture policy changed.
 
 7. Verify:
 

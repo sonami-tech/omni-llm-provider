@@ -9,6 +9,36 @@ shape, or credential behavior.
 - Never commit raw captures or unredacted headers.
 - Do not call xAI or run a MITM capture without explicit operator approval.
 
+## Shared Capture CLI
+
+For provider wire drift, prefer the shared capture framework in `tools/capture/`:
+
+```sh
+# General capture (requires OMNI_CAPTURE_LIVE=1 or --live-capture)
+python3 -m tools.capture capture run --provider grok --mode general --live-capture
+
+# Refresh capture forces stale credentials and also needs OMNI_CAPTURE_REFRESH=1
+python3 -m tools.capture capture run --provider grok --mode refresh \
+  --live-capture --refresh-capture
+
+# Dry-run prints the planned mitmdump and grok commands without network I/O
+python3 -m tools.capture capture run --provider grok --mode general --dry-run
+```
+
+Dry-run uses placeholder credential paths only. It does not copy real credentials
+or create a tmpfs workdir.
+
+The shared CLI stages credentials into a clean tmpfs HOME, drives `grok --single`
+through a local mitmproxy, and writes a redacted Markdown extract. Live runs
+remove the tmpfs workdir (including staged credential copies) by default.
+`KEEP_FLOW=1` retains the workdir and raw flow on tmpfs and prints warnings.
+Use `tools.capture extract flow` for mitmproxy `.flow` files. Refresh capture
+requires OIDC credentials in `~/.grok/auth.json`; static xAI key files cannot be
+force-expired.
+
+`tools/providers/grok/capture/extract_grok_http.py` remains a compatibility
+wrapper around `tools.capture extract jsonl` for sanitized JSONL exports.
+
 ## Procedure
 
 1. Start a local Omni server with only Grok enabled:
@@ -37,6 +67,12 @@ shape, or credential behavior.
      `Authorization` before storing any report.
 
 4. Extract and review with:
+
+   ```sh
+   python3 -m tools.capture extract jsonl <capture-jsonl> --provider grok
+   ```
+
+   Or the compatibility wrapper:
 
    ```sh
    python3 tools/providers/grok/capture/extract_grok_http.py <capture-jsonl>

@@ -61,7 +61,7 @@ They are **translatable** with a canonical internal representation (see redclaw'
 ### Internal CLI models (from `~/.grok/models_cache.json` and `grok models`)
 These are what the Grok Build TUI actually uses:
 - `grok-build` (default for advanced coding; 512k context in cache; "Best for advanced coding tasks"; uses `grok-build-plan` agent type; supports backend search).
-- `grok-composer-2.5-fast` ("Composer 2.5" — "Cursor's latest coding model"; 200k context; `agent_type: "cursor"`).
+- `grok-composer-2.5-fast` ("Composer 2.5" - "Cursor's latest coding model"; 200k context; `agent_type: "cursor"`).
 
 Run `grok models` locally for the live list (it prefetches from the proxy).
 
@@ -83,7 +83,7 @@ The proxy requires special "fingerprint" headers (see below) and the session JWT
 
 ---
 
-## 3. How to Connect — Full MITM Investigation and Header Discovery
+## 3. How to Connect - Full MITM Investigation and Header Discovery
 
 ### Background and Why MITM Was Needed
 The Grok Build CLI (`~/.grok/bin/grok`) talks to `cli-chat-proxy.grok.com/v1` using the user's `grok login` session (OIDC JWT stored in `~/.grok/auth.json`).
@@ -277,18 +277,21 @@ Inbound: normalize back to canonical, then apply response replacements.
 4. **Compression:** Many responses come gzipped/br; let the HTTP client handle it.
 5. **Model names:** Internal names (`grok-build`) vs public (`grok-build-0.1`). Use `x-grok-model-override` on the proxy.
 6. **Streaming vs non-stream:** Proxy often prefers streaming internally; non-stream works for simple tests.
-7. **For other LLMs:** Re-run the exact mitm command with the target binary (grok, claude, etc.) to re-capture when versions change. Keep `SSLKEYLOGFILE` + pcap as backup when strace can't see plaintext (TLS).
+7. **For other LLMs:** Use the shared capture framework in `tools/capture/` to re-capture when provider binaries or credentials change. Keep `SSLKEYLOGFILE` + pcap as backup when strace cannot see plaintext TLS.
 8. **Translation cost:** Expect to maintain per-format tool arg serialization, reasoning block mapping, and error shaping. Test with real agent loops (not just "say hello").
 
-### Reproducible Next Steps for Another LLM
-1. `ls ~/.grok/auth.json` and extract the JWT + user_id.
-2. Install mitmproxy if needed; run the capture command above with a fresh prompt.
+### Historical Next Steps
+This section is retained as investigation context. For current operations, use
+`docs/providers/grok/CAPTURE.md` and `python3 -m tools.capture`.
+
+1. Confirm `~/.grok/auth.json` exists. Do not extract or paste JWTs into notes.
+2. Install mitmproxy if needed; run the shared capture command with a fresh prompt.
 3. Parse the log for the POST to `/v1/responses` (or `/chat/completions`).
 4. Copy the exact header set into your client (OpenAI SDK `default_headers` or `extra_headers`).
 5. Test `client.chat.completions.create` and `client.responses.create` (if SDK supports) with `x-grok-model-override`.
 6. For omni-llm-provider: implement a `grok` provider crate that injects the fingerprint and chooses `/responses` for agentic models.
 7. Add tests that assert the exact headers are sent (like the contract tests in redclaw-llm).
-8. When the binary updates, re-capture and bump the version string in code/config.
+8. When the binary updates, re-capture through `tools/capture/` and update code/config only after tests pin the new behavior.
 
 This report should let another system (or LLM) reproduce the entire connection process, understand why plain OpenAI calls fail, and implement robust multi-format support without repeating the discovery work.
 

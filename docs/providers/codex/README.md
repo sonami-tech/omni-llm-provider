@@ -80,3 +80,43 @@ forwards them to the upstream Responses-compatible body:
 - `service_tier`
 
 Unsupported extras fail loudly.
+
+## Capture
+
+Use the shared capture framework in `tools/capture/` when Codex wire behavior,
+auth refresh, or custom `base_url` routing changes:
+
+```sh
+# General capture (requires OMNI_CAPTURE_LIVE=1 or --live-capture)
+python3 -m tools.capture capture run --provider codex --mode general --live-capture
+
+# Refresh capture forces stale auth and also needs OMNI_CAPTURE_REFRESH=1
+python3 -m tools.capture capture run --provider codex --mode refresh \
+  --live-capture --refresh-capture
+
+# Dry-run prints the planned mitmdump and codex commands without network I/O
+python3 -m tools.capture capture run --provider codex --mode general --dry-run
+```
+
+Refresh validation proves traffic to the selected API `base_url` (from
+`openai_base_url` or `[model_providers.<id>].base_url`). Separate auth-host proof
+awaits a stable observed auth endpoint; do not invent auth hosts.
+
+Dry-run uses placeholder credential paths only. It does not copy real credentials
+or create a tmpfs workdir.
+
+The shared CLI copies `config.toml` and `auth.json` into an isolated
+`CODEX_HOME`, runs `codex exec -c 'mcp_servers={}' -` with the prompt on stdin,
+and records traffic through a local mitmproxy. Live runs remove the tmpfs workdir
+(including staged credential copies) by default. `KEEP_FLOW=1` retains the
+workdir and raw flow on tmpfs and prints warnings. Extract with:
+
+```sh
+python3 -m tools.capture extract flow <capture.flow> --provider codex
+```
+
+Raw `.flow` files contain live bearer tokens. Keep them on tmpfs only and never
+commit them.
+
+Refresh capture requires `auth.json`; API-key-only Codex setups cannot prove the
+OAuth refresh path.

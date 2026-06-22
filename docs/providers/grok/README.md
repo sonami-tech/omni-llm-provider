@@ -8,7 +8,8 @@ Grok-specific behavior lives in `crates/provider-grok`.
 - Credential loader: `crates/provider-grok/src/credentials.rs`
 - Gate notes: `docs/grok-gate.md`
 - Capture procedure: `docs/providers/grok/CAPTURE.md`
-- Capture tooling: `tools/providers/grok/capture/`
+- Shared capture framework: `tools/capture/`
+- Compatibility capture wrappers: `tools/providers/grok/capture/`
 
 ## Invariant
 
@@ -30,6 +31,9 @@ uses `XAI_API_KEY` per request only, or no Authorization header if it is unset.
 The default xAI credential files must not be sent to a custom endpoint.
 
 Default tests use wiremock. Live xAI calls require `OMNI_LIVE_TESTS=1`.
+
+Capture and refresh-capture work uses `python3 -m tools.capture`; see
+`docs/providers/grok/CAPTURE.md`.
 
 ## Provider Extras
 

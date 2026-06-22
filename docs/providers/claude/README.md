@@ -10,7 +10,9 @@ Claude-specific behavior lives in `crates/provider-claude`.
 - Credentials: `crates/provider-claude/src/credentials.rs`
 - Upstream HTTP and streaming: `crates/provider-claude/src/upstream.rs`
 - Rebaseline procedure: `docs/providers/claude/REBASELINE.md`
-- Fingerprint tooling: `tools/providers/claude/fingerprint/`
+- Shared capture framework: `tools/capture/`
+- Claude fingerprint tooling and compatibility wrappers:
+  `tools/providers/claude/fingerprint/`
 
 ## Invariant
 
