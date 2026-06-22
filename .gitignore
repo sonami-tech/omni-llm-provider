@@ -1,9 +1,0 @@
-/target
-/research
-
-# Claude Code session state.
-/.claude
-
-# Python tooling artifacts (pytest integration tests).
-__pycache__/
-.pytest_cache/
