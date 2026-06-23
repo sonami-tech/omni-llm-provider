@@ -60,7 +60,8 @@ use omni_common::Replacements;
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalReasoning, CanonicalRequest, CanonicalResponse,
     CanonicalResponseMetadata, CanonicalStream, CanonicalStreamEvent, CanonicalToolCall,
-    CanonicalToolChoice, CanonicalUsage, LlmProvider, ProviderError,
+    CanonicalToolChoice, CanonicalUsage, CatalogMode, CatalogModel, LlmProvider, ProviderError,
+    ProviderVersion,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -76,42 +77,43 @@ static GROK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
 
-const GROK_MODELS: &[GrokModelDef] = &[
-    GrokModelDef {
-        id: "grok-4.3",
-        aliases: &["grok", "grok-4", "grok-3"],
-    },
-    GrokModelDef {
-        id: "grok-build",
-        aliases: &["build"],
-    },
-    GrokModelDef {
-        id: "grok-build-0.1",
-        aliases: &[],
-    },
-    GrokModelDef {
-        id: "grok-composer-2.5-fast",
-        aliases: &["composer"],
-    },
-    GrokModelDef {
-        id: "grok-4.20-0309-reasoning",
-        aliases: &[],
-    },
-    GrokModelDef {
-        id: "grok-4.20-0309-non-reasoning",
-        aliases: &[],
-    },
+// Grok catalogs, verified 2026-06-22 via live capture (see
+// docs/providers/grok/README.md and the grok-codex-live-catalog-probe memory).
+//
+// CONSERVATIVE = what the installed grok-shell 0.2.60 CLI advertises on its own
+// surface (cli-chat-proxy.grok.com /v1/models): exactly these two. Byte-exact CLI
+// protocol parity for this list lands in Phase 2.
+//
+// EXTENDED (default) = the api.x.ai /v1/chat/completions surface this provider
+// already speaks - the most optimal working surface for us. The list is the
+// verified union of api.x.ai advertised+chat-OK ids and ids that returned 200 on
+// chat/completions but are not advertised (work-but-unlisted). Aliases are
+// inbound-only conveniences (never emitted from /v1/models).
+const GROK_CONSERVATIVE_0_2_60: &[CatalogModel] = &[
+    CatalogModel::new("grok-build", &["build"]),
+    CatalogModel::new("grok-composer-2.5-fast", &["composer"]),
 ];
 
-/// xAI chat model entry and aliases verified against `/v1/chat/completions`.
-///
-/// Aliases are accepted inbound conveniences only. They are not emitted from
-/// `/v1/models`, which keeps that surface limited to real upstream IDs.
-#[derive(Debug, Clone, Copy)]
-pub struct GrokModelDef {
-    pub id: &'static str,
-    pub aliases: &'static [&'static str],
-}
+const GROK_EXTENDED_0_2_60: &[CatalogModel] = &[
+    CatalogModel::new("grok-4.3", &["grok", "grok-latest"]),
+    CatalogModel::new("grok-build-0.1", &[]),
+    CatalogModel::new("grok-4.20-0309-reasoning", &[]),
+    CatalogModel::new("grok-4.20-0309-non-reasoning", &[]),
+    // work-but-unlisted on api.x.ai (verified 200 on /v1/chat/completions):
+    CatalogModel::new("grok-3", &[]),
+    CatalogModel::new("grok-4", &[]),
+    CatalogModel::new("grok-build", &["build"]),
+    CatalogModel::new("grok-composer-2.5-fast", &["composer"]),
+];
+
+/// Grok version catalog, newest-first. The version string is the installed
+/// grok-shell CLI version this catalog was verified against.
+static GROK_VERSIONS: &[ProviderVersion] = &[ProviderVersion {
+    version: "0.2.60",
+    conservative: GROK_CONSERVATIVE_0_2_60,
+    extended: GROK_EXTENDED_0_2_60,
+    default_model: "grok-4.3",
+}];
 
 /// OpenAI-compatible model entry exposed by the server's `/v1/models` route.
 #[derive(Debug, Clone, Serialize)]
@@ -136,6 +138,12 @@ pub struct GrokProvider {
     client: Client,
     base_url: String,
     auth: GrokAuthConfig,
+    /// Catalog mode (conservative = advertised-only, extended = optimal working
+    /// surface). Default Extended. Selects which catalog `models_list`,
+    /// `model_aliases`, and inbound model resolution use.
+    mode: CatalogMode,
+    /// Pinned version from the provider's own catalog. Default newest.
+    version: &'static ProviderVersion,
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +187,8 @@ impl GrokProvider {
             auth: GrokAuthConfig::Default {
                 fallback_api_key: api_key,
             },
+            mode: CatalogMode::default(),
+            version: &GROK_VERSIONS[0],
         })
     }
 
@@ -208,6 +218,35 @@ impl GrokProvider {
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into().trim_end_matches('/').to_string();
         self
+    }
+
+    /// Set the catalog mode (conservative vs extended). Chainable. Default Extended.
+    pub fn with_mode(mut self, mode: CatalogMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Pin a specific version from the provider's catalog. Chainable. Default
+    /// newest. Returns `Err` listing available versions if `version` is unknown
+    /// (exact-or-fail; no closest match).
+    pub fn with_version(mut self, version: &str) -> Result<Self, ProviderError> {
+        let found = GROK_VERSIONS
+            .iter()
+            .find(|v| v.version == version)
+            .ok_or_else(|| {
+                let available: Vec<&str> = GROK_VERSIONS.iter().map(|v| v.version).collect();
+                ProviderError::Other(anyhow::Error::msg(format!(
+                    "unknown grok version {version:?}; available: [{}]",
+                    available.join(", ")
+                )))
+            })?;
+        self.version = found;
+        Ok(self)
+    }
+
+    /// The active catalog for the current mode + pinned version.
+    fn active_catalog(&self) -> &'static [CatalogModel] {
+        self.version.catalog(self.mode)
     }
 
     /// Configure this provider as a custom OpenAI-compatible endpoint.
@@ -261,6 +300,8 @@ impl GrokProvider {
             auth: GrokAuthConfig::Default {
                 fallback_api_key: Some(api_key.into()),
             },
+            mode: CatalogMode::default(),
+            version: &GROK_VERSIONS[0],
         }
     }
 
@@ -269,28 +310,30 @@ impl GrokProvider {
         &self.base_url
     }
 
-    /// Static xAI model catalog for `/v1/models`.
-    pub fn models_list() -> Vec<GrokModelInfo> {
-        GROK_MODELS
-            .iter()
-            .map(|model| GrokModelInfo {
-                id: model.id.to_string(),
-                object: "model",
-                created: 0,
-                owned_by: "grok",
-            })
-            .collect()
+    /// xAI model catalog for `/v1/models`, for this provider's active mode+version.
+    pub fn models_list(&self) -> Vec<GrokModelInfo> {
+        catalog_models_list(self.active_catalog())
     }
 
-    /// Static alias map for router-level shorthand support.
-    pub fn model_aliases() -> Vec<(&'static str, &'static str)> {
-        GROK_MODELS
-            .iter()
-            .flat_map(|model| {
-                std::iter::once((model.id, model.id))
-                    .chain(model.aliases.iter().map(move |alias| (*alias, model.id)))
-            })
-            .collect()
+    /// Alias map for router-level shorthand support, for the active mode+version.
+    pub fn model_aliases(&self) -> Vec<(&'static str, &'static str)> {
+        catalog_model_aliases(self.active_catalog())
+    }
+
+    /// Default (newest version, extended mode) `/v1/models` list, for startup
+    /// sites that run before a provider instance exists.
+    pub fn default_models_list() -> Vec<GrokModelInfo> {
+        catalog_models_list(GROK_VERSIONS[0].extended)
+    }
+
+    /// Default (newest version, extended mode) alias map, for startup sites.
+    pub fn default_model_aliases() -> Vec<(&'static str, &'static str)> {
+        catalog_model_aliases(GROK_VERSIONS[0].extended)
+    }
+
+    /// The provider's version catalog (newest-first).
+    pub fn version_catalog() -> &'static [ProviderVersion] {
+        GROK_VERSIONS
     }
 
     /// Resolve the effective bearer key the same way for every request: load the operator's
@@ -432,6 +475,7 @@ fn env_nonempty(name: &str) -> Option<String> {
 fn to_xai_chat_request(
     req: &CanonicalRequest,
     repl: &Replacements,
+    catalog: &[CatalogModel],
 ) -> Result<Value, ProviderError> {
     let mut messages: Vec<Value> = Vec::new();
     for m in &req.messages {
@@ -534,7 +578,7 @@ fn to_xai_chat_request(
             .collect()
     });
 
-    let model = resolve_model_alias(&req.model).unwrap_or(req.model.as_str());
+    let model = resolve_model_alias(&req.model, catalog).unwrap_or(req.model.as_str());
     let mut body = json!({
         "model": model,
         "messages": messages,
@@ -616,14 +660,42 @@ pub fn grok_extra_allowed(key: &str) -> bool {
     )
 }
 
-fn resolve_model_alias(model: &str) -> Option<&'static str> {
-    GROK_MODELS.iter().find_map(|entry| {
-        if entry.id == model || entry.aliases.contains(&model) {
+/// Resolve `model` (id or alias) to a real upstream id within `catalog`.
+/// Returns `None` when nothing in the catalog matches (the caller forwards the
+/// input verbatim so an unknown-but-valid upstream id still reaches xAI).
+fn resolve_model_alias(model: &str, catalog: &[CatalogModel]) -> Option<&'static str> {
+    catalog.iter().find_map(|entry| {
+        if entry.matches(model) {
             Some(entry.id)
         } else {
             None
         }
     })
+}
+
+/// Build the `/v1/models` response entries from a catalog (real ids only; aliases
+/// are inbound-only and never advertised).
+fn catalog_models_list(catalog: &[CatalogModel]) -> Vec<GrokModelInfo> {
+    catalog
+        .iter()
+        .map(|model| GrokModelInfo {
+            id: model.id.to_string(),
+            object: "model",
+            created: 0,
+            owned_by: "grok",
+        })
+        .collect()
+}
+
+/// Build the router alias map (id->id plus each alias->id) from a catalog.
+fn catalog_model_aliases(catalog: &[CatalogModel]) -> Vec<(&'static str, &'static str)> {
+    catalog
+        .iter()
+        .flat_map(|model| {
+            std::iter::once((model.id, model.id))
+                .chain(model.aliases.iter().map(move |alias| (*alias, model.id)))
+        })
+        .collect()
 }
 
 /// Map a CanonicalRequest to the JSON body for a *streaming* xAI /v1/chat/completions call.
@@ -634,8 +706,9 @@ fn resolve_model_alias(model: &str) -> Option<&'static str> {
 fn to_xai_chat_stream_request(
     req: &CanonicalRequest,
     repl: &Replacements,
+    catalog: &[CatalogModel],
 ) -> Result<Value, ProviderError> {
-    let mut body = to_xai_chat_request(req, repl)?;
+    let mut body = to_xai_chat_request(req, repl, catalog)?;
     body["stream"] = json!(true);
     body["stream_options"] = json!({ "include_usage": true });
     Ok(body)
@@ -994,6 +1067,10 @@ impl LlmProvider for GrokProvider {
         "grok"
     }
 
+    fn versions(&self) -> &'static [ProviderVersion] {
+        GROK_VERSIONS
+    }
+
     async fn send(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError> {
         debug!(
             provider = "grok",
@@ -1007,7 +1084,7 @@ impl LlmProvider for GrokProvider {
         // Hook point (using omni-common): replacements applied at prompt boundary inside the provider.
         // In real deployment the Replacements would be loaded once in the binary and injected here.
         let repl = Replacements::empty();
-        let body = to_xai_chat_request(&req, &repl)?;
+        let body = to_xai_chat_request(&req, &repl, self.active_catalog())?;
 
         let url = format!("{}/chat/completions", self.base_url);
         debug!(%url, "POST xAI chat completions");
@@ -1079,7 +1156,7 @@ impl LlmProvider for GrokProvider {
 
         // Same prompt-scope replacements seam as send() (Replacements::empty() hook).
         let repl = Replacements::empty();
-        let body = to_xai_chat_stream_request(&req, &repl)?;
+        let body = to_xai_chat_stream_request(&req, &repl, self.active_catalog())?;
         let url = format!("{}/chat/completions", self.base_url);
 
         let auth_headers = self.auth_headers().await?;
@@ -1222,7 +1299,7 @@ mod tests {
             provider_extras: Some(json!({"service_tier": "priority"})),
         };
 
-        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         assert_eq!(body["model"], "grok-4.3");
         assert_eq!(body["messages"].as_array().unwrap().len(), 2);
         assert_eq!(body["max_completion_tokens"], 128);
@@ -1237,7 +1314,7 @@ mod tests {
     fn test_model_catalog_exposes_canonical_ids_and_aliases_normalize() {
         // WHY: `/v1/models` must expose real xAI ids, while inbound shorthand
         // aliases are normalized before hitting the upstream chat API.
-        let ids: Vec<String> = GrokProvider::models_list()
+        let ids: Vec<String> = GrokProvider::default_models_list()
             .into_iter()
             .map(|model| model.id)
             .collect();
@@ -1248,7 +1325,7 @@ mod tests {
             "aliases must not be advertised as canonical models: {ids:?}"
         );
 
-        let aliases = GrokProvider::model_aliases();
+        let aliases = GrokProvider::default_model_aliases();
         assert!(aliases.contains(&("grok", "grok-4.3")));
         assert!(aliases.contains(&("composer", "grok-composer-2.5-fast")));
 
@@ -1260,7 +1337,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         assert_eq!(body["model"], "grok-composer-2.5-fast");
     }
 
@@ -1557,7 +1634,7 @@ mod tests {
             provider_extras: None,
         };
 
-        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "get_weather");
@@ -1597,7 +1674,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         let messages = body["messages"].as_array().unwrap();
 
         // The assistant message keeps its Text sibling as `content` AND carries
@@ -1652,7 +1729,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         let messages = body["messages"].as_array().unwrap();
         let asst_idx = messages.iter().position(|m| m["role"] == "assistant");
         let tool_idx = messages.iter().position(|m| m["role"] == "tool");
@@ -1680,7 +1757,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         let messages = body["messages"].as_array().unwrap();
         let assistant = messages
             .iter()
@@ -1796,7 +1873,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &repl).unwrap();
+        let body = to_xai_chat_request(&req, &repl, GROK_EXTENDED_0_2_60).unwrap();
         let msg0 = &body["messages"][0];
         assert_eq!(msg0["content"], "tell REDACTED");
     }
@@ -1826,7 +1903,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "look");
@@ -1860,7 +1937,7 @@ mod tests {
             metadata: Default::default(),
             provider_extras: Some(serde_json::json!({"service_tier": "standard"})),
         };
-        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         assert_eq!(body["model"], "grok-4.3");
         assert!(body.get("tools").is_some());
         assert_eq!(body["tool_choice"], "auto");
@@ -2083,7 +2160,7 @@ mod tests {
         let mut r = base.clone();
         r.temperature = Some(0.2);
         r.max_tokens = Some(64);
-        let b = to_xai_chat_request(&r, &empty_repl()).unwrap();
+        let b = to_xai_chat_request(&r, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         let t = b["temperature"].as_f64().unwrap();
         assert!((t - 0.2).abs() < 1e-6, "temp float json: {}", t);
         assert_eq!(b["max_completion_tokens"], 64);
@@ -2091,7 +2168,7 @@ mod tests {
         // top_p only
         let mut r = base.clone();
         r.top_p = Some(0.95);
-        let b = to_xai_chat_request(&r, &empty_repl()).unwrap();
+        let b = to_xai_chat_request(&r, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         let tp = b["top_p"].as_f64().unwrap();
         assert!((tp - 0.95).abs() < 1e-6, "top_p float json approx: {}", tp);
 
@@ -2101,7 +2178,7 @@ mod tests {
             effort: Some("low".into()),
             budget_tokens: Some(50),
         });
-        let b = to_xai_chat_request(&r, &empty_repl()).unwrap();
+        let b = to_xai_chat_request(&r, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         assert_eq!(b["reasoning_effort"], "low");
 
         // all together
@@ -2114,7 +2191,7 @@ mod tests {
             budget_tokens: None,
         });
         r.provider_extras = Some(json!({"service_tier": "priority"}));
-        let b = to_xai_chat_request(&r, &empty_repl()).unwrap();
+        let b = to_xai_chat_request(&r, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         assert_eq!(b["temperature"], 1.0);
         assert_eq!(b["max_completion_tokens"], 10);
         assert_eq!(b["reasoning_effort"], "high");
@@ -2139,7 +2216,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         assert_eq!(body["parallel_tool_calls"], true);
         assert_eq!(body["response_format"]["type"], "json_object");
         assert_eq!(body["seed"], 42);
@@ -2161,7 +2238,7 @@ mod tests {
             provider_extras: Some(json!({"user": "u123"})),
             ..Default::default()
         };
-        let err = to_xai_chat_request(&req, &empty_repl())
+        let err = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60)
             .expect_err("gateway user must reject as provider extra");
         assert!(
             err.to_string().contains("user"),
@@ -2188,7 +2265,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let err = to_xai_chat_request(&req, &empty_repl())
+        let err = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60)
             .expect_err("unsupported Responses extras must reject");
         let msg = err.to_string();
         assert!(
@@ -2211,7 +2288,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         assert!(body.get("input").is_none(), "no responses 'input' shape");
         assert!(body.get("messages").is_some());
         assert_eq!(body["stream"], false);
@@ -2239,7 +2316,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         // extras "tools" wins (last write)
         let tools = &body["tools"];
         assert!(tools.is_array());
@@ -2263,7 +2340,7 @@ mod tests {
             tool_choice: Some(CanonicalToolChoice::Required),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         assert_eq!(body["tool_choice"], "required");
     }
 
@@ -2289,7 +2366,7 @@ mod tests {
             }]),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &repl).unwrap();
+        let body = to_xai_chat_request(&req, &repl, GROK_EXTENDED_0_2_60).unwrap();
         assert_eq!(body["messages"][0]["content"], "tell REDACTED");
         // desc gets prompt apply (name currently does not per mapper)
         assert_eq!(
@@ -2789,7 +2866,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl()).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         assert_eq!(body["tools"][0]["function"]["name"], "adder");
         assert_eq!(body["tool_choice"]["function"]["name"], "adder");
 
@@ -2830,7 +2907,7 @@ mod tests {
         // maps content/tool_call deltas to canonical events (see the dedicated
         // SSE parser test). Pin the builder flags here so the non-stream tool path
         // above and the stream path stay distinct.
-        let stream_body = to_xai_chat_stream_request(&req, &empty_repl()).unwrap();
+        let stream_body = to_xai_chat_stream_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         assert_eq!(stream_body["stream"], true);
         assert_eq!(stream_body["stream_options"]["include_usage"], true);
         assert_eq!(body["stream"], false);
@@ -3009,12 +3086,12 @@ mod tests {
             }],
             ..Default::default()
         };
-        let stream_body = to_xai_chat_stream_request(&req, &empty_repl()).unwrap();
+        let stream_body = to_xai_chat_stream_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         assert_eq!(stream_body["stream"], true);
         assert_eq!(stream_body["stream_options"]["include_usage"], true);
 
         // The non-stream builder is unchanged: still stream: false, no stream_options.
-        let plain_body = to_xai_chat_request(&req, &empty_repl()).unwrap();
+        let plain_body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         assert_eq!(plain_body["stream"], false);
         assert!(plain_body.get("stream_options").is_none());
     }
@@ -3579,6 +3656,70 @@ mod tests {
     /// the production parser (`GrokCredentials::load_fresh`) keeps this in lockstep with real parsing.
     /// Requiring `XAI_CREDENTIALS_PATH` to be unset makes it race-immune against the env-mutating
     /// credential tests and keeps the offline suite green.
+    #[test]
+    fn conservative_mode_hides_extended_only_models() {
+        // WHY: conservative = what the grok-shell CLI advertises (2 ids). Extended
+        // = the optimal api.x.ai working surface (superset). A regression that
+        // leaked an extended-only id (e.g. grok-4.3) into conservative, or dropped
+        // one from extended, would misrepresent the catalog the user asked for.
+        let cons = GrokProvider::new(None).unwrap().with_mode(CatalogMode::Conservative);
+        let ids: Vec<String> = cons.models_list().into_iter().map(|m| m.id).collect();
+        assert_eq!(
+            ids,
+            vec!["grok-build".to_string(), "grok-composer-2.5-fast".to_string()],
+            "conservative must be exactly the advertised cli-chat-proxy ids"
+        );
+        assert!(!ids.iter().any(|id| id == "grok-4.3"));
+
+        let ext = GrokProvider::new(None).unwrap(); // default extended
+        let ext_ids: Vec<String> = ext.models_list().into_iter().map(|m| m.id).collect();
+        assert!(ext_ids.iter().any(|id| id == "grok-4.3"));
+        assert!(ext_ids.iter().any(|id| id == "grok-3"));
+        assert!(ext_ids.len() > ids.len(), "extended must be a superset");
+    }
+
+    #[test]
+    fn conservative_mode_resolves_only_its_own_aliases() {
+        // The wire body model id must come from the active catalog. In conservative
+        // mode, an extended-only alias must NOT resolve to an extended id.
+        let cons = GrokProvider::new(None).unwrap().with_mode(CatalogMode::Conservative);
+        let mut req = CanonicalRequest {
+            model: "grok".into(), // alias of grok-4.3 (extended-only)
+            ..base_req()
+        };
+        let body =
+            to_xai_chat_request(&req, &empty_repl(), cons.active_catalog()).unwrap();
+        // "grok" is not in conservative -> forwarded verbatim, not mapped to grok-4.3.
+        assert_eq!(body["model"], "grok");
+
+        // But "composer" (in conservative) resolves to its canonical id.
+        req.model = "composer".into();
+        let body =
+            to_xai_chat_request(&req, &empty_repl(), cons.active_catalog()).unwrap();
+        assert_eq!(body["model"], "grok-composer-2.5-fast");
+    }
+
+    #[test]
+    fn version_pin_is_exact_or_fails() {
+        // Exact known version pins.
+        let p = GrokProvider::new(None).unwrap().with_version("0.2.60");
+        assert!(p.is_ok());
+        // Unknown version is a hard error (exact-or-fail), not a silent newest.
+        let err = GrokProvider::new(None).unwrap().with_version("0.0.1");
+        assert!(err.is_err(), "unknown version must fail, not fall back");
+    }
+
+    fn base_req() -> CanonicalRequest {
+        CanonicalRequest {
+            model: String::new(),
+            messages: vec![omni_core::CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            ..Default::default()
+        }
+    }
+
     fn live_grok_key() -> Option<String> {
         if std::env::var_os("XAI_CREDENTIALS_PATH").is_some() {
             return None;
