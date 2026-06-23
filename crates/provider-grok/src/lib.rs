@@ -1161,8 +1161,9 @@ fn to_grok_responses_request(
         "stream": stream,
     });
 
+    let has_tools = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
     if let Some(tools) = &req.tools
-        && !tools.is_empty()
+        && has_tools
     {
         // FLAT Responses tool shape: {type:"function", name, parameters, description}
         // (NOT nested under a "function" key, which is the Chat Completions shape).
@@ -1181,7 +1182,10 @@ fn to_grok_responses_request(
         );
     }
 
-    if let Some(choice) = &req.tool_choice {
+    // Only emit tool_choice alongside tools. The Responses endpoint rejects a
+    // tool_choice with no tools ("A tool_choice was set ... but no tools were
+    // specified."), and a tool_choice is meaningless without tools anyway.
+    if has_tools && let Some(choice) = &req.tool_choice {
         body["tool_choice"] = match choice {
             CanonicalToolChoice::Auto => json!("auto"),
             CanonicalToolChoice::Required => json!("required"),
@@ -4481,6 +4485,34 @@ mod tests {
         assert_eq!(
             body["tool_choice"],
             json!({"type": "function", "name": "get_weather"})
+        );
+    }
+
+    #[test]
+    fn to_grok_responses_request_omits_tool_choice_without_tools() {
+        // WHY: the real cli-chat-proxy Responses endpoint returns 400
+        // "A tool_choice was set on the request but no tools were specified."
+        // (caught by the live conservative probe). A tool_choice is meaningless
+        // without tools, so when the caller supplies a choice but no tools we must
+        // emit NEITHER field. Verified live against the real endpoint.
+        let req = CanonicalRequest {
+            model: "grok-build".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("say OK".into()),
+            }],
+            tools: None,
+            tool_choice: Some(CanonicalToolChoice::Auto),
+            ..Default::default()
+        };
+        let body = to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_60, false).unwrap();
+        assert!(
+            body.get("tool_choice").is_none(),
+            "tool_choice must be omitted when there are no tools (endpoint rejects it)"
+        );
+        assert!(
+            body.get("tools").is_none(),
+            "tools must be absent when none were supplied"
         );
     }
 
