@@ -79,6 +79,7 @@ use omni_common::{
 };
 use omni_core::{
     CanonicalResponse, CanonicalStream, CanonicalStreamEvent, LlmProvider, ProviderError,
+    ProviderVersion, VersionSelector,
 };
 
 // Re-export the concrete providers so main can construct them by name.
@@ -156,6 +157,55 @@ struct Cli {
         default_value_t = omni_common::DEFAULT_LOG_BACKUPS
     )]
     log_backups: usize,
+
+    /// Pin Claude to an exact fingerprint version (e.g. 2.1.186). Exact match or
+    /// the server fails to start; no closest match. Default: newest in catalog.
+    #[arg(long, env = "OMNI_CLAUDE_VERSION")]
+    claude_version: Option<String>,
+
+    /// Pin Grok to an exact catalog version (e.g. 0.2.60). Exact-or-fail.
+    #[arg(long, env = "OMNI_GROK_VERSION")]
+    grok_version: Option<String>,
+
+    /// Pin Codex to an exact catalog version (e.g. 0.142.0). Exact-or-fail.
+    #[arg(long, env = "OMNI_CODEX_VERSION")]
+    codex_version: Option<String>,
+
+    /// Grok catalog mode: conservative (only client-advertised models) or extended
+    /// (any verified-working model). Default: extended.
+    #[arg(long, env = "OMNI_GROK_MODE", value_enum, default_value_t = CatalogModeArg::Extended)]
+    grok_mode: CatalogModeArg,
+
+    /// Codex catalog mode: conservative or extended. Default: extended.
+    #[arg(long, env = "OMNI_CODEX_MODE", value_enum, default_value_t = CatalogModeArg::Extended)]
+    codex_mode: CatalogModeArg,
+
+    /// Match every provider to the client version installed on this system,
+    /// choosing the CLOSEST catalog version when there is no exact match. A
+    /// per-provider --{provider}-version overrides this for that provider.
+    #[arg(long, env = "OMNI_MATCH_SYSTEM", conflicts_with = "match_system_exact")]
+    match_system: bool,
+
+    /// Like --match-system, but require an EXACT catalog version for each detected
+    /// installed client; fail loudly at startup if the catalog lacks it.
+    #[arg(long, env = "OMNI_MATCH_SYSTEM_EXACT")]
+    match_system_exact: bool,
+}
+
+/// CLI surface for [`omni_core::CatalogMode`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum CatalogModeArg {
+    Conservative,
+    Extended,
+}
+
+impl From<CatalogModeArg> for omni_core::CatalogMode {
+    fn from(value: CatalogModeArg) -> Self {
+        match value {
+            CatalogModeArg::Conservative => omni_core::CatalogMode::Conservative,
+            CatalogModeArg::Extended => omni_core::CatalogMode::Extended,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -197,7 +247,13 @@ async fn main() -> anyhow::Result<()> {
     for name in &enabled {
         let entry = match name.as_str() {
             "claude" => {
-                let provider = init_claude_provider()
+                let selector = version_selector_for(
+                    &cli.claude_version,
+                    cli.match_system,
+                    cli.match_system_exact,
+                    "claude",
+                );
+                let provider = init_claude_provider(&selector)
                     .context("failed to initialize claude provider (fingerprint profile)")?;
                 let models = provider_model_values("claude", provider.profile().models_list())?;
                 let catalog = claude_model_catalog(provider.profile());
@@ -210,9 +266,18 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             "grok" => {
-                let p = init_grok_provider().context("failed to init grok provider")?;
-                let models = provider_model_values("grok", GrokProvider::models_list())?;
-                let catalog = grok_model_catalog();
+                let selector = version_selector_for(
+                    &cli.grok_version,
+                    cli.match_system,
+                    cli.match_system_exact,
+                    "grok",
+                );
+                let p = init_grok_provider(&selector, cli.grok_mode.into())
+                    .context("failed to init grok provider")?;
+                // Advertise the catalog the provider actually resolved (mode+version),
+                // not the static default.
+                let models = provider_model_values("grok", p.models_list())?;
+                let catalog = grok_model_catalog(&p);
                 ProviderEntry {
                     provider: Arc::new(p),
                     claude_native: None,
@@ -222,7 +287,14 @@ async fn main() -> anyhow::Result<()> {
             }
             "codex" => {
                 info!("initializing codex provider (config read from CODEX_HOME or ~/.codex)");
-                let p = CodexProvider::new().context("failed to init codex provider")?;
+                let selector = version_selector_for(
+                    &cli.codex_version,
+                    cli.match_system,
+                    cli.match_system_exact,
+                    "codex",
+                );
+                let p = init_codex_provider(&selector, cli.codex_mode.into())
+                    .context("failed to init codex provider")?;
                 let models = provider_model_values("codex", p.models_list())?;
                 let catalog = codex_model_catalog(&p);
                 ProviderEntry {
@@ -296,7 +368,8 @@ fn log_startup_banner() {
     );
 }
 
-fn init_claude_provider() -> anyhow::Result<ClaudeProvider> {
+fn init_claude_provider(selector: &VersionSelector) -> anyhow::Result<ClaudeProvider> {
+    let profile = resolve_claude_profile(selector)?;
     if let Some(base_url) = env_nonempty("OMNI_CLAUDE_BASE_URL") {
         let authorization_bearer = env_nonempty("OMNI_CLAUDE_AUTH_TOKEN")
             .is_some()
@@ -319,7 +392,7 @@ fn init_claude_provider() -> anyhow::Result<ClaudeProvider> {
             "initializing claude provider with OMNI_CLAUDE_BASE_URL custom gateway"
         );
         return ClaudeProvider::new_for_custom_gateway_env(
-            provider_claude::default_profile(),
+            profile,
             base_url,
             authorization_bearer,
             api_key,
@@ -350,7 +423,7 @@ fn init_claude_provider() -> anyhow::Result<ClaudeProvider> {
             "initializing claude provider with ANTHROPIC_BASE_URL custom gateway"
         );
         return ClaudeProvider::new_for_custom_gateway_env(
-            provider_claude::default_profile(),
+            profile,
             base_url,
             authorization_bearer,
             api_key,
@@ -360,11 +433,21 @@ fn init_claude_provider() -> anyhow::Result<ClaudeProvider> {
     }
 
     info!("initializing claude provider");
-    ClaudeProvider::new().map_err(anyhow::Error::from)
+    ClaudeProvider::new_with_profile(profile).map_err(anyhow::Error::from)
 }
 
-fn init_grok_provider() -> anyhow::Result<GrokProvider> {
-    let provider = GrokProvider::new(None).map_err(anyhow::Error::from)?;
+fn init_grok_provider(
+    selector: &VersionSelector,
+    mode: omni_core::CatalogMode,
+) -> anyhow::Result<GrokProvider> {
+    let version =
+        resolve_provider_version("grok", GrokProvider::version_catalog(), selector)?;
+    let provider = GrokProvider::new(None)
+        .map_err(anyhow::Error::from)?
+        .with_mode(mode)
+        .with_version(version.version)
+        .map_err(anyhow::Error::from)?;
+    info!(version = version.version, mode = %mode, "grok catalog resolved");
     if let Some(base_url) = env_nonempty("OMNI_GROK_BASE_URL") {
         info!(
             base_url = %base_url,
@@ -404,11 +487,128 @@ fn init_grok_provider() -> anyhow::Result<GrokProvider> {
     Ok(provider)
 }
 
+fn init_codex_provider(
+    selector: &VersionSelector,
+    mode: omni_core::CatalogMode,
+) -> anyhow::Result<CodexProvider> {
+    let version =
+        resolve_provider_version("codex", CodexProvider::version_catalog(), selector)?;
+    let provider = CodexProvider::new()
+        .map_err(anyhow::Error::from)?
+        .with_mode(mode)
+        .with_version(version.version)
+        .map_err(anyhow::Error::from)?;
+    info!(version = version.version, mode = %mode, "codex catalog resolved");
+    Ok(provider)
+}
+
+/// Resolve the Claude fingerprint profile for a [`VersionSelector`].
+///
+/// Claude does not use the conservative/extended catalog split (it already speaks
+/// the exact Anthropic protocol), so only the version selector applies. An exact
+/// or match-system-exact pin that names no known profile is a hard startup error.
+fn resolve_claude_profile(
+    selector: &VersionSelector,
+) -> anyhow::Result<&'static provider_claude::FingerprintProfile> {
+    match selector {
+        VersionSelector::Latest => Ok(provider_claude::default_profile()),
+        VersionSelector::Exact(v) | VersionSelector::MatchSystemExact(v) => {
+            provider_claude::resolve_profile(v).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "claude: no fingerprint profile matches version {v:?} (exact-or-fail); known selectors: {}",
+                    provider_claude::valid_profile_selectors()
+                )
+            })
+        }
+        VersionSelector::MatchSystem(v) => {
+            // Closest match: try exact, else fall back to the default (newest).
+            Ok(provider_claude::resolve_profile(v).unwrap_or_else(|| {
+                warn!(
+                    "claude: no exact profile for installed {v:?}; using newest (default) profile"
+                );
+                provider_claude::default_profile()
+            }))
+        }
+    }
+}
+
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// Build a [`VersionSelector`] for one provider from the CLI flags.
+///
+/// Precedence: an explicit per-provider `--{provider}-version` (exact-or-fail)
+/// wins. Otherwise the system-match flags apply, detecting the installed client
+/// version for `bin`. With no flags, `Latest`.
+fn version_selector_for(
+    explicit: &Option<String>,
+    match_system: bool,
+    match_system_exact: bool,
+    bin: &str,
+) -> VersionSelector {
+    if let Some(v) = explicit.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        return VersionSelector::Exact(v.to_string());
+    }
+    if match_system_exact {
+        match detect_installed_cli_version(bin) {
+            Some(v) => return VersionSelector::MatchSystemExact(v),
+            None => {
+                warn!(
+                    "{bin}: --match-system-exact set but no installed {bin} version detected; using newest catalog version"
+                );
+            }
+        }
+    } else if match_system {
+        match detect_installed_cli_version(bin) {
+            Some(v) => return VersionSelector::MatchSystem(v),
+            None => {
+                warn!(
+                    "{bin}: --match-system set but no installed {bin} version detected; using newest catalog version"
+                );
+            }
+        }
+    }
+    VersionSelector::Latest
+}
+
+/// Detect the version string of an installed provider CLI by running
+/// `<bin> --version` and extracting the first dotted-number token. Returns `None`
+/// if the binary is absent or prints nothing parseable.
+fn detect_installed_cli_version(bin: &str) -> Option<String> {
+    let out = std::process::Command::new(bin).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    extract_version_token(&text)
+}
+
+/// Extract the first whitespace-delimited token that looks like a dotted version
+/// (starts with a digit and contains a dot), e.g. "2.1.186" from
+/// "2.1.186 (Claude Code)" or "0.2.60" from "grok 0.2.60 (abc) [stable]".
+fn extract_version_token(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .find(|tok| {
+            let t = tok.trim_start_matches('v');
+            t.chars().next().is_some_and(|c| c.is_ascii_digit()) && t.contains('.')
+        })
+        .map(|tok| tok.trim_start_matches('v').to_string())
+}
+
+/// Resolve a selector against a provider's catalog, mapping the fail-loud cases to
+/// a clear startup error that names the provider.
+fn resolve_provider_version(
+    provider: &str,
+    versions: &'static [ProviderVersion],
+    selector: &VersionSelector,
+) -> anyhow::Result<&'static ProviderVersion> {
+    omni_core::resolve_version(versions, selector).map_err(|e| {
+        anyhow::anyhow!("{provider}: cannot resolve version selector: {e}")
+    })
 }
 
 fn build_router(state: Arc<AppState>, auth_keys: Arc<HashSet<String>>) -> Router {
@@ -542,9 +742,9 @@ fn claude_model_catalog(profile: &provider_claude::FingerprintProfile) -> ModelC
     catalog
 }
 
-fn grok_model_catalog() -> ModelCatalog {
+fn grok_model_catalog(provider: &GrokProvider) -> ModelCatalog {
     let mut catalog = ModelCatalog::default();
-    for (alias, canonical) in GrokProvider::model_aliases() {
+    for (alias, canonical) in provider.model_aliases() {
         catalog.insert(alias, canonical);
     }
     catalog
@@ -1761,7 +1961,7 @@ mod tests {
                 "claude".to_string(),
                 claude_model_catalog(provider_claude::default_profile()),
             ),
-            ("grok".to_string(), grok_model_catalog()),
+            ("grok".to_string(), grok_model_catalog(&GrokProvider::new(None).expect("grok provider"))),
         ])
     }
 
@@ -2297,9 +2497,9 @@ mod tests {
         ProviderEntry {
             provider: Arc::new(GrokProvider::new_for_test("k", base_url)),
             claude_native: None,
-            models: provider_model_values("grok", GrokProvider::models_list())
+            models: provider_model_values("grok", GrokProvider::default_models_list())
                 .expect("grok model catalog serializes"),
-            catalog: grok_model_catalog(),
+            catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
         }
     }
 
@@ -2453,9 +2653,9 @@ requires_openai_auth = false
         ProviderEntry {
             provider: Arc::new(GrokProvider::new(None).expect("grok provider with creds")),
             claude_native: None,
-            models: provider_model_values("grok", GrokProvider::models_list())
+            models: provider_model_values("grok", GrokProvider::default_models_list())
                 .expect("grok model catalog serializes"),
-            catalog: grok_model_catalog(),
+            catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
         }
     }
 
@@ -2753,7 +2953,7 @@ requires_openai_auth = false
             .mount(&server)
             .await;
 
-        let provider = init_claude_provider().expect("custom Claude provider from env");
+        let provider = init_claude_provider(&VersionSelector::Latest).expect("custom Claude provider from env");
         drop(creds);
         let response = provider
             .send(omni_core::CanonicalRequest {
@@ -2812,7 +3012,7 @@ requires_openai_auth = false
             .mount(&server)
             .await;
 
-        let provider = init_claude_provider().expect("custom Claude provider from env");
+        let provider = init_claude_provider(&VersionSelector::Latest).expect("custom Claude provider from env");
         drop(creds);
         let models = provider_model_values("claude", provider.profile().models_list()).unwrap();
         let catalog = claude_model_catalog(provider.profile());
@@ -2884,7 +3084,7 @@ requires_openai_auth = false
                 .await;
         }
 
-        let provider = init_claude_provider().expect("custom Claude provider from env");
+        let provider = init_claude_provider(&VersionSelector::Latest).expect("custom Claude provider from env");
         drop(creds);
         let request = || omni_core::CanonicalRequest {
             model: "sonnet".into(),
@@ -2916,7 +3116,7 @@ requires_openai_auth = false
             ("ANTHROPIC_API_KEY", None),
             ("ANTHROPIC_CUSTOM_HEADERS", Some("X-Valid: yes")),
         ]);
-        let provider = init_claude_provider().expect("custom Claude provider from env");
+        let provider = init_claude_provider(&VersionSelector::Latest).expect("custom Claude provider from env");
         unsafe {
             std::env::set_var("ANTHROPIC_CUSTOM_HEADERS", "bad header");
         }
@@ -2973,7 +3173,7 @@ requires_openai_auth = false
             .mount(&omni_server)
             .await;
 
-        let provider = init_claude_provider().expect("OMNI Claude provider from env");
+        let provider = init_claude_provider(&VersionSelector::Latest).expect("OMNI Claude provider from env");
         drop(creds);
         let response = provider
             .send(omni_core::CanonicalRequest {
@@ -3021,7 +3221,7 @@ requires_openai_auth = false
             .mount(&server)
             .await;
 
-        let provider = init_grok_provider().expect("custom Grok provider from env");
+        let provider = init_grok_provider(&VersionSelector::Latest, omni_core::CatalogMode::Extended).expect("custom Grok provider from env");
         let response = provider
             .send(omni_core::CanonicalRequest {
                 model: "grok".into(),
@@ -3081,7 +3281,7 @@ requires_openai_auth = false
             .mount(&omni_server)
             .await;
 
-        let provider = init_grok_provider().expect("OMNI Grok provider from env");
+        let provider = init_grok_provider(&VersionSelector::Latest, omni_core::CatalogMode::Extended).expect("OMNI Grok provider from env");
         let response = provider
             .send(omni_core::CanonicalRequest {
                 model: "grok".into(),
@@ -3134,7 +3334,7 @@ requires_openai_auth = false
                 .await;
         }
 
-        let provider = init_grok_provider().expect("custom Grok provider from env");
+        let provider = init_grok_provider(&VersionSelector::Latest, omni_core::CatalogMode::Extended).expect("custom Grok provider from env");
         let request = || omni_core::CanonicalRequest {
             model: "grok".into(),
             messages: vec![omni_core::CanonicalMessage {
@@ -3178,7 +3378,7 @@ requires_openai_auth = false
             .mount(&server)
             .await;
 
-        let provider = init_grok_provider().expect("custom Grok provider from env");
+        let provider = init_grok_provider(&VersionSelector::Latest, omni_core::CatalogMode::Extended).expect("custom Grok provider from env");
         let response = provider
             .send(omni_core::CanonicalRequest {
                 model: "grok".into(),
@@ -3882,8 +4082,8 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             ProviderEntry {
                 provider: Arc::new(StaticProvider),
                 claude_native: None,
-                models: provider_model_values("grok", GrokProvider::models_list()).unwrap(),
-                catalog: grok_model_catalog(),
+                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
+                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
             },
         );
         let (state, _guard) = state_with_stats(providers);
@@ -3978,8 +4178,8 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             ProviderEntry {
                 provider: Arc::new(StaticProvider),
                 claude_native: None,
-                models: provider_model_values("grok", GrokProvider::models_list()).unwrap(),
-                catalog: grok_model_catalog(),
+                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
+                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
             },
         );
         let state = state_with_conversation_log(providers, &dir);
@@ -4060,8 +4260,8 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             ProviderEntry {
                 provider: Arc::new(StreamingProvider),
                 claude_native: None,
-                models: provider_model_values("grok", GrokProvider::models_list()).unwrap(),
-                catalog: grok_model_catalog(),
+                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
+                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
             },
         );
         let (state, _guard) = state_with_stats(providers);
@@ -4142,8 +4342,8 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             ProviderEntry {
                 provider: Arc::new(FailingStreamProvider),
                 claude_native: None,
-                models: provider_model_values("grok", GrokProvider::models_list()).unwrap(),
-                catalog: grok_model_catalog(),
+                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
+                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
             },
         );
         let (state, _guard) = state_with_stats(providers);
@@ -4230,8 +4430,8 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             ProviderEntry {
                 provider: Arc::new(ErrorFinishStreamProvider),
                 claude_native: None,
-                models: provider_model_values("grok", GrokProvider::models_list()).unwrap(),
-                catalog: grok_model_catalog(),
+                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
+                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
             },
         );
         let (state, _guard) = state_with_stats(providers);
@@ -4319,8 +4519,8 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             ProviderEntry {
                 provider: Arc::new(MissingFinishStreamProvider),
                 claude_native: None,
-                models: provider_model_values("grok", GrokProvider::models_list()).unwrap(),
-                catalog: grok_model_catalog(),
+                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
+                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
             },
         );
         let (state, _guard) = state_with_stats(providers);
@@ -4633,8 +4833,8 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             ProviderEntry {
                 provider: Arc::new(StaticProvider),
                 claude_native: None,
-                models: provider_model_values("grok", GrokProvider::models_list()).unwrap(),
-                catalog: grok_model_catalog(),
+                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
+                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
             },
         );
         let state = state_with(map);
@@ -4700,8 +4900,8 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             ProviderEntry {
                 provider: Arc::new(StaticProvider),
                 claude_native: None,
-                models: provider_model_values("grok", GrokProvider::models_list()).unwrap(),
-                catalog: grok_model_catalog(),
+                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
+                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
             },
         );
         let (state, _guard) = state_with_stats(providers);
