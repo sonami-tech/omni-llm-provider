@@ -95,6 +95,10 @@ enum BillingCchMode {
     Static(&'static str),
     FinalBodyChecksum,
     FinalBodyChecksumSkipModelsAndMaxTokens,
+    /// No `cch=` segment in the billing header at all. Observed on Claude Code
+    /// 2.1.186: the header ends at `cc_entrypoint=<entrypoint>;` with no
+    /// trailing checksum field. The body is sent unmodified.
+    None,
 }
 
 impl FingerprintProfile {
@@ -166,6 +170,15 @@ impl FingerprintProfile {
     }
 
     pub fn billing_header_text(&self, first_user_text: &str) -> String {
+        if matches!(self.billing.cch, BillingCchMode::None) {
+            // 2.1.186+: no trailing cch field; header ends at cc_entrypoint.
+            return format!(
+                "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint={};",
+                self.claude_cli_version,
+                self.billing_suffix(first_user_text),
+                self.entrypoint,
+            );
+        }
         format!(
             "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint={}; cch={};",
             self.claude_cli_version,
@@ -186,7 +199,7 @@ impl FingerprintProfile {
 
     fn finalize_body_bytes(&self, bytes: Vec<u8>, _ctx: &RequestContext) -> Vec<u8> {
         match self.billing.cch {
-            BillingCchMode::Static(_) => bytes,
+            BillingCchMode::Static(_) | BillingCchMode::None => bytes,
             BillingCchMode::FinalBodyChecksum => {
                 self.finalize_body_cch_checksum(bytes, claude_code_cch_checksum)
             }
@@ -259,6 +272,8 @@ impl BillingCchMode {
             BillingCchMode::Static(value) => value,
             BillingCchMode::FinalBodyChecksum
             | BillingCchMode::FinalBodyChecksumSkipModelsAndMaxTokens => "00000",
+            // No cch segment is emitted; the placeholder is never used.
+            BillingCchMode::None => "",
         }
     }
 }
@@ -283,6 +298,16 @@ const BILLING_SCHEME_V1_CCH_XXH64_SKIP_MODELS_AND_MAX_TOKENS: BillingScheme = Bi
     seed: BILLING_SUFFIX_SEED_V1,
     sample_indices: &BILLING_SUFFIX_INDICES_V1,
     cch: BillingCchMode::FinalBodyChecksumSkipModelsAndMaxTokens,
+};
+// 2.1.186: the version suffix is still computed (cc_version=...a80), but the
+// billing header carries no cch field and the body is not rewritten. Verified
+// 2026-06-22 against two independent live captures (mitmproxy reverse proxy and
+// the drift checker's capture server): the header ends at `cc_entrypoint=sdk-cli;`.
+const BILLING_SCHEME_V1_NO_CCH: BillingScheme = BillingScheme {
+    suffix_algorithm: BillingSuffixAlgorithm::Sha256Utf16SampleV1,
+    seed: BILLING_SUFFIX_SEED_V1,
+    sample_indices: &BILLING_SUFFIX_INDICES_V1,
+    cch: BillingCchMode::None,
 };
 
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -344,6 +369,21 @@ pub const BETA_CC_2_1_175_OPUS: &str = "claude-code-20250219,oauth-2025-04-20,in
 pub const BETA_CC_2_1_175_SONNET: &str = BETA_CC_2_1_158_SONNET;
 pub const BETA_CC_2_1_175_HAIKU: &str = BETA_CC_2_1_158_HAIKU;
 pub const BETA_CC_2_1_175_FABLE: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11";
+
+/// 2.1.186 betas captured 2026-06-22 via the shared `tools.capture` framework
+/// (mitmproxy reverse proxy + real claude CLI 2.1.186, clean tmpfs HOME), for
+/// default/opus, explicit opus, sonnet, and haiku. Versus 2.1.175 every model
+/// gains `thinking-token-count-2026-05-13` and drops `afk-mode-2026-01-31`;
+/// sonnet additionally gains `mid-conversation-system-2026-04-07`. Default-model
+/// resolution to Opus still carries context-1m; explicit Opus does not. Fable was
+/// unavailable on the capture account (Fable Mythos access gate), so its list is
+/// carried forward from 2.1.175 with the same thinking-token-count/afk-mode delta
+/// applied to stay internally consistent (account gate, not a client change).
+pub const BETA_CC_2_1_186_DEFAULT: &str = "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,extended-cache-ttl-2025-04-11";
+pub const BETA_CC_2_1_186_OPUS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,extended-cache-ttl-2025-04-11";
+pub const BETA_CC_2_1_186_SONNET: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24,extended-cache-ttl-2025-04-11";
+pub const BETA_CC_2_1_186_HAIKU: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,extended-cache-ttl-2025-04-11";
+pub const BETA_CC_2_1_186_FABLE: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11";
 
 const MODEL_BETA_OVERRIDES_CC_2_1_154: &[ModelBetaOverride] = &[
     ModelBetaOverride {
@@ -537,6 +577,33 @@ const MODEL_BETA_OVERRIDES_CC_2_1_175: &[ModelBetaOverride] = &[
     ModelBetaOverride {
         model: "haiku",
         beta_reply: BETA_CC_2_1_175_HAIKU,
+    },
+];
+
+const MODEL_BETA_OVERRIDES_CC_2_1_186: &[ModelBetaOverride] = &[
+    ModelBetaOverride {
+        model: "claude-fable-5",
+        beta_reply: BETA_CC_2_1_186_FABLE,
+    },
+    ModelBetaOverride {
+        model: "claude-opus-4-8",
+        beta_reply: BETA_CC_2_1_186_OPUS,
+    },
+    ModelBetaOverride {
+        model: "claude-sonnet-4-6",
+        beta_reply: BETA_CC_2_1_186_SONNET,
+    },
+    ModelBetaOverride {
+        model: "claude-haiku-4-5",
+        beta_reply: BETA_CC_2_1_186_HAIKU,
+    },
+    ModelBetaOverride {
+        model: "claude-haiku-4-5-20251001",
+        beta_reply: BETA_CC_2_1_186_HAIKU,
+    },
+    ModelBetaOverride {
+        model: "haiku",
+        beta_reply: BETA_CC_2_1_186_HAIKU,
     },
 ];
 
@@ -837,7 +904,18 @@ pub const WIRE_DEFAULTS_CC_2_1_175: WireDefaults = WireDefaults {
     output_effort: Some("high"),
 };
 
-pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.175-sdk-cli";
+// 2.1.186 wire defaults - captured 2026-06-22 (shared tools.capture, real claude
+// CLI 2.1.186): opus 64k/no-temp/high-effort, sonnet & haiku 32k/temp=1 (haiku no
+// effort). Byte-identical to 2.1.175; the per-model overrides carry the exact
+// values, this struct only supplies the non-opus fallback.
+pub const WIRE_DEFAULTS_CC_2_1_186: WireDefaults = WireDefaults {
+    max_tokens: 32_000,
+    opus_max_tokens: 64_000,
+    temperature: Some(1.0),
+    output_effort: Some("high"),
+};
+
+pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.186-sdk-cli";
 pub const LATEST_PROFILE_ALIAS: &str = "latest";
 
 pub const PROFILE_CLAUDE_2_1_142_SDK_CLI: FingerprintProfile = FingerprintProfile {
@@ -998,7 +1076,7 @@ pub const PROFILE_CLAUDE_2_1_165_SDK_CLI: FingerprintProfile = FingerprintProfil
 // output_config.effort=xhigh, Fable is in the catalog with fallback-credit beta,
 // and the cch input omits model values plus the max_tokens field.
 pub const PROFILE_CLAUDE_2_1_175_SDK_CLI: FingerprintProfile = FingerprintProfile {
-    name: DEFAULT_PROFILE_NAME,
+    name: "cc-2.1.175-sdk-cli",
     aliases: &["2.1.175"],
     claude_cli_version: "2.1.175",
     stainless_package_version: "0.94.0",
@@ -1015,7 +1093,41 @@ pub const PROFILE_CLAUDE_2_1_175_SDK_CLI: FingerprintProfile = FingerprintProfil
     billing: BILLING_SCHEME_V1_CCH_XXH64_SKIP_MODELS_AND_MAX_TOKENS,
 };
 
+// Captured 2026-06-22 against installed Claude Code 2.1.186 via the shared
+// tools.capture framework (mitmproxy reverse proxy + real claude CLI, clean tmpfs
+// HOME), for default/opus, explicit opus, sonnet, and haiku. Headers keep SDK
+// 0.94.0 / Node v24.3.0 and anthropic-version 2023-06-01. The cc_version suffix
+// algorithm is UNCHANGED: the existing Sha256Utf16SampleV1 suffix reproduces the
+// captured cc_version=2.1.186.a80 exactly (verified against the live header).
+// TWO substantive drifts vs 2.1.175:
+//   1. The billing header DROPS the trailing `cch=` field entirely - it now ends
+//      at `cc_entrypoint=sdk-cli;` with no checksum and no body rewrite. Confirmed
+//      byte-for-byte by two independent live captures (mitmproxy + drift checker
+//      capture server). Hence billing = BILLING_SCHEME_V1_NO_CCH.
+//   2. Per-model betas: every model gains thinking-token-count-2026-05-13 and
+//      drops afk-mode-2026-01-31; sonnet also gains mid-conversation-system.
+// Wire defaults, catalog, default model (opus -> claude-opus-4-8), and
+// preserve_explicit_model carry forward from 2.1.175 (all live-confirmed).
+pub const PROFILE_CLAUDE_2_1_186_SDK_CLI: FingerprintProfile = FingerprintProfile {
+    name: DEFAULT_PROFILE_NAME,
+    aliases: &["2.1.186"],
+    claude_cli_version: "2.1.186",
+    stainless_package_version: "0.94.0",
+    stainless_runtime_version: "v24.3.0",
+    entrypoint: "sdk-cli",
+    beta_reply: BETA_CC_2_1_186_DEFAULT,
+    model_beta_overrides: MODEL_BETA_OVERRIDES_CC_2_1_186,
+    system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
+    models: CATALOG_CC_2_1_175,
+    default_model: "opus",
+    preserve_explicit_model: true,
+    wire_defaults: WIRE_DEFAULTS_CC_2_1_186,
+    model_wire_overrides: MODEL_WIRE_OVERRIDES_CC_2_1_175,
+    billing: BILLING_SCHEME_V1_NO_CCH,
+};
+
 pub static FINGERPRINT_PROFILES: &[FingerprintProfile] = &[
+    PROFILE_CLAUDE_2_1_186_SDK_CLI,
     PROFILE_CLAUDE_2_1_175_SDK_CLI,
     PROFILE_CLAUDE_2_1_165_SDK_CLI,
     PROFILE_CLAUDE_2_1_162_SDK_CLI,
@@ -1055,9 +1167,11 @@ pub fn valid_profile_selectors() -> String {
 }
 
 pub fn is_claude_code_billing_header(text: &str) -> bool {
+    // Two accepted shapes:
+    //   <= 2.1.175: ...; cc_entrypoint=<ep>; cch=<checksum>;
+    //   >= 2.1.186: ...; cc_entrypoint=<ep>;     (no trailing cch field)
     text.starts_with("x-anthropic-billing-header: cc_version=")
         && text.contains("; cc_entrypoint=")
-        && text.contains("; cch=")
 }
 
 /// What kind of request this is - controls minor header variations.
@@ -1650,10 +1764,10 @@ mod tests {
         let profile = default_profile();
         let creds = fixture_creds();
         let cases = [
-            ("fable", BETA_CC_2_1_175_FABLE, false),
-            ("opus", BETA_CC_2_1_175_OPUS, false),
-            ("sonnet", BETA_CC_2_1_175_SONNET, false),
-            ("haiku", BETA_CC_2_1_175_HAIKU, false),
+            ("fable", BETA_CC_2_1_186_FABLE, false),
+            ("opus", BETA_CC_2_1_186_OPUS, false),
+            ("sonnet", BETA_CC_2_1_186_SONNET, false),
+            ("haiku", BETA_CC_2_1_186_HAIKU, false),
         ];
         for (alias, expected_beta, has_context_1m) in cases {
             // Mirror the handler: resolve + canonicalize before building headers.
@@ -1797,13 +1911,13 @@ mod tests {
     #[test]
     fn default_profile_matches_refreshed_claude_code_baseline() {
         let profile = default_profile();
-        assert_eq!(profile.name, "cc-2.1.175-sdk-cli");
-        assert_eq!(profile.claude_cli_version, "2.1.175");
+        assert_eq!(profile.name, "cc-2.1.186-sdk-cli");
+        assert_eq!(profile.claude_cli_version, "2.1.186");
         assert_eq!(profile.stainless_package_version, "0.94.0");
         assert_eq!(profile.stainless_runtime_version, "v24.3.0");
         assert_eq!(
             profile.user_agent(),
-            "claude-cli/2.1.175 (external, sdk-cli)"
+            "claude-cli/2.1.186 (external, sdk-cli)"
         );
         assert_eq!(profile.default_model, "opus");
         assert_eq!(profile.resolve_model("fable").canonical, "claude-fable-5");
@@ -1822,8 +1936,19 @@ mod tests {
     fn profile_registry_resolves_known_selectors() {
         assert_eq!(
             resolve_profile("latest").unwrap().name,
-            "cc-2.1.175-sdk-cli"
+            "cc-2.1.186-sdk-cli"
         );
+        assert_eq!(
+            resolve_profile("cc-2.1.186-sdk-cli")
+                .unwrap()
+                .claude_cli_version,
+            "2.1.186"
+        );
+        assert_eq!(
+            resolve_profile("2.1.186").unwrap().name,
+            "cc-2.1.186-sdk-cli"
+        );
+        // 2.1.175 is retained for back-compat (no longer the default).
         assert_eq!(
             resolve_profile("cc-2.1.175-sdk-cli")
                 .unwrap()
@@ -1940,8 +2065,19 @@ mod tests {
         // Captured from Claude Code 2.1.175 with CLAUDE_CODE_ENTRYPOINT=sdk-cli
         // and prompt "Say OK" on 2026-06-12.
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.175"), "174");
+        // Captured from Claude Code 2.1.186 with CLAUDE_CODE_ENTRYPOINT=sdk-cli
+        // and prompt "Say OK" on 2026-06-22 (live shared-capture mitmproxy run:
+        // the real billing header read `cc_version=2.1.186.a80`).
+        assert_eq!(claude_code_version_suffix("Say OK", "2.1.186"), "a80");
+        // 2.1.186 (the default) emits NO cch field - the header ends at the
+        // entrypoint. Verified byte-for-byte from two independent live captures.
         assert_eq!(
             default_profile().billing_header_text("Say OK"),
+            "x-anthropic-billing-header: cc_version=2.1.186.a80; cc_entrypoint=sdk-cli;"
+        );
+        // The 2.1.175 profile still emits the cch placeholder form.
+        assert_eq!(
+            resolve_profile("2.1.175").unwrap().billing_header_text("Say OK"),
             "x-anthropic-billing-header: cc_version=2.1.175.174; cc_entrypoint=sdk-cli; cch=00000;"
         );
     }
@@ -1950,17 +2086,31 @@ mod tests {
     fn billing_cch_stays_on_known_safe_sentinel() {
         for profile in FINGERPRINT_PROFILES {
             let header = profile.billing_header_text("Say OK");
-            assert!(
-                header.contains("cch=00000;"),
-                "profile {} emitted unexpected cch value: {header}",
-                profile.name
-            );
+            // A profile either carries the safe sentinel placeholder (rewritten by
+            // finalize_body) or carries no cch field at all (2.1.186+). What is
+            // never allowed is a baked-in real (non-sentinel) cch value.
+            if header.contains("cch=") {
+                assert!(
+                    header.contains("cch=00000;"),
+                    "profile {} emitted unexpected cch value: {header}",
+                    profile.name
+                );
+            } else {
+                assert!(
+                    header.ends_with("; cc_entrypoint=sdk-cli;"),
+                    "profile {} omitted cch but has an unexpected header tail: {header}",
+                    profile.name
+                );
+            }
         }
     }
 
     #[test]
     fn finalized_body_writes_profile_checksum() {
-        let profile = default_profile();
+        // Exercises the cch REWRITE mechanism, which only the cch-emitting
+        // profiles use. The default (2.1.186) has no cch; pin a representative
+        // cch profile so this guards the rewrite path itself.
+        let profile = resolve_profile("2.1.175").unwrap();
         let ctx = RequestContext::new_reply();
         let body = serde_json::json!({
             "system": [
@@ -2013,15 +2163,52 @@ mod tests {
         });
         let json = String::from_utf8(profile.finalize_body_json(&body, &ctx).unwrap()).unwrap();
 
-        // cch over this fixed body for the DEFAULT profile. Re-derived
-        // from the rebuilt binary, not hand-edited: it moves whenever the embedded
-        // cc_version suffix or cch algorithm changes.
+        // The default (2.1.186) emits NO cch: the body must carry the bare
+        // entrypoint terminator and no cch field anywhere.
+        assert!(
+            json.contains("cc_entrypoint=sdk-cli;"),
+            "default body missing entrypoint terminator"
+        );
+        assert!(
+            !json.contains("cch="),
+            "default (2.1.186) body unexpectedly contains a cch field: {json}"
+        );
+
+        // Regression guard for the cch REWRITE algorithm on the 2.1.175 profile:
+        // the snapshot value is re-derived from the rebuilt binary, not hand-edited,
+        // and moves whenever the embedded cc_version suffix or cch algorithm changes.
+        let cch_profile = resolve_profile("2.1.175").unwrap();
+        let cch_body = serde_json::json!({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 4096,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Say OK"}
+                    ]
+                }
+            ],
+            "system": [
+                {
+                    "type": "text",
+                    "text": cch_profile.billing_header_text("Say OK"),
+                },
+                {
+                    "type": "text",
+                    "text": cch_profile.system_preamble,
+                }
+            ],
+            "stream": false
+        });
+        let cch_json =
+            String::from_utf8(cch_profile.finalize_body_json(&cch_body, &ctx).unwrap()).unwrap();
         let marker = "cc_entrypoint=sdk-cli; cch=";
-        let idx = json.find(marker).expect("snapshot body missing cch marker");
-        let got = &json[idx + marker.len()..idx + marker.len() + 5];
+        let idx = cch_json.find(marker).expect("snapshot body missing cch marker");
+        let got = &cch_json[idx + marker.len()..idx + marker.len() + 5];
         assert_eq!(
             got, "527d7",
-            "default-profile snapshot cch changed (re-derive literal)"
+            "2.1.175 snapshot cch changed (re-derive literal)"
         );
     }
 
@@ -2047,7 +2234,10 @@ mod tests {
 
     #[test]
     fn finalized_body_does_not_rewrite_user_text_sentinel() {
-        let profile = default_profile();
+        // The "don't clobber a user-supplied cch=00000" guard only applies to the
+        // cch REWRITE path. Pin a cch-emitting profile (2.1.175); the default
+        // (2.1.186) performs no rewrite at all.
+        let profile = resolve_profile("2.1.175").unwrap();
         let ctx = RequestContext::new_reply();
         let user_text = "leave user cch=00000 untouched";
         let body = serde_json::json!({
@@ -2114,7 +2304,9 @@ mod tests {
 
     #[test]
     fn finalized_body_rewrites_only_first_billing_sentinel() {
-        let profile = default_profile();
+        // "Rewrite only the first sentinel" is a property of the cch REWRITE path.
+        // Pin a cch-emitting profile (2.1.175); the default (2.1.186) has no cch.
+        let profile = resolve_profile("2.1.175").unwrap();
         let ctx = RequestContext::new_reply();
         let body = serde_json::json!({
             "system": [
@@ -2444,13 +2636,32 @@ mod tests {
                 "suffix not hex for {input:?}: {expected_suffix}"
             );
             let header = profile.billing_header_text(input);
+            // The default (2.1.186) emits the No-CCH header shape; the suffix
+            // itself is what this oracle is guarding across varied first-user text.
             assert_eq!(
                 header,
                 format!(
                     "x-anthropic-billing-header: cc_version={ver}.{expected_suffix}; \
-                     cc_entrypoint=sdk-cli; cch=00000;"
+                     cc_entrypoint=sdk-cli;"
                 ),
                 "billing_header_text diverged from suffix oracle for first_user_text {input:?}"
+            );
+        }
+
+        // Same oracle on a cch-emitting profile (2.1.175) to lock the cch-tail
+        // shape too.
+        let cch_profile = resolve_profile("2.1.175").unwrap();
+        let cver = cch_profile.claude_cli_version;
+        for input in inputs {
+            let expected_suffix = claude_code_version_suffix(input, cver);
+            let header = cch_profile.billing_header_text(input);
+            assert_eq!(
+                header,
+                format!(
+                    "x-anthropic-billing-header: cc_version={cver}.{expected_suffix}; \
+                     cc_entrypoint=sdk-cli; cch=00000;"
+                ),
+                "cch billing_header_text diverged from suffix oracle for {input:?}"
             );
         }
     }

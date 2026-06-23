@@ -31,7 +31,7 @@ pub mod upstream;
 
 pub use fingerprint::{
     CLAUDE_CODE_SYSTEM_PREAMBLE, FingerprintProfile, RequestContext, RequestKind, default_profile,
-    resolve_profile,
+    resolve_profile, valid_profile_selectors,
 };
 pub use upstream::{UpstreamClient, UpstreamError};
 
@@ -488,7 +488,7 @@ mod tests {
         assert_eq!(provider_id(), "claude");
         let p = ClaudeProvider::new().expect("default profile constructs");
         assert_eq!(p.id(), "claude");
-        assert_eq!(p.profile().name, "cc-2.1.175-sdk-cli");
+        assert_eq!(p.profile().name, "cc-2.1.186-sdk-cli");
     }
 
     #[test]

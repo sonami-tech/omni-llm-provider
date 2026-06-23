@@ -25,10 +25,17 @@ except ImportError:
 	sys.exit(2)
 
 
-PINNED_VERSION = "2.1.175"
-PINNED_PROFILE = "cc-2.1.175-sdk-cli"
+PINNED_VERSION = "2.1.186"
+PINNED_PROFILE = "cc-2.1.186-sdk-cli"
 CCH_SEED = 0x4D659218E32A3268
 CCH_RE = re.compile(r"(cc_entrypoint=sdk-cli; cch=)([0-9a-f]{5})(;)")
+# 2.1.186+ emits the billing header with NO trailing cch field; it ends at the
+# entrypoint terminator. This regex matches that no-cch shape.
+NO_CCH_HEADER_RE = re.compile(
+	r"x-anthropic-billing-header: cc_version=([0-9.]+)\.([0-9a-f]{3}); cc_entrypoint=sdk-cli;(?!\s*cch=)"
+)
+# Versions whose billing header carries no cch field at all (BillingCchMode::None).
+NO_CCH_VERSIONS = {"2.1.186"}
 MODEL_RE = re.compile(rb'("model":")((?:\\.|[^"\\])*)(")')
 
 # --- Clean-room recovered-vector capture (--emit-vectors) ---------------------
@@ -256,8 +263,13 @@ def cch_for_placeholder_body(placeholder: bytes) -> str:
 	return f"{xxhash.xxh64(body, seed=CCH_SEED).intdigest() & 0xfffff:05x}"
 
 
+# Versions whose cch hashes the body with model string values and the numeric
+# max_tokens field removed (BILLING_SCHEME_V1_CCH_XXH64_SKIP_MODELS_AND_MAX_TOKENS).
+CCH_SKIP_MODELS_AND_MAX_TOKENS_VERSIONS = {"2.1.175", "2.1.186"}
+
+
 def cch_input_bytes(placeholder: bytes) -> bytes:
-	if PINNED_VERSION == "2.1.175":
+	if PINNED_VERSION in CCH_SKIP_MODELS_AND_MAX_TOKENS_VERSIONS:
 		return body_without_model_values_and_max_tokens(placeholder)
 	return placeholder
 
@@ -499,6 +511,21 @@ def emit_vectors(claude_bin: str, version: str, out_dir: str, timeout: int) -> i
 
 
 def validate_body(body: str) -> tuple[bool, str]:
+	if PINNED_VERSION in NO_CCH_VERSIONS:
+		# No-cch era: assert the billing header is present in the no-cch shape and
+		# carries the pinned version. There is no checksum to recompute.
+		match = NO_CCH_HEADER_RE.search(body)
+		if match is None:
+			return False, "no sdk-cli billing header in expected no-cch shape"
+		header_version = match.group(1)
+		if header_version != PINNED_VERSION:
+			return (
+				False,
+				f"billing header cc_version {header_version} != pinned {PINNED_VERSION}",
+			)
+		if CCH_RE.search(body):
+			return False, "no-cch version unexpectedly emitted a cch field"
+		return True, f"no-cch billing header matches pinned {PINNED_VERSION}.{match.group(2)}"
 	match = CCH_RE.search(body)
 	if match is None:
 		return False, "no sdk-cli cch marker found"
