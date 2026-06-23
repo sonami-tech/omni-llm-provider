@@ -57,12 +57,16 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use omni_common::Replacements;
-use omni_core::{
-    CanonicalBlock, CanonicalContent, CanonicalReasoning, CanonicalRequest, CanonicalResponse,
-    CanonicalResponseMetadata, CanonicalStream, CanonicalStreamEvent, CanonicalToolCall,
-    CanonicalToolChoice, CanonicalUsage, CatalogMode, CatalogModel, LlmProvider, ProviderError,
-    ProviderVersion,
+use omni_common::responses_upstream::{
+    self, ErrorRedactor, ResponsesSseBuffer, ResponsesStreamParser,
 };
+use omni_core::{
+    CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
+    CanonicalResponse, CanonicalResponseMetadata, CanonicalStream, CanonicalStreamEvent,
+    CanonicalToolCall, CanonicalToolChoice, CanonicalUsage, CatalogMode, CatalogModel, LlmProvider,
+    ProviderError, ProviderVersion,
+};
+use reqwest::header;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -76,6 +80,17 @@ use credentials::GrokCredentials;
 static GROK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
+
+/// Conservative-mode upstream: the host the installed grok-shell CLI talks to
+/// (`POST /v1/responses`, OpenAI Responses shape). Used when conservative mode is
+/// active and the operator has not explicitly overridden `base_url`.
+const CONSERVATIVE_BASE_URL: &str = "https://cli-chat-proxy.grok.com";
+
+/// User-Agent template for conservative-mode requests. `{version}` is filled from
+/// the pinned catalog version (`self.version.version`, e.g. "0.2.60") so the UA
+/// and `x-grok-client-version` cannot drift from the catalog the request claims.
+/// Verified live against grok-shell 0.2.60 (2026-06-23).
+const CONSERVATIVE_USER_AGENT_TEMPLATE: &str = "grok-shell/{version} (linux; x86_64)";
 
 // Grok catalogs, verified 2026-06-22 via live capture (see
 // docs/providers/grok/README.md and the grok-codex-live-catalog-probe memory).
@@ -144,12 +159,23 @@ pub struct GrokProvider {
     mode: CatalogMode,
     /// Pinned version from the provider's own catalog. Default newest.
     version: &'static ProviderVersion,
+    /// Whether conservative mode emits a parity-loss `warn!` when an override
+    /// (custom base_url / custom auth / `XAI_CREDENTIALS_PATH`) is active. True in
+    /// every production constructor; only the conservative test constructor sets it
+    /// false so a mock-pointed test does not log warn noise.
+    warn_overrides: bool,
 }
 
 #[derive(Debug, Clone)]
 enum GrokAuthConfig {
     Default {
+        /// Explicit bearer set only by `new(Some(..))` / `new_for_test*`; production
+        /// `new(None)` leaves it `None` and the send path resolves from disk.
         fallback_api_key: Option<String>,
+        /// Explicit OIDC `user_id` paired with `fallback_api_key`, used for
+        /// `x-grok-user-id` in conservative mode without touching disk (mirrors how
+        /// `fallback_api_key` short-circuits the file chain). `None` in production.
+        fallback_user_id: Option<String>,
     },
     Custom {
         api_key: Option<String>,
@@ -186,9 +212,11 @@ impl GrokProvider {
             base_url: DEFAULT_BASE_URL.to_owned(),
             auth: GrokAuthConfig::Default {
                 fallback_api_key: api_key,
+                fallback_user_id: None,
             },
             mode: CatalogMode::default(),
             version: &GROK_VERSIONS[0],
+            warn_overrides: true,
         })
     }
 
@@ -299,9 +327,39 @@ impl GrokProvider {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             auth: GrokAuthConfig::Default {
                 fallback_api_key: Some(api_key.into()),
+                fallback_user_id: None,
             },
             mode: CatalogMode::default(),
             version: &GROK_VERSIONS[0],
+            warn_overrides: true,
+        }
+    }
+
+    /// Test-only constructor for the conservative path: points `base_url` at a
+    /// mock and injects an explicit bearer (a fake JWT) + optional fake user_id
+    /// uuid through the REAL `Default` auth fields, so the resolver short-circuits
+    /// the disk chain exactly the way an operator-supplied `new(Some(..))` key does
+    /// (no test-only field on the production struct). A conservative test thus
+    /// exercises the real request build + HTTP + shared Responses parse without
+    /// touching disk. `warn_overrides` is forced off so the mock base does not spam
+    /// parity warnings (the warn precedence is covered by a unit test on the pure
+    /// helper). NEVER use real credentials here.
+    #[cfg(test)]
+    pub fn new_for_test_conservative(
+        api_key: impl Into<String>,
+        user_id: Option<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            client: Client::new(),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            auth: GrokAuthConfig::Default {
+                fallback_api_key: Some(api_key.into()),
+                fallback_user_id: user_id,
+            },
+            mode: CatalogMode::Conservative,
+            version: &GROK_VERSIONS[0],
+            warn_overrides: false,
         }
     }
 
@@ -346,7 +404,10 @@ impl GrokProvider {
     /// `new_for_test`; production `new(None)` never sets one), and otherwise return a clear `Auth`
     /// error naming where we looked.
     async fn resolve_api_key(&self) -> Result<String, ProviderError> {
-        let GrokAuthConfig::Default { fallback_api_key } = &self.auth else {
+        let GrokAuthConfig::Default {
+            fallback_api_key, ..
+        } = &self.auth
+        else {
             return Err(ProviderError::Auth(
                 "custom Grok auth does not use the default xAI credential chain".into(),
             ));
@@ -416,6 +477,343 @@ impl GrokProvider {
             }
         }
     }
+
+    /// The effective conservative upstream base, and whether it is a real override
+    /// (an explicit base_url that is neither the extended default nor the
+    /// conservative host). Precedence: the extended default (`api.x.ai`, untouched
+    /// by the operator) maps to the conservative host with no override; the
+    /// conservative host itself is the intended target (no override); anything else
+    /// is a deliberate redirect (proxy/mock) reported as an override so the caller
+    /// can warn that exact CLI parity no longer holds.
+    fn conservative_base(&self) -> (String, bool) {
+        if self.base_url == DEFAULT_BASE_URL {
+            (CONSERVATIVE_BASE_URL.to_string(), false)
+        } else if self.base_url == CONSERVATIVE_BASE_URL {
+            (self.base_url.clone(), false)
+        } else {
+            (self.base_url.clone(), true)
+        }
+    }
+
+    /// Resolve credentials for the conservative path (api_key + OIDC user_id).
+    ///
+    /// An explicit `fallback_api_key` on the `Default` auth (set by
+    /// `new(Some(..))` / the conservative test constructor) short-circuits the disk
+    /// chain and is used directly, paired with its `fallback_user_id` - the same
+    /// "explicit ctor key wins" rule the chat path uses, so no test-only state
+    /// lives on the production struct. Otherwise the same fresh file chain as the
+    /// chat path is used (so a CLI re-login / rotation is picked up), and an expired
+    /// OIDC token warns-but-continues exactly like the chat path. A `Custom` auth
+    /// config is not the default xAI chain and is rejected (callers that hit this
+    /// fall back to extended, which honors Custom).
+    async fn resolve_conservative_credentials(
+        &self,
+    ) -> Result<GrokCredentials, credentials::GrokCredentialsError> {
+        let GrokAuthConfig::Default {
+            fallback_api_key,
+            fallback_user_id,
+        } = &self.auth
+        else {
+            return Err(credentials::GrokCredentialsError::NoSource);
+        };
+        if let Some(api_key) = fallback_api_key {
+            return Ok(GrokCredentials {
+                api_key: api_key.clone(),
+                expires_at_ms: None,
+                user_id: fallback_user_id.clone(),
+            });
+        }
+        let creds = GrokCredentials::load_resolved_async().await?;
+        if let Err(e) = creds.check_expired() {
+            warn!(
+                error = %e,
+                "grok OIDC token past expiry (continuing; re-run the Grok CLI login if requests 401)"
+            );
+        }
+        Ok(creds)
+    }
+
+    /// Build the conservative (grok-shell 0.2.60) request headers for
+    /// `cli-chat-proxy.grok.com /v1/responses`.
+    ///
+    /// Header NAMES + VALUES are the fingerprint surface; order does not matter
+    /// (reqwest sets them). The 0.2.60 version string and the UA are both derived
+    /// from `self.version.version`, so they cannot drift from the catalog the
+    /// request claims.
+    ///
+    /// INTENTIONALLY OMITTED CLI headers and why:
+    /// - `x-grok-conv-id`, `x-grok-req-id`, `x-grok-session-id`, `x-grok-agent-id`:
+    ///   session-tracking, EMPTY on a fresh single-shot request, not
+    ///   auth/signature-bearing. reqwest may drop empty header values anyway, so
+    ///   we omit them rather than send empty strings.
+    /// - `accept-encoding`: left to reqwest's own default (it sets gzip/br when the
+    ///   features are on); not signature-critical.
+    /// - `x-grok-user-id`: omitted when the resolved credential has no `user_id`
+    ///   (e.g. a static key), mirroring the CLI which omits it when unavailable.
+    fn conservative_headers(
+        &self,
+        creds: &GrokCredentials,
+        model: &str,
+    ) -> Result<header::HeaderMap, ProviderError> {
+        let version = self.version.version;
+        let user_agent = CONSERVATIVE_USER_AGENT_TEMPLATE.replace("{version}", version);
+
+        let mut headers = header::HeaderMap::new();
+
+        // Authorization first, marked sensitive so the value is never printed by a
+        // header dump (the error redactor also scrubs Bearer JWTs from bodies).
+        let bearer = format!("Bearer {}", creds.api_key);
+        let mut bearer_value = header::HeaderValue::from_str(&bearer)
+            .map_err(|_| ProviderError::Auth("invalid Grok bearer token".into()))?;
+        bearer_value.set_sensitive(true);
+        headers.insert(header::AUTHORIZATION, bearer_value);
+
+        // Fixed + derived headers. Names are static; values are validated.
+        let fixed: [(&'static str, &str); 8] = [
+            ("content-type", "application/json"),
+            ("x-xai-token-auth", "xai-grok-cli"),
+            ("x-authenticateresponse", "authenticate-response"),
+            ("x-grok-client-version", version),
+            ("x-grok-client-identifier", "grok-shell"),
+            ("user-agent", &user_agent),
+            ("x-grok-model-override", model),
+            ("accept", "text/event-stream"),
+        ];
+        for (name, value) in fixed {
+            let value = header::HeaderValue::from_str(value).map_err(|_| {
+                ProviderError::Auth(format!("invalid conservative grok header value for {name}"))
+            })?;
+            headers.insert(header::HeaderName::from_static(name), value);
+        }
+        // x-grok-user-id only when the credential carries an OIDC subject (the CLI
+        // omits this header for static keys / when user_id is unavailable).
+        if let Some(user_id) = creds.user_id.as_deref().filter(|id| !id.trim().is_empty()) {
+            let value = header::HeaderValue::from_str(user_id)
+                .map_err(|_| ProviderError::Auth("invalid grok user_id header value".into()))?;
+            headers.insert(header::HeaderName::from_static("x-grok-user-id"), value);
+        }
+        Ok(headers)
+    }
+
+    /// Non-stream conservative send: POST a Responses body (stream=false) to
+    /// cli-chat-proxy and map the JSON via the SHARED Responses mapper.
+    async fn send_conservative(
+        &self,
+        req: CanonicalRequest,
+        creds: GrokCredentials,
+    ) -> Result<CanonicalResponse, ProviderError> {
+        let (base, overridden) = self.conservative_base();
+        self.warn_conservative_override(overridden);
+        let model = resolve_model_alias(&req.model, self.active_catalog())
+            .unwrap_or(req.model.as_str())
+            .to_string();
+        let body = to_grok_responses_request(&req, self.active_catalog(), false)?;
+        let headers = self.conservative_headers(&creds, &model)?;
+        let url = format!("{}/v1/responses", base);
+        debug!(%url, "POST grok conservative responses");
+
+        let redactor = GrokErrorRedactor;
+        let resp = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                ProviderError::Upstream(redactor.redact(&format!(
+                    "network error calling grok conservative: {e}"
+                )))
+            })?;
+
+        let status = resp.status();
+        let bytes = resp.bytes().await.map_err(|e| {
+            ProviderError::Upstream(
+                redactor.redact(&format!("grok conservative response read error: {e}")),
+            )
+        })?;
+        if !status.is_success() {
+            return Err(ProviderError::Upstream(redactor.redact(&format!(
+                "grok conservative {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            ))));
+        }
+
+        let value: Value = serde_json::from_slice(&bytes).map_err(|e| {
+            ProviderError::Upstream(format!("failed to decode grok conservative response: {e}"))
+        })?;
+        responses_upstream::response_to_canonical(&value, &req.model, "grok", &redactor)
+    }
+
+    /// Streaming conservative send: POST a Responses body (stream=true) and drive
+    /// the SHARED Responses SSE parser, mirroring provider-codex's loop.
+    async fn send_stream_conservative(
+        &self,
+        req: CanonicalRequest,
+        creds: GrokCredentials,
+    ) -> Result<CanonicalStream, ProviderError> {
+        let (base, overridden) = self.conservative_base();
+        self.warn_conservative_override(overridden);
+        let model = resolve_model_alias(&req.model, self.active_catalog())
+            .unwrap_or(req.model.as_str())
+            .to_string();
+        let body = to_grok_responses_request(&req, self.active_catalog(), true)?;
+        let headers = self.conservative_headers(&creds, &model)?;
+        let url = format!("{}/v1/responses", base);
+        let client = self.client.clone();
+        let redactor = GrokErrorRedactor;
+
+        let stream = async_stream::stream! {
+            let send_result = client.post(&url).headers(headers).json(&body).send().await;
+
+            let http_resp = match send_result {
+                Ok(resp) => resp,
+                Err(e) => {
+                    yield Err(ProviderError::Upstream(redactor.redact(&format!(
+                        "network error calling grok conservative: {e}"
+                    ))));
+                    return;
+                }
+            };
+
+            let status = http_resp.status();
+            if !status.is_success() {
+                let err_body = redactor.redact(
+                    &http_resp
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "<no body>".to_string()),
+                );
+                error!(%status, body = %err_body, "grok conservative upstream stream error");
+                yield Err(ProviderError::Upstream(redactor.redact(&format!(
+                    "grok conservative {status}: {err_body}"
+                ))));
+                return;
+            }
+
+            if let Some(content_type) = http_resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                && !content_type
+                    .to_ascii_lowercase()
+                    .starts_with("text/event-stream")
+            {
+                yield Err(ProviderError::Upstream(format!(
+                    "grok conservative stream expected text/event-stream, got {content_type}"
+                )));
+                return;
+            }
+
+            let mut bytes = http_resp.bytes_stream();
+            let mut sse = ResponsesSseBuffer::default();
+            let mut parser = ResponsesStreamParser::new("grok", redactor.clone());
+            let mut finished = false;
+            let mut saw_event = false;
+
+            while let Some(chunk) = bytes.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(e) => {
+                        yield Err(ProviderError::Upstream(redactor.redact(&format!(
+                            "grok conservative stream read error: {e}"
+                        ))));
+                        return;
+                    }
+                };
+                let events = match sse.push(&chunk) {
+                    Ok(events) => events,
+                    Err(e) => {
+                        yield Err(ProviderError::Upstream(e));
+                        return;
+                    }
+                };
+                for event in events {
+                    saw_event = true;
+                    for parsed in parser.handle_event(event) {
+                        match parsed {
+                            Ok(CanonicalStreamEvent::Finish { .. }) => {
+                                finished = true;
+                                yield parsed;
+                            }
+                            Err(_) => {
+                                yield parsed;
+                                return;
+                            }
+                            Ok(other) => {
+                                yield Ok(other);
+                            }
+                        }
+                    }
+                    if finished {
+                        break;
+                    }
+                }
+                if finished {
+                    break;
+                }
+            }
+
+            if !finished {
+                match sse.finish() {
+                    Ok(Some(event)) => {
+                        saw_event = true;
+                        for parsed in parser.handle_event(event) {
+                            match parsed {
+                                Ok(CanonicalStreamEvent::Finish { .. }) => {
+                                    finished = true;
+                                    yield parsed;
+                                }
+                                Err(_) => {
+                                    yield parsed;
+                                    return;
+                                }
+                                Ok(other) => {
+                                    yield Ok(other);
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        yield Err(ProviderError::Upstream(e));
+                        return;
+                    }
+                }
+            }
+
+            if !finished {
+                let message = if saw_event {
+                    "grok conservative stream ended before a terminal response event"
+                } else {
+                    "grok conservative stream ended without any SSE events"
+                };
+                yield Err(ProviderError::Upstream(redactor.redact(message)));
+            }
+        };
+
+        Ok(Box::pin(stream))
+    }
+
+    /// Emit a single parity-loss warning when an override is active in
+    /// conservative mode. Honored-but-not-exact: env/config overrides (custom
+    /// base_url, Custom auth, or `XAI_CREDENTIALS_PATH`) are still used, but they
+    /// break byte-exact CLI parity, so we surface that once and proceed.
+    fn warn_conservative_override(&self, base_overridden: bool) {
+        if !self.warn_overrides {
+            return;
+        }
+        let custom_auth = !matches!(self.auth, GrokAuthConfig::Default { .. });
+        let creds_path = std::env::var_os("XAI_CREDENTIALS_PATH").is_some();
+        if base_overridden || custom_auth || creds_path {
+            warn!(
+                base_overridden,
+                custom_auth,
+                xai_credentials_path = creds_path,
+                "grok conservative mode parity is not exact: an override (custom base_url / custom auth / XAI_CREDENTIALS_PATH) is active; proceeding with the override"
+            );
+        }
+    }
 }
 
 fn headers_from_env(env_name: &str) -> Result<Vec<(String, String)>, ProviderError> {
@@ -461,6 +859,19 @@ fn redact(input: &str) -> String {
         }
     }
     out
+}
+
+/// `ErrorRedactor` for the shared Responses machinery (conservative mode). Reuses
+/// the existing free `redact` (which scrubs `sk-`/`xai-`/`eyJ` bearer prefixes) so
+/// the conservative path uses the identical redaction as the chat path - no
+/// duplicated secret-detection logic.
+#[derive(Clone, Debug, Default)]
+struct GrokErrorRedactor;
+
+impl ErrorRedactor for GrokErrorRedactor {
+    fn redact(&self, input: &str) -> String {
+        redact(input)
+    }
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -712,6 +1123,210 @@ fn to_xai_chat_stream_request(
     body["stream"] = json!(true);
     body["stream_options"] = json!({ "include_usage": true });
     Ok(body)
+}
+
+// --- Conservative mode (grok-shell CLI parity): OpenAI Responses request body ----------------
+//
+// In conservative mode Grok talks the OpenAI *Responses* wire to
+// cli-chat-proxy.grok.com (verified live against grok-shell 0.2.60). The HEADERS
+// are the fingerprint surface (see `conservative_headers`); the BODY only needs a
+// valid Responses shape carrying the USER's request, NOT a byte-replay of the
+// CLI's private content/tools. So this builder is deliberately minimal and
+// user-driven: typed `input` messages (system/developer kept as typed roles, NOT
+// hoisted to `instructions` - that hoist is Codex-only and wrong for Grok), FLAT
+// function `tools`, `tool_choice`, sampling, and `reasoning.effort`. We never emit
+// `instructions`, `include`, or `store`, and never inject the CLI's session_title
+// tool.
+
+/// Build the OpenAI-Responses request body for conservative mode.
+///
+/// `stream` sets the `stream` flag. The model id is resolved through the active
+/// (conservative) catalog so aliases map to real ids, falling back to the input
+/// verbatim. Testable in isolation (no network, no provider state).
+fn to_grok_responses_request(
+    req: &CanonicalRequest,
+    catalog: &[CatalogModel],
+    stream: bool,
+) -> Result<Value, ProviderError> {
+    let model = resolve_model_alias(&req.model, catalog).unwrap_or(req.model.as_str());
+
+    let mut input: Vec<Value> = Vec::new();
+    for message in &req.messages {
+        append_grok_responses_items(message, &mut input);
+    }
+
+    let mut body = json!({
+        "model": model,
+        "input": input,
+        "stream": stream,
+    });
+
+    if let Some(tools) = &req.tools
+        && !tools.is_empty()
+    {
+        // FLAT Responses tool shape: {type:"function", name, parameters, description}
+        // (NOT nested under a "function" key, which is the Chat Completions shape).
+        body["tools"] = Value::Array(
+            tools
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "type": "function",
+                        "name": tool.name,
+                        "parameters": tool.parameters,
+                        "description": tool.description,
+                    })
+                })
+                .collect(),
+        );
+    }
+
+    if let Some(choice) = &req.tool_choice {
+        body["tool_choice"] = match choice {
+            CanonicalToolChoice::Auto => json!("auto"),
+            CanonicalToolChoice::Required => json!("required"),
+            CanonicalToolChoice::None => json!("none"),
+            CanonicalToolChoice::Specific { name } => json!({"type": "function", "name": name}),
+        };
+    }
+
+    if let Some(max_tokens) = req.max_tokens {
+        body["max_output_tokens"] = json!(max_tokens);
+    }
+    if let Some(temperature) = req.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = req.top_p {
+        body["top_p"] = json!(top_p);
+    }
+    if let Some(CanonicalReasoning {
+        effort: Some(effort),
+        ..
+    }) = &req.reasoning
+        && !effort.is_empty()
+    {
+        // Responses-standard reasoning; NOT the CLI's {summary:"concise"} preference.
+        body["reasoning"] = json!({ "effort": effort });
+    }
+
+    Ok(body)
+}
+
+/// Map one canonical message onto OpenAI-Responses `input` items, mirroring the
+/// inbound Responses converter + provider-codex block shaping (text ->
+/// `input_text`, image -> `input_image`, ToolUse -> `function_call`, ToolResult ->
+/// `function_call_output`) but WITHOUT the Codex instructions hoist: system and
+/// developer roles stay as typed message items with their own role.
+fn append_grok_responses_items(message: &CanonicalMessage, input: &mut Vec<Value>) {
+    match &message.content {
+        CanonicalContent::Text(text) => {
+            input.push(json!({
+                "type": "message",
+                "role": message.role,
+                "content": text,
+            }));
+        }
+        CanonicalContent::Blocks(blocks) => {
+            let mut text = String::new();
+            let mut content_parts: Vec<Value> = Vec::new();
+            let mut has_image = false;
+            for block in blocks {
+                match block {
+                    CanonicalBlock::Text(t) => {
+                        text.push_str(t);
+                        if !t.is_empty() {
+                            content_parts.push(json!({ "type": "input_text", "text": t }));
+                        }
+                    }
+                    CanonicalBlock::Image { source } => {
+                        has_image = true;
+                        content_parts.push(json!({
+                            "type": "input_image",
+                            "image_url": source.as_image_url(),
+                        }));
+                    }
+                    CanonicalBlock::ToolUse {
+                        id,
+                        name,
+                        arguments,
+                    } => {
+                        flush_grok_responses_message(
+                            input,
+                            &message.role,
+                            &mut text,
+                            &mut content_parts,
+                            &mut has_image,
+                        );
+                        input.push(json!({
+                            "type": "function_call",
+                            "call_id": id,
+                            "name": name,
+                            "arguments": arguments,
+                        }));
+                    }
+                    CanonicalBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } => {
+                        flush_grok_responses_message(
+                            input,
+                            &message.role,
+                            &mut text,
+                            &mut content_parts,
+                            &mut has_image,
+                        );
+                        input.push(json!({
+                            "type": "function_call_output",
+                            "call_id": tool_use_id,
+                            "output": content,
+                        }));
+                    }
+                }
+            }
+            flush_grok_responses_message(
+                input,
+                &message.role,
+                &mut text,
+                &mut content_parts,
+                &mut has_image,
+            );
+        }
+    }
+}
+
+/// Emit the buffered message item (if any) before/after a tool item, matching the
+/// codex flush rule: a pure-image message uses the typed parts array; a text-only
+/// message uses a bare string; an empty buffer emits nothing.
+fn flush_grok_responses_message(
+    input: &mut Vec<Value>,
+    role: &str,
+    text: &mut String,
+    content_parts: &mut Vec<Value>,
+    has_image: &mut bool,
+) {
+    if *has_image && content_parts.is_empty() {
+        text.clear();
+        *has_image = false;
+        return;
+    }
+    if !*has_image && text.is_empty() {
+        content_parts.clear();
+        return;
+    }
+    let content = if *has_image {
+        Value::Array(std::mem::take(content_parts))
+    } else {
+        content_parts.clear();
+        Value::String(std::mem::take(text))
+    };
+    input.push(json!({
+        "type": "message",
+        "role": role,
+        "content": content,
+    }));
+    text.clear();
+    *has_image = false;
 }
 
 /// Internal typed response shapes (subset of xAI chat.completions response for robust mapping).
@@ -1081,6 +1696,24 @@ impl LlmProvider for GrokProvider {
             "sending to xAI"
         );
 
+        // Conservative mode: mimic the grok-shell CLI wire (Responses /v1/responses
+        // at cli-chat-proxy). Falls back to the extended chat path below if CLI
+        // credentials are absent (NoSource); a present-but-expired token does NOT
+        // fall back (it warns inside resolve_conservative_credentials and proceeds).
+        if self.mode == CatalogMode::Conservative {
+            match self.resolve_conservative_credentials().await {
+                Ok(creds) => return self.send_conservative(req, creds).await,
+                Err(credentials::GrokCredentialsError::NoSource) => {
+                    warn!(
+                        "grok conservative mode: no CLI credentials found; falling back to extended (api.x.ai chat-completions)"
+                    );
+                }
+                Err(e) => return Err(ProviderError::Auth(format!(
+                    "failed to load Grok conservative credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {e}"
+                ))),
+            }
+        }
+
         // Hook point (using omni-common): replacements applied at prompt boundary inside the provider.
         // In real deployment the Replacements would be loaded once in the binary and injected here.
         let repl = Replacements::empty();
@@ -1153,6 +1786,22 @@ impl LlmProvider for GrokProvider {
             has_reasoning = req.reasoning.is_some(),
             "streaming to xAI"
         );
+
+        // Conservative-mode dispatch + fall-back-to-extended-on-NoSource, mirroring
+        // the non-stream send() path.
+        if self.mode == CatalogMode::Conservative {
+            match self.resolve_conservative_credentials().await {
+                Ok(creds) => return self.send_stream_conservative(req, creds).await,
+                Err(credentials::GrokCredentialsError::NoSource) => {
+                    warn!(
+                        "grok conservative mode: no CLI credentials found; falling back to extended (api.x.ai chat-completions)"
+                    );
+                }
+                Err(e) => return Err(ProviderError::Auth(format!(
+                    "failed to load Grok conservative credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {e}"
+                ))),
+            }
+        }
 
         // Same prompt-scope replacements seam as send() (Replacements::empty() hook).
         let repl = Replacements::empty();
@@ -2960,6 +3609,7 @@ mod tests {
         let static_key = GrokCredentials {
             api_key: "xai-foo-bar-123".into(),
             expires_at_ms: None,
+            user_id: None,
         };
         assert!(
             static_key.check_expired().is_ok(),
@@ -2969,6 +3619,7 @@ mod tests {
         let live_oidc = GrokCredentials {
             api_key: "jwt-live".into(),
             expires_at_ms: Some(chrono::Utc::now().timestamp_millis() + 60_000),
+            user_id: None,
         };
         assert!(
             live_oidc.check_expired().is_ok(),
@@ -2978,6 +3629,7 @@ mod tests {
         let dead_oidc = GrokCredentials {
             api_key: "jwt-dead".into(),
             expires_at_ms: Some(chrono::Utc::now().timestamp_millis() - 60_000),
+            user_id: None,
         };
         assert!(
             dead_oidc.check_expired().is_err(),
@@ -3713,6 +4365,450 @@ mod tests {
         CanonicalRequest {
             model: String::new(),
             messages: vec![omni_core::CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            ..Default::default()
+        }
+    }
+
+    // ── Conservative mode (grok-shell 0.2.60 CLI parity) ──────────────────────
+    //
+    // WHY this block exists: conservative mode is a SECOND transport mimicking the
+    // installed grok-shell CLI wire to cli-chat-proxy.grok.com /v1/responses
+    // (OpenAI Responses shape). The parity guarantees under test are: (1) the body
+    // is valid Responses shape carrying the USER's content - system stays a typed
+    // role (NOT hoisted to `instructions`, which is Codex-only), tools are FLAT,
+    // and we never emit instructions/include/store; (2) the request carries the
+    // EXACT fingerprint header set; (3) responses map through the SHARED Responses
+    // mapper/parser tagged provider=="grok"; and (4) the default extended path is
+    // untouched.
+
+    #[test]
+    fn to_grok_responses_request_keeps_system_as_typed_role_not_instructions() {
+        // WHY: the single biggest body-correctness risk is copying the Codex
+        // `instructions` hoist. For Grok, a system/developer message MUST stay a
+        // typed `input` message with its own role. A regression that hoisted would
+        // change conversation semantics on the CLI surface.
+        let req = CanonicalRequest {
+            model: "grok-build".into(),
+            messages: vec![
+                CanonicalMessage {
+                    role: "system".into(),
+                    content: CanonicalContent::Text("be terse".into()),
+                },
+                CanonicalMessage {
+                    role: "developer".into(),
+                    content: CanonicalContent::Text("dev note".into()),
+                },
+                CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Text("hi".into()),
+                },
+            ],
+            max_tokens: Some(256),
+            // Exactly-representable f32 values so the f32->f64 widening in the JSON
+            // number compares cleanly (0.3 would widen to 0.30000001...).
+            temperature: Some(0.5),
+            top_p: Some(0.25),
+            reasoning: Some(CanonicalReasoning {
+                effort: Some("high".into()),
+                budget_tokens: None,
+            }),
+            ..Default::default()
+        };
+        let body =
+            to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_60, false).unwrap();
+
+        // No Codex-only / CLI-preference keys.
+        assert!(body.get("instructions").is_none(), "must NOT hoist system to instructions");
+        assert!(body.get("include").is_none(), "must not replay CLI include");
+        assert!(body.get("store").is_none(), "must not replay CLI store");
+
+        let input = body["input"].as_array().expect("input is an array");
+        assert_eq!(input.len(), 3, "every message stays a typed input item");
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "system");
+        assert_eq!(input[0]["content"], "be terse");
+        assert_eq!(input[1]["role"], "developer");
+        assert_eq!(input[2]["role"], "user");
+
+        // Sampling + reasoning use the Responses-standard fields.
+        assert_eq!(body["model"], "grok-build");
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["max_output_tokens"], 256);
+        assert_eq!(body["temperature"], 0.5);
+        assert_eq!(body["top_p"], 0.25);
+        assert_eq!(body["reasoning"], json!({"effort": "high"}));
+        assert!(body.get("reasoning_effort").is_none(), "chat-shape reasoning_effort is wrong here");
+        assert!(body.get("tools").is_none(), "no user tools -> omit tools entirely");
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn to_grok_responses_request_emits_flat_tools_and_tool_choice() {
+        // WHY: Responses tools are FLAT ({type:function,name,parameters,description}),
+        // NOT nested under "function" like Chat Completions. tool_choice must map
+        // to the Responses forms. A regression to the nested shape would be silently
+        // rejected by the Responses upstream.
+        let req = CanonicalRequest {
+            model: "grok-build".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("weather?".into()),
+            }],
+            tools: Some(vec![omni_core::CanonicalTool {
+                name: "get_weather".into(),
+                description: Some("look up weather".into()),
+                parameters: json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+            }]),
+            tool_choice: Some(CanonicalToolChoice::Specific {
+                name: "get_weather".into(),
+            }),
+            ..Default::default()
+        };
+        let body =
+            to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_60, true).unwrap();
+
+        assert_eq!(body["stream"], true);
+        let tools = body["tools"].as_array().expect("tools is an array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "get_weather", "name is FLAT, not nested under function");
+        assert!(tools[0].get("function").is_none(), "must NOT nest under a function key");
+        assert_eq!(tools[0]["parameters"]["type"], "object");
+        assert_eq!(tools[0]["description"], "look up weather");
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type": "function", "name": "get_weather"})
+        );
+    }
+
+    #[test]
+    fn to_grok_responses_request_maps_tool_blocks_to_responses_items() {
+        // WHY: a multi-turn tool conversation must round-trip through the
+        // Responses item types: ToolUse -> function_call, ToolResult ->
+        // function_call_output, keyed by call_id - mirroring the inbound Responses
+        // converter so a tool loop works end to end on the conservative wire.
+        let req = CanonicalRequest {
+            model: "grok-build".into(),
+            messages: vec![
+                CanonicalMessage {
+                    role: "assistant".into(),
+                    content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolUse {
+                        id: "call_1".into(),
+                        name: "get_weather".into(),
+                        arguments: "{\"city\":\"SF\"}".into(),
+                    }]),
+                },
+                CanonicalMessage {
+                    role: "tool".into(),
+                    content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: "sunny".into(),
+                        is_error: false,
+                    }]),
+                },
+            ],
+            ..Default::default()
+        };
+        let body =
+            to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_60, false).unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["call_id"], "call_1");
+        assert_eq!(input[0]["name"], "get_weather");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["output"], "sunny");
+    }
+
+    #[test]
+    fn conservative_base_precedence_detects_real_override_only() {
+        // WHY: the override-detection seam decides BOTH the upstream host and
+        // whether to warn. The extended default (untouched api.x.ai) maps to the
+        // conservative host as a non-override; the conservative host itself is the
+        // intended target (non-override); any other base is a deliberate redirect
+        // reported as an override. Getting this wrong either sends conservative to
+        // api.x.ai or warns on every default request.
+        let default_p = GrokProvider::new(None).unwrap().with_mode(CatalogMode::Conservative);
+        assert_eq!(
+            default_p.conservative_base(),
+            (CONSERVATIVE_BASE_URL.to_string(), false),
+            "untouched api.x.ai default -> conservative host, no override"
+        );
+
+        let cons_p = GrokProvider::new(None)
+            .unwrap()
+            .with_mode(CatalogMode::Conservative)
+            .with_base_url(CONSERVATIVE_BASE_URL);
+        assert_eq!(
+            cons_p.conservative_base(),
+            (CONSERVATIVE_BASE_URL.to_string(), false),
+            "explicit conservative host is the intended target, no override"
+        );
+
+        let proxy_p = GrokProvider::new(None)
+            .unwrap()
+            .with_mode(CatalogMode::Conservative)
+            .with_base_url("https://proxy.example.com");
+        assert_eq!(
+            proxy_p.conservative_base(),
+            ("https://proxy.example.com".to_string(), true),
+            "any other base is a real override -> warn"
+        );
+    }
+
+    #[tokio::test]
+    async fn conservative_send_carries_exact_fingerprint_headers() {
+        // WHY: in conservative mode the HEADERS are the parity surface. This pins
+        // the EXACT header name+value set the CLI sends (token-auth, client
+        // version/identifier, UA derived from the pinned version, model-override,
+        // authenticate-response, Bearer, and x-grok-user-id when creds provide it)
+        // and the /v1/responses path. A drift in any of these breaks fingerprint
+        // parity with grok-shell 0.2.60. No real credentials: a fake JWT + fake
+        // uuid are injected via the test constructor.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_cons",
+                "model": "grok-build",
+                "status": "completed",
+                "output": [{"type":"message","content":[{"type":"output_text","text":"ok"}]}],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = GrokProvider::new_for_test_conservative(
+            "eyJ-fake-jwt-not-real",
+            Some("11111111-2222-3333-4444-555555555555".to_string()),
+            server.uri(),
+        );
+        let req = CanonicalRequest {
+            model: "grok-build".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hi".into()),
+            }],
+            ..Default::default()
+        };
+        let resp = provider.send(req).await.expect("conservative send must succeed");
+        assert_eq!(resp.content, "ok");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let h = &requests[0].headers;
+        let val = |name: &str| h.get(name).map(|v| v.to_str().unwrap().to_string());
+
+        assert_eq!(val("x-xai-token-auth").as_deref(), Some("xai-grok-cli"));
+        assert_eq!(val("x-authenticateresponse").as_deref(), Some("authenticate-response"));
+        assert_eq!(val("x-grok-client-version").as_deref(), Some("0.2.60"));
+        assert_eq!(val("x-grok-client-identifier").as_deref(), Some("grok-shell"));
+        assert_eq!(
+            val("user-agent").as_deref(),
+            Some("grok-shell/0.2.60 (linux; x86_64)"),
+            "UA must be derived from the pinned catalog version"
+        );
+        assert_eq!(val("x-grok-model-override").as_deref(), Some("grok-build"));
+        assert_eq!(val("accept").as_deref(), Some("text/event-stream"));
+        assert_eq!(val("content-type").as_deref(), Some("application/json"));
+        assert_eq!(val("authorization").as_deref(), Some("Bearer eyJ-fake-jwt-not-real"));
+        assert_eq!(
+            val("x-grok-user-id").as_deref(),
+            Some("11111111-2222-3333-4444-555555555555"),
+            "x-grok-user-id must be sent when creds carry an OIDC user_id"
+        );
+        // Empty session-tracking headers are intentionally omitted.
+        assert!(h.get("x-grok-conv-id").is_none());
+        assert!(h.get("x-grok-session-id").is_none());
+    }
+
+    #[tokio::test]
+    async fn conservative_omits_user_id_header_when_creds_lack_it() {
+        // WHY: the CLI omits x-grok-user-id when the id is unavailable (e.g. a
+        // static key). With injected creds carrying user_id=None the header MUST
+        // NOT be sent (an empty/garbage subject would be a fingerprint mismatch).
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "grok-build",
+                "status": "completed",
+                "output": [{"type":"message","content":[{"type":"output_text","text":"ok"}]}],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider =
+            GrokProvider::new_for_test_conservative("eyJ-fake", None, server.uri());
+        let resp = provider.send(base_req_model("grok-build")).await.unwrap();
+        assert_eq!(resp.content, "ok");
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests[0].headers.get("x-grok-user-id").is_none(),
+            "no user_id in creds -> omit the header"
+        );
+        // The Bearer is still present even without a user_id.
+        assert_eq!(
+            requests[0].headers.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer eyJ-fake"
+        );
+    }
+
+    #[tokio::test]
+    async fn conservative_nonstream_maps_via_shared_responses_mapper() {
+        // WHY: the non-stream conservative response must flow through the SHARED
+        // Responses mapper (response_to_canonical) - the same code Codex uses -
+        // surfacing content + tool_calls + usage and tagging provider=="grok". This
+        // pins the reuse guarantee (no bespoke Grok Responses parser).
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_map",
+                "model": "grok-build",
+                "status": "completed",
+                "output": [
+                    {"type":"message","content":[{"type":"output_text","text":"hello"}]},
+                    {"type":"function_call","call_id":"call_9","name":"lookup","arguments":"{\"q\":\"x\"}"}
+                ],
+                "usage": {"input_tokens": 7, "output_tokens": 3}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider =
+            GrokProvider::new_for_test_conservative("eyJ-fake", None, server.uri());
+        let resp = provider.send(base_req_model("grok-build")).await.unwrap();
+        assert_eq!(resp.content, "hello");
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].id, "call_9");
+        assert_eq!(resp.tool_calls[0].name, "lookup");
+        assert_eq!(resp.usage.input_tokens, 7);
+        assert_eq!(resp.usage.output_tokens, 3);
+        assert_eq!(resp.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(
+            resp.metadata.as_ref().and_then(|m| m.provider.as_deref()),
+            Some("grok"),
+            "shared mapper must stamp provider=grok"
+        );
+    }
+
+    #[tokio::test]
+    async fn conservative_streaming_maps_via_shared_responses_parser() {
+        // WHY: the streaming conservative response must drive the SHARED Responses
+        // SSE parser (the same one Codex uses), turning Responses events into
+        // canonical deltas/usage/finish with provider=="grok". Pins ordered
+        // TextDelta -> Usage -> single Finish over the real HTTP path, with NO
+        // [DONE] sentinel (Responses framing).
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let sse_body = concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_stream\"}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n\n",
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider =
+            GrokProvider::new_for_test_conservative("eyJ-fake", None, server.uri());
+        let stream = provider
+            .send_stream(base_req_model("grok-build"))
+            .await
+            .expect("conservative stream opens");
+        let events: Vec<CanonicalStreamEvent> =
+            stream.map(|r| r.expect("no stream error")).collect().await;
+
+        // ResponseMetadata(id) may lead; assert the content/usage/finish core and tag.
+        assert!(
+            events.iter().any(|e| matches!(e, CanonicalStreamEvent::TextDelta(t) if t == "Hello")),
+            "expected a Hello TextDelta, got {events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            CanonicalStreamEvent::Usage(u) if u.input_tokens == 4 && u.output_tokens == 2
+        )));
+        assert_eq!(
+            events.last().unwrap(),
+            &CanonicalStreamEvent::Finish {
+                finish_reason: Some("stop".into())
+            }
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            CanonicalStreamEvent::ResponseMetadata(m) if m.provider.as_deref() == Some("grok")
+        )));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn extended_mode_default_still_hits_chat_completions() {
+        // WHY: the conservative work must not touch the DEFAULT (extended) path.
+        // This proves a default provider still POSTs the chat-completions shape to
+        // /chat/completions (NOT /v1/responses), so the second transport is fully
+        // gated behind CatalogMode::Conservative.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _creds = DummyXaiCreds::install("extended-unchanged");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-ext",
+                "model": "grok-4.3",
+                "choices": [{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Default mode (Extended), pointed at the mock.
+        let provider = GrokProvider::new_for_test(DummyXaiCreds::WRONG_CTOR_KEY, server.uri());
+        let resp = provider.send(base_req_model("grok-4.3")).await.unwrap();
+        assert_eq!(resp.content, "hi");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].url.path().ends_with("/chat/completions"),
+            "extended default must use chat-completions, not /v1/responses"
+        );
+    }
+
+    /// A base request pinned to a specific model id (conservative tests pass a
+    /// real conservative catalog id so model resolution is exercised).
+    fn base_req_model(model: &str) -> CanonicalRequest {
+        CanonicalRequest {
+            model: model.into(),
+            messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("hi".into()),
             }],

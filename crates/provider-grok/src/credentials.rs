@@ -72,6 +72,9 @@ struct GrokCliEntry {
     auth_mode: Option<String>,
     /// ISO 8601 expiry of the access token (e.g. "2026-06-10T22:20:22.000000Z").
     expires_at: Option<String>,
+    /// The OIDC subject (a uuid) the Grok CLI sends as `x-grok-user-id` in
+    /// conservative mode. Absent on static-key files (None there).
+    user_id: Option<String>,
 }
 
 /// In-memory parsed Grok credentials.
@@ -81,6 +84,9 @@ pub struct GrokCredentials {
     /// Access-token expiry in Unix epoch milliseconds. `None` for static API keys
     /// (which do not expire) or when the OIDC entry omits/!parses `expires_at`.
     pub expires_at_ms: Option<i64>,
+    /// The OIDC `user_id` (a uuid) used as `x-grok-user-id` in conservative mode.
+    /// `None` for static API keys (the CLI omits the header when unavailable).
+    pub user_id: Option<String>,
 }
 
 impl GrokCredentials {
@@ -171,6 +177,7 @@ impl GrokCredentials {
         Ok(GrokCredentials {
             api_key: key,
             expires_at_ms: None,
+            user_id: None,
         })
     }
 
@@ -189,6 +196,7 @@ impl GrokCredentials {
                 return Some(GrokCredentials {
                     api_key: key,
                     expires_at_ms: entry.expires_at.as_deref().and_then(parse_iso8601_to_ms),
+                    user_id: entry.user_id.filter(|id| !id.trim().is_empty()),
                 });
             }
         }
@@ -308,6 +316,7 @@ mod tests {
         let c = GrokCredentials {
             api_key: "xai-foo".into(),
             expires_at_ms: None,
+            user_id: None,
         };
         assert!(c.check_expired().is_ok());
     }
@@ -411,7 +420,8 @@ mod tests {
                 "key": "{key}",
                 "auth_mode": "oidc",
                 "refresh_token": "rt-single-use-rotating",
-                "expires_at": "{expires_at}"
+                "expires_at": "{expires_at}",
+                "user_id": "11111111-2222-3333-4444-555555555555"
             }} }}"#
         )
     }
@@ -431,6 +441,36 @@ mod tests {
         assert_eq!(c.api_key, "jwt-abc.def.ghi");
         assert!(c.expires_at_ms.is_some(), "OIDC expiry must be captured");
         assert!(c.check_expired().is_ok(), "future-dated token must be Ok");
+        assert_eq!(
+            c.user_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555"),
+            "OIDC user_id must be captured for x-grok-user-id"
+        );
+    }
+
+    #[test]
+    fn oidc_captures_user_id_static_key_omits_it() {
+        // WHY: conservative mode sends `x-grok-user-id: <user_id>`, sourced ONLY
+        // from the OIDC file's `user_id`. A static-key file has no subject, so the
+        // header (and thus user_id) must be None there - the CLI omits the header
+        // when the id is unavailable, and we must mirror that exactly.
+        let oidc = temp_credentials_path();
+        write_temp_creds(&oidc, &grok_cli_json("jwt-uid", "2999-01-01T00:00:00Z"));
+        let c = GrokCredentials::load_fresh(&oidc).unwrap();
+        let _ = std::fs::remove_file(&oidc);
+        assert_eq!(
+            c.user_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+
+        let static_p = temp_credentials_path();
+        write_temp_creds(&static_p, r#"{"apiKey": "xai-static-no-uid"}"#);
+        let s = GrokCredentials::load_fresh(&static_p).unwrap();
+        let _ = std::fs::remove_file(&static_p);
+        assert!(
+            s.user_id.is_none(),
+            "static-key file has no OIDC subject; user_id must be None"
+        );
     }
 
     #[test]
