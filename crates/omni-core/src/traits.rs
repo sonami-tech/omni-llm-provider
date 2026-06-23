@@ -1,11 +1,22 @@
 use crate::canonical::{
     CanonicalRequest, CanonicalResponse, CanonicalStream, CanonicalStreamEvent,
 };
+use crate::version::ProviderVersion;
 use async_trait::async_trait;
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     fn id(&self) -> &'static str;
+
+    /// The provider's own version catalog, newest-first (index 0 is the newest).
+    ///
+    /// Each version carries its conservative and extended model lists. Core uses
+    /// this to resolve a [`crate::version::VersionSelector`] without ever
+    /// hardcoding a provider's models. The default is empty: a provider that does
+    /// not track an upstream client version opts out of version selection.
+    fn versions(&self) -> &'static [ProviderVersion] {
+        &[]
+    }
 
     /// Non-streaming send: returns the full response once the upstream completes.
     async fn send(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError>;

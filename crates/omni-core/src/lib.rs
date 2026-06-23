@@ -4,6 +4,8 @@
 
 pub mod canonical;
 pub mod traits;
+pub mod version;
 
 pub use canonical::*;
 pub use traits::*;
+pub use version::*;
