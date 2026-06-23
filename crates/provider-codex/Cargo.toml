@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 omni-core = { path = "../omni-core" }
+omni-common = { path = "../omni-common" }
 
 anyhow.workspace = true
 async-stream.workspace = true

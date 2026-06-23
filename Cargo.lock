@@ -1143,6 +1143,7 @@ dependencies = [
  "chrono",
  "dirs",
  "futures-util",
+ "omni-common",
  "omni-core",
  "reqwest",
  "serde",

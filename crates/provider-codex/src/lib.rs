@@ -6,17 +6,19 @@
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use omni_common::responses_upstream::{
+    self, ErrorRedactor, ResponsesSseBuffer, ResponsesStreamParser,
+};
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
-    CanonicalResponse, CanonicalResponseMetadata, CanonicalStream, CanonicalStreamEvent,
-    CanonicalToolChoice, CanonicalUsage, CatalogMode, CatalogModel, LlmProvider, ProviderError,
-    ProviderVersion,
+    CanonicalResponse, CanonicalStream, CanonicalStreamEvent, CanonicalToolChoice, CatalogMode,
+    CatalogModel, LlmProvider, ProviderError, ProviderVersion,
 };
 use reqwest::header::HeaderMap;
 use reqwest::{Client, Url, header};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -27,8 +29,6 @@ use tokio::time::timeout;
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
 const DEFAULT_AUTH_COMMAND_TIMEOUT_MS: u64 = 5_000;
-const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
-const MAX_SSE_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
 // Codex catalogs, verified 2026-06-22 via live capture of the installed codex
 // 0.142.0 CLI against the ChatGPT backend (chatgpt.com/backend-api/codex), plan
@@ -242,7 +242,7 @@ impl LlmProvider for CodexProvider {
 
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|e| ProviderError::Upstream(format!("decode codex response: {e}")))?;
-        codex_response_to_canonical(&value, &req.model, &error_redactor)
+        responses_upstream::response_to_canonical(&value, &req.model, "codex", &error_redactor)
     }
 
     async fn send_stream(&self, req: CanonicalRequest) -> Result<CanonicalStream, ProviderError> {
@@ -312,7 +312,7 @@ impl LlmProvider for CodexProvider {
 
             let mut bytes = http_resp.bytes_stream();
             let mut sse = ResponsesSseBuffer::default();
-            let mut parser = ResponsesStreamParser::new(error_redactor.clone());
+            let mut parser = ResponsesStreamParser::new("codex", error_redactor.clone());
             let mut finished = false;
             let mut saw_event = false;
 
@@ -1064,891 +1064,6 @@ pub fn codex_extra_allowed(key: &str) -> bool {
     )
 }
 
-fn codex_response_to_canonical(
-    value: &Value,
-    fallback_model: &str,
-    error_redactor: &CodexErrorRedactor,
-) -> Result<CanonicalResponse, ProviderError> {
-    if value.get("status").and_then(|v| v.as_str()) == Some("failed") {
-        return Err(ProviderError::Upstream(
-            error_redactor.redact(&value.to_string()),
-        ));
-    }
-
-    let model = value
-        .get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or(fallback_model)
-        .to_string();
-    let response_id = value.get("id").and_then(|v| v.as_str()).map(str::to_string);
-    let mut content = String::new();
-    let mut refusal = String::new();
-    let mut tool_calls = Vec::new();
-    let mut annotations = Vec::new();
-    if let Some(items) = value.get("output").and_then(|v| v.as_array()) {
-        for item in items {
-            match item.get("type").and_then(|v| v.as_str()) {
-                Some("message") => {
-                    if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
-                        for part in parts {
-                            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                                content.push_str(text);
-                                if let Some(part_annotations) =
-                                    part.get("annotations").and_then(|v| v.as_array())
-                                {
-                                    annotations.extend(part_annotations.iter().cloned());
-                                }
-                            } else if let Some(refusal_text) =
-                                part.get("refusal").and_then(|v| v.as_str())
-                            {
-                                refusal.push_str(refusal_text);
-                            }
-                        }
-                    }
-                }
-                Some("function_call") => {
-                    let id = item
-                        .get("call_id")
-                        .or_else(|| item.get("id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("call_unknown")
-                        .to_string();
-                    let name = item
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let arguments = item
-                        .get("arguments")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("{}")
-                        .to_string();
-                    tool_calls.push(omni_core::CanonicalToolCall {
-                        id,
-                        name,
-                        arguments,
-                    });
-                }
-                _ => {}
-            }
-        }
-    }
-    if content.is_empty()
-        && let Some(text) = value.get("output_text").and_then(|v| v.as_str())
-    {
-        content.push_str(text);
-    }
-
-    let usage = response_usage(value).unwrap_or_default();
-    let finish_reason = match response_status(value) {
-        Some("incomplete") => Some(response_incomplete_reason(value).to_string()),
-        _ if !tool_calls.is_empty() => Some("tool_calls".to_string()),
-        _ => Some("stop".to_string()),
-    };
-
-    Ok(CanonicalResponse {
-        model,
-        content,
-        refusal: if refusal.is_empty() {
-            None
-        } else {
-            Some(refusal)
-        },
-        tool_calls,
-        finish_reason,
-        usage,
-        id: response_id.clone(),
-        annotations,
-        metadata: Some(CanonicalResponseMetadata {
-            id: response_id,
-            system_fingerprint: value
-                .get("system_fingerprint")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            service_tier: value
-                .get("service_tier")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            provider: Some("codex".into()),
-            raw: None,
-        }),
-        reasoning: Vec::new(),
-    })
-}
-
-#[derive(Debug, Default)]
-struct ResponsesSseBuffer {
-    line: Vec<u8>,
-    last_was_cr: bool,
-    event: Option<String>,
-    data: Vec<String>,
-    event_bytes: usize,
-}
-
-#[derive(Debug)]
-struct ResponsesSseEvent {
-    event: Option<String>,
-    data: String,
-}
-
-impl ResponsesSseBuffer {
-    fn push(&mut self, bytes: &[u8]) -> Result<Vec<ResponsesSseEvent>, String> {
-        let mut events = Vec::new();
-        for line in self.complete_lines(bytes)? {
-            self.process_line(line, &mut events)?;
-        }
-        Ok(events)
-    }
-
-    fn complete_lines(&mut self, bytes: &[u8]) -> Result<Vec<String>, String> {
-        let mut lines = Vec::new();
-        for byte in bytes {
-            if self.last_was_cr {
-                self.last_was_cr = false;
-                if *byte == b'\n' {
-                    continue;
-                }
-            }
-            match *byte {
-                b'\n' => lines.push(self.take_line()?),
-                b'\r' => {
-                    lines.push(self.take_line()?);
-                    self.last_was_cr = true;
-                }
-                byte => {
-                    self.line.push(byte);
-                    if self.line.len() > MAX_SSE_LINE_BYTES {
-                        return Err(format!(
-                            "codex stream line exceeded {} bytes",
-                            MAX_SSE_LINE_BYTES
-                        ));
-                    }
-                }
-            }
-        }
-        Ok(lines)
-    }
-
-    fn take_line(&mut self) -> Result<String, String> {
-        String::from_utf8(std::mem::take(&mut self.line))
-            .map_err(|e| format!("codex stream line was not UTF-8: {e}"))
-    }
-
-    fn process_line(
-        &mut self,
-        line: String,
-        events: &mut Vec<ResponsesSseEvent>,
-    ) -> Result<(), String> {
-        if line.is_empty() {
-            if let Some(event) = self.take_event() {
-                events.push(event);
-            }
-            return Ok(());
-        }
-        if line.starts_with(':') {
-            return Ok(());
-        }
-        if let Some(value) = line.strip_prefix("event:") {
-            self.event = Some(value.trim().to_string());
-        } else if let Some(value) = line.strip_prefix("data:") {
-            let value = value.trim_start();
-            self.event_bytes = self.event_bytes.saturating_add(value.len());
-            if self.event_bytes > MAX_SSE_EVENT_BYTES {
-                return Err(format!(
-                    "codex stream event exceeded {} bytes",
-                    MAX_SSE_EVENT_BYTES
-                ));
-            }
-            self.data.push(value.to_string());
-        }
-        Ok(())
-    }
-
-    fn finish(&mut self) -> Result<Option<ResponsesSseEvent>, String> {
-        if !self.line.is_empty() {
-            let line = self.take_line()?;
-            let mut events = Vec::new();
-            self.process_line(line, &mut events)?;
-            if let Some(event) = events.into_iter().next() {
-                return Ok(Some(event));
-            }
-        }
-        Ok(self.take_event())
-    }
-
-    fn take_event(&mut self) -> Option<ResponsesSseEvent> {
-        if self.event.is_none() && self.data.is_empty() {
-            return None;
-        }
-        let event = ResponsesSseEvent {
-            event: self.event.take(),
-            data: std::mem::take(&mut self.data).join("\n"),
-        };
-        self.event_bytes = 0;
-        Some(event)
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct StreamToolCall {
-    id: Option<String>,
-    name: Option<String>,
-    emitted_open: bool,
-    arguments: String,
-    emitted_arguments_len: usize,
-    canonical_index: u32,
-}
-
-#[derive(Debug, Default)]
-struct ResponsesStreamParser {
-    tool_calls: HashMap<u32, StreamToolCall>,
-    next_tool_index: u32,
-    saw_tool_call: bool,
-    emitted_text: HashMap<(u32, &'static str), String>,
-    completed: bool,
-    error_redactor: CodexErrorRedactor,
-}
-
-impl ResponsesStreamParser {
-    fn new(error_redactor: CodexErrorRedactor) -> Self {
-        Self {
-            error_redactor,
-            ..Default::default()
-        }
-    }
-
-    fn redact(&self, input: &str) -> String {
-        self.error_redactor.redact(input)
-    }
-
-    fn handle_event(
-        &mut self,
-        event: ResponsesSseEvent,
-    ) -> Vec<Result<CanonicalStreamEvent, ProviderError>> {
-        let event_type = event.event.as_deref().unwrap_or_default();
-        if event.data.trim() == "[DONE]" {
-            return vec![Err(ProviderError::Upstream(
-                "codex Responses stream sent Chat [DONE] sentinel without a terminal response event"
-                    .into(),
-            ))];
-        }
-        let value: Value = match serde_json::from_str(&event.data) {
-            Ok(value) => value,
-            Err(e) => {
-                return vec![Err(ProviderError::Upstream(self.redact(&format!(
-                    "decode codex stream event {event_type}: {e}: {}",
-                    event.data
-                ))))];
-            }
-        };
-        let kind = value
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or(event_type);
-        match kind {
-            "response.created" => self.handle_response_metadata(&value),
-            "response.output_text.delta" | "response.refusal.delta" => self
-                .emit_text_delta(
-                    response_output_index(&value),
-                    if kind == "response.refusal.delta" {
-                        "refusal"
-                    } else {
-                        "text"
-                    },
-                    value
-                        .get("delta")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default(),
-                )
-                .into_iter()
-                .map(Ok)
-                .collect(),
-            "response.output_text.done" => self.handle_text_done(&value, "text"),
-            "response.refusal.done" => self.handle_text_done(&value, "refusal"),
-            "response.output_item.added" => self.handle_output_item_added(&value),
-            "response.function_call_arguments.delta" => self.handle_function_args_delta(&value),
-            "response.function_call_arguments.done" => self.handle_function_args_done(&value),
-            "response.output_item.done" => self.handle_output_item_done(&value),
-            "response.completed" => self.handle_completed(&value),
-            "response.incomplete" => self.handle_incomplete(&value),
-            "response.failed" | "error" => {
-                vec![Err(ProviderError::Upstream(
-                    self.redact(&value.to_string()),
-                ))]
-            }
-            _ => Vec::new(),
-        }
-    }
-
-    fn handle_response_metadata(
-        &self,
-        value: &Value,
-    ) -> Vec<Result<CanonicalStreamEvent, ProviderError>> {
-        let id = value
-            .get("response")
-            .and_then(|v| v.get("id"))
-            .or_else(|| value.get("id"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let response = response_payload(value);
-        let metadata = CanonicalResponseMetadata {
-            id,
-            system_fingerprint: response
-                .get("system_fingerprint")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            service_tier: response
-                .get("service_tier")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            provider: Some("codex".into()),
-            raw: None,
-        };
-        if metadata.id.is_none()
-            && metadata.system_fingerprint.is_none()
-            && metadata.service_tier.is_none()
-        {
-            Vec::new()
-        } else {
-            vec![Ok(CanonicalStreamEvent::ResponseMetadata(metadata))]
-        }
-    }
-
-    fn emit_text_delta(
-        &mut self,
-        output_index: u32,
-        channel: &'static str,
-        delta: &str,
-    ) -> Vec<CanonicalStreamEvent> {
-        if delta.is_empty() {
-            return Vec::new();
-        }
-        self.emitted_text
-            .entry((output_index, channel))
-            .or_default()
-            .push_str(delta);
-        let delta = delta.to_string();
-        if channel == "refusal" {
-            vec![CanonicalStreamEvent::RefusalDelta(delta)]
-        } else {
-            vec![CanonicalStreamEvent::TextDelta(delta)]
-        }
-    }
-
-    fn handle_text_done(
-        &mut self,
-        value: &Value,
-        field: &'static str,
-    ) -> Vec<Result<CanonicalStreamEvent, ProviderError>> {
-        let final_text = value
-            .get(field)
-            .or_else(|| value.get("text"))
-            .or_else(|| value.get("content"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let output_index = response_output_index(value);
-        self.emit_final_text(output_index, field, final_text)
-    }
-
-    fn emit_final_text(
-        &mut self,
-        output_index: u32,
-        field: &'static str,
-        final_text: &str,
-    ) -> Vec<Result<CanonicalStreamEvent, ProviderError>> {
-        if final_text.is_empty() {
-            return Vec::new();
-        }
-        let emitted = self
-            .emitted_text
-            .get(&(output_index, field))
-            .map(String::as_str)
-            .unwrap_or_default();
-        if !final_text.starts_with(emitted) {
-            return vec![Err(ProviderError::Upstream(self.redact(&format!(
-                "codex stream {field}.done text did not extend prior text deltas"
-            ))))];
-        }
-        let suffix = &final_text[emitted.len()..];
-        self.emit_text_delta(output_index, field, suffix)
-            .into_iter()
-            .map(Ok)
-            .collect()
-    }
-
-    fn handle_output_item_added(
-        &mut self,
-        value: &Value,
-    ) -> Vec<Result<CanonicalStreamEvent, ProviderError>> {
-        let Some(item) = value.get("item") else {
-            return Vec::new();
-        };
-        if item.get("type").and_then(|v| v.as_str()) != Some("function_call") {
-            return Vec::new();
-        }
-        let output_index = value
-            .get("output_index")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let canonical_index = self.ensure_tool_call(output_index);
-        let call = self.tool_calls.entry(output_index).or_default();
-        call.id = item
-            .get("call_id")
-            .or_else(|| item.get("id"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        call.name = item
-            .get("name")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        self.saw_tool_call = true;
-        if let Some(arguments) = item.get("arguments").and_then(|v| v.as_str()) {
-            if let Some(err) = self.append_tool_arguments_from_full(output_index, arguments) {
-                return vec![Err(err)];
-            }
-        }
-        let mut events = self.emit_tool_open_if_ready(output_index);
-        events.extend(self.emit_pending_tool_args(output_index, canonical_index));
-        events.into_iter().map(Ok).collect::<Vec<_>>()
-    }
-
-    fn handle_function_args_delta(
-        &mut self,
-        value: &Value,
-    ) -> Vec<Result<CanonicalStreamEvent, ProviderError>> {
-        let output_index = value
-            .get("output_index")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let delta = value
-            .get("delta")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        self.saw_tool_call = true;
-        let canonical_index = self.ensure_tool_call(output_index);
-        if !delta.is_empty() {
-            let already = self
-                .tool_calls
-                .get(&output_index)
-                .map(|call| call.arguments.clone())
-                .unwrap_or_default();
-            if !already.is_empty() && delta == already {
-                // Some Responses-compatible gateways repeat the full arguments
-                // as the first delta after announcing them on output_item.added.
-            } else if delta.starts_with(&already) && delta.len() > already.len() {
-                self.append_tool_arguments(output_index, &delta[already.len()..]);
-            } else {
-                self.append_tool_arguments(output_index, &delta);
-            }
-        }
-        let mut events = self.emit_tool_open_if_ready(output_index);
-        events.extend(self.emit_pending_tool_args(output_index, canonical_index));
-        events.into_iter().map(Ok).collect()
-    }
-
-    fn handle_function_args_done(
-        &mut self,
-        value: &Value,
-    ) -> Vec<Result<CanonicalStreamEvent, ProviderError>> {
-        let output_index = value
-            .get("output_index")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let Some(arguments) = value.get("arguments").and_then(|v| v.as_str()) else {
-            return Vec::new();
-        };
-        let already = self
-            .tool_calls
-            .get(&output_index)
-            .map(|call| call.arguments.clone())
-            .unwrap_or_default();
-        if arguments == already {
-            return Vec::new();
-        }
-        if arguments.len() <= already.len() || !arguments.starts_with(&already) {
-            return vec![Err(ProviderError::Upstream(self.redact(
-                "codex stream function_call_arguments.done arguments did not extend prior argument deltas",
-            )))];
-        }
-        let delta = arguments[already.len()..].to_string();
-        let canonical_index = self.ensure_tool_call(output_index);
-        self.append_tool_arguments(output_index, &delta);
-        let mut events = self.emit_tool_open_if_ready(output_index);
-        events.extend(self.emit_pending_tool_args(output_index, canonical_index));
-        events.into_iter().map(Ok).collect()
-    }
-
-    fn handle_output_item_done(
-        &mut self,
-        value: &Value,
-    ) -> Vec<Result<CanonicalStreamEvent, ProviderError>> {
-        let Some(item) = value.get("item") else {
-            return Vec::new();
-        };
-        if item.get("type").and_then(|v| v.as_str()) != Some("function_call") {
-            return Vec::new();
-        }
-        let output_index = value
-            .get("output_index")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let canonical_index = self.ensure_tool_call(output_index);
-        {
-            let call = self.tool_calls.entry(output_index).or_default();
-            if call.id.is_none() {
-                call.id = item
-                    .get("call_id")
-                    .or_else(|| item.get("id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-            }
-            if call.name.is_none() {
-                call.name = item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-            }
-        }
-        self.saw_tool_call = true;
-        if let Some(arguments) = item.get("arguments").and_then(|v| v.as_str()) {
-            if let Some(err) = self.append_tool_arguments_from_full(output_index, arguments) {
-                return vec![Err(err)];
-            }
-        }
-        let mut events = self.emit_tool_open_if_ready(output_index);
-        events.extend(self.emit_pending_tool_args(output_index, canonical_index));
-        events.into_iter().map(Ok).collect()
-    }
-
-    fn handle_completed(
-        &mut self,
-        value: &Value,
-    ) -> Vec<Result<CanonicalStreamEvent, ProviderError>> {
-        if response_status(value) == Some("failed") {
-            return vec![Err(ProviderError::Upstream(
-                self.redact(&value.to_string()),
-            ))];
-        }
-        self.completed = true;
-        let mut events = self.handle_response_metadata(value);
-        events.extend(self.emit_terminal_output(value));
-        if let Some(usage) = response_usage(value) {
-            events.push(Ok(CanonicalStreamEvent::Usage(usage)));
-        }
-        events.push(Ok(CanonicalStreamEvent::Finish {
-            finish_reason: self.finish_reason(),
-        }));
-        events
-    }
-
-    fn handle_incomplete(
-        &mut self,
-        value: &Value,
-    ) -> Vec<Result<CanonicalStreamEvent, ProviderError>> {
-        self.completed = true;
-        let mut events = self.handle_response_metadata(value);
-        events.extend(self.emit_terminal_output(value));
-        if let Some(usage) = response_usage(value) {
-            events.push(Ok(CanonicalStreamEvent::Usage(usage)));
-        }
-        events.push(Ok(CanonicalStreamEvent::Finish {
-            finish_reason: Some(response_incomplete_reason(value).to_string()),
-        }));
-        events
-    }
-
-    fn emit_terminal_output(
-        &mut self,
-        value: &Value,
-    ) -> Vec<Result<CanonicalStreamEvent, ProviderError>> {
-        let mut events = Vec::new();
-        let Some(items) = response_payload(value)
-            .get("output")
-            .and_then(|v| v.as_array())
-        else {
-            return events;
-        };
-        for (position, item) in items.iter().enumerate() {
-            let output_index = item
-                .get("output_index")
-                .and_then(|v| v.as_u64())
-                .and_then(|value| u32::try_from(value).ok())
-                .unwrap_or(position as u32);
-            match item.get("type").and_then(|v| v.as_str()) {
-                Some("message") => {
-                    if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
-                        for part in parts {
-                            events.extend(self.emit_terminal_content_part(output_index, part));
-                        }
-                    }
-                }
-                Some("function_call") => {
-                    events.extend(self.emit_terminal_function_call(output_index, item));
-                }
-                _ => {}
-            }
-        }
-        events
-    }
-
-    fn emit_terminal_content_part(
-        &mut self,
-        output_index: u32,
-        part: &Value,
-    ) -> Vec<Result<CanonicalStreamEvent, ProviderError>> {
-        let kind = part.get("type").and_then(|v| v.as_str());
-        if kind == Some("refusal") || part.get("refusal").is_some() {
-            let final_text = part
-                .get("refusal")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            return self.emit_final_text(output_index, "refusal", final_text);
-        }
-        if kind == Some("output_text") || part.get("text").is_some() {
-            let final_text = part
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let mut events = self.emit_final_text(output_index, "text", final_text);
-            if let Some(annotations) = part.get("annotations").and_then(|v| v.as_array())
-                && !annotations.is_empty()
-            {
-                events.push(Ok(CanonicalStreamEvent::OutputAnnotations(
-                    annotations.to_vec(),
-                )));
-            }
-            return events;
-        }
-        Vec::new()
-    }
-
-    fn emit_terminal_function_call(
-        &mut self,
-        output_index: u32,
-        item: &Value,
-    ) -> Vec<Result<CanonicalStreamEvent, ProviderError>> {
-        let canonical_index = self.ensure_tool_call(output_index);
-        {
-            let call = self.tool_calls.entry(output_index).or_default();
-            if call.id.is_none() {
-                call.id = item
-                    .get("call_id")
-                    .or_else(|| item.get("id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-            }
-            if call.name.is_none() {
-                call.name = item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-            }
-        }
-        self.saw_tool_call = true;
-        if let Some(arguments) = item.get("arguments").and_then(|v| v.as_str()) {
-            if let Some(err) = self.append_tool_arguments_from_full(output_index, arguments) {
-                return vec![Err(err)];
-            }
-        }
-        let mut events = self.emit_tool_open_if_ready(output_index);
-        events.extend(self.emit_pending_tool_args(output_index, canonical_index));
-        events.into_iter().map(Ok).collect()
-    }
-
-    fn ensure_tool_call(&mut self, output_index: u32) -> u32 {
-        if let Some(call) = self.tool_calls.get(&output_index) {
-            return call.canonical_index;
-        }
-        let canonical_index = self.next_tool_index;
-        self.next_tool_index += 1;
-        self.tool_calls.insert(
-            output_index,
-            StreamToolCall {
-                canonical_index,
-                ..Default::default()
-            },
-        );
-        canonical_index
-    }
-
-    fn emit_tool_open(&mut self, output_index: u32) -> Vec<CanonicalStreamEvent> {
-        let canonical_index = self.ensure_tool_call(output_index);
-        let call = self.tool_calls.entry(output_index).or_default();
-        if call.emitted_open {
-            return Vec::new();
-        }
-        call.emitted_open = true;
-        vec![CanonicalStreamEvent::ToolCallDelta {
-            index: canonical_index,
-            id: call.id.clone(),
-            name: call.name.clone(),
-            arguments_delta: String::new(),
-        }]
-    }
-
-    fn emit_tool_open_if_ready(&mut self, output_index: u32) -> Vec<CanonicalStreamEvent> {
-        let Some(call) = self.tool_calls.get(&output_index) else {
-            return Vec::new();
-        };
-        if call.emitted_open || call.id.is_none() || call.name.is_none() {
-            return Vec::new();
-        }
-        self.emit_tool_open(output_index)
-    }
-
-    fn append_tool_arguments(&mut self, output_index: u32, delta: &str) {
-        if delta.is_empty() {
-            return;
-        }
-        if let Some(call) = self.tool_calls.get_mut(&output_index) {
-            call.arguments.push_str(delta);
-        }
-    }
-
-    fn append_tool_arguments_from_full(
-        &mut self,
-        output_index: u32,
-        arguments: &str,
-    ) -> Option<ProviderError> {
-        if arguments.is_empty() {
-            return None;
-        }
-        let already = self
-            .tool_calls
-            .get(&output_index)
-            .map(|call| call.arguments.clone())
-            .unwrap_or_default();
-        if arguments == already {
-            return None;
-        }
-        if arguments.len() > already.len() && arguments.starts_with(&already) {
-            self.append_tool_arguments(output_index, &arguments[already.len()..]);
-            return None;
-        }
-        Some(ProviderError::Upstream(self.redact(
-            "codex stream terminal function_call arguments did not extend prior argument deltas",
-        )))
-    }
-
-    fn emit_pending_tool_args(
-        &mut self,
-        output_index: u32,
-        canonical_index: u32,
-    ) -> Vec<CanonicalStreamEvent> {
-        let Some(call) = self.tool_calls.get_mut(&output_index) else {
-            return Vec::new();
-        };
-        if !call.emitted_open || call.emitted_arguments_len >= call.arguments.len() {
-            return Vec::new();
-        }
-        let delta = call.arguments[call.emitted_arguments_len..].to_string();
-        call.emitted_arguments_len = call.arguments.len();
-        vec![CanonicalStreamEvent::ToolCallDelta {
-            index: canonical_index,
-            id: None,
-            name: None,
-            arguments_delta: delta,
-        }]
-    }
-
-    fn finish_reason(&self) -> Option<String> {
-        Some(if self.saw_tool_call {
-            "tool_calls".to_string()
-        } else {
-            "stop".to_string()
-        })
-    }
-}
-
-fn response_usage(value: &Value) -> Option<CanonicalUsage> {
-    let usage = value
-        .get("response")
-        .and_then(|v| v.get("usage"))
-        .or_else(|| value.get("usage"))?;
-    let input_audio_tokens = usage
-        .get("input_tokens_details")
-        .and_then(|v| v.get("audio_tokens"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let output_audio_tokens = usage
-        .get("output_tokens_details")
-        .and_then(|v| v.get("audio_tokens"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    Some(CanonicalUsage {
-        input_tokens: usage
-            .get("input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        output_tokens: usage
-            .get("output_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        cache_read: usage
-            .get("input_tokens_details")
-            .and_then(|v| v.get("cached_tokens"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        cache_creation: 0,
-        reasoning_tokens: usage
-            .get("output_tokens_details")
-            .and_then(|v| v.get("reasoning_tokens"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        audio_tokens: input_audio_tokens + output_audio_tokens,
-        input_audio_tokens,
-        output_audio_tokens,
-        accepted_prediction_tokens: usage
-            .get("output_tokens_details")
-            .and_then(|v| v.get("accepted_prediction_tokens"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        rejected_prediction_tokens: usage
-            .get("output_tokens_details")
-            .and_then(|v| v.get("rejected_prediction_tokens"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        ..CanonicalUsage::default()
-    })
-}
-
-fn response_status(value: &Value) -> Option<&str> {
-    response_payload(value)
-        .get("status")
-        .and_then(|v| v.as_str())
-}
-
-fn response_payload(value: &Value) -> &Value {
-    value.get("response").unwrap_or(value)
-}
-
-fn response_output_index(value: &Value) -> u32 {
-    value
-        .get("output_index")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32
-}
-
-fn response_incomplete_reason(value: &Value) -> &str {
-    let reason = value
-        .get("response")
-        .and_then(|v| v.get("incomplete_details"))
-        .and_then(|v| v.get("reason"))
-        .or_else(|| {
-            value
-                .get("incomplete_details")
-                .and_then(|v| v.get("reason"))
-        })
-        .and_then(|v| v.as_str())
-        .unwrap_or("max_output_tokens");
-    if reason == "max_output_tokens" {
-        "length"
-    } else {
-        reason
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 struct CodexErrorRedactor {
     secrets: Vec<String>,
@@ -1977,6 +1092,14 @@ impl CodexErrorRedactor {
             out = out.replace(secret, "<redacted>");
         }
         out
+    }
+}
+
+impl ErrorRedactor for CodexErrorRedactor {
+    fn redact(&self, input: &str) -> String {
+        // Delegate to the inherent method (named via the type path so it can never
+        // resolve back to this trait method, which would recurse infinitely).
+        CodexErrorRedactor::redact(self, input)
     }
 }
 
@@ -2020,7 +1143,8 @@ fn redact(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omni_core::CanonicalTool;
+    use omni_common::responses_upstream::MAX_SSE_EVENT_BYTES;
+    use omni_core::{CanonicalResponseMetadata, CanonicalTool, CanonicalUsage};
     use std::sync::Mutex;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2665,8 +1789,13 @@ query_params = { api-version = "2026-01-01" }
                 "output_tokens_details": {"reasoning_tokens": 6, "audio_tokens": 7}
             }
         });
-        let resp = codex_response_to_canonical(&value, "fallback", &CodexErrorRedactor::default())
-            .unwrap();
+        let resp = responses_upstream::response_to_canonical(
+            &value,
+            "fallback",
+            "codex",
+            &CodexErrorRedactor::default(),
+        )
+        .unwrap();
         assert_eq!(resp.id.as_deref(), Some("resp_backend"));
         assert_eq!(resp.model, "gpt-5.5");
         assert_eq!(resp.content, "hello");
@@ -2708,8 +1837,13 @@ query_params = { api-version = "2026-01-01" }
             ],
             "usage": {"input_tokens": 1, "output_tokens": 2}
         });
-        let resp = codex_response_to_canonical(&value, "fallback", &CodexErrorRedactor::default())
-            .unwrap();
+        let resp = responses_upstream::response_to_canonical(
+            &value,
+            "fallback",
+            "codex",
+            &CodexErrorRedactor::default(),
+        )
+        .unwrap();
         assert_eq!(resp.content, "");
         assert_eq!(resp.refusal.as_deref(), Some("No thanks"));
         assert_eq!(resp.finish_reason.as_deref(), Some("content_filter"));
