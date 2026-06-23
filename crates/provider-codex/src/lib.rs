@@ -9,7 +9,8 @@ use futures_util::StreamExt;
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
     CanonicalResponse, CanonicalResponseMetadata, CanonicalStream, CanonicalStreamEvent,
-    CanonicalToolChoice, CanonicalUsage, LlmProvider, ProviderError,
+    CanonicalToolChoice, CanonicalUsage, CatalogMode, CatalogModel, LlmProvider, ProviderError,
+    ProviderVersion,
 };
 use reqwest::header::HeaderMap;
 use reqwest::{Client, Url, header};
@@ -29,6 +30,29 @@ const DEFAULT_AUTH_COMMAND_TIMEOUT_MS: u64 = 5_000;
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
+// Codex catalogs, verified 2026-06-22 via live capture of the installed codex
+// 0.142.0 CLI against the ChatGPT backend (chatgpt.com/backend-api/codex), plan
+// type = free. The /codex/models endpoint advertised gpt-5.5 and gpt-5.4-mini
+// (plus an internal codex-auto-review model, excluded from the caller catalog),
+// and streamed /responses accepted exactly that same set - so on this plan
+// CONSERVATIVE == EXTENDED (no work-but-unlisted extras; the gate is strict).
+// This is plan-dependent: a platform sk- key / higher plan would likely expose
+// more, which a future version entry would capture.
+const CODEX_CATALOG_0_142_0: &[CatalogModel] = &[
+    CatalogModel::new("gpt-5.5", &["codex", "gpt"]),
+    CatalogModel::new("gpt-5.4-mini", &["mini", "gpt-mini"]),
+];
+
+/// Codex version catalog, newest-first. The version string is the installed
+/// codex CLI version this catalog was verified against. Conservative and extended
+/// point at the same list for the captured (free) plan.
+static CODEX_VERSIONS: &[ProviderVersion] = &[ProviderVersion {
+    version: "0.142.0",
+    conservative: CODEX_CATALOG_0_142_0,
+    extended: CODEX_CATALOG_0_142_0,
+    default_model: DEFAULT_CODEX_MODEL,
+}];
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CodexModelInfo {
     pub id: String,
@@ -40,6 +64,13 @@ pub struct CodexModelInfo {
 #[derive(Debug, Clone)]
 pub struct CodexProvider {
     client: Client,
+    /// Catalog mode (conservative vs extended). Default Extended. On the captured
+    /// free plan the two catalogs are identical, but the field is carried so the
+    /// selector is uniform across providers and a future plan-dependent split is a
+    /// data-only change.
+    mode: CatalogMode,
+    /// Pinned version from the provider's own catalog. Default newest.
+    version: &'static ProviderVersion,
 }
 
 impl CodexProvider {
@@ -49,9 +80,45 @@ impl CodexProvider {
             .timeout(Duration::from_secs(600))
             .build()
             .map_err(|e| ProviderError::Other(anyhow::anyhow!("http client: {e}")))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            mode: CatalogMode::default(),
+            version: &CODEX_VERSIONS[0],
+        })
     }
 
+    /// Set the catalog mode (conservative vs extended). Chainable. Default Extended.
+    pub fn with_mode(mut self, mode: CatalogMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Pin a specific version from the provider's catalog. Chainable. Default
+    /// newest. Returns `Err` listing available versions if `version` is unknown
+    /// (exact-or-fail; no closest match).
+    pub fn with_version(mut self, version: &str) -> Result<Self, ProviderError> {
+        let found = CODEX_VERSIONS
+            .iter()
+            .find(|v| v.version == version)
+            .ok_or_else(|| {
+                let available: Vec<&str> = CODEX_VERSIONS.iter().map(|v| v.version).collect();
+                ProviderError::Other(anyhow::anyhow!(
+                    "unknown codex version {version:?}; available: [{}]",
+                    available.join(", ")
+                ))
+            })?;
+        self.version = found;
+        Ok(self)
+    }
+
+    /// The active catalog for the current mode + pinned version.
+    fn active_catalog(&self) -> &'static [CatalogModel] {
+        self.version.catalog(self.mode)
+    }
+
+    /// The model id used for an actual request. This stays config-driven (the
+    /// installed Codex picks its model from `~/.codex/config.toml`); the catalog
+    /// above is only what `/v1/models` advertises.
     pub fn current_model(&self) -> Result<String, ProviderError> {
         Ok(CodexRequestConfig::load()?.model)
     }
@@ -60,27 +127,64 @@ impl CodexProvider {
         CodexRequestConfig::detected()
     }
 
+    /// `/v1/models` advertises the active version catalog plus the actually
+    /// configured model if it is not already in the catalog.
+    ///
+    /// Codex's model is config-driven (`~/.codex/config.toml` or an `OMNI_CODEX_*`
+    /// override), so whatever the operator configured must appear here even if it
+    /// is outside the verified catalog - that is the id requests will actually
+    /// use. The configured model is listed first.
     pub fn models_list(&self) -> Vec<CodexModelInfo> {
-        let id = self
-            .current_model()
-            .unwrap_or_else(|_| DEFAULT_CODEX_MODEL.to_string());
-        vec![CodexModelInfo {
-            id,
-            object: "model",
-            created: 0,
-            owned_by: "codex",
-        }]
+        let mut ids: Vec<String> = Vec::new();
+        if let Ok(configured) = self.current_model() {
+            if !configured.is_empty() {
+                ids.push(configured);
+            }
+        }
+        for m in self.active_catalog() {
+            if !ids.iter().any(|id| id == m.id) {
+                ids.push(m.id.to_string());
+            }
+        }
+        ids.into_iter()
+            .map(|id| CodexModelInfo {
+                id,
+                object: "model",
+                created: 0,
+                owned_by: "codex",
+            })
+            .collect()
     }
 
     pub fn model_aliases(&self) -> Vec<(String, String)> {
-        let model = self
-            .current_model()
-            .unwrap_or_else(|_| DEFAULT_CODEX_MODEL.to_string());
-        vec![
-            ("codex".to_string(), model.clone()),
-            ("gpt".to_string(), model.clone()),
-            (model.clone(), model),
-        ]
+        let mut out: Vec<(String, String)> = Vec::new();
+        // The configured model keeps the classic codex/gpt shorthands pointing at
+        // whatever is actually in use.
+        if let Ok(configured) = self.current_model() {
+            if !configured.is_empty() {
+                out.push(("codex".to_string(), configured.clone()));
+                out.push(("gpt".to_string(), configured.clone()));
+                out.push((configured.clone(), configured));
+            }
+        }
+        // Catalog aliases (id->id plus each alias->id), skipping dups.
+        for m in self.active_catalog() {
+            for pair in std::iter::once((m.id.to_string(), m.id.to_string())).chain(
+                m.aliases
+                    .iter()
+                    .map(|alias| (alias.to_string(), m.id.to_string())),
+            ) {
+                if !out.iter().any(|(a, _)| a == &pair.0) {
+                    out.push(pair);
+                }
+            }
+        }
+        out
+    }
+
+    /// The provider's version catalog (newest-first).
+    pub fn version_catalog() -> &'static [ProviderVersion] {
+        CODEX_VERSIONS
     }
 }
 
@@ -88,6 +192,10 @@ impl CodexProvider {
 impl LlmProvider for CodexProvider {
     fn id(&self) -> &'static str {
         "codex"
+    }
+
+    fn versions(&self) -> &'static [ProviderVersion] {
+        CODEX_VERSIONS
     }
 
     async fn send(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError> {
@@ -2185,6 +2293,33 @@ model = "gpt-native"
         let aliases = provider.model_aliases();
         assert!(aliases.contains(&("codex".into(), "gpt-override".into())));
         assert!(aliases.contains(&("gpt".into(), "gpt-override".into())));
+    }
+
+    #[test]
+    fn version_catalog_advertises_verified_models_alongside_configured() {
+        // WHY: /v1/models must surface the verified catalog (gpt-5.5, gpt-5.4-mini)
+        // AND the actually-configured model. A regression that dropped the catalog
+        // would hide gpt-5.4-mini; one that dropped the configured model would hide
+        // whatever the operator pinned. Both must appear.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _home = TempCodexHome::new("", None);
+        // Clear any OMNI override from a prior test in the shared process.
+        unsafe {
+            std::env::remove_var("OMNI_CODEX_BASE_URL");
+            std::env::remove_var("OMNI_CODEX_MODEL");
+        }
+        let provider = CodexProvider::new().unwrap();
+        let ids: Vec<String> = provider.models_list().into_iter().map(|m| m.id).collect();
+        assert!(ids.iter().any(|id| id == "gpt-5.5"), "ids: {ids:?}");
+        assert!(ids.iter().any(|id| id == "gpt-5.4-mini"), "ids: {ids:?}");
+    }
+
+    #[test]
+    fn codex_version_pin_is_exact_or_fails() {
+        let ok = CodexProvider::new().unwrap().with_version("0.142.0");
+        assert!(ok.is_ok());
+        let bad = CodexProvider::new().unwrap().with_version("0.0.1");
+        assert!(bad.is_err(), "unknown version must fail, not fall back");
     }
 
     #[test]
