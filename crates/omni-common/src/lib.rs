@@ -8,6 +8,7 @@ pub mod error;
 pub mod http;
 pub mod replacements;
 pub mod responses;
+pub mod responses_upstream;
 pub mod session;
 pub mod stats;
 #[cfg(feature = "test-support")]
