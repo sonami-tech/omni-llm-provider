@@ -181,22 +181,32 @@ pub fn resolve_version<'v>(
             if let Some(exact) = versions.iter().find(|v| v.version == want) {
                 return Ok(exact);
             }
+            // Guard against empty / non-numeric detection output (e.g. ""): it would
+            // otherwise parse to [0] and "closest-match" against version 0, masking
+            // a detection failure. Fall back to newest explicitly instead.
+            if !has_numeric_component(want) {
+                return Ok(newest);
+            }
             Ok(closest_version(versions, want).unwrap_or(newest))
         }
     }
 }
 
-/// Pick the catalog version closest to `want` by comparing dotted numeric
-/// components lexicographically (e.g. 2.1.180 is closer to 2.1.186 than 2.1.142).
-/// Non-numeric components compare as 0. Returns `None` only for an empty slice.
+/// Pick the catalog version closest to `want`.
+///
+/// "Closest" is decided by [`version_distance`], which compares the per-component
+/// absolute differences lexicographically from most-significant to least. This
+/// guarantees a more-significant component always dominates a less-significant one
+/// regardless of magnitude (no overflow-prone weighting). Returns `None` only for
+/// an empty slice.
 fn closest_version<'v>(
     versions: &'v [ProviderVersion],
     want: &str,
 ) -> Option<&'v ProviderVersion> {
     let target = parse_version(want);
-    versions.iter().min_by_key(|v| {
-        let cand = parse_version(v.version);
-        version_distance(&target, &cand)
+    versions.iter().min_by(|a, b| {
+        version_distance(&target, &parse_version(a.version))
+            .cmp(&version_distance(&target, &parse_version(b.version)))
     })
 }
 
@@ -206,20 +216,26 @@ fn parse_version(s: &str) -> Vec<u64> {
         .collect()
 }
 
-/// Absolute distance between two dotted version vectors, component-wise, with the
-/// most-significant component dominating so 2.x never beats 1.x on a tie below.
-fn version_distance(a: &[u64], b: &[u64]) -> u64 {
+/// True if `s` has at least one dotted component that parses as a number. Used to
+/// reject empty / fully non-numeric detection output before fuzzy matching.
+fn has_numeric_component(s: &str) -> bool {
+    s.split('.').any(|part| part.trim().parse::<u64>().is_ok())
+}
+
+/// Per-component absolute-difference vector between two dotted version vectors,
+/// most-significant component first, so a lexicographic `Ord` on the result makes
+/// a more-significant component dominate a less-significant one regardless of
+/// magnitude. (Replaces an earlier base-1000 weighted sum that lost dominance once
+/// a component reached 1000 - flagged by external review and covered by a test.)
+fn version_distance(a: &[u64], b: &[u64]) -> Vec<u64> {
     let len = a.len().max(b.len());
-    let mut dist: u64 = 0;
+    let mut diffs = Vec::with_capacity(len);
     for i in 0..len {
         let av = a.get(i).copied().unwrap_or(0);
         let bv = b.get(i).copied().unwrap_or(0);
-        let d = av.abs_diff(bv);
-        // Weight earlier (more significant) components much more heavily.
-        let weight = 1_000u64.saturating_pow((len - i) as u32 - 1);
-        dist = dist.saturating_add(d.saturating_mul(weight));
+        diffs.push(av.abs_diff(bv));
     }
-    dist
+    diffs
 }
 
 #[cfg(test)]
@@ -318,5 +334,45 @@ mod tests {
         const VS: &[ProviderVersion] = &[V3, V_NEW];
         let v = resolve_version(VS, &VersionSelector::MatchSystem("2.1.999".into())).unwrap();
         assert_eq!(v.version, "2.1.186");
+    }
+
+    #[test]
+    fn major_dominates_even_when_minor_component_exceeds_1000() {
+        // Regression guard (external review): a more-significant component must
+        // dominate regardless of magnitude. Target 2.0.0; candidate 2.5000.0 shares
+        // the major and must win over 3.0.0, even though the minor gap (5000) is far
+        // larger than the major gap (1). The old base-1000 weighting got this wrong.
+        const V2_BIG: ProviderVersion = ProviderVersion {
+            version: "2.5000.0",
+            conservative: M_A,
+            extended: M_A,
+            default_model: "m-a",
+        };
+        const V3: ProviderVersion = ProviderVersion {
+            version: "3.0.0",
+            conservative: M_A,
+            extended: M_A,
+            default_model: "m-a",
+        };
+        const VS: &[ProviderVersion] = &[V3, V2_BIG];
+        let v = resolve_version(VS, &VersionSelector::MatchSystem("2.0.0".into())).unwrap();
+        assert_eq!(
+            v.version, "2.5000.0",
+            "same-major candidate must win over a different-major one"
+        );
+    }
+
+    #[test]
+    fn match_system_with_empty_or_nonnumeric_input_falls_back_to_newest() {
+        // Regression guard (external review): empty / non-numeric detection output
+        // must NOT silently fuzzy-match version 0; it falls back to newest.
+        for bad in ["", "   ", "unknown", "not.a.version"] {
+            let v =
+                resolve_version(VERSIONS, &VersionSelector::MatchSystem(bad.into())).unwrap();
+            assert_eq!(
+                v.version, "2.1.186",
+                "empty/non-numeric {bad:?} must fall back to newest, not match version 0"
+            );
+        }
     }
 }
