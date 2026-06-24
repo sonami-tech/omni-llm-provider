@@ -143,6 +143,53 @@ impl GrokCredentials {
         Err(ambient_static_error.unwrap_or(GrokCredentialsError::NoSource))
     }
 
+    /// Resolve credentials for CONSERVATIVE (grok-shell CLI parity) mode.
+    ///
+    /// Differs from [`load_resolved_async`] in precedence ONLY: it prefers the Grok
+    /// CLI OIDC login (`~/.grok/auth.json`) over the static-key file. The
+    /// conservative wire sends `x-grok-user-id`, which is carried ONLY by the OIDC
+    /// entry; a static key has no subject, so preferring it would drift from the
+    /// grok-shell fingerprint (Authorization with no matching user_id). The chat
+    /// path keeps its documented "explicit static beats ambient OIDC" rule via
+    /// [`load_resolved_async`]; this is a conservative-specific override and does
+    /// NOT change that.
+    ///
+    /// Order (highest first), all read fresh:
+    /// 1. `$XAI_CREDENTIALS_PATH` — explicit operator override, still wins (a
+    ///    deliberate choice; may be either shape).
+    /// 2. `~/.grok/auth.json` — the Grok CLI OIDC login (carries `user_id`).
+    /// 3. `~/.xai/.credentials.json` — static-key fallback (no `user_id`), only
+    ///    when the CLI login is absent/unusable.
+    pub async fn load_resolved_conservative_async() -> Result<Self, GrokCredentialsError> {
+        if let Some(p) = std::env::var_os("XAI_CREDENTIALS_PATH") {
+            return Self::load_fresh_async(Path::new(&p)).await;
+        }
+
+        let mut ambient_cli_error = None;
+        if let Some(cli_path) = Self::grok_cli_path()
+            && tokio::fs::try_exists(&cli_path).await.unwrap_or(false)
+        {
+            match Self::load_fresh_async(&cli_path).await {
+                Ok(creds) => return Ok(creds),
+                // A present-but-unusable CLI login (no usable key) falls through to
+                // the static-key file rather than breaking an otherwise valid setup.
+                Err(GrokCredentialsError::MissingToken) => {
+                    ambient_cli_error = Some(GrokCredentialsError::MissingToken);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        if let Some(home) = dirs::home_dir() {
+            let static_path = home.join(".xai").join(".credentials.json");
+            if tokio::fs::try_exists(&static_path).await.unwrap_or(false) {
+                return Self::load_fresh_async(&static_path).await;
+            }
+        }
+
+        Err(ambient_cli_error.unwrap_or(GrokCredentialsError::NoSource))
+    }
+
     /// Read and parse a specific credentials file synchronously. Never cached.
     /// Parses either supported shape (static-key or Grok CLI OIDC). Use outside the
     /// async hot path (e.g. startup); handlers should prefer [`load_resolved_async`].
@@ -632,5 +679,121 @@ mod tests {
 
         let creds = res.expect("stale ambient static file must fall through to CLI login");
         assert_eq!(creds.api_key, "jwt-from-cli");
+    }
+
+    #[tokio::test]
+    // ENV_LOCK held across the await: HOME / XAI_CREDENTIALS_PATH must stay fixed
+    // through the resolve; safe on the current-thread test runtime.
+    #[allow(clippy::await_holding_lock)]
+    async fn conservative_prefers_oidc_over_static_for_user_id() {
+        // WHY (Finding 3 regression): conservative mode must prefer the Grok CLI
+        // OIDC login over a static key so `x-grok-user-id` is present and the
+        // grok-shell fingerprint is exact. With BOTH files present, the
+        // conservative resolver returns the OIDC creds (carrying user_id), whereas
+        // the chat resolver (asserted alongside) still prefers the static key. This
+        // pins the deliberate per-mode precedence divergence in both directions.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!("omni-grok-cons-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(home.join(".xai")).unwrap();
+        std::fs::create_dir_all(home.join(".grok")).unwrap();
+        write_temp_creds(
+            &home.join(".xai/.credentials.json"),
+            r#"{"apiKey": "xai-static-no-uid"}"#,
+        );
+        write_temp_creds(
+            &home.join(".grok/auth.json"),
+            &grok_cli_json("jwt-oidc-with-uid", "2999-01-01T00:00:00Z"),
+        );
+
+        let old_home = std::env::var("HOME").ok();
+        let old_path = std::env::var("XAI_CREDENTIALS_PATH").ok();
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("XAI_CREDENTIALS_PATH");
+        }
+        let conservative = GrokCredentials::load_resolved_conservative_async().await;
+        // The chat path (unchanged) must still prefer the static key here.
+        let chat = GrokCredentials::load_resolved_async().await;
+        unsafe {
+            match old_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match old_path {
+                Some(v) => std::env::set_var("XAI_CREDENTIALS_PATH", v),
+                None => std::env::remove_var("XAI_CREDENTIALS_PATH"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+
+        let conservative = conservative.expect("conservative resolve must succeed");
+        assert_eq!(
+            conservative.api_key, "jwt-oidc-with-uid",
+            "conservative must prefer the OIDC CLI login"
+        );
+        assert_eq!(
+            conservative.user_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555"),
+            "OIDC user_id must be present for x-grok-user-id parity"
+        );
+
+        let chat = chat.expect("chat resolve must succeed");
+        assert_eq!(
+            chat.api_key, "xai-static-no-uid",
+            "chat path precedence is UNCHANGED: explicit static beats ambient OIDC"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn conservative_honors_explicit_env_override_then_falls_to_static() {
+        // WHY: $XAI_CREDENTIALS_PATH stays the highest-precedence explicit override
+        // even in conservative mode (a deliberate operator choice); and when no CLI
+        // OIDC file exists, conservative falls back to the static key rather than
+        // erroring. Two cases in one lock window.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // Case A: explicit env override wins (points at a static file).
+        let env_file = temp_credentials_path();
+        write_temp_creds(&env_file, r#"{"apiKey": "xai-env-explicit"}"#);
+        let old_path = std::env::var("XAI_CREDENTIALS_PATH").ok();
+        let old_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("XAI_CREDENTIALS_PATH", env_file.to_str().unwrap());
+        }
+        let via_env = GrokCredentials::load_resolved_conservative_async().await;
+
+        // Case B: no env override, only a static key present (no ~/.grok) -> static.
+        let home = std::env::temp_dir().join(format!("omni-grok-consb-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(home.join(".xai")).unwrap();
+        write_temp_creds(
+            &home.join(".xai/.credentials.json"),
+            r#"{"apiKey": "xai-static-only"}"#,
+        );
+        unsafe {
+            std::env::remove_var("XAI_CREDENTIALS_PATH");
+            std::env::set_var("HOME", &home);
+        }
+        let via_static = GrokCredentials::load_resolved_conservative_async().await;
+
+        unsafe {
+            match old_path {
+                Some(v) => std::env::set_var("XAI_CREDENTIALS_PATH", v),
+                None => std::env::remove_var("XAI_CREDENTIALS_PATH"),
+            }
+            match old_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_file(&env_file);
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(via_env.unwrap().api_key, "xai-env-explicit");
+        assert_eq!(
+            via_static.unwrap().api_key,
+            "xai-static-only",
+            "conservative must fall back to the static key when no CLI OIDC file exists"
+        );
     }
 }

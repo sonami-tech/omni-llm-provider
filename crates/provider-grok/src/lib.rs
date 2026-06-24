@@ -277,6 +277,35 @@ impl GrokProvider {
         self.version.catalog(self.mode)
     }
 
+    /// The catalog a chat-completions request should resolve against. Normally the
+    /// active catalog, but on a conservative->extended fallback it must be the
+    /// EXTENDED catalog (the surface actually being hit) so extended-only aliases
+    /// like "grok" resolve instead of being forwarded verbatim.
+    fn fallback_catalog(&self, conservative_fallback: bool) -> &'static [CatalogModel] {
+        if conservative_fallback {
+            self.version.extended
+        } else {
+            self.active_catalog()
+        }
+    }
+
+    /// Whether conservative mode must divert this request to the extended path
+    /// BEFORE attempting the conservative wire. True only for `Custom` auth: the
+    /// conservative wire is xAI-OIDC-specific (Bearer + matching `x-grok-user-id`
+    /// to cli-chat-proxy), so a `Custom` gateway credential is incompatible with
+    /// the grok-shell fingerprint and is honored on the extended path instead. We
+    /// warn accurately here so the log matches what actually happens (no
+    /// conservative request is made for Custom auth).
+    fn conservative_diverts_to_extended(&self) -> bool {
+        if matches!(self.auth, GrokAuthConfig::Custom { .. }) {
+            warn!(
+                "grok conservative mode: custom auth is not compatible with the conservative cli-chat-proxy fingerprint (which needs the xAI OIDC bearer + matching x-grok-user-id); using the extended path (custom endpoint/auth) instead"
+            );
+            return true;
+        }
+        false
+    }
+
     /// Configure this provider as a custom OpenAI-compatible endpoint.
     ///
     /// Custom auth is isolated from the default Grok/xAI credential chain:
@@ -501,11 +530,13 @@ impl GrokProvider {
     /// `new(Some(..))` / the conservative test constructor) short-circuits the disk
     /// chain and is used directly, paired with its `fallback_user_id` - the same
     /// "explicit ctor key wins" rule the chat path uses, so no test-only state
-    /// lives on the production struct. Otherwise the same fresh file chain as the
-    /// chat path is used (so a CLI re-login / rotation is picked up), and an expired
-    /// OIDC token warns-but-continues exactly like the chat path. A `Custom` auth
-    /// config is not the default xAI chain and is rejected (callers that hit this
-    /// fall back to extended, which honors Custom).
+    /// lives on the production struct. Otherwise the CONSERVATIVE file chain is used
+    /// (which prefers the Grok CLI OIDC login so `x-grok-user-id` is present; see
+    /// [`credentials::GrokCredentials::load_resolved_conservative_async`]), picking
+    /// up a CLI re-login / rotation, with an expired OIDC token warning-but-
+    /// continuing like the chat path. A `Custom` auth config is for a different
+    /// gateway, not the xAI-OIDC conservative wire, so it is rejected with
+    /// `NoSource`; the caller then takes the extended path (which honors Custom).
     async fn resolve_conservative_credentials(
         &self,
     ) -> Result<GrokCredentials, credentials::GrokCredentialsError> {
@@ -523,7 +554,7 @@ impl GrokProvider {
                 user_id: fallback_user_id.clone(),
             });
         }
-        let creds = GrokCredentials::load_resolved_async().await?;
+        let creds = GrokCredentials::load_resolved_conservative_async().await?;
         if let Err(e) = creds.check_expired() {
             warn!(
                 error = %e,
@@ -612,7 +643,9 @@ impl GrokProvider {
         let url = format!("{}/v1/responses", base);
         debug!(%url, "POST grok conservative responses");
 
-        let redactor = GrokErrorRedactor;
+        // Redactor carries the EXACT resolved bearer/key so a non-prefixed operator
+        // token cannot leak through an upstream error body (Finding 4).
+        let redactor = GrokErrorRedactor::for_credentials(&creds);
         let resp = self
             .client
             .post(&url)
@@ -661,7 +694,9 @@ impl GrokProvider {
         let headers = self.conservative_headers(&creds, &model)?;
         let url = format!("{}/v1/responses", base);
         let client = self.client.clone();
-        let redactor = GrokErrorRedactor;
+        // Redactor carries the EXACT resolved bearer/key so a non-prefixed operator
+        // token cannot leak through an upstream error body (Finding 4).
+        let redactor = GrokErrorRedactor::for_credentials(&creds);
 
         let stream = async_stream::stream! {
             let send_result = client.post(&url).headers(headers).json(&body).send().await;
@@ -795,22 +830,23 @@ impl GrokProvider {
         Ok(Box::pin(stream))
     }
 
-    /// Emit a single parity-loss warning when an override is active in
-    /// conservative mode. Honored-but-not-exact: env/config overrides (custom
-    /// base_url, Custom auth, or `XAI_CREDENTIALS_PATH`) are still used, but they
-    /// break byte-exact CLI parity, so we surface that once and proceed.
+    /// Emit a single parity-loss warning when an override is active on the
+    /// conservative wire. Honored-but-not-exact: a custom base_url or an explicit
+    /// `XAI_CREDENTIALS_PATH` is still used, but it breaks byte-exact CLI parity, so
+    /// we surface that once and proceed. Custom AUTH is NOT covered here: it never
+    /// reaches the conservative wire (it is diverted to the extended path with its
+    /// own accurate warning before `send_conservative` runs), so listing it here
+    /// would be misleading.
     fn warn_conservative_override(&self, base_overridden: bool) {
         if !self.warn_overrides {
             return;
         }
-        let custom_auth = !matches!(self.auth, GrokAuthConfig::Default { .. });
         let creds_path = std::env::var_os("XAI_CREDENTIALS_PATH").is_some();
-        if base_overridden || custom_auth || creds_path {
+        if base_overridden || creds_path {
             warn!(
                 base_overridden,
-                custom_auth,
                 xai_credentials_path = creds_path,
-                "grok conservative mode parity is not exact: an override (custom base_url / custom auth / XAI_CREDENTIALS_PATH) is active; proceeding with the override"
+                "grok conservative mode parity is not exact: an override (custom base_url / XAI_CREDENTIALS_PATH) is active; proceeding with the override on the conservative wire"
             );
         }
     }
@@ -861,16 +897,47 @@ fn redact(input: &str) -> String {
     out
 }
 
-/// `ErrorRedactor` for the shared Responses machinery (conservative mode). Reuses
-/// the existing free `redact` (which scrubs `sk-`/`xai-`/`eyJ` bearer prefixes) so
-/// the conservative path uses the identical redaction as the chat path - no
-/// duplicated secret-detection logic.
+/// `ErrorRedactor` for the shared Responses machinery (conservative mode).
+///
+/// Layered redaction: the prefix scrubber [`redact`] (`sk-`/`xai-`/`eyJ`) PLUS the
+/// EXACT resolved secret strings captured in `secrets` (the bearer token and the
+/// raw key). The exact list is load-bearing: an operator may supply a bearer that
+/// has none of the known prefixes (e.g. a plain static key), which the prefix
+/// scrubber would miss; capturing the exact value guarantees it never leaks into a
+/// surfaced error body. Mirrors `CodexErrorRedactor`'s exact-secret approach.
+/// `Default` yields an empty secret list (still prefix-redacts) so the type
+/// satisfies the `ErrorRedactor` bounds used by `ResponsesStreamParser`.
 #[derive(Clone, Debug, Default)]
-struct GrokErrorRedactor;
+struct GrokErrorRedactor {
+    secrets: Vec<String>,
+}
+
+impl GrokErrorRedactor {
+    /// Capture the exact secrets for a conservative request from the resolved
+    /// credentials: both the full `Bearer <key>` header value and the bare key, so
+    /// either form appearing in an upstream error body is scrubbed regardless of
+    /// prefix. Empty/blank values are skipped; longest-first so a longer secret is
+    /// replaced before a substring of it.
+    fn for_credentials(creds: &GrokCredentials) -> Self {
+        let mut secrets = Vec::new();
+        let key = creds.api_key.trim();
+        if !key.is_empty() {
+            secrets.push(format!("Bearer {key}"));
+            secrets.push(key.to_string());
+        }
+        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        secrets.dedup();
+        Self { secrets }
+    }
+}
 
 impl ErrorRedactor for GrokErrorRedactor {
     fn redact(&self, input: &str) -> String {
-        redact(input)
+        let mut out = redact(input);
+        for secret in &self.secrets {
+            out = out.replace(secret, "<redacted>");
+        }
+        out
     }
 }
 
@@ -1704,24 +1771,35 @@ impl LlmProvider for GrokProvider {
         // at cli-chat-proxy). Falls back to the extended chat path below if CLI
         // credentials are absent (NoSource); a present-but-expired token does NOT
         // fall back (it warns inside resolve_conservative_credentials and proceeds).
+        let mut conservative_fallback = false;
         if self.mode == CatalogMode::Conservative {
-            match self.resolve_conservative_credentials().await {
-                Ok(creds) => return self.send_conservative(req, creds).await,
-                Err(credentials::GrokCredentialsError::NoSource) => {
-                    warn!(
-                        "grok conservative mode: no CLI credentials found; falling back to extended (api.x.ai chat-completions)"
-                    );
+            if self.conservative_diverts_to_extended() {
+                conservative_fallback = true;
+            } else {
+                match self.resolve_conservative_credentials().await {
+                    Ok(creds) => return self.send_conservative(req, creds).await,
+                    Err(credentials::GrokCredentialsError::NoSource) => {
+                        warn!(
+                            "grok conservative mode: no CLI credentials found; falling back to extended (api.x.ai chat-completions)"
+                        );
+                        conservative_fallback = true;
+                    }
+                    Err(e) => return Err(ProviderError::Auth(format!(
+                        "failed to load Grok conservative credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {e}"
+                    ))),
                 }
-                Err(e) => return Err(ProviderError::Auth(format!(
-                    "failed to load Grok conservative credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {e}"
-                ))),
             }
         }
 
         // Hook point (using omni-common): replacements applied at prompt boundary inside the provider.
         // In real deployment the Replacements would be loaded once in the binary and injected here.
         let repl = Replacements::empty();
-        let body = to_xai_chat_request(&req, &repl, self.active_catalog())?;
+        // On a conservative->extended fallback the request must resolve against the
+        // EXTENDED catalog (the surface it is actually hitting), NOT active_catalog()
+        // which is the conservative list in this mode and would forward extended
+        // aliases (e.g. "grok") verbatim.
+        let catalog = self.fallback_catalog(conservative_fallback);
+        let body = to_xai_chat_request(&req, &repl, catalog)?;
 
         let url = format!("{}/chat/completions", self.base_url);
         debug!(%url, "POST xAI chat completions");
@@ -1791,25 +1869,32 @@ impl LlmProvider for GrokProvider {
             "streaming to xAI"
         );
 
-        // Conservative-mode dispatch + fall-back-to-extended-on-NoSource, mirroring
-        // the non-stream send() path.
+        // Conservative-mode dispatch + fall-back-to-extended, mirroring the
+        // non-stream send() path (including the EXTENDED-catalog fallback below).
+        let mut conservative_fallback = false;
         if self.mode == CatalogMode::Conservative {
-            match self.resolve_conservative_credentials().await {
-                Ok(creds) => return self.send_stream_conservative(req, creds).await,
-                Err(credentials::GrokCredentialsError::NoSource) => {
-                    warn!(
-                        "grok conservative mode: no CLI credentials found; falling back to extended (api.x.ai chat-completions)"
-                    );
+            if self.conservative_diverts_to_extended() {
+                conservative_fallback = true;
+            } else {
+                match self.resolve_conservative_credentials().await {
+                    Ok(creds) => return self.send_stream_conservative(req, creds).await,
+                    Err(credentials::GrokCredentialsError::NoSource) => {
+                        warn!(
+                            "grok conservative mode: no CLI credentials found; falling back to extended (api.x.ai chat-completions)"
+                        );
+                        conservative_fallback = true;
+                    }
+                    Err(e) => return Err(ProviderError::Auth(format!(
+                        "failed to load Grok conservative credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {e}"
+                    ))),
                 }
-                Err(e) => return Err(ProviderError::Auth(format!(
-                    "failed to load Grok conservative credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {e}"
-                ))),
             }
         }
 
         // Same prompt-scope replacements seam as send() (Replacements::empty() hook).
         let repl = Replacements::empty();
-        let body = to_xai_chat_stream_request(&req, &repl, self.active_catalog())?;
+        let catalog = self.fallback_catalog(conservative_fallback);
+        let body = to_xai_chat_stream_request(&req, &repl, catalog)?;
         let url = format!("{}/chat/completions", self.base_url);
 
         let auth_headers = self.auth_headers().await?;
@@ -4833,6 +4918,200 @@ mod tests {
             requests[0].url.path().ends_with("/chat/completions"),
             "extended default must use chat-completions, not /v1/responses"
         );
+    }
+
+    #[test]
+    fn fallback_catalog_uses_extended_list_on_conservative_fallback() {
+        // WHY (Finding 2, unit half): the fix routes a conservative->extended
+        // fallback request to the EXTENDED catalog (`version.extended`), NOT
+        // active_catalog() which is the conservative list in this mode. This pins
+        // the catalog SELECTION directly: in conservative mode, fallback_catalog(true)
+        // must return the extended list (so extended-only aliases resolve) while
+        // fallback_catalog(false) stays the active (conservative) list.
+        let cons = GrokProvider::new(None)
+            .unwrap()
+            .with_mode(CatalogMode::Conservative);
+        // Conservative active list lacks the "grok" alias; extended has it.
+        assert!(
+            resolve_model_alias("grok", cons.active_catalog()).is_none(),
+            "precondition: 'grok' is not a conservative alias"
+        );
+        assert_eq!(
+            resolve_model_alias("grok", cons.fallback_catalog(true)),
+            Some("grok-4.3"),
+            "fallback must resolve 'grok'->'grok-4.3' via the EXTENDED catalog"
+        );
+        assert!(
+            resolve_model_alias("grok", cons.fallback_catalog(false)).is_none(),
+            "non-fallback keeps the conservative active catalog"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn conservative_no_creds_falls_through_to_extended_path() {
+        // WHY (Finding 2, integration half): a real conservative NoSource (empty
+        // temp HOME, no XAI_CREDENTIALS_PATH, no ctor key) must FALL THROUGH to the
+        // extended chat path rather than erroring on the conservative wire. Since
+        // the shared chain has no key, the extended path then surfaces its OWN auth
+        // error - whose distinctive message ("failed to load Grok credentials",
+        // from resolve_api_key) proves we reached the extended path. The body that
+        // path builds is pinned to the EXTENDED catalog by
+        // `fallback_catalog_uses_extended_list_on_conservative_fallback` above; the
+        // reachable end-to-end body assertion is covered by the Custom-auth divert
+        // test (same fallback_catalog(true) build path).
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!("omni-grok-nocreds-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+
+        let old_home = std::env::var_os("HOME");
+        let old_path = std::env::var_os("XAI_CREDENTIALS_PATH");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("XAI_CREDENTIALS_PATH");
+        }
+        // Point at a dead port: if it reached the extended HTTP call it would be a
+        // network error; instead it must fail earlier with the extended AUTH error,
+        // proving the fall-through happened and stopped at extended auth resolution.
+        let provider = GrokProvider::new(None)
+            .unwrap()
+            .with_mode(CatalogMode::Conservative)
+            .with_base_url("http://127.0.0.1:1");
+        let err = provider.send(base_req_model("grok")).await.unwrap_err();
+        restore_env("HOME", old_home);
+        restore_env("XAI_CREDENTIALS_PATH", old_path);
+        let _ = std::fs::remove_dir_all(&home);
+
+        match err {
+            ProviderError::Auth(msg) => assert!(
+                msg.contains("failed to load Grok credentials"),
+                "must be the EXTENDED-path auth error (proves fall-through), got: {msg}"
+            ),
+            other => panic!("expected the extended-path Auth error after fall-through, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn conservative_nonstream_error_redacts_non_prefixed_bearer() {
+        // WHY (Finding 4 regression): an operator bearer WITHOUT a known prefix
+        // (sk-/xai-/eyJ) must never leak through an upstream error body. The
+        // redactor carries the EXACT resolved bearer, so a 401 body echoing the raw
+        // token is scrubbed. Without the exact-secret capture the prefix scrubber
+        // would miss "plaintextsecrettoken123" and leak it into ProviderError.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const SECRET: &str = "plaintextsecrettoken123";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+                "{{\"error\":\"invalid bearer {SECRET}\"}}"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = GrokProvider::new_for_test_conservative(SECRET, None, server.uri());
+        let err = provider
+            .send(base_req_model("grok-build"))
+            .await
+            .expect_err("401 must surface an error")
+            .to_string();
+        assert!(!err.contains(SECRET), "non-prefixed bearer leaked: {err}");
+        assert!(err.contains("<redacted>"), "redaction marker missing: {err}");
+    }
+
+    #[tokio::test]
+    async fn conservative_stream_error_redacts_non_prefixed_bearer() {
+        // WHY (Finding 4 regression, stream path): same exact-bearer redaction must
+        // apply to the streaming conservative error path (the 401 branch inside the
+        // async stream), not only the non-stream send.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const SECRET: &str = "plaintextsecrettoken123";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+                "{{\"error\":\"invalid bearer {SECRET}\"}}"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = GrokProvider::new_for_test_conservative(SECRET, None, server.uri());
+        let mut stream = provider
+            .send_stream(base_req_model("grok-build"))
+            .await
+            .expect("stream opens");
+        let err = stream
+            .next()
+            .await
+            .expect("an event")
+            .expect_err("401 must surface an error")
+            .to_string();
+        assert!(!err.contains(SECRET), "non-prefixed bearer leaked in stream: {err}");
+        assert!(err.contains("<redacted>"), "redaction marker missing: {err}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn conservative_custom_auth_diverts_to_extended_path() {
+        // WHY (Finding 1 regression): Custom auth is for a different gateway and is
+        // incompatible with the conservative cli-chat-proxy fingerprint (which needs
+        // the xAI OIDC bearer + matching x-grok-user-id). The documented, intended
+        // behavior is to honor Custom on the EXTENDED path. This proves conservative
+        // + Custom auth POSTs to /chat/completions (NOT /v1/responses) and sends NO
+        // conservative fingerprint headers - matching the accurate warn emitted by
+        // conservative_diverts_to_extended().
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-custom",
+                "model": "grok-4.3",
+                "choices": [{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Conservative mode but Custom auth (explicit key, no env). Must divert to
+        // extended and use the custom Bearer, never the conservative wire.
+        let provider = GrokProvider::new(None)
+            .unwrap()
+            .with_mode(CatalogMode::Conservative)
+            .with_base_url(server.uri())
+            .with_custom_auth(Some("custom-bearer-key".into()), None, Vec::new());
+        let resp = provider.send(base_req_model("grok")).await.unwrap();
+        assert_eq!(resp.content, "hi");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let req = &requests[0];
+        assert!(
+            req.url.path().ends_with("/chat/completions"),
+            "custom auth in conservative mode must take the extended chat path"
+        );
+        // No conservative fingerprint headers leaked onto the extended request.
+        assert!(req.headers.get("x-grok-client-identifier").is_none());
+        assert!(req.headers.get("x-xai-token-auth").is_none());
+        assert!(req.headers.get("x-grok-model-override").is_none());
+        // The custom Bearer is used (extended path honors Custom auth).
+        assert_eq!(
+            req.headers.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer custom-bearer-key"
+        );
+        // Extended alias resolution still applies on this path.
+        let body: serde_json::Value = req.body_json().unwrap();
+        assert_eq!(body["model"], "grok-4.3");
     }
 
     /// A base request pinned to a specific model id (conservative tests pass a
