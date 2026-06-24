@@ -5,14 +5,14 @@
 //! parallel Omni-only setup.
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use omni_common::responses_upstream::{
-    self, ErrorRedactor, ResponsesSseBuffer, ResponsesStreamParser,
+    self, ErrorRedactor, ResponsesSseBuffer, ResponsesSseEvent, ResponsesStreamParser,
 };
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
-    CanonicalResponse, CanonicalStream, CanonicalStreamEvent, CanonicalToolChoice, CatalogMode,
-    CatalogModel, LlmProvider, ProviderError, ProviderVersion,
+    CanonicalResponse, CanonicalStream, CanonicalStreamEvent, CanonicalToolCall,
+    CanonicalToolChoice, CatalogMode, CatalogModel, LlmProvider, ProviderError, ProviderVersion,
 };
 use reqwest::header::HeaderMap;
 use reqwest::{Client, Url, header};
@@ -25,8 +25,19 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http;
+use tokio_tungstenite::tungstenite::protocol::Message;
+use tracing::warn;
 
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const CONSERVATIVE_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const CONSERVATIVE_OPENAI_BETA: &str = "responses_websockets=2026-02-06";
+const CONSERVATIVE_ORIGINATOR: &str = "codex_exec";
+const CONSERVATIVE_BETA_FEATURES: &str = "remote_compaction_v2";
+const CONSERVATIVE_CLIENT_REQUEST_ID: &str = "00000000-0000-4000-8000-000000000000";
+const CONSERVATIVE_WINDOW_ID: &str = "00000000-0000-4000-8000-000000000000:0";
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
 const DEFAULT_AUTH_COMMAND_TIMEOUT_MS: u64 = 5_000;
 
@@ -186,6 +197,156 @@ impl CodexProvider {
     pub fn version_catalog() -> &'static [ProviderVersion] {
         CODEX_VERSIONS
     }
+
+    async fn send_conservative_ws(
+        &self,
+        req: CanonicalRequest,
+        config: CodexRequestConfig,
+    ) -> Result<CanonicalResponse, ProviderError> {
+        let model = req.model.clone();
+        let mut stream = self.send_stream_conservative_ws(req, config).await?;
+        collect_canonical_stream(&mut stream, &model).await
+    }
+
+    async fn send_stream_conservative_ws(
+        &self,
+        req: CanonicalRequest,
+        config: CodexRequestConfig,
+    ) -> Result<CanonicalStream, ProviderError> {
+        let auth = config.chatgpt_auth()?;
+        let models_url = config.conservative_models_url(self.version.version)?;
+        let headers = conservative_codex_headers(self.version.version, &auth)?;
+        let redactor = CodexErrorRedactor::for_secrets([auth.access_token.clone()]);
+
+        let preflight = self
+            .client
+            .get(models_url)
+            .headers(headers.clone())
+            .send()
+            .await
+            .map_err(|e| {
+                ProviderError::Upstream(
+                    redactor.redact(&format!("codex conservative models preflight error: {e}")),
+                )
+            })?;
+        let status = preflight.status();
+        let bytes = preflight.bytes().await.map_err(|e| {
+            ProviderError::Upstream(redactor.redact(&format!(
+                "codex conservative models preflight read error: {e}"
+            )))
+        })?;
+        if !status.is_success() {
+            return Err(ProviderError::Upstream(redactor.redact(&format!(
+                "codex conservative models preflight HTTP {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            ))));
+        }
+
+        let ws_url = config.conservative_responses_ws_url()?;
+        let ws_request = conservative_ws_request(&ws_url, self.version.version, &auth)?;
+        let body = codex_response_create_body(&req)?;
+
+        let stream = async_stream::stream! {
+            let (mut ws, _) = match connect_async(ws_request).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    yield Err(ProviderError::Upstream(redactor.redact(&format!(
+                        "codex conservative websocket connect error: {e}"
+                    ))));
+                    return;
+                }
+            };
+
+            let frame = match serde_json::to_string(&body) {
+                Ok(frame) => frame,
+                Err(e) => {
+                    yield Err(ProviderError::Upstream(format!(
+                        "encode codex conservative response.create: {e}"
+                    )));
+                    return;
+                }
+            };
+            if let Err(e) = ws.send(Message::Text(frame.into())).await {
+                yield Err(ProviderError::Upstream(redactor.redact(&format!(
+                    "codex conservative websocket send error: {e}"
+                ))));
+                return;
+            }
+
+            let mut parser = ResponsesStreamParser::new("codex", redactor.clone());
+            let mut saw_event = false;
+            let mut finished = false;
+
+            while let Some(message) = ws.next().await {
+                let message = match message {
+                    Ok(message) => message,
+                    Err(e) => {
+                        yield Err(ProviderError::Upstream(redactor.redact(&format!(
+                            "codex conservative websocket read error: {e}"
+                        ))));
+                        return;
+                    }
+                };
+                match message {
+                    Message::Text(text) => {
+                        saw_event = true;
+                        let event = ResponsesSseEvent {
+                            event: None,
+                            data: text.to_string(),
+                        };
+                        for parsed in parser.handle_event(event) {
+                            match parsed {
+                                Ok(CanonicalStreamEvent::Finish { .. }) => {
+                                    finished = true;
+                                    yield parsed;
+                                }
+                                Err(_) => {
+                                    yield parsed;
+                                    return;
+                                }
+                                Ok(other) => {
+                                    yield Ok(other);
+                                }
+                            }
+                        }
+                        if finished {
+                            let _ = ws.close(None).await;
+                            break;
+                        }
+                    }
+                    Message::Binary(_) => {
+                        yield Err(ProviderError::Upstream(
+                            "codex conservative websocket returned a binary frame".into(),
+                        ));
+                        return;
+                    }
+                    Message::Close(_) => {
+                        break;
+                    }
+                    Message::Ping(payload) => {
+                        if let Err(e) = ws.send(Message::Pong(payload)).await {
+                            yield Err(ProviderError::Upstream(redactor.redact(&format!(
+                                "codex conservative websocket pong error: {e}"
+                            ))));
+                            return;
+                        }
+                    }
+                    Message::Pong(_) | Message::Frame(_) => {}
+                }
+            }
+
+            if !finished {
+                let message = if saw_event {
+                    "codex conservative websocket ended before a terminal response event"
+                } else {
+                    "codex conservative websocket ended without any response events"
+                };
+                yield Err(ProviderError::Upstream(redactor.redact(message)));
+            }
+        };
+
+        Ok(Box::pin(stream))
+    }
 }
 
 #[async_trait]
@@ -200,6 +361,12 @@ impl LlmProvider for CodexProvider {
 
     async fn send(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError> {
         let config = CodexRequestConfig::load()?;
+        if self.mode == CatalogMode::Conservative {
+            if config.conservative_ws_eligible() {
+                return self.send_conservative_ws(req, config).await;
+            }
+            warn_codex_conservative_fallback(&config);
+        }
         if config.wire_api != WireApi::Responses {
             return Err(ProviderError::Upstream(format!(
                 "unsupported Codex wire_api {}; only responses is supported",
@@ -247,6 +414,12 @@ impl LlmProvider for CodexProvider {
 
     async fn send_stream(&self, req: CanonicalRequest) -> Result<CanonicalStream, ProviderError> {
         let config = CodexRequestConfig::load()?;
+        if self.mode == CatalogMode::Conservative {
+            if config.conservative_ws_eligible() {
+                return self.send_stream_conservative_ws(req, config).await;
+            }
+            warn_codex_conservative_fallback(&config);
+        }
         if config.wire_api != WireApi::Responses {
             return Err(ProviderError::Upstream(format!(
                 "unsupported Codex wire_api {}; only responses is supported",
@@ -434,6 +607,12 @@ struct CodexRequestConfig {
     http_headers: BTreeMap<String, String>,
     env_http_headers: BTreeMap<String, String>,
     query_params: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct ChatGptAuth {
+    access_token: String,
+    account_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -641,6 +820,49 @@ impl CodexRequestConfig {
         Ok(url)
     }
 
+    fn conservative_ws_eligible(&self) -> bool {
+        !omni_codex_override_present()
+            && self.wire_api == WireApi::Responses
+            && Url::parse(&self.base_url)
+                .ok()
+                .is_some_and(|url| is_default_openai_base(url.as_str()))
+            && self.http_headers.is_empty()
+            && self.env_http_headers.is_empty()
+            && self.query_params.is_empty()
+            && self.auth_command.is_none()
+            && self.experimental_bearer_token.is_none()
+            && self.env_key.is_none()
+            && self.requires_openai_auth
+    }
+
+    fn conservative_models_url(&self, version: &str) -> Result<Url, ProviderError> {
+        let mut url = Url::parse(&conservative_chatgpt_base_url())
+            .map_err(|e| ProviderError::Auth(format!("invalid Codex conservative URL: {e}")))?;
+        url.set_path("/backend-api/codex/models");
+        url.query_pairs_mut().append_pair("client_version", version);
+        Ok(url)
+    }
+
+    fn conservative_responses_ws_url(&self) -> Result<String, ProviderError> {
+        let mut url = Url::parse(&conservative_chatgpt_ws_base_url())
+            .map_err(|e| ProviderError::Auth(format!("invalid Codex conservative URL: {e}")))?;
+        let scheme = match url.scheme() {
+            "http" => "ws",
+            "https" => "wss",
+            other => {
+                return Err(ProviderError::Auth(format!(
+                    "unsupported Codex conservative scheme {other:?}"
+                )));
+            }
+        };
+        url.set_scheme(scheme).map_err(|_| {
+            ProviderError::Auth("invalid Codex conservative WebSocket scheme".into())
+        })?;
+        url.set_path("/backend-api/codex/responses");
+        url.set_query(None);
+        Ok(url.to_string())
+    }
+
     async fn headers(&self) -> Result<header::HeaderMap, ProviderError> {
         let mut headers = header::HeaderMap::new();
         for (name, value) in &self.http_headers {
@@ -663,6 +885,49 @@ impl CodexRequestConfig {
             headers.insert(header::AUTHORIZATION, value);
         }
         Ok(headers)
+    }
+
+    fn chatgpt_auth(&self) -> Result<ChatGptAuth, ProviderError> {
+        let auth_path = self.home.join("auth.json");
+        let bytes = std::fs::read(&auth_path).map_err(|e| {
+            ProviderError::Auth(format!(
+                "Codex conservative mode requires ChatGPT OAuth auth.json: failed to read auth.json: {e}"
+            ))
+        })?;
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|e| ProviderError::Auth(format!("Codex auth.json malformed: {e}")))?;
+        let tokens = value
+            .get("tokens")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| {
+                ProviderError::Auth(
+                    "Codex conservative mode requires auth.json tokens from ChatGPT login".into(),
+                )
+            })?;
+        let access_token = tokens
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                ProviderError::Auth(
+                    "Codex conservative mode requires tokens.access_token in auth.json".into(),
+                )
+            })?
+            .to_string();
+        let account_id = tokens
+            .get("account_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                ProviderError::Auth(
+                    "Codex conservative mode requires tokens.account_id in auth.json".into(),
+                )
+            })?
+            .to_string();
+        Ok(ChatGptAuth {
+            access_token,
+            account_id,
+        })
     }
 
     async fn auth_token(&self) -> Result<Option<String>, ProviderError> {
@@ -731,6 +996,44 @@ impl CodexRequestConfig {
 
 fn omni_codex_override_present() -> bool {
     env_nonempty("OMNI_CODEX_BASE_URL").is_some()
+}
+
+fn is_default_openai_base(base_url: &str) -> bool {
+    Url::parse(base_url)
+        .ok()
+        .is_some_and(|url| url.as_str().trim_end_matches('/') == DEFAULT_OPENAI_BASE_URL)
+}
+
+fn conservative_chatgpt_base_url() -> String {
+    #[cfg(test)]
+    if let Some(base) = env_nonempty("OMNI_CODEX_CONSERVATIVE_BASE_URL_FOR_TEST") {
+        return base.trim_end_matches('/').to_string();
+    }
+    CONSERVATIVE_CHATGPT_BASE_URL.to_string()
+}
+
+fn conservative_chatgpt_ws_base_url() -> String {
+    #[cfg(test)]
+    if let Some(base) = env_nonempty("OMNI_CODEX_CONSERVATIVE_WS_BASE_URL_FOR_TEST") {
+        return base.trim_end_matches('/').to_string();
+    }
+    conservative_chatgpt_base_url()
+}
+
+fn warn_codex_conservative_fallback(config: &CodexRequestConfig) {
+    let reason = if omni_codex_override_present() {
+        "OMNI_CODEX_BASE_URL override is active"
+    } else if !is_default_openai_base(&config.base_url) {
+        "Codex config uses a custom/non-default base_url"
+    } else if !config.requires_openai_auth {
+        "Codex config does not require OpenAI/ChatGPT auth"
+    } else {
+        "Codex config has custom auth, headers, or query parameters"
+    };
+    warn!(
+        reason,
+        "codex conservative mode parity is not exact; using the configured REST Responses path instead"
+    );
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -853,6 +1156,115 @@ fn parse_auth_command(table: &toml::map::Map<String, toml::Value>) -> Option<Aut
     })
 }
 
+fn conservative_user_agent(version: &str) -> String {
+    format!("codex_exec/{version} (Ubuntu 24.4.0; x86_64) unknown (codex_exec; {version})")
+}
+
+fn conservative_codex_headers(
+    version: &str,
+    auth: &ChatGptAuth,
+) -> Result<header::HeaderMap, ProviderError> {
+    let mut headers = header::HeaderMap::new();
+    insert_header(&mut headers, "version", version)?;
+    let bearer = format!("Bearer {}", auth.access_token);
+    insert_header(&mut headers, "authorization", &bearer)?;
+    if let Some(value) = headers.get_mut(header::AUTHORIZATION) {
+        value.set_sensitive(true);
+    }
+    insert_header(&mut headers, "chatgpt-account-id", &auth.account_id)?;
+    insert_header(&mut headers, "accept", "*/*")?;
+    insert_header(&mut headers, "originator", CONSERVATIVE_ORIGINATOR)?;
+    insert_header(
+        &mut headers,
+        "user-agent",
+        &conservative_user_agent(version),
+    )?;
+    Ok(headers)
+}
+
+fn conservative_turn_metadata() -> String {
+    json!({
+        "installation_id": "omni-llm-provider",
+        "session_id": CONSERVATIVE_CLIENT_REQUEST_ID,
+        "thread_id": CONSERVATIVE_CLIENT_REQUEST_ID,
+        "turn_id": "",
+        "window_id": CONSERVATIVE_WINDOW_ID,
+        "request_kind": "prewarm",
+        "thread_source": "user",
+        "sandbox": "none",
+        "workspaces": {},
+    })
+    .to_string()
+}
+
+fn conservative_ws_request(
+    ws_url: &str,
+    version: &str,
+    auth: &ChatGptAuth,
+) -> Result<http::Request<()>, ProviderError> {
+    let mut request = ws_url
+        .into_client_request()
+        .map_err(|e| ProviderError::Auth(format!("invalid Codex WebSocket request: {e}")))?;
+    let headers = request.headers_mut();
+    headers.insert(
+        "chatgpt-account-id",
+        http_header_value("chatgpt-account-id", &auth.account_id)?,
+    );
+    let mut bearer = http_header_value("authorization", &format!("Bearer {}", auth.access_token))?;
+    bearer.set_sensitive(true);
+    headers.insert(http::header::AUTHORIZATION, bearer);
+    headers.insert(
+        http::header::USER_AGENT,
+        http_header_value("user-agent", &conservative_user_agent(version))?,
+    );
+    headers.insert(
+        "originator",
+        http::HeaderValue::from_static(CONSERVATIVE_ORIGINATOR),
+    );
+    headers.insert(
+        "openai-beta",
+        http::HeaderValue::from_static(CONSERVATIVE_OPENAI_BETA),
+    );
+    headers.insert("version", http_header_value("version", version)?);
+    headers.insert(
+        "x-codex-beta-features",
+        http::HeaderValue::from_static(CONSERVATIVE_BETA_FEATURES),
+    );
+    headers.insert(
+        "x-client-request-id",
+        http::HeaderValue::from_static(CONSERVATIVE_CLIENT_REQUEST_ID),
+    );
+    headers.insert(
+        "session-id",
+        http::HeaderValue::from_static(CONSERVATIVE_CLIENT_REQUEST_ID),
+    );
+    headers.insert(
+        "thread-id",
+        http::HeaderValue::from_static(CONSERVATIVE_CLIENT_REQUEST_ID),
+    );
+    headers.insert(
+        "x-codex-window-id",
+        http::HeaderValue::from_static(CONSERVATIVE_WINDOW_ID),
+    );
+    headers.insert(
+        "x-codex-turn-metadata",
+        http_header_value("x-codex-turn-metadata", &conservative_turn_metadata())?,
+    );
+    Ok(request)
+}
+
+fn http_header_value(name: &str, value: &str) -> Result<http::HeaderValue, ProviderError> {
+    http::HeaderValue::from_str(value)
+        .map_err(|_| ProviderError::Auth(format!("invalid Codex header value for {name}")))
+}
+
+fn codex_response_create_body(req: &CanonicalRequest) -> Result<Value, ProviderError> {
+    let mut body = codex_responses_body(req, true)?;
+    body["type"] = Value::String("response.create".into());
+    body.as_object_mut().map(|obj| obj.remove("stream"));
+    Ok(body)
+}
+
 fn insert_header(
     headers: &mut header::HeaderMap,
     name: &str,
@@ -864,6 +1276,85 @@ fn insert_header(
         .map_err(|_| ProviderError::Auth(format!("invalid Codex header value for {name}")))?;
     headers.insert(name, value);
     Ok(())
+}
+
+async fn collect_canonical_stream(
+    stream: &mut CanonicalStream,
+    model: &str,
+) -> Result<CanonicalResponse, ProviderError> {
+    let mut content = String::new();
+    let mut refusal = String::new();
+    let mut tool_slots: BTreeMap<u32, CanonicalToolCall> = BTreeMap::new();
+    let mut usage = Default::default();
+    let mut id = None;
+    let mut metadata = None;
+    let mut annotations = Vec::new();
+    let mut finish_reason = None;
+    let mut saw_finish = false;
+
+    while let Some(event) = stream.next().await {
+        match event? {
+            CanonicalStreamEvent::ResponseMetadata(meta) => {
+                if let Some(response_id) = meta.id.clone() {
+                    id = Some(response_id);
+                }
+                metadata = Some(meta);
+            }
+            CanonicalStreamEvent::TextDelta(delta) => content.push_str(&delta),
+            CanonicalStreamEvent::RefusalDelta(delta) => refusal.push_str(&delta),
+            CanonicalStreamEvent::ReasoningDelta(_)
+            | CanonicalStreamEvent::ReasoningSignatureDelta(_) => {}
+            CanonicalStreamEvent::OutputAnnotations(new_annotations) => {
+                annotations.extend(new_annotations);
+            }
+            CanonicalStreamEvent::ToolCallDelta {
+                index,
+                id,
+                name,
+                arguments_delta,
+            } => {
+                let slot = tool_slots
+                    .entry(index)
+                    .or_insert_with(|| CanonicalToolCall {
+                        id: String::new(),
+                        name: String::new(),
+                        arguments: String::new(),
+                    });
+                if let Some(id) = id {
+                    slot.id = id;
+                }
+                if let Some(name) = name {
+                    slot.name = name;
+                }
+                slot.arguments.push_str(&arguments_delta);
+            }
+            CanonicalStreamEvent::Usage(u) => usage = u,
+            CanonicalStreamEvent::Finish { finish_reason: fr } => {
+                finish_reason = fr;
+                saw_finish = true;
+            }
+        }
+    }
+
+    if !saw_finish {
+        return Err(ProviderError::Upstream(
+            "codex conservative websocket ended before a terminal response event".into(),
+        ));
+    }
+
+    let tool_calls = tool_slots.into_values().collect::<Vec<_>>();
+    Ok(CanonicalResponse {
+        model: model.to_string(),
+        content,
+        refusal: (!refusal.is_empty()).then_some(refusal),
+        finish_reason,
+        usage,
+        id,
+        annotations,
+        metadata,
+        tool_calls,
+        reasoning: Vec::new(),
+    })
 }
 
 fn codex_responses_body(req: &CanonicalRequest, stream: bool) -> Result<Value, ProviderError> {
@@ -1070,6 +1561,16 @@ struct CodexErrorRedactor {
 }
 
 impl CodexErrorRedactor {
+    fn for_secrets(secrets: impl IntoIterator<Item = String>) -> Self {
+        let mut secrets = secrets
+            .into_iter()
+            .filter(|secret| !secret.trim().is_empty())
+            .collect::<Vec<_>>();
+        secrets.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        secrets.dedup();
+        Self { secrets }
+    }
+
     fn from_request(url: &Url, headers: &HeaderMap) -> Self {
         let mut secrets = Vec::new();
         for (name, value) in headers {
@@ -1146,6 +1647,9 @@ mod tests {
     use omni_common::responses_upstream::MAX_SSE_EVENT_BYTES;
     use omni_core::{CanonicalResponseMetadata, CanonicalTool, CanonicalUsage};
     use std::sync::Mutex;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio_tungstenite::accept_hdr_async;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1186,6 +1690,8 @@ mod tests {
         old_omni_auth_token: Option<std::ffi::OsString>,
         old_omni_api_key: Option<std::ffi::OsString>,
         old_omni_custom_headers: Option<std::ffi::OsString>,
+        old_conservative_base_url: Option<std::ffi::OsString>,
+        old_conservative_ws_base_url: Option<std::ffi::OsString>,
     }
 
     impl TempCodexHome {
@@ -1211,6 +1717,10 @@ mod tests {
             let old_omni_auth_token = std::env::var_os("OMNI_CODEX_AUTH_TOKEN");
             let old_omni_api_key = std::env::var_os("OMNI_CODEX_API_KEY");
             let old_omni_custom_headers = std::env::var_os("OMNI_CODEX_CUSTOM_HEADERS");
+            let old_conservative_base_url =
+                std::env::var_os("OMNI_CODEX_CONSERVATIVE_BASE_URL_FOR_TEST");
+            let old_conservative_ws_base_url =
+                std::env::var_os("OMNI_CODEX_CONSERVATIVE_WS_BASE_URL_FOR_TEST");
             unsafe {
                 std::env::set_var("CODEX_HOME", &path);
                 std::env::remove_var("CODEX_API_KEY");
@@ -1224,6 +1734,8 @@ mod tests {
                 std::env::remove_var("OMNI_CODEX_AUTH_TOKEN");
                 std::env::remove_var("OMNI_CODEX_API_KEY");
                 std::env::remove_var("OMNI_CODEX_CUSTOM_HEADERS");
+                std::env::remove_var("OMNI_CODEX_CONSERVATIVE_BASE_URL_FOR_TEST");
+                std::env::remove_var("OMNI_CODEX_CONSERVATIVE_WS_BASE_URL_FOR_TEST");
             }
             Self {
                 path,
@@ -1239,6 +1751,8 @@ mod tests {
                 old_omni_auth_token,
                 old_omni_api_key,
                 old_omni_custom_headers,
+                old_conservative_base_url,
+                old_conservative_ws_base_url,
             }
         }
     }
@@ -1293,6 +1807,14 @@ mod tests {
                 match &self.old_omni_custom_headers {
                     Some(v) => std::env::set_var("OMNI_CODEX_CUSTOM_HEADERS", v),
                     None => std::env::remove_var("OMNI_CODEX_CUSTOM_HEADERS"),
+                }
+                match &self.old_conservative_base_url {
+                    Some(v) => std::env::set_var("OMNI_CODEX_CONSERVATIVE_BASE_URL_FOR_TEST", v),
+                    None => std::env::remove_var("OMNI_CODEX_CONSERVATIVE_BASE_URL_FOR_TEST"),
+                }
+                match &self.old_conservative_ws_base_url {
+                    Some(v) => std::env::set_var("OMNI_CODEX_CONSERVATIVE_WS_BASE_URL_FOR_TEST", v),
+                    None => std::env::remove_var("OMNI_CODEX_CONSERVATIVE_WS_BASE_URL_FOR_TEST"),
                 }
             }
             let _ = std::fs::remove_dir_all(&self.path);
@@ -1709,6 +2231,321 @@ query_params = { api-version = "2026-01-01" }
         assert_eq!(body["previous_response_id"], "resp_1");
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(body["text"]["format"]["type"], "json_schema");
+    }
+
+    #[test]
+    fn conservative_headers_match_captured_codex_0142_names_and_values() {
+        let auth = ChatGptAuth {
+            access_token: "eyJ-fake-oauth".into(),
+            account_id: "11111111-2222-3333-4444-555555555555".into(),
+        };
+        let headers = conservative_codex_headers("0.142.0", &auth).unwrap();
+        assert_eq!(headers.get("version").unwrap(), "0.142.0");
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            "Bearer eyJ-fake-oauth"
+        );
+        assert_eq!(
+            headers.get("chatgpt-account-id").unwrap(),
+            "11111111-2222-3333-4444-555555555555"
+        );
+        assert_eq!(headers.get("accept").unwrap(), "*/*");
+        assert_eq!(headers.get("originator").unwrap(), "codex_exec");
+        assert_eq!(
+            headers.get("user-agent").unwrap(),
+            "codex_exec/0.142.0 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.142.0)"
+        );
+
+        let request = conservative_ws_request(
+            "ws://127.0.0.1/backend-api/codex/responses",
+            "0.142.0",
+            &auth,
+        )
+        .unwrap();
+        let ws_headers = request.headers();
+        assert_eq!(request.uri().path(), "/backend-api/codex/responses");
+        assert_eq!(
+            ws_headers.get("openai-beta").unwrap(),
+            CONSERVATIVE_OPENAI_BETA
+        );
+        assert_eq!(
+            ws_headers.get("x-codex-beta-features").unwrap(),
+            CONSERVATIVE_BETA_FEATURES
+        );
+        assert_eq!(ws_headers.get("originator").unwrap(), "codex_exec");
+        assert_eq!(ws_headers.get("version").unwrap(), "0.142.0");
+        assert_eq!(
+            ws_headers.get("x-client-request-id").unwrap(),
+            CONSERVATIVE_CLIENT_REQUEST_ID
+        );
+        assert_eq!(
+            ws_headers.get("session-id").unwrap(),
+            CONSERVATIVE_CLIENT_REQUEST_ID
+        );
+        assert_eq!(
+            ws_headers.get("thread-id").unwrap(),
+            CONSERVATIVE_CLIENT_REQUEST_ID
+        );
+        let metadata: Value = serde_json::from_str(
+            ws_headers
+                .get("x-codex-turn-metadata")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["request_kind"], "prewarm");
+        assert_eq!(metadata["thread_source"], "user");
+        assert_eq!(metadata["workspaces"], json!({}));
+    }
+
+    #[test]
+    fn conservative_response_create_wraps_existing_codex_body_shape() {
+        let req = CanonicalRequest {
+            model: "gpt-5.5".into(),
+            messages: vec![
+                CanonicalMessage {
+                    role: "system".into(),
+                    content: CanonicalContent::Text("sys".into()),
+                },
+                CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Text("hi".into()),
+                },
+            ],
+            reasoning: Some(CanonicalReasoning {
+                effort: Some("high".into()),
+                budget_tokens: None,
+            }),
+            provider_extras: Some(json!({"store": false, "metadata": {"source": "test"}})),
+            ..Default::default()
+        };
+        let body = codex_response_create_body(&req).unwrap();
+        assert_eq!(body["type"], "response.create");
+        assert_eq!(body["model"], "gpt-5.5");
+        assert_eq!(body["instructions"], "sys");
+        assert_eq!(body["input"][0]["content"], "hi");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["store"], false);
+        assert!(
+            body.get("stream").is_none(),
+            "WebSocket response.create frames are text messages, not REST stream:true bodies"
+        );
+    }
+
+    #[test]
+    fn conservative_auth_requires_chatgpt_oauth_token_and_account_id() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _home = TempCodexHome::new(
+            r#"model = "gpt-5.5""#,
+            Some(
+                r#"{"OPENAI_API_KEY":"sk-rest","tokens":{"access_token":"eyJ-oauth","account_id":"acct-1"}}"#,
+            ),
+        );
+        let cfg = CodexRequestConfig::load().unwrap();
+        let auth = cfg.chatgpt_auth().unwrap();
+        assert_eq!(auth.access_token, "eyJ-oauth");
+        assert_eq!(auth.account_id, "acct-1");
+    }
+
+    #[test]
+    fn custom_codex_config_is_not_conservative_ws_eligible() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _home = TempCodexHome::new(
+            r#"
+model = "gpt-custom"
+model_provider = "proxy"
+[model_providers.proxy]
+base_url = "https://proxy.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = false
+"#,
+            None,
+        );
+        let cfg = CodexRequestConfig::load().unwrap();
+        assert!(
+            !cfg.conservative_ws_eligible(),
+            "custom provider auth/base_url must stay on the configured REST path"
+        );
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn assert_codex_ws_request(
+        req: &http::Request<()>,
+        response: http::Response<()>,
+    ) -> Result<http::Response<()>, http::Response<Option<String>>> {
+        let headers = req.headers();
+        assert_eq!(req.uri().path(), "/backend-api/codex/responses");
+        assert_eq!(
+            headers.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer eyJ-test-oauth"
+        );
+        assert_eq!(
+            headers.get("chatgpt-account-id").unwrap().to_str().unwrap(),
+            "acct-test"
+        );
+        assert_eq!(
+            headers.get("user-agent").unwrap().to_str().unwrap(),
+            "codex_exec/0.142.0 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.142.0)"
+        );
+        assert_eq!(headers.get("originator").unwrap(), "codex_exec");
+        assert_eq!(
+            headers.get("openai-beta").unwrap(),
+            CONSERVATIVE_OPENAI_BETA
+        );
+        assert_eq!(headers.get("version").unwrap(), "0.142.0");
+        assert_eq!(
+            headers.get("x-codex-beta-features").unwrap(),
+            CONSERVATIVE_BETA_FEATURES
+        );
+        Ok(response)
+    }
+
+    async fn spawn_codex_ws_server() -> (String, oneshot::Receiver<Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_hdr_async(stream, assert_codex_ws_request)
+                .await
+                .unwrap();
+            let frame = ws.next().await.unwrap().unwrap();
+            let body: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            tx.send(body).unwrap();
+            ws.send(Message::Text(
+                json!({
+                    "type": "codex.rate_limits",
+                    "rate_limits": {"allowed": true}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            ws.send(Message::Text(
+                json!({
+                    "type": "response.created",
+                    "response": {
+                        "id": "resp_ws",
+                        "status": "in_progress",
+                        "model": "gpt-5.5"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            ws.send(Message::Text(
+                json!({
+                    "type": "response.output_text.delta",
+                    "delta": "Hel",
+                    "output_index": 0,
+                    "content_index": 0
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            ws.send(Message::Text(
+                json!({
+                    "type": "response.output_text.delta",
+                    "delta": "lo",
+                    "output_index": 0,
+                    "content_index": 0
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            ws.send(Message::Text(
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_ws",
+                        "status": "completed",
+                        "model": "gpt-5.5",
+                        "usage": {"input_tokens": 3, "output_tokens": 4}
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn conservative_send_uses_models_preflight_ws_and_shared_parser() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (ws_base_url, body_rx) = spawn_codex_ws_server().await;
+        let _home = TempCodexHome::new(
+            r#"
+model = "gpt-5.5"
+"#,
+            Some(
+                r#"{"OPENAI_API_KEY":"sk-rest","tokens":{"access_token":"eyJ-test-oauth","account_id":"acct-test"}}"#,
+            ),
+        );
+        let models_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/backend-api/codex/models"))
+            .and(header("authorization", "Bearer eyJ-test-oauth"))
+            .and(header("chatgpt-account-id", "acct-test"))
+            .and(header("originator", "codex_exec"))
+            .and(header("version", "0.142.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"slug": "gpt-5.5", "prefer_websockets": true}]
+            })))
+            .expect(1)
+            .mount(&models_server)
+            .await;
+        unsafe {
+            std::env::set_var(
+                "OMNI_CODEX_CONSERVATIVE_BASE_URL_FOR_TEST",
+                models_server.uri(),
+            );
+            std::env::set_var("OMNI_CODEX_CONSERVATIVE_WS_BASE_URL_FOR_TEST", &ws_base_url);
+        }
+
+        let provider = CodexProvider::new()
+            .unwrap()
+            .with_mode(CatalogMode::Conservative);
+        let resp = provider
+            .send(CanonicalRequest {
+                model: "gpt-5.5".into(),
+                messages: vec![CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Text("hi".into()),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.content, "Hello");
+        assert_eq!(resp.id.as_deref(), Some("resp_ws"));
+        assert_eq!(resp.usage.input_tokens, 3);
+        assert_eq!(resp.usage.output_tokens, 4);
+        assert_eq!(resp.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            resp.metadata
+                .as_ref()
+                .and_then(|meta| meta.provider.as_deref()),
+            Some("codex")
+        );
+
+        let body = body_rx.await.unwrap();
+        assert_eq!(body["type"], "response.create");
+        assert_eq!(body["model"], "gpt-5.5");
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"], "hi");
+        assert!(body.get("stream").is_none());
     }
 
     #[test]
