@@ -74,6 +74,12 @@ fn futures_util_stream(
 pub enum ProviderError {
     #[error("auth: {0}")]
     Auth(String),
+    /// A client-input validation failure detected while preparing the request
+    /// (malformed body, unrecognized model, unrepresentable content). This is the
+    /// caller's fault, not an upstream failure, so the edge surfaces it as a 400
+    /// rather than routing it through the upstream classifier.
+    #[error("bad request: {0}")]
+    BadRequest(String),
     /// An upstream provider/gateway failure. `status` carries the upstream HTTP
     /// status when the error originated at an HTTP-response boundary (so the
     /// edge can translate it deliberately); it is `None` for transport, decode,

@@ -377,7 +377,9 @@ impl LlmProvider for ClaudeProvider {
             &repl,
             true, // always inject for the gate (callers that want --no-preamble use a different path)
         )
-        .map_err(|e| ProviderError::Other(anyhow::Error::msg(e)))?;
+        // Request-shaping failures (unrepresentable content, malformed tool args,
+        // bad image URL, unsupported role) are the client's fault -> 400, not 500.
+        .map_err(ProviderError::BadRequest)?;
 
         // 3. Serialize for finalize (cch lives in the billing text inside system).
         let body_val = serde_json::to_value(&anth_req).map_err(|e| {
@@ -427,7 +429,8 @@ impl LlmProvider for ClaudeProvider {
         // JSON value (the typed builder set Some(false)).
         let repl = Replacements::empty();
         let anth_req = translate::prepare_anthropic_request(&req, self.profile, &repl, true)
-            .map_err(|e| ProviderError::Other(anyhow::Error::msg(e)))?;
+            // Request-shaping failures are client faults -> 400, not 500.
+            .map_err(ProviderError::BadRequest)?;
         let mut body_val = serde_json::to_value(&anth_req).map_err(|e| {
             ProviderError::Other(anyhow::Error::msg(format!("anth serialize: {e}")))
         })?;
@@ -481,7 +484,9 @@ pub fn provider_id() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omni_core::{CanonicalContent, CanonicalMessage, /*CanonicalTool, CanonicalToolChoice*/};
+    use omni_core::{
+        CanonicalBlock, CanonicalContent, CanonicalMessage, /*CanonicalTool, CanonicalToolChoice*/
+    };
 
     #[test]
     fn provider_id_and_construction() {
@@ -1042,6 +1047,53 @@ mod tests {
         assert_eq!(resp.usage.input_tokens, 10);
         assert_eq!(resp.usage.output_tokens, 2);
         assert!(resp.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn claude_send_non_text_system_block_is_client_bad_request() {
+        // WHY (issue #2 + Rule 9): a non-text block in a system message is a
+        // client-input fault. The translate-level test only proves the builder
+        // returns Err; this proves the CLIENT-FACING outcome: `send` must surface
+        // ProviderError::BadRequest (-> HTTP 400), NOT Other/Upstream (-> 500/502).
+        // It would fail if prepare errors were mapped back through Other.
+        let _guard = CREDS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _creds = TempCreds::install("non-text-system");
+
+        let server = MockServer::start().await;
+        // No mock expectation: validation must fail BEFORE any upstream call.
+        let p = ClaudeProvider::new_for_test_with_base(default_profile(), server.uri())
+            .expect("test provider against mock base");
+
+        let req = CanonicalRequest {
+            model: "claude-sonnet-4-5".into(),
+            messages: vec![
+                CanonicalMessage {
+                    role: "system".into(),
+                    content: CanonicalContent::Blocks(vec![CanonicalBlock::Image {
+                        source: omni_core::CanonicalImageSource::Url {
+                            url: "https://example.com/x.png".into(),
+                        },
+                    }]),
+                },
+                CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Text("hi".into()),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let err = p.send(req).await.expect_err("non-text system must reject");
+        assert!(
+            matches!(err, ProviderError::BadRequest(_)),
+            "non-text system block must surface as a client BadRequest (400), got {err:?}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            0,
+            "validation must fail before any upstream request"
+        );
     }
 
     #[tokio::test]

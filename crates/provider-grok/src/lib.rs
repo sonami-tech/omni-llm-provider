@@ -720,7 +720,7 @@ impl GrokProvider {
                         .unwrap_or_else(|_| "<no body>".to_string()),
                 );
                 error!(%status, body = %err_body, "grok conservative upstream stream error");
-                yield Err(ProviderError::upstream(redactor.redact(&format!(
+                yield Err(ProviderError::upstream_status(status.as_u16(), redactor.redact(&format!(
                     "grok conservative {status}: {err_body}"
                 ))));
                 return;
@@ -5054,6 +5054,40 @@ mod tests {
             .to_string();
         assert!(!err.contains(SECRET), "non-prefixed bearer leaked in stream: {err}");
         assert!(err.contains("<redacted>"), "redaction marker missing: {err}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn conservative_stream_pre_stream_http_error_carries_status() {
+        // WHY (issue #3, Round-2 finding F1): the conservative STREAMING pre-stream
+        // HTTP error branch must carry the upstream status, like its non-stream
+        // sibling. Without it, a 429/503 collapses to 502 and breaks client backoff.
+        // This pins status: Some(429) on that branch (it was None before the fix).
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("{\"error\":\"slow down\"}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = GrokProvider::new_for_test_conservative("bearer-token", None, server.uri());
+        let mut stream = provider
+            .send_stream(base_req_model("grok-build"))
+            .await
+            .expect("stream opens");
+        let err = stream
+            .next()
+            .await
+            .expect("an event")
+            .expect_err("429 must surface an error");
+        assert!(
+            matches!(err, ProviderError::Upstream { status: Some(429), .. }),
+            "conservative stream HTTP error must carry the upstream status, got {err:?}"
+        );
     }
 
     #[tokio::test]

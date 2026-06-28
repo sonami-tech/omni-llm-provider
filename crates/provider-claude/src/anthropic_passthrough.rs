@@ -144,7 +144,7 @@ pub fn prepare_client_messages_request(
     inject_identity: bool,
 ) -> Result<PreparedAnthropicRequest, ProviderError> {
     let client: ClientMessagesRequest = serde_json::from_value(raw_body.clone())
-        .map_err(|e| ProviderError::upstream(format!("invalid Anthropic request: {e}")))?;
+        .map_err(|e| ProviderError::BadRequest(format!("invalid Anthropic request: {e}")))?;
     let stream = client_requested_stream(&raw_body);
     let dropped = dropped_fields(&raw_body);
     let mut req =
@@ -175,7 +175,7 @@ pub fn prepare_count_tokens_request(
     replacements: &Replacements,
 ) -> Result<PreparedAnthropicRequest, ProviderError> {
     let client: ClientMessagesRequest = serde_json::from_value(raw_body.clone())
-        .map_err(|e| ProviderError::upstream(format!("invalid Anthropic request: {e}")))?;
+        .map_err(|e| ProviderError::BadRequest(format!("invalid Anthropic request: {e}")))?;
     let dropped = dropped_fields(&raw_body);
     let mut req = reconcile_client_request(&client, profile, replacements, false, false)?;
     req.stream = None;
@@ -239,7 +239,7 @@ fn resolve_strict_claude_model(
             .iter()
             .any(|alias| alias.eq_ignore_ascii_case(input));
     if !is_claude_family {
-        return Err(ProviderError::upstream(format!(
+        return Err(ProviderError::BadRequest(format!(
             "model: {input} is not a recognized Anthropic model"
         )));
     }
@@ -760,6 +760,45 @@ mod tests {
         )
         .expect_err("grok must not resolve through fallback");
         assert!(err.to_string().contains("not a recognized Anthropic model"));
+        // Issue #3 regression guard: this is client-input validation and MUST be
+        // a BadRequest (-> 400), not an Upstream (-> 502 via classify_upstream).
+        assert!(
+            matches!(err, ProviderError::BadRequest(_)),
+            "unrecognized model is a client error (400), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn prepare_surfaces_client_validation_as_bad_request() {
+        // WHY (Rule 9 / issue #3): on /v1/messages, a malformed body and an
+        // unrecognized model are CLIENT faults. Before the error-type was unified
+        // these rode the prepare route's accidental 400; the fix types them as
+        // ProviderError::BadRequest so they stay 400 instead of regressing to 502.
+        let bad_model = serde_json::json!({
+            "model": "grok-4.3",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let err = prepare_client_messages_request(bad_model, default_profile(), &empty_repl(), true)
+            .expect_err("unrecognized model must reject");
+        assert!(
+            matches!(err, ProviderError::BadRequest(_)),
+            "unrecognized model must be a client BadRequest, got {err:?}"
+        );
+
+        // A body that does not match the Anthropic request schema (max_tokens as a
+        // string) -> serde failure -> client BadRequest, not an upstream 502.
+        let malformed = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": "not-a-number",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let err = prepare_client_messages_request(malformed, default_profile(), &empty_repl(), true)
+            .expect_err("malformed body must reject");
+        assert!(
+            matches!(err, ProviderError::BadRequest(_)),
+            "malformed body must be a client BadRequest, got {err:?}"
+        );
     }
 
     #[test]

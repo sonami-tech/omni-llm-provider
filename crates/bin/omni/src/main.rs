@@ -1170,6 +1170,7 @@ async fn chat_completions_handler(
 fn map_provider_err(e: ProviderError) -> AppError {
     match e {
         ProviderError::Auth(msg) => AppError::Unauthorized(msg),
+        ProviderError::BadRequest(msg) => AppError::BadRequest(msg),
         ProviderError::Upstream { status, message } => {
             omni_common::classify_upstream(status, message)
         }
@@ -1633,6 +1634,7 @@ fn strip_claude_model_prefix(mut body: serde_json::Value) -> Result<serde_json::
 fn map_anthropic_prepare_err(error: ProviderError) -> AppError {
     match error {
         ProviderError::Auth(message) => AppError::Unauthorized(message),
+        ProviderError::BadRequest(message) => AppError::BadRequest(message),
         ProviderError::Upstream { status, message } => {
             omni_common::classify_upstream(status, message)
         }
@@ -1826,8 +1828,11 @@ fn request_id_header(request_id: &str) -> header::HeaderValue {
 }
 
 /// Anthropic-flavored `error.type` for a translated HTTP status, for the
-/// Anthropic-native (`/v1/messages`) error envelope. The upstream classifier
-/// only emits 400/404/409/422/429/502/503/504 via `AppError::Http`.
+/// Anthropic-native (`/v1/messages`) error envelope. `classify_upstream` routes
+/// 400 and 404 through the dedicated `AppError::BadRequest`/`NotFound` variants,
+/// so the statuses that actually reach here via `AppError::Http` are
+/// 409/422/429/502/503/504 (plus 408->504); the 409/422/other arms below cover
+/// them, with everything else falling through to `api_error`.
 fn anthropic_error_type_for_status(status: StatusCode) -> &'static str {
     match status.as_u16() {
         429 => "rate_limit_error",
