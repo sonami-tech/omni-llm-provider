@@ -2563,7 +2563,7 @@ mod tests {
         // for an errored stream is response.failed with status failed.
         let stream = canonical_stream(vec![
             Ok(CanonicalStreamEvent::TextDelta("par".into())),
-            Err(ProviderError::Upstream("boom mid-stream".into())),
+            Err(ProviderError::upstream("boom mid-stream")),
         ]);
         let sse = sse_from_canonical_stream_responses(stream, "m".into(), "resp_e".into(), 0);
         let body = sse_body_to_string(sse).await;

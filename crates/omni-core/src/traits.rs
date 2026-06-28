@@ -74,8 +74,37 @@ fn futures_util_stream(
 pub enum ProviderError {
     #[error("auth: {0}")]
     Auth(String),
-    #[error("upstream: {0}")]
-    Upstream(String),
+    /// An upstream provider/gateway failure. `status` carries the upstream HTTP
+    /// status when the error originated at an HTTP-response boundary (so the
+    /// edge can translate it deliberately); it is `None` for transport, decode,
+    /// stream-framing, and other non-HTTP failures. `message` is the (already
+    /// redacted, where applicable) detail; `status` is never redacted.
+    #[error("upstream: {message}")]
+    Upstream {
+        status: Option<u16>,
+        message: String,
+    },
     #[error("other: {0}")]
     Other(#[from] anyhow::Error),
+}
+
+impl ProviderError {
+    /// Construct an upstream error with no known HTTP status (transport, decode,
+    /// stream-framing, or other non-HTTP failures). The edge classifier maps
+    /// these to a 502 Bad Gateway.
+    pub fn upstream(message: impl Into<String>) -> Self {
+        Self::Upstream {
+            status: None,
+            message: message.into(),
+        }
+    }
+
+    /// Construct an upstream error carrying the upstream HTTP status, so the edge
+    /// can translate it per the gateway status policy instead of collapsing it.
+    pub fn upstream_status(status: u16, message: impl Into<String>) -> Self {
+        Self::Upstream {
+            status: Some(status),
+            message: message.into(),
+        }
+    }
 }

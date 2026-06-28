@@ -654,26 +654,26 @@ impl GrokProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::Upstream(redactor.redact(&format!(
+                ProviderError::upstream(redactor.redact(&format!(
                     "network error calling grok conservative: {e}"
                 )))
             })?;
 
         let status = resp.status();
         let bytes = resp.bytes().await.map_err(|e| {
-            ProviderError::Upstream(
+            ProviderError::upstream(
                 redactor.redact(&format!("grok conservative response read error: {e}")),
             )
         })?;
         if !status.is_success() {
-            return Err(ProviderError::Upstream(redactor.redact(&format!(
+            return Err(ProviderError::upstream_status(status.as_u16(), redactor.redact(&format!(
                 "grok conservative {status}: {}",
                 String::from_utf8_lossy(&bytes)
             ))));
         }
 
         let value: Value = serde_json::from_slice(&bytes).map_err(|e| {
-            ProviderError::Upstream(format!("failed to decode grok conservative response: {e}"))
+            ProviderError::upstream(format!("failed to decode grok conservative response: {e}"))
         })?;
         responses_upstream::response_to_canonical(&value, &req.model, "grok", &redactor)
     }
@@ -704,7 +704,7 @@ impl GrokProvider {
             let http_resp = match send_result {
                 Ok(resp) => resp,
                 Err(e) => {
-                    yield Err(ProviderError::Upstream(redactor.redact(&format!(
+                    yield Err(ProviderError::upstream(redactor.redact(&format!(
                         "network error calling grok conservative: {e}"
                     ))));
                     return;
@@ -720,7 +720,7 @@ impl GrokProvider {
                         .unwrap_or_else(|_| "<no body>".to_string()),
                 );
                 error!(%status, body = %err_body, "grok conservative upstream stream error");
-                yield Err(ProviderError::Upstream(redactor.redact(&format!(
+                yield Err(ProviderError::upstream(redactor.redact(&format!(
                     "grok conservative {status}: {err_body}"
                 ))));
                 return;
@@ -734,7 +734,7 @@ impl GrokProvider {
                     .to_ascii_lowercase()
                     .starts_with("text/event-stream")
             {
-                yield Err(ProviderError::Upstream(format!(
+                yield Err(ProviderError::upstream(format!(
                     "grok conservative stream expected text/event-stream, got {content_type}"
                 )));
                 return;
@@ -750,7 +750,7 @@ impl GrokProvider {
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
                     Err(e) => {
-                        yield Err(ProviderError::Upstream(redactor.redact(&format!(
+                        yield Err(ProviderError::upstream(redactor.redact(&format!(
                             "grok conservative stream read error: {e}"
                         ))));
                         return;
@@ -759,7 +759,7 @@ impl GrokProvider {
                 let events = match sse.push(&chunk) {
                     Ok(events) => events,
                     Err(e) => {
-                        yield Err(ProviderError::Upstream(e));
+                        yield Err(ProviderError::upstream(e));
                         return;
                     }
                 };
@@ -811,7 +811,7 @@ impl GrokProvider {
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        yield Err(ProviderError::Upstream(e));
+                        yield Err(ProviderError::upstream(e));
                         return;
                     }
                 }
@@ -823,7 +823,7 @@ impl GrokProvider {
                 } else {
                     "grok conservative stream ended without any SSE events"
                 };
-                yield Err(ProviderError::Upstream(redactor.redact(message)));
+                yield Err(ProviderError::upstream(redactor.redact(message)));
             }
         };
 
@@ -1632,7 +1632,7 @@ fn parse_grok_sse_frame(data: &str) -> Vec<Result<CanonicalStreamEvent, Provider
     let chunk: XaiStreamChunk = match serde_json::from_str(data) {
         Ok(c) => c,
         Err(e) => {
-            return vec![Err(ProviderError::Upstream(format!(
+            return vec![Err(ProviderError::upstream(format!(
                 "failed to decode xAI stream chunk: {e}: {data}"
             )))];
         }
@@ -1814,7 +1814,7 @@ impl LlmProvider for GrokProvider {
 
         let http_resp =
             request.json(&body).send().await.map_err(|e| {
-                ProviderError::Upstream(format!("network error calling xAI: {}", e))
+                ProviderError::upstream(format!("network error calling xAI: {}", e))
             })?;
 
         let status = http_resp.status();
@@ -1826,14 +1826,14 @@ impl LlmProvider for GrokProvider {
                     .unwrap_or_else(|_| "<no body>".to_string()),
             );
             error!(%status, body = %err_body, "xAI upstream error");
-            return Err(ProviderError::Upstream(format!(
+            return Err(ProviderError::upstream_status(status.as_u16(), format!(
                 "xAI {}: {}",
                 status, err_body
             )));
         }
 
         let raw: XaiChatCompletion = http_resp.json().await.map_err(|e| {
-            ProviderError::Upstream(format!("failed to decode xAI response: {}", e))
+            ProviderError::upstream(format!("failed to decode xAI response: {}", e))
         })?;
 
         debug!(
@@ -1913,7 +1913,7 @@ impl LlmProvider for GrokProvider {
             let http_resp = match send_result {
                 Ok(r) => r,
                 Err(e) => {
-                    yield Err(ProviderError::Upstream(format!("network error calling xAI: {}", e)));
+                    yield Err(ProviderError::upstream(format!("network error calling xAI: {}", e)));
                     return;
                 }
             };
@@ -1928,7 +1928,7 @@ impl LlmProvider for GrokProvider {
                         .unwrap_or_else(|_| "<no body>".to_string()),
                 );
                 error!(%status, body = %err_body, "xAI upstream stream error");
-                yield Err(ProviderError::Upstream(format!("xAI {}: {}", status, err_body)));
+                yield Err(ProviderError::upstream_status(status.as_u16(), format!("xAI {}: {}", status, err_body)));
                 return;
             }
 
@@ -1945,7 +1945,7 @@ impl LlmProvider for GrokProvider {
                 let chunk = match chunk {
                     Ok(b) => b,
                     Err(e) => {
-                        yield Err(ProviderError::Upstream(format!("xAI stream read error: {}", e)));
+                        yield Err(ProviderError::upstream(format!("xAI stream read error: {}", e)));
                         return;
                     }
                 };
@@ -1979,7 +1979,7 @@ impl LlmProvider for GrokProvider {
             }
 
             if !done {
-                yield Err(ProviderError::Upstream("xAI stream ended before [DONE]".into()));
+                yield Err(ProviderError::upstream("xAI stream ended before [DONE]"));
                 return;
             }
 
@@ -2817,7 +2817,7 @@ mod tests {
         };
         let err = p.send(req).await.unwrap_err();
         match err {
-            ProviderError::Upstream(s) => {
+            ProviderError::Upstream { message: s, .. } => {
                 assert!(s.contains("error calling xAI") || s.contains("connection"))
             }
             _ => panic!("expected Upstream error for mocked bad port"),
@@ -3264,7 +3264,7 @@ mod tests {
             }
         }
         match err {
-            ProviderError::Upstream(s) => assert!(
+            ProviderError::Upstream { message: s, .. } => assert!(
                 s.contains("error calling xAI") || s.contains("connection"),
                 "expected net err after file load: {}",
                 s
@@ -3355,7 +3355,7 @@ mod tests {
         let _ = ::std::fs::remove_file(&tmp);
         // Key resolved from the file -> reached the (dead) upstream -> network err, not Auth.
         match err {
-            ProviderError::Upstream(s) => {
+            ProviderError::Upstream { message: s, .. } => {
                 assert!(s.contains("error calling xAI") || s.contains("connection"))
             }
             other => panic!(
@@ -3407,7 +3407,7 @@ mod tests {
         let _ = ::std::fs::remove_dir_all(&empty_home);
         // No file source -> ctor key used -> reached the (dead) upstream as a network error.
         match err {
-            ProviderError::Upstream(s) => {
+            ProviderError::Upstream { message: s, .. } => {
                 assert!(s.contains("error calling xAI") || s.contains("connection"))
             }
             other => panic!(
@@ -3478,7 +3478,7 @@ mod tests {
         }
         let _ = ::std::fs::remove_file(&tmp);
         match err {
-            ProviderError::Upstream(s) => {
+            ProviderError::Upstream { message: s, .. } => {
                 assert!(
                     s.contains("401")
                         || s.contains("xAI 401")
@@ -3542,7 +3542,7 @@ mod tests {
         };
         let err = p_bad.send(req_bad).await.unwrap_err();
         match err {
-            ProviderError::Upstream(s) => {
+            ProviderError::Upstream { message: s, .. } => {
                 assert!(
                     s.contains("400") || s.contains("404") || s.contains("model"),
                     "expected 4xx model error: {}",
@@ -3776,7 +3776,7 @@ mod tests {
             // A network error means the file key WAS resolved and we got as far as
             // dialing the (dead) upstream. An Auth error here would mean the file
             // was never read -- the bug this test guards against.
-            ProviderError::Upstream(s) => assert!(
+            ProviderError::Upstream { message: s, .. } => assert!(
                 s.contains("error calling xAI")
                     || s.contains("connection")
                     || s.contains("network"),
@@ -3973,7 +3973,7 @@ mod tests {
         let bad: &[u8] = b"data: {not json}\n\n";
         let events = drive_sse(&[bad]);
         match &events[0] {
-            Err(ProviderError::Upstream(s)) => {
+            Err(ProviderError::Upstream { message: s, .. }) => {
                 assert!(s.contains("decode xAI stream chunk"), "got: {s}")
             }
             other => panic!("expected Upstream error for malformed frame, got {other:?}"),
@@ -4004,7 +4004,7 @@ mod tests {
             .await
             .expect("stream must yield at least one item");
         match first {
-            Err(ProviderError::Upstream(s)) => {
+            Err(ProviderError::Upstream { message: s, .. }) => {
                 assert!(
                     s.contains("network error calling xAI") || s.contains("connection"),
                     "got: {s}"

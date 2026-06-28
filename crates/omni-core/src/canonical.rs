@@ -831,7 +831,7 @@ mod tests {
     fn provider_error_variants_constructible() {
         // ensure error types used by trait impls in providers are usable from core
         let _ = ProviderError::Auth("no token".into());
-        let _ = ProviderError::Upstream("429".into());
+        let _ = ProviderError::upstream("429");
         let _ = ProviderError::Other(anyhow::Error::msg("boom"));
     }
 
@@ -1111,7 +1111,7 @@ mod tests {
     #[test]
     fn provider_error_variants_more_construct() {
         let e1 = ProviderError::Auth("bad".into());
-        let e2 = ProviderError::Upstream("rate".into());
+        let e2 = ProviderError::upstream("rate");
         let e3: ProviderError = anyhow::Error::msg("x").into();
         assert!(format!("{}", e1).contains("auth"));
         let _ = (e1, e2, e3);

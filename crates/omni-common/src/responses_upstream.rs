@@ -66,7 +66,7 @@ pub fn response_to_canonical(
 	error_redactor: &impl ErrorRedactor,
 ) -> Result<CanonicalResponse, ProviderError> {
 	if value.get("status").and_then(|v| v.as_str()) == Some("failed") {
-		return Err(ProviderError::Upstream(
+		return Err(ProviderError::upstream(
 			error_redactor.redact(&value.to_string()),
 		));
 	}
@@ -356,15 +356,14 @@ impl<R: ErrorRedactor> ResponsesStreamParser<R> {
 	) -> Vec<Result<CanonicalStreamEvent, ProviderError>> {
 		let event_type = event.event.as_deref().unwrap_or_default();
 		if event.data.trim() == "[DONE]" {
-			return vec![Err(ProviderError::Upstream(
-				"Responses stream sent Chat [DONE] sentinel without a terminal response event"
-					.into(),
+			return vec![Err(ProviderError::upstream(
+				"Responses stream sent Chat [DONE] sentinel without a terminal response event",
 			))];
 		}
 		let value: Value = match serde_json::from_str(&event.data) {
 			Ok(value) => value,
 			Err(e) => {
-				return vec![Err(ProviderError::Upstream(self.redact(&format!(
+				return vec![Err(ProviderError::upstream(self.redact(&format!(
 					"decode Responses stream event {event_type}: {e}: {}",
 					event.data
 				))))];
@@ -401,7 +400,7 @@ impl<R: ErrorRedactor> ResponsesStreamParser<R> {
 			"response.completed" => self.handle_completed(&value),
 			"response.incomplete" => self.handle_incomplete(&value),
 			"response.failed" | "error" => {
-				vec![Err(ProviderError::Upstream(
+				vec![Err(ProviderError::upstream(
 					self.redact(&value.to_string()),
 				))]
 			}
@@ -494,7 +493,7 @@ impl<R: ErrorRedactor> ResponsesStreamParser<R> {
 			.map(String::as_str)
 			.unwrap_or_default();
 		if !final_text.starts_with(emitted) {
-			return vec![Err(ProviderError::Upstream(self.redact(&format!(
+			return vec![Err(ProviderError::upstream(self.redact(&format!(
 				"Responses stream {field}.done text did not extend prior text deltas"
 			))))];
 		}
@@ -596,7 +595,7 @@ impl<R: ErrorRedactor> ResponsesStreamParser<R> {
 			return Vec::new();
 		}
 		if arguments.len() <= already.len() || !arguments.starts_with(&already) {
-			return vec![Err(ProviderError::Upstream(self.redact(
+			return vec![Err(ProviderError::upstream(self.redact(
 				"Responses stream function_call_arguments.done arguments did not extend prior argument deltas",
 			)))];
 		}
@@ -655,7 +654,7 @@ impl<R: ErrorRedactor> ResponsesStreamParser<R> {
 		value: &Value,
 	) -> Vec<Result<CanonicalStreamEvent, ProviderError>> {
 		if response_status(value) == Some("failed") {
-			return vec![Err(ProviderError::Upstream(
+			return vec![Err(ProviderError::upstream(
 				self.redact(&value.to_string()),
 			))];
 		}
@@ -855,7 +854,7 @@ impl<R: ErrorRedactor> ResponsesStreamParser<R> {
 			self.append_tool_arguments(output_index, &arguments[already.len()..]);
 			return None;
 		}
-		Some(ProviderError::Upstream(self.redact(
+		Some(ProviderError::upstream(self.redact(
 			"Responses stream terminal function_call arguments did not extend prior argument deltas",
 		)))
 	}
@@ -1344,8 +1343,8 @@ mod tests {
 			.unwrap_err()
 			.to_string();
 		assert!(matches!(
-			ProviderError::Upstream(String::new()),
-			ProviderError::Upstream(_)
+			ProviderError::upstream(String::new()),
+			ProviderError::Upstream { .. }
 		));
 		assert!(!err.contains("sk-secret"), "leaked secret: {err}");
 		assert!(err.contains("<redacted>"), "redaction missing: {err}");

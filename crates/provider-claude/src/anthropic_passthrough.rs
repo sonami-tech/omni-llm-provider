@@ -144,7 +144,7 @@ pub fn prepare_client_messages_request(
     inject_identity: bool,
 ) -> Result<PreparedAnthropicRequest, ProviderError> {
     let client: ClientMessagesRequest = serde_json::from_value(raw_body.clone())
-        .map_err(|e| ProviderError::Upstream(format!("invalid Anthropic request: {e}")))?;
+        .map_err(|e| ProviderError::upstream(format!("invalid Anthropic request: {e}")))?;
     let stream = client_requested_stream(&raw_body);
     let dropped = dropped_fields(&raw_body);
     let mut req =
@@ -175,7 +175,7 @@ pub fn prepare_count_tokens_request(
     replacements: &Replacements,
 ) -> Result<PreparedAnthropicRequest, ProviderError> {
     let client: ClientMessagesRequest = serde_json::from_value(raw_body.clone())
-        .map_err(|e| ProviderError::Upstream(format!("invalid Anthropic request: {e}")))?;
+        .map_err(|e| ProviderError::upstream(format!("invalid Anthropic request: {e}")))?;
     let dropped = dropped_fields(&raw_body);
     let mut req = reconcile_client_request(&client, profile, replacements, false, false)?;
     req.stream = None;
@@ -239,7 +239,7 @@ fn resolve_strict_claude_model(
             .iter()
             .any(|alias| alias.eq_ignore_ascii_case(input));
     if !is_claude_family {
-        return Err(ProviderError::Upstream(format!(
+        return Err(ProviderError::upstream(format!(
             "model: {input} is not a recognized Anthropic model"
         )));
     }

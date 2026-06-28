@@ -225,18 +225,18 @@ impl CodexProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::Upstream(
+                ProviderError::upstream(
                     redactor.redact(&format!("codex conservative models preflight error: {e}")),
                 )
             })?;
         let status = preflight.status();
         let bytes = preflight.bytes().await.map_err(|e| {
-            ProviderError::Upstream(redactor.redact(&format!(
+            ProviderError::upstream(redactor.redact(&format!(
                 "codex conservative models preflight read error: {e}"
             )))
         })?;
         if !status.is_success() {
-            return Err(ProviderError::Upstream(redactor.redact(&format!(
+            return Err(ProviderError::upstream_status(status.as_u16(), redactor.redact(&format!(
                 "codex conservative models preflight HTTP {status}: {}",
                 String::from_utf8_lossy(&bytes)
             ))));
@@ -250,7 +250,7 @@ impl CodexProvider {
             let (mut ws, _) = match connect_async(ws_request).await {
                 Ok(pair) => pair,
                 Err(e) => {
-                    yield Err(ProviderError::Upstream(redactor.redact(&format!(
+                    yield Err(ProviderError::upstream(redactor.redact(&format!(
                         "codex conservative websocket connect error: {e}"
                     ))));
                     return;
@@ -260,14 +260,14 @@ impl CodexProvider {
             let frame = match serde_json::to_string(&body) {
                 Ok(frame) => frame,
                 Err(e) => {
-                    yield Err(ProviderError::Upstream(format!(
+                    yield Err(ProviderError::upstream(format!(
                         "encode codex conservative response.create: {e}"
                     )));
                     return;
                 }
             };
             if let Err(e) = ws.send(Message::Text(frame.into())).await {
-                yield Err(ProviderError::Upstream(redactor.redact(&format!(
+                yield Err(ProviderError::upstream(redactor.redact(&format!(
                     "codex conservative websocket send error: {e}"
                 ))));
                 return;
@@ -281,7 +281,7 @@ impl CodexProvider {
                 let message = match message {
                     Ok(message) => message,
                     Err(e) => {
-                        yield Err(ProviderError::Upstream(redactor.redact(&format!(
+                        yield Err(ProviderError::upstream(redactor.redact(&format!(
                             "codex conservative websocket read error: {e}"
                         ))));
                         return;
@@ -315,8 +315,8 @@ impl CodexProvider {
                         }
                     }
                     Message::Binary(_) => {
-                        yield Err(ProviderError::Upstream(
-                            "codex conservative websocket returned a binary frame".into(),
+                        yield Err(ProviderError::upstream(
+                            "codex conservative websocket returned a binary frame",
                         ));
                         return;
                     }
@@ -325,7 +325,7 @@ impl CodexProvider {
                     }
                     Message::Ping(payload) => {
                         if let Err(e) = ws.send(Message::Pong(payload)).await {
-                            yield Err(ProviderError::Upstream(redactor.redact(&format!(
+                            yield Err(ProviderError::upstream(redactor.redact(&format!(
                                 "codex conservative websocket pong error: {e}"
                             ))));
                             return;
@@ -341,7 +341,7 @@ impl CodexProvider {
                 } else {
                     "codex conservative websocket ended without any response events"
                 };
-                yield Err(ProviderError::Upstream(redactor.redact(message)));
+                yield Err(ProviderError::upstream(redactor.redact(message)));
             }
         };
 
@@ -368,7 +368,7 @@ impl LlmProvider for CodexProvider {
             warn_codex_conservative_fallback(&config);
         }
         if config.wire_api != WireApi::Responses {
-            return Err(ProviderError::Upstream(format!(
+            return Err(ProviderError::upstream(format!(
                 "unsupported Codex wire_api {}; only responses is supported",
                 config.wire_api.as_str()
             )));
@@ -391,24 +391,24 @@ impl LlmProvider for CodexProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::Upstream(error_redactor.redact(&format!("codex network error: {e}")))
+                ProviderError::upstream(error_redactor.redact(&format!("codex network error: {e}")))
             })?;
 
         let status = resp.status();
         let bytes = resp.bytes().await.map_err(|e| {
-            ProviderError::Upstream(
+            ProviderError::upstream(
                 error_redactor.redact(&format!("codex response read error: {e}")),
             )
         })?;
         if !status.is_success() {
-            return Err(ProviderError::Upstream(error_redactor.redact(&format!(
+            return Err(ProviderError::upstream_status(status.as_u16(), error_redactor.redact(&format!(
                 "codex HTTP {status}: {}",
                 String::from_utf8_lossy(&bytes)
             ))));
         }
 
         let value: Value = serde_json::from_slice(&bytes)
-            .map_err(|e| ProviderError::Upstream(format!("decode codex response: {e}")))?;
+            .map_err(|e| ProviderError::upstream(format!("decode codex response: {e}")))?;
         responses_upstream::response_to_canonical(&value, &req.model, "codex", &error_redactor)
     }
 
@@ -421,7 +421,7 @@ impl LlmProvider for CodexProvider {
             warn_codex_conservative_fallback(&config);
         }
         if config.wire_api != WireApi::Responses {
-            return Err(ProviderError::Upstream(format!(
+            return Err(ProviderError::upstream(format!(
                 "unsupported Codex wire_api {}; only responses is supported",
                 config.wire_api.as_str()
             )));
@@ -452,7 +452,7 @@ impl LlmProvider for CodexProvider {
             let http_resp = match send_result {
                 Ok(resp) => resp,
                 Err(e) => {
-                    yield Err(ProviderError::Upstream(error_redactor.redact(&format!("codex network error: {e}"))));
+                    yield Err(ProviderError::upstream(error_redactor.redact(&format!("codex network error: {e}"))));
                     return;
                 }
             };
@@ -465,7 +465,7 @@ impl LlmProvider for CodexProvider {
                         .await
                         .unwrap_or_else(|_| "<no body>".to_string()),
                 );
-                yield Err(ProviderError::Upstream(error_redactor.redact(&format!("codex HTTP {status}: {err_body}"))));
+                yield Err(ProviderError::upstream_status(status.as_u16(), error_redactor.redact(&format!("codex HTTP {status}: {err_body}"))));
                 return;
             }
 
@@ -477,7 +477,7 @@ impl LlmProvider for CodexProvider {
                     .to_ascii_lowercase()
                     .starts_with("text/event-stream")
             {
-                yield Err(ProviderError::Upstream(format!(
+                yield Err(ProviderError::upstream(format!(
                     "codex stream expected text/event-stream, got {content_type}"
                 )));
                 return;
@@ -493,14 +493,14 @@ impl LlmProvider for CodexProvider {
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
                     Err(e) => {
-                        yield Err(ProviderError::Upstream(error_redactor.redact(&format!("codex stream read error: {e}"))));
+                        yield Err(ProviderError::upstream(error_redactor.redact(&format!("codex stream read error: {e}"))));
                         return;
                     }
                 };
                 let events = match sse.push(&chunk) {
                     Ok(events) => events,
                     Err(e) => {
-                        yield Err(ProviderError::Upstream(e));
+                        yield Err(ProviderError::upstream(e));
                         return;
                     }
                 };
@@ -552,7 +552,7 @@ impl LlmProvider for CodexProvider {
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        yield Err(ProviderError::Upstream(e));
+                        yield Err(ProviderError::upstream(e));
                         return;
                     }
                 }
@@ -564,7 +564,7 @@ impl LlmProvider for CodexProvider {
                 } else {
                     "codex stream ended without any SSE events"
                 };
-                yield Err(ProviderError::Upstream(error_redactor.redact(message)));
+                yield Err(ProviderError::upstream(error_redactor.redact(message)));
             }
         };
 
@@ -1376,8 +1376,8 @@ async fn collect_canonical_stream(
     }
 
     if !saw_finish {
-        return Err(ProviderError::Upstream(
-            "codex conservative websocket ended before a terminal response event".into(),
+        return Err(ProviderError::upstream(
+            "codex conservative websocket ended before a terminal response event",
         ));
     }
 

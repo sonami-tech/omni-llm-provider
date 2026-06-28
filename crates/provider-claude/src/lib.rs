@@ -339,10 +339,10 @@ fn map_upstream_err(e: UpstreamError) -> ProviderError {
             ProviderError::Auth(e.to_string())
         }
         UpstreamError::Anthropic { status, body, .. } => {
-            ProviderError::Upstream(format!("anthropic {status}: {body}"))
+            ProviderError::upstream_status(status, format!("anthropic {status}: {body}"))
         }
         UpstreamError::Transport(_) | UpstreamError::Decode(_) => {
-            ProviderError::Upstream(e.to_string())
+            ProviderError::upstream(e.to_string())
         }
     }
 }
@@ -401,7 +401,7 @@ impl LlmProvider for ClaudeProvider {
 
         // 5. Parse into our response type (non-stream path).
         let anth_resp: translate::MessagesResponse = serde_json::from_value(raw_resp)
-            .map_err(|e| ProviderError::Upstream(format!("decode anth response: {e}")))?;
+            .map_err(|e| ProviderError::upstream(format!("decode anth response: {e}")))?;
 
         // 6. Map back to canonical + apply response-scope replacements hook.
         let canon = translate::build_canonical_response(&anth_resp, &req.model, &repl);

@@ -1170,7 +1170,9 @@ async fn chat_completions_handler(
 fn map_provider_err(e: ProviderError) -> AppError {
     match e {
         ProviderError::Auth(msg) => AppError::Unauthorized(msg),
-        ProviderError::Upstream(msg) => AppError::ServerError(format!("upstream: {}", msg)),
+        ProviderError::Upstream { status, message } => {
+            omni_common::classify_upstream(status, message)
+        }
         ProviderError::Other(a) => AppError::ServerError(a.to_string()),
     }
 }
@@ -1631,7 +1633,9 @@ fn strip_claude_model_prefix(mut body: serde_json::Value) -> Result<serde_json::
 fn map_anthropic_prepare_err(error: ProviderError) -> AppError {
     match error {
         ProviderError::Auth(message) => AppError::Unauthorized(message),
-        ProviderError::Upstream(message) => AppError::BadRequest(message),
+        ProviderError::Upstream { status, message } => {
+            omni_common::classify_upstream(status, message)
+        }
         ProviderError::Other(error) => AppError::ServerError(error.to_string()),
     }
 }
@@ -1821,12 +1825,25 @@ fn request_id_header(request_id: &str) -> header::HeaderValue {
         .unwrap_or_else(|_| header::HeaderValue::from_static("unknown"))
 }
 
+/// Anthropic-flavored `error.type` for a translated HTTP status, for the
+/// Anthropic-native (`/v1/messages`) error envelope. The upstream classifier
+/// only emits 400/404/409/422/429/502/503/504 via `AppError::Http`.
+fn anthropic_error_type_for_status(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        429 => "rate_limit_error",
+        400 | 409 | 422 => "invalid_request_error",
+        404 => "not_found_error",
+        _ => "api_error",
+    }
+}
+
 fn anthropic_error_response(error: AppError) -> Response {
     let (status, kind) = match &error {
         AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "authentication_error"),
         AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
         AppError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found_error"),
         AppError::ServerError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "api_error"),
+        AppError::Http(s, _) => (*s, anthropic_error_type_for_status(*s)),
     };
     (
         status,
@@ -2517,6 +2534,7 @@ mod tests {
     struct TempCodexHome {
         path: PathBuf,
         prev: Option<std::ffi::OsString>,
+        prev_auth_env: Vec<(&'static str, Option<std::ffi::OsString>)>,
     }
 
     impl TempCodexHome {
@@ -2538,12 +2556,25 @@ requires_openai_auth = false
             )
             .expect("write codex config");
             let old = std::env::var_os("CODEX_HOME");
+            // No auth.json and no env credential: with requires_openai_auth=false
+            // and nothing else configured, the issue #1 fallback yields None, so
+            // these routing tests can assert no Authorization header is sent.
+            // Clear the ambient auth env so the result does not depend on the host.
+            let auth_keys = ["CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"];
+            let prev_auth_env = auth_keys
+                .iter()
+                .map(|k| (*k, std::env::var_os(k)))
+                .collect();
             unsafe {
                 std::env::set_var("CODEX_HOME", &dir);
+                for k in auth_keys {
+                    std::env::remove_var(k);
+                }
             }
             Self {
                 path: dir,
                 prev: old,
+                prev_auth_env,
             }
         }
     }
@@ -2554,6 +2585,12 @@ requires_openai_auth = false
                 match &self.prev {
                     Some(value) => std::env::set_var("CODEX_HOME", value),
                     None => std::env::remove_var("CODEX_HOME"),
+                }
+                for (k, v) in &self.prev_auth_env {
+                    match v {
+                        Some(value) => std::env::set_var(k, value),
+                        None => std::env::remove_var(k),
+                    }
                 }
             }
             let _ = std::fs::remove_dir_all(&self.path);
@@ -3875,7 +3912,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         let stats = Arc::new(Stats::open(&stats_path).unwrap());
         stats.record_request("claude:claude-sonnet-4-6", None);
         let upstream =
-            futures_util::stream::iter(vec![Err(ProviderError::Upstream("raw boom".into()))]);
+            futures_util::stream::iter(vec![Err(ProviderError::upstream("raw boom"))]);
         let resp = anthropic_sse_response(
             Box::pin(upstream),
             Some(stats.clone()),
@@ -4331,7 +4368,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             ) -> Result<CanonicalStream, ProviderError> {
                 Ok(Box::pin(futures_util::stream::iter(vec![
                     Ok(CanonicalStreamEvent::TextDelta("partial".into())),
-                    Err(ProviderError::Upstream("boom".into())),
+                    Err(ProviderError::upstream("boom")),
                 ])))
             }
         }
@@ -4791,7 +4828,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         };
         let res = call_chat_handler(state, req).await;
         match res {
-            Err(AppError::ServerError(msg)) => {
+            // A dead upstream is a transport error (no HTTP status): #3 maps it
+            // to a 502 Bad Gateway, not an omni-internal 500.
+            Err(AppError::Http(status, msg)) if status.as_u16() == 502 => {
                 assert!(msg.contains("upstream") || msg.contains("network"))
             }
             other => panic!("bare grok alias must route to provider, got {other:?}"),
@@ -4961,8 +5000,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             Err(e) => e,
             Ok(_) => panic!("expected err from grok test"),
         };
-        match err {
-            AppError::ServerError(msg) => {
+        match &err {
+            // Dead upstream -> transport error -> 502 Bad Gateway (#3).
+            AppError::Http(status, msg) if status.as_u16() == 502 => {
                 assert!(msg.contains("upstream") || msg.contains("network"))
             }
             _ => panic!(
@@ -5002,7 +5042,8 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         };
         let res = call_chat_handler(state, req).await;
         match res {
-            Err(AppError::ServerError(msg)) => {
+            // Dead upstream -> transport error -> 502 Bad Gateway (#3).
+            Err(AppError::Http(status, msg)) if status.as_u16() == 502 => {
                 assert!(msg.contains("upstream") || msg.contains("network"))
             }
             other => panic!("expected provider upstream error, got {other:?}"),
@@ -5143,7 +5184,8 @@ rule = [
             .await
             .expect_err("dead upstream must fail after provider delegation");
         match err {
-            AppError::ServerError(msg) => {
+            // Dead upstream -> transport error -> 502 Bad Gateway (#3).
+            AppError::Http(status, msg) if status.as_u16() == 502 => {
                 assert!(msg.contains("upstream") || msg.contains("network"))
             }
             other => panic!("expected provider upstream error, got {other:?}"),
@@ -5529,7 +5571,9 @@ rule = [
         .unwrap();
         let res = call_chat_handler(state, req).await;
         match res {
-            Err(AppError::ServerError(_)) => {}
+            // Reaching the (dead) upstream proves `user` was accepted as gateway
+            // metadata and dispatched; the transport failure maps to 502 (#3).
+            Err(AppError::Http(status, _)) if status.as_u16() == 502 => {}
             Err(AppError::BadRequest(msg)) => {
                 panic!("user must not be rejected as an extra: {msg}")
             }
@@ -5646,10 +5690,11 @@ rule = [
         let req = responses_req(r#"{"model":"grok:grok-4.3","input":"ping"}"#);
         let res = call_responses_handler(state, req).await;
         match res {
-            Err(AppError::ServerError(msg)) => {
+            // Dead upstream -> transport error -> 502 Bad Gateway (#3).
+            Err(AppError::Http(status, msg)) if status.as_u16() == 502 => {
                 assert!(msg.contains("upstream") || msg.contains("network"))
             }
-            other => panic!("expected upstream ServerError via grok route, got {other:?}"),
+            other => panic!("expected upstream 502 via grok route, got {other:?}"),
         }
     }
 

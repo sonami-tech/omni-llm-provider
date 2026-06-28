@@ -17,7 +17,7 @@ pub mod time_util;
 
 pub use auth::{ApiKeyId, auth_layer};
 pub use conversation_log::{ConversationLog, DEFAULT_LOG_BACKUPS, DEFAULT_LOG_MAX_BYTES};
-pub use error::AppError;
+pub use error::{AppError, classify_upstream};
 pub use http::{
     ChatCompletionRequest, ChatCompletionResponse, ChatContentPart, ChatImageUrl, ChatMessage,
     ChatMessageContent, from_canonical, sse_from_canonical_stream, to_canonical, unix_now_secs,
