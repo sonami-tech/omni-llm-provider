@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use omni_common::Replacements;
 use omni_core::{
-    CanonicalBlock, CanonicalContent, CanonicalImageSource, CanonicalReasoning,
+    CanonicalBlock, CanonicalContent, CanonicalImageSource, CanonicalMessage, CanonicalReasoning,
     CanonicalReasoningBlock, CanonicalRequest, CanonicalResponse, CanonicalResponseMetadata,
     CanonicalTool, CanonicalToolCall, CanonicalToolChoice, CanonicalUsage,
 };
@@ -265,8 +265,51 @@ pub fn build_messages_request_from_canonical(
     repl: &Replacements,
 ) -> Result<MessagesRequest, String> {
     // Apply prompt-scope replacements to the canonical texts (and tool surfaces).
+    //
+    // Anthropic's /v1/messages has no `system` (or `developer`) role inside the
+    // `messages` array; leaving one there draws a 400. Reshape per the in-repo
+    // reference (reference-src-claude/translate/messages.rs `reshape`): hoist a
+    // *leading* run of system/developer messages into the top-level `system`
+    // field, and fold a *mid-thread* system/developer message in place into a
+    // marked `user` turn so its position relative to the conversation is kept.
+    // Both `system` and `developer` are handled because the Chat Completions
+    // surface does not normalize `developer` to `system` (see
+    // omni-common/src/http.rs chat_message_to_canonical).
+    let mut system_blocks: Vec<SystemBlock> = Vec::new();
+    let mut seen_non_system = false;
     let mut messages: Vec<Message> = Vec::new();
     for m in &req.messages {
+        if m.role == "system" || m.role == "developer" {
+            // Non-text blocks (e.g. an image) in a system/developer message are
+            // unrepresentable as system content; fail loud rather than silently
+            // drop them (diverges from the reference's silent text-only extract).
+            let text = repl.apply_prompt(&system_text(m)?);
+            if text.is_empty() {
+                // Empty system/developer content contributes nothing; skip it so
+                // we never emit a phantom system block or marked user turn.
+                continue;
+            }
+            if seen_non_system {
+                // Mid-thread: fold in place into a user turn, preserving order.
+                messages.push(Message {
+                    role: "user".to_string(),
+                    content: MessageContent::Blocks(vec![ContentBlock::Text {
+                        text: format!("[system message]\n{text}"),
+                        cache_control: None,
+                    }]),
+                });
+            } else {
+                // Leading: accumulate into the top-level `system` field.
+                system_blocks.push(SystemBlock {
+                    kind: "text".to_string(),
+                    text,
+                    cache_control: None,
+                });
+            }
+            continue;
+        }
+        seen_non_system = true;
+
         let content = match &m.content {
             CanonicalContent::Text(t) => MessageContent::Text(repl.apply_prompt(t)),
             CanonicalContent::Blocks(blocks) => {
@@ -371,11 +414,20 @@ pub fn build_messages_request_from_canonical(
         return Err("unsupported provider extras for claude".into());
     }
 
+    // Hoisted leading system/developer text. `prepend_claude_code_identity`
+    // (run later in the provider) treats this as the existing system blocks and
+    // prepends the Claude Code identity blocks before it, preserving order.
+    let system = if system_blocks.is_empty() {
+        None
+    } else {
+        Some(SystemField::Blocks(system_blocks))
+    };
+
     Ok(MessagesRequest {
         model: model_def.canonical.to_string(),
         max_tokens,
         messages,
-        system: None, // identity injection happens *after* this in the provider
+        system,
         tools,
         tool_choice,
         temperature,
@@ -387,6 +439,31 @@ pub fn build_messages_request_from_canonical(
         thinking,
         output_config: None,
     })
+}
+
+/// Extract the text of a canonical system/developer message for hoisting into
+/// the top-level `system` field (or a mid-thread marked user turn). Any non-text
+/// block (image, tool_use, tool_result) is rejected with a 400-class error
+/// rather than silently dropped, because such content cannot be represented as
+/// Anthropic system content. Multiple text blocks are joined with newlines.
+fn system_text(m: &CanonicalMessage) -> Result<String, String> {
+    match &m.content {
+        CanonicalContent::Text(t) => Ok(t.clone()),
+        CanonicalContent::Blocks(blocks) => {
+            let mut parts: Vec<&str> = Vec::with_capacity(blocks.len());
+            for b in blocks {
+                match b {
+                    CanonicalBlock::Text(t) => parts.push(t),
+                    _ => {
+                        return Err(
+                            "system/developer messages must contain only text content".into()
+                        );
+                    }
+                }
+            }
+            Ok(parts.join("\n"))
+        }
+    }
 }
 
 /// Convert one canonical content block into its Anthropic `ContentBlock`.
@@ -1495,5 +1572,192 @@ mod tests {
         parse_tool_arguments("not json").expect_err("invalid JSON must reject");
         parse_tool_arguments("[1,2]").expect_err("a JSON array is not an object: must reject");
         parse_tool_arguments("\"x\"").expect_err("a JSON string is not an object: must reject");
+    }
+
+    // ── Issue #2: system/developer hoisting (C-ref reshape) ───────────────
+
+    fn sys_msg(role: &str, text: &str) -> CanonicalMessage {
+        CanonicalMessage {
+            role: role.into(),
+            content: CanonicalContent::Text(text.into()),
+        }
+    }
+
+    fn user_msg(text: &str) -> CanonicalMessage {
+        CanonicalMessage {
+            role: "user".into(),
+            content: CanonicalContent::Text(text.into()),
+        }
+    }
+
+    fn build_haiku(messages: Vec<CanonicalMessage>) -> Result<MessagesRequest, String> {
+        let req = CanonicalRequest {
+            model: "haiku".into(),
+            messages,
+            ..Default::default()
+        };
+        let profile = crate::fingerprint::default_profile();
+        let model_def = profile.resolve_model("haiku");
+        build_messages_request_from_canonical(&req, model_def, &empty_repl())
+    }
+
+    fn system_texts(req: &MessagesRequest) -> Vec<String> {
+        match &req.system {
+            Some(SystemField::Blocks(b)) => b.iter().map(|s| s.text.clone()).collect(),
+            Some(SystemField::Text(t)) => vec![t.clone()],
+            None => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn leading_system_hoists_to_top_level_system() {
+        // WHY: Anthropic /v1/messages rejects a `system` role inside `messages`
+        // with a 400; a leading system prompt (the common OpenAI case) MUST be
+        // moved to the top-level `system` field instead.
+        let anth = build_haiku(vec![sys_msg("system", "You are terse."), user_msg("hi")]).unwrap();
+        assert_eq!(system_texts(&anth), vec!["You are terse.".to_string()]);
+        assert!(
+            anth.messages.iter().all(|m| m.role != "system"),
+            "no system role may remain in the messages array"
+        );
+        assert_eq!(anth.messages.len(), 1);
+        assert_eq!(anth.messages[0].role, "user");
+    }
+
+    #[test]
+    fn developer_role_hoists_like_system() {
+        // WHY: the Chat Completions surface does not normalize `developer` to
+        // `system` (omni-common chat_message_to_canonical clones the role), so
+        // the Claude path must handle `developer` identically or it 400s.
+        let anth =
+            build_haiku(vec![sys_msg("developer", "Be precise."), user_msg("hi")]).unwrap();
+        assert_eq!(system_texts(&anth), vec!["Be precise.".to_string()]);
+        assert!(anth.messages.iter().all(|m| m.role != "developer"));
+    }
+
+    #[test]
+    fn mid_thread_system_folds_into_marked_user_turn_in_place() {
+        // WHY: a system message after the conversation has started carries a
+        // temporal directive ("from now on..."); relocating it to the global
+        // preamble would lose its position. C-ref folds it in place into a
+        // user turn marked "[system message]\n", preserving order.
+        let anth = build_haiku(vec![
+            sys_msg("system", "Lead."),
+            user_msg("u1"),
+            sys_msg("system", "Switch to JSON."),
+            user_msg("u2"),
+        ])
+        .unwrap();
+
+        // Leading system hoisted; mid-thread one stays in the array as a user turn.
+        assert_eq!(system_texts(&anth), vec!["Lead.".to_string()]);
+        assert!(anth.messages.iter().all(|m| m.role != "system"));
+        assert_eq!(anth.messages.len(), 3);
+        assert_eq!(anth.messages[0].role, "user"); // u1
+        assert_eq!(anth.messages[1].role, "user"); // folded mid-thread system, position preserved
+        assert_eq!(anth.messages[2].role, "user"); // u2
+        match &anth.messages[1].content {
+            MessageContent::Blocks(blocks) => match &blocks[0] {
+                ContentBlock::Text { text, .. } => {
+                    assert_eq!(text, "[system message]\nSwitch to JSON.");
+                }
+                other => panic!("expected Text block, got {other:?}"),
+            },
+            other => panic!("expected Blocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_leading_system_messages_concatenate_as_blocks() {
+        let anth = build_haiku(vec![
+            sys_msg("system", "One."),
+            sys_msg("developer", "Two."),
+            user_msg("hi"),
+        ])
+        .unwrap();
+        assert_eq!(
+            system_texts(&anth),
+            vec!["One.".to_string(), "Two.".to_string()]
+        );
+    }
+
+    #[test]
+    fn empty_system_message_is_skipped() {
+        // WHY: a truly empty ("") system/developer message must not produce a
+        // phantom top-level system block (leading) or an empty marked user turn
+        // (mid-thread). Matches the reference's `!text.is_empty()` guard.
+        let anth = build_haiku(vec![
+            sys_msg("system", ""),
+            user_msg("u1"),
+            sys_msg("system", ""),
+            user_msg("u2"),
+        ])
+        .unwrap();
+        assert!(
+            anth.system.is_none(),
+            "empty leading system contributes no top-level system"
+        );
+        assert_eq!(
+            anth.messages.len(),
+            2,
+            "empty mid-thread system must not add a phantom user turn"
+        );
+        assert!(anth.messages.iter().all(|m| m.role == "user"));
+    }
+
+    #[test]
+    fn non_text_block_in_system_message_errors() {
+        // WHY: an image (or other non-text) block in a system/developer message
+        // cannot be represented as Anthropic system content; fail loud (400)
+        // rather than silently drop it.
+        let req = CanonicalRequest {
+            model: "haiku".into(),
+            messages: vec![
+                CanonicalMessage {
+                    role: "system".into(),
+                    content: CanonicalContent::Blocks(vec![CanonicalBlock::Image {
+                        source: CanonicalImageSource::Url {
+                            url: "https://example.com/x.png".into(),
+                        },
+                    }]),
+                },
+                user_msg("hi"),
+            ],
+            ..Default::default()
+        };
+        let profile = crate::fingerprint::default_profile();
+        let model_def = profile.resolve_model("haiku");
+        build_messages_request_from_canonical(&req, model_def, &empty_repl())
+            .expect_err("non-text block in a system message must be rejected");
+    }
+
+    #[test]
+    fn hoisted_system_survives_identity_injection_both_ways() {
+        // WHY: prepend_claude_code_identity early-returns when inject_identity is
+        // false WITHOUT clearing req.system, and prepends identity before it when
+        // true. Either way the hoisted leading system must survive.
+        let profile = crate::fingerprint::default_profile();
+
+        let mut with_identity =
+            build_haiku(vec![sys_msg("system", "Keep me."), user_msg("hi")]).unwrap();
+        prepend_claude_code_identity(&mut with_identity, profile, true);
+        let texts = system_texts(&with_identity);
+        assert!(
+            texts.iter().any(|t| t == "Keep me."),
+            "hoisted system must survive identity injection (true)"
+        );
+        assert!(
+            crate::fingerprint::is_claude_code_billing_header(&texts[0]),
+            "identity billing block prepended before the hoisted system"
+        );
+
+        let mut without_identity =
+            build_haiku(vec![sys_msg("system", "Keep me."), user_msg("hi")]).unwrap();
+        prepend_claude_code_identity(&mut without_identity, profile, false);
+        assert_eq!(
+            system_texts(&without_identity),
+            vec!["Keep me.".to_string()],
+            "hoisted system must survive when identity injection is off"
+        );
     }
 }
