@@ -954,7 +954,46 @@ impl CodexRequestConfig {
             }
             return Ok(Some(token));
         }
-        Ok(None)
+        // Custom gateway (requires_openai_auth=false) with no explicit source: mirror the real
+        // Codex CLI, which still falls back to auth.json's OPENAI_API_KEY (then tokens.access_token,
+        // then env) rather than sending no credential. Non-failing: None when nothing usable exists.
+        Ok(self.openai_auth_token_fallback())
+    }
+
+    /// Optional auth.json-first credential lookup for the `requires_openai_auth=false` fallback.
+    /// Order (auth.json prioritized over env, matching the observed CLI winner): auth.json
+    /// `OPENAI_API_KEY`, auth.json `tokens.access_token`, then env `CODEX_API_KEY` /
+    /// `OPENAI_API_KEY` / `CODEX_ACCESS_TOKEN`. Returns `None` when no source yields a token
+    /// (never errors, unlike the strict `openai_auth_token`).
+    fn openai_auth_token_fallback(&self) -> Option<String> {
+        let auth_path = self.home.join("auth.json");
+        if let Ok(bytes) = std::fs::read(&auth_path)
+            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+        {
+            if let Some(token) = value
+                .get("OPENAI_API_KEY")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            {
+                return Some(token.to_string());
+            }
+            if let Some(token) = value
+                .get("tokens")
+                .and_then(|v| v.get("access_token"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            {
+                return Some(token.to_string());
+            }
+        }
+        for env_key in ["CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"] {
+            if let Ok(token) = std::env::var(env_key)
+                && !token.trim().is_empty()
+            {
+                return Some(token);
+            }
+        }
+        None
     }
 
     fn openai_auth_token(&self) -> Result<String, ProviderError> {
@@ -1821,24 +1860,66 @@ mod tests {
         }
     }
 
-    #[test]
-    fn custom_provider_without_auth_does_not_use_auth_json_or_env() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let _home = TempCodexHome::new(
-            r#"
+    const CUSTOM_PROVIDER_CONFIG: &str = r#"
 model = "gpt-custom"
 model_provider = "proxy"
 [model_providers.proxy]
 base_url = "https://proxy.example.com"
 wire_api = "responses"
 requires_openai_auth = false
-"#,
-            Some(
-                r#"{"OPENAI_API_KEY":"sk-should-not-leak","tokens":{"access_token":"eyJshould-not-leak"}}"#,
-            ),
+"#;
+
+    // Issue #1: a custom gateway (requires_openai_auth=false) with no explicit source must mirror
+    // the real Codex CLI and fall back to auth.json's OPENAI_API_KEY, prioritized over env.
+    #[test]
+    fn custom_provider_falls_back_to_auth_json_over_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _home = TempCodexHome::new(
+            CUSTOM_PROVIDER_CONFIG,
+            Some(r#"{"OPENAI_API_KEY":"sk-from-auth-json"}"#),
         );
         unsafe {
-            std::env::set_var("OPENAI_API_KEY", "sk-env-should-not-leak");
+            std::env::set_var("OPENAI_API_KEY", "sk-from-env-should-lose");
+        }
+
+        let cfg = CodexRequestConfig::load().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let headers = rt.block_on(cfg.headers()).unwrap();
+        assert_eq!(
+            headers.get(header::AUTHORIZATION).unwrap(),
+            "Bearer sk-from-auth-json",
+            "auth.json OPENAI_API_KEY must win over env (matches the CLI's observed winner)"
+        );
+    }
+
+    #[test]
+    fn custom_provider_falls_back_to_env_when_no_auth_json() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _home = TempCodexHome::new(CUSTOM_PROVIDER_CONFIG, None);
+        unsafe {
+            std::env::remove_var("CODEX_API_KEY");
+            std::env::remove_var("CODEX_ACCESS_TOKEN");
+            std::env::set_var("OPENAI_API_KEY", "sk-from-env-fallback");
+        }
+
+        let cfg = CodexRequestConfig::load().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let headers = rt.block_on(cfg.headers()).unwrap();
+        assert_eq!(
+            headers.get(header::AUTHORIZATION).unwrap(),
+            "Bearer sk-from-env-fallback",
+            "env OPENAI_API_KEY is the fallback when auth.json holds no usable token"
+        );
+    }
+
+    #[test]
+    fn custom_provider_no_auth_source_sends_no_header() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _home = TempCodexHome::new(CUSTOM_PROVIDER_CONFIG, None);
+        unsafe {
+            std::env::remove_var("CODEX_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("CODEX_ACCESS_TOKEN");
         }
 
         let cfg = CodexRequestConfig::load().unwrap();
@@ -1846,7 +1927,7 @@ requires_openai_auth = false
         let headers = rt.block_on(cfg.headers()).unwrap();
         assert!(
             !headers.contains_key(header::AUTHORIZATION),
-            "custom provider no-auth must not inherit OpenAI auth"
+            "no usable source must yield no Authorization header (Ok(None)), not an error"
         );
     }
 
@@ -2105,8 +2186,10 @@ timeout_ms = 1000
     }
 
     #[test]
-    fn custom_headers_and_env_headers_are_applied_without_auth_fallback() {
+    fn custom_headers_and_env_headers_are_applied() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // No auth.json and no env credential: isolates the header behavior from the issue #1
+        // auth.json fallback so this test asserts only that static + env headers are applied.
         let _home = TempCodexHome::new(
             r#"
 model = "gpt-custom"
@@ -2118,9 +2201,12 @@ requires_openai_auth = false
 http_headers = { "X-Static" = "static-value" }
 env_http_headers = { "X-Dynamic" = "CUSTOM_CODEX_HEADER" }
 "#,
-            Some(r#"{"OPENAI_API_KEY":"sk-should-not-leak"}"#),
+            None,
         );
         unsafe {
+            std::env::remove_var("CODEX_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("CODEX_ACCESS_TOKEN");
             std::env::set_var("CUSTOM_CODEX_HEADER", "dynamic-value");
         }
 
@@ -2129,10 +2215,6 @@ env_http_headers = { "X-Dynamic" = "CUSTOM_CODEX_HEADER" }
         let headers = rt.block_on(cfg.headers()).unwrap();
         assert_eq!(headers.get("x-static").unwrap(), "static-value");
         assert_eq!(headers.get("x-dynamic").unwrap(), "dynamic-value");
-        assert!(
-            !headers.contains_key(header::AUTHORIZATION),
-            "custom headers must not imply OpenAI auth fallback"
-        );
     }
 
     #[test]
@@ -2698,9 +2780,11 @@ model = "gpt-5.5"
         assert!(redacted.contains("<redacted>"));
     }
 
+    // Issue #1: a custom gateway with requires_openai_auth=false and a key only in auth.json must
+    // send that key as Bearer, matching the real Codex CLI (which the gateway requires; otherwise 401).
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn send_uses_custom_provider_without_auth_header() {
+    async fn send_uses_custom_provider_auth_json_fallback_header() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let server = MockServer::start().await;
         let _home = TempCodexHome::new(
@@ -2715,8 +2799,13 @@ requires_openai_auth = false
 "#,
                 server.uri()
             ),
-            Some(r#"{"OPENAI_API_KEY":"sk-must-not-leak"}"#),
+            Some(r#"{"OPENAI_API_KEY":"sk-from-auth-json"}"#),
         );
+        unsafe {
+            std::env::remove_var("CODEX_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("CODEX_ACCESS_TOKEN");
+        }
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -2744,9 +2833,10 @@ requires_openai_auth = false
         assert_eq!(resp.content, "ok");
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
-        assert!(
-            !requests[0].headers.contains_key("authorization"),
-            "custom no-auth provider must not send Authorization"
+        assert_eq!(
+            requests[0].headers.get("authorization").unwrap(),
+            "Bearer sk-from-auth-json",
+            "custom no-auth provider must fall back to auth.json's OPENAI_API_KEY"
         );
     }
 
