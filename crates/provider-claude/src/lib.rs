@@ -310,6 +310,9 @@ impl ClaudeProvider {
         if self.client.uses_custom_auth() {
             Ok(credentials::Credentials::placeholder_for_custom_gateway())
         } else {
+            // No creds in scope here (this IS the failure to load them), so the
+            // default (1-arg) mapper is used: empty exact-secret list, still
+            // prefix-scrubs.
             credentials::Credentials::load_fresh_async(&credentials::Credentials::default_path())
                 .await
                 .map_err(map_upstream_err)
@@ -330,7 +333,72 @@ impl Default for ClaudeProvider {
     }
 }
 
+/// Prefix scrubber for Claude secrets in an upstream error body. Scans for the
+/// marker prefixes and replaces from the marker to the next delimiter
+/// (whitespace / quote / comma) with `<redacted>`. `sk-` also covers Claude
+/// OAuth tokens (`sk-ant-oat01-...`) and custom-gateway `sk-...` keys since both
+/// start with `sk-`; `eyJ` covers JWT bearers. Mirrors grok's `redact`.
+fn redact(input: &str) -> String {
+    let mut out = input.to_string();
+    for marker in ["sk-", "eyJ"] {
+        while let Some(pos) = out.find(marker) {
+            let end = out[pos..]
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',')
+                .map(|i| pos + i)
+                .unwrap_or(out.len());
+            out.replace_range(pos..end, "<redacted>");
+        }
+    }
+    out
+}
+
+/// Layered redactor for Claude error bodies: the prefix scrubber [`redact`]
+/// PLUS the EXACT resolved bearer/token strings captured in `secrets`. The exact
+/// list catches a token that has no known prefix; the prefix scrubber catches a
+/// known-prefix secret even when creds are not in scope. `Default` yields an
+/// empty secret list (still prefix-redacts). Mirrors `GrokErrorRedactor`.
+#[derive(Clone, Debug, Default)]
+struct ClaudeErrorRedactor {
+    secrets: Vec<String>,
+}
+
+impl ClaudeErrorRedactor {
+    /// Capture the exact secrets from the resolved credentials: both the full
+    /// `Bearer <token>` header value and the bare token, so either form in an
+    /// upstream error body is scrubbed regardless of prefix. The custom-gateway
+    /// placeholder sentinel and empty tokens are skipped (no real secret).
+    /// Longest-first so a longer secret is replaced before a substring of it.
+    fn for_credentials(creds: &credentials::Credentials) -> Self {
+        let mut secrets = Vec::new();
+        let token = creds.access_token.trim();
+        if !token.is_empty() && token != "custom-gateway-placeholder" {
+            secrets.push(format!("Bearer {token}"));
+            secrets.push(token.to_string());
+        }
+        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        secrets.dedup();
+        Self { secrets }
+    }
+
+    fn redact(&self, input: &str) -> String {
+        let mut out = redact(input);
+        for secret in &self.secrets {
+            out = out.replace(secret, "<redacted>");
+        }
+        out
+    }
+}
+
+/// 1-arg form for callers that have no resolved credentials in scope (the
+/// `anthropic_passthrough` paths). Uses a default redactor: empty exact-secret
+/// list, but still prefix-scrubs `sk-`/`eyJ` from the upstream body.
 fn map_upstream_err(e: UpstreamError) -> ProviderError {
+    map_upstream_err_with(e, &ClaudeErrorRedactor::default())
+}
+
+/// Redaction-aware form for the credentialed send / send_stream paths: scrubs
+/// the EXACT bearer/token captured in `redactor` plus the prefix markers.
+fn map_upstream_err_with(e: UpstreamError, redactor: &ClaudeErrorRedactor) -> ProviderError {
     match e {
         UpstreamError::TokenExpired | UpstreamError::CredentialsMissingToken => {
             ProviderError::Auth(e.to_string())
@@ -339,10 +407,11 @@ fn map_upstream_err(e: UpstreamError) -> ProviderError {
             ProviderError::Auth(e.to_string())
         }
         UpstreamError::Anthropic { status, body, .. } => {
+            let body = redactor.redact(&body);
             ProviderError::upstream_status(status, format!("anthropic {status}: {body}"))
         }
         UpstreamError::Transport(_) | UpstreamError::Decode(_) => {
-            ProviderError::upstream(e.to_string())
+            ProviderError::upstream(redactor.redact(&e.to_string()))
         }
     }
 }
@@ -391,6 +460,7 @@ impl LlmProvider for ClaudeProvider {
         // Fresh creds read for the default Claude Code path. Custom gateways
         // own auth and must not require or leak the local OAuth file.
         let creds = self.credentials_for_request().await?;
+        let redactor = ClaudeErrorRedactor::for_credentials(&creds);
 
         // 4. Send (this does finalize_body_json which patches the 5-hex cch,
         //    builds the full header set with per-profile betas / stainless / ua,
@@ -399,7 +469,7 @@ impl LlmProvider for ClaudeProvider {
             .client
             .send_messages_json(&creds, &ctx, &body_val)
             .await
-            .map_err(map_upstream_err)?;
+            .map_err(|e| map_upstream_err_with(e, &redactor))?;
 
         // 5. Parse into our response type (non-stream path).
         let anth_resp: translate::MessagesResponse = serde_json::from_value(raw_resp)
@@ -439,6 +509,10 @@ impl LlmProvider for ClaudeProvider {
         let ctx = RequestContext::new_reply().with_model(anth_req.model.clone());
 
         let creds = self.credentials_for_request().await?;
+        // Build the redactor BEFORE the stream closure: `creds` is borrowed by the
+        // open call below and must not be captured by the (potentially long-lived)
+        // closure. Clone the redactor into the closure for per-event redaction.
+        let redactor = ClaudeErrorRedactor::for_credentials(&creds);
 
         // Open the upstream SSE stream (full retry / 401-refresh semantics live
         // in send_messages_stream). Yields typed Anthropic StreamEvents.
@@ -446,16 +520,17 @@ impl LlmProvider for ClaudeProvider {
             .client
             .send_messages_stream(&creds, &ctx, &body_val)
             .await
-            .map_err(map_upstream_err)?;
+            .map_err(|e| map_upstream_err_with(e, &redactor))?;
 
         // Map each Anthropic event to zero-or-more canonical events, flattening
         // into a single ordered canonical stream. The converter is stateful, so
         // it lives inside the async stream closure.
+        let stream_redactor = redactor.clone();
         let canonical = async_stream::try_stream! {
             let mut conv = ClaudeStreamConverter::default();
             futures_util::pin_mut!(upstream);
             while let Some(item) = upstream.next().await {
-                let event = item.map_err(map_upstream_err)?;
+                let event = item.map_err(|e| map_upstream_err_with(e, &stream_redactor))?;
                 for canon_event in conv.on_event(event) {
                     yield canon_event;
                 }
@@ -1418,6 +1493,99 @@ mod tests {
             Some(&CanonicalStreamEvent::Finish {
                 finish_reason: Some("stop".into())
             })
+        );
+    }
+
+    #[test]
+    fn redactor_scrubs_exact_bearer_and_prefixed_tokens_leaves_text() {
+        // WHY: the client-facing error.message must never echo the upstream
+        // credential. This pins both redaction layers: the EXACT captured bearer
+        // (a token with no recognizable prefix is still scrubbed) AND the prefix
+        // scrubber for sk-ant-oat01-.../eyJ... tokens that appear in an error body
+        // but were NOT the captured creds, while ordinary prose survives intact.
+        let creds = credentials::Credentials {
+            // Deliberately prefix-less so only the exact-secret layer can catch it.
+            access_token: "plainsecret123".into(),
+            expires_at_ms: None,
+            subscription_type: None,
+        };
+        let r = ClaudeErrorRedactor::for_credentials(&creds);
+
+        // A fake Anthropic error body echoing the exact bearer plus other secrets.
+        let body = "anthropic 401: {\"error\":{\"message\":\"invalid Bearer plainsecret123 \
+            and key sk-ant-oat01-leak999, jwt eyJhbGciOiJI.payload.sig\"}}";
+        let out = r.redact(body);
+
+        assert!(
+            !out.contains("plainsecret123"),
+            "exact bearer token must be scrubbed: {out}"
+        );
+        assert!(
+            !out.contains("sk-ant-oat01-leak999"),
+            "sk-ant-oat01- prefixed token must be prefix-scrubbed: {out}"
+        );
+        assert!(
+            !out.contains("eyJhbGciOiJI"),
+            "eyJ JWT must be prefix-scrubbed: {out}"
+        );
+        assert!(out.contains("<redacted>"), "redaction marker present: {out}");
+        // Ordinary words around the secrets survive.
+        assert!(out.contains("invalid"), "prose preserved: {out}");
+        assert!(out.contains("anthropic 401"), "prose preserved: {out}");
+    }
+
+    #[test]
+    fn redactor_skips_custom_gateway_placeholder_and_empty() {
+        // WHY: the custom-gateway sentinel and empty tokens are not real secrets;
+        // capturing them would replace those harmless substrings everywhere. The
+        // default redactor (empty secrets) still prefix-scrubs.
+        let placeholder = credentials::Credentials::placeholder_for_custom_gateway();
+        let r = ClaudeErrorRedactor::for_credentials(&placeholder);
+        assert!(r.secrets.is_empty(), "placeholder must not be captured");
+        // Prefix scrub still runs.
+        assert!(r.redact("key sk-leak end").contains("<redacted>"));
+        assert!(!r.redact("key sk-leak end").contains("sk-leak"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn claude_error_body_is_redacted_before_surfacing() {
+        // WHY (the fix): Anthropic's raw error body flows into the client-facing
+        // ProviderError message. It can echo the bearer the provider just sent.
+        // This proves end to end that the surfaced message scrubs the dummy token
+        // (which TempCreds makes the provider send) and replaces it with
+        // <redacted>, with no network and no real creds.
+        let _guard = CREDS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _creds = TempCreds::install("error-redact");
+
+        // 401 body deliberately echoes the exact bearer the provider sends.
+        let leaky_body = format!(
+            "{{\"type\":\"error\",\"error\":{{\"type\":\"authentication_error\",\"message\":\"invalid token Bearer {tok} ({tok})\"}}}}",
+            tok = TempCreds::dummy_token()
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(leaky_body))
+            .mount(&server)
+            .await;
+
+        let p = ClaudeProvider::new_for_test_with_base(default_profile(), server.uri())
+            .expect("test provider against mock base");
+        let err = p
+            .send(sample_req("hi"))
+            .await
+            .expect_err("401 must surface as an error");
+
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(TempCreds::dummy_token()),
+            "surfaced error must not leak the bearer token: {msg}"
+        );
+        assert!(
+            msg.contains("<redacted>"),
+            "surfaced error must show the redaction marker: {msg}"
         );
     }
 
