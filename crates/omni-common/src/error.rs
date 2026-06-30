@@ -23,8 +23,7 @@ impl AppError {
     /// A status-carrying error (used by the upstream classifier to translate
     /// gateway statuses that have no dedicated variant, e.g. 429/502/503/504).
     pub fn http(status: u16, message: impl Into<String>) -> Self {
-        let status =
-            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         AppError::Http(status, message.into())
     }
 

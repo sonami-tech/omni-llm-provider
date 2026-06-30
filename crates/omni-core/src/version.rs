@@ -199,10 +199,7 @@ pub fn resolve_version<'v>(
 /// guarantees a more-significant component always dominates a less-significant one
 /// regardless of magnitude (no overflow-prone weighting). Returns `None` only for
 /// an empty slice.
-fn closest_version<'v>(
-    versions: &'v [ProviderVersion],
-    want: &str,
-) -> Option<&'v ProviderVersion> {
+fn closest_version<'v>(versions: &'v [ProviderVersion], want: &str) -> Option<&'v ProviderVersion> {
     let target = parse_version(want);
     versions.iter().min_by(|a, b| {
         version_distance(&target, &parse_version(a.version))
@@ -274,7 +271,10 @@ mod tests {
         // or hide models from the wrong surface.
         assert_eq!(V_NEW.catalog(CatalogMode::Conservative).len(), 1);
         assert_eq!(V_NEW.catalog(CatalogMode::Extended).len(), 2);
-        assert_eq!(V_NEW.resolve_model("bee", CatalogMode::Extended), Some("m-b"));
+        assert_eq!(
+            V_NEW.resolve_model("bee", CatalogMode::Extended),
+            Some("m-b")
+        );
         assert_eq!(V_NEW.resolve_model("bee", CatalogMode::Conservative), None);
     }
 
@@ -302,11 +302,8 @@ mod tests {
 
     #[test]
     fn match_system_exact_fails_loudly_when_absent() {
-        let err = resolve_version(
-            VERSIONS,
-            &VersionSelector::MatchSystemExact("9.9.9".into()),
-        )
-        .unwrap_err();
+        let err = resolve_version(VERSIONS, &VersionSelector::MatchSystemExact("9.9.9".into()))
+            .unwrap_err();
         assert!(matches!(err, VersionResolveError::ExactNotFound { .. }));
     }
 
@@ -367,8 +364,7 @@ mod tests {
         // Regression guard (external review): empty / non-numeric detection output
         // must NOT silently fuzzy-match version 0; it falls back to newest.
         for bad in ["", "   ", "unknown", "not.a.version"] {
-            let v =
-                resolve_version(VERSIONS, &VersionSelector::MatchSystem(bad.into())).unwrap();
+            let v = resolve_version(VERSIONS, &VersionSelector::MatchSystem(bad.into())).unwrap();
             assert_eq!(
                 v.version, "2.1.186",
                 "empty/non-numeric {bad:?} must fall back to newest, not match version 0"

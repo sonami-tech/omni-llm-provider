@@ -560,7 +560,8 @@ pub fn provider_id() -> &'static str {
 mod tests {
     use super::*;
     use omni_core::{
-        CanonicalBlock, CanonicalContent, CanonicalMessage, /*CanonicalTool, CanonicalToolChoice*/
+        CanonicalBlock, CanonicalContent,
+        CanonicalMessage, /*CanonicalTool, CanonicalToolChoice*/
     };
 
     #[test]
@@ -1528,7 +1529,10 @@ mod tests {
             !out.contains("eyJhbGciOiJI"),
             "eyJ JWT must be prefix-scrubbed: {out}"
         );
-        assert!(out.contains("<redacted>"), "redaction marker present: {out}");
+        assert!(
+            out.contains("<redacted>"),
+            "redaction marker present: {out}"
+        );
         // Ordinary words around the secrets survive.
         assert!(out.contains("invalid"), "prose preserved: {out}");
         assert!(out.contains("anthropic 401"), "prose preserved: {out}");

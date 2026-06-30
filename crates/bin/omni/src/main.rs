@@ -440,8 +440,7 @@ fn init_grok_provider(
     selector: &VersionSelector,
     mode: omni_core::CatalogMode,
 ) -> anyhow::Result<GrokProvider> {
-    let version =
-        resolve_provider_version("grok", GrokProvider::version_catalog(), selector)?;
+    let version = resolve_provider_version("grok", GrokProvider::version_catalog(), selector)?;
     let provider = GrokProvider::new(None)
         .map_err(anyhow::Error::from)?
         .with_mode(mode)
@@ -491,8 +490,7 @@ fn init_codex_provider(
     selector: &VersionSelector,
     mode: omni_core::CatalogMode,
 ) -> anyhow::Result<CodexProvider> {
-    let version =
-        resolve_provider_version("codex", CodexProvider::version_catalog(), selector)?;
+    let version = resolve_provider_version("codex", CodexProvider::version_catalog(), selector)?;
     let provider = CodexProvider::new()
         .map_err(anyhow::Error::from)?
         .with_mode(mode)
@@ -550,7 +548,11 @@ fn version_selector_for(
     match_system_exact: bool,
     bin: &str,
 ) -> VersionSelector {
-    if let Some(v) = explicit.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    if let Some(v) = explicit
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         return VersionSelector::Exact(v.to_string());
     }
     if match_system_exact {
@@ -579,7 +581,10 @@ fn version_selector_for(
 /// `<bin> --version` and extracting the first dotted-number token. Returns `None`
 /// if the binary is absent or prints nothing parseable.
 fn detect_installed_cli_version(bin: &str) -> Option<String> {
-    let out = std::process::Command::new(bin).arg("--version").output().ok()?;
+    let out = std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -606,9 +611,8 @@ fn resolve_provider_version(
     versions: &'static [ProviderVersion],
     selector: &VersionSelector,
 ) -> anyhow::Result<&'static ProviderVersion> {
-    omni_core::resolve_version(versions, selector).map_err(|e| {
-        anyhow::anyhow!("{provider}: cannot resolve version selector: {e}")
-    })
+    omni_core::resolve_version(versions, selector)
+        .map_err(|e| anyhow::anyhow!("{provider}: cannot resolve version selector: {e}"))
 }
 
 fn build_router(state: Arc<AppState>, auth_keys: Arc<HashSet<String>>) -> Router {
@@ -1983,7 +1987,10 @@ mod tests {
                 "claude".to_string(),
                 claude_model_catalog(provider_claude::default_profile()),
             ),
-            ("grok".to_string(), grok_model_catalog(&GrokProvider::new(None).expect("grok provider"))),
+            (
+                "grok".to_string(),
+                grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+            ),
         ])
     }
 
@@ -2995,7 +3002,8 @@ requires_openai_auth = false
             .mount(&server)
             .await;
 
-        let provider = init_claude_provider(&VersionSelector::Latest).expect("custom Claude provider from env");
+        let provider = init_claude_provider(&VersionSelector::Latest)
+            .expect("custom Claude provider from env");
         drop(creds);
         let response = provider
             .send(omni_core::CanonicalRequest {
@@ -3054,7 +3062,8 @@ requires_openai_auth = false
             .mount(&server)
             .await;
 
-        let provider = init_claude_provider(&VersionSelector::Latest).expect("custom Claude provider from env");
+        let provider = init_claude_provider(&VersionSelector::Latest)
+            .expect("custom Claude provider from env");
         drop(creds);
         let models = provider_model_values("claude", provider.profile().models_list()).unwrap();
         let catalog = claude_model_catalog(provider.profile());
@@ -3126,7 +3135,8 @@ requires_openai_auth = false
                 .await;
         }
 
-        let provider = init_claude_provider(&VersionSelector::Latest).expect("custom Claude provider from env");
+        let provider = init_claude_provider(&VersionSelector::Latest)
+            .expect("custom Claude provider from env");
         drop(creds);
         let request = || omni_core::CanonicalRequest {
             model: "sonnet".into(),
@@ -3158,7 +3168,8 @@ requires_openai_auth = false
             ("ANTHROPIC_API_KEY", None),
             ("ANTHROPIC_CUSTOM_HEADERS", Some("X-Valid: yes")),
         ]);
-        let provider = init_claude_provider(&VersionSelector::Latest).expect("custom Claude provider from env");
+        let provider = init_claude_provider(&VersionSelector::Latest)
+            .expect("custom Claude provider from env");
         unsafe {
             std::env::set_var("ANTHROPIC_CUSTOM_HEADERS", "bad header");
         }
@@ -3215,7 +3226,8 @@ requires_openai_auth = false
             .mount(&omni_server)
             .await;
 
-        let provider = init_claude_provider(&VersionSelector::Latest).expect("OMNI Claude provider from env");
+        let provider =
+            init_claude_provider(&VersionSelector::Latest).expect("OMNI Claude provider from env");
         drop(creds);
         let response = provider
             .send(omni_core::CanonicalRequest {
@@ -3263,7 +3275,9 @@ requires_openai_auth = false
             .mount(&server)
             .await;
 
-        let provider = init_grok_provider(&VersionSelector::Latest, omni_core::CatalogMode::Extended).expect("custom Grok provider from env");
+        let provider =
+            init_grok_provider(&VersionSelector::Latest, omni_core::CatalogMode::Extended)
+                .expect("custom Grok provider from env");
         let response = provider
             .send(omni_core::CanonicalRequest {
                 model: "grok".into(),
@@ -3323,7 +3337,9 @@ requires_openai_auth = false
             .mount(&omni_server)
             .await;
 
-        let provider = init_grok_provider(&VersionSelector::Latest, omni_core::CatalogMode::Extended).expect("OMNI Grok provider from env");
+        let provider =
+            init_grok_provider(&VersionSelector::Latest, omni_core::CatalogMode::Extended)
+                .expect("OMNI Grok provider from env");
         let response = provider
             .send(omni_core::CanonicalRequest {
                 model: "grok".into(),
@@ -3376,7 +3392,9 @@ requires_openai_auth = false
                 .await;
         }
 
-        let provider = init_grok_provider(&VersionSelector::Latest, omni_core::CatalogMode::Extended).expect("custom Grok provider from env");
+        let provider =
+            init_grok_provider(&VersionSelector::Latest, omni_core::CatalogMode::Extended)
+                .expect("custom Grok provider from env");
         let request = || omni_core::CanonicalRequest {
             model: "grok".into(),
             messages: vec![omni_core::CanonicalMessage {
@@ -3420,7 +3438,9 @@ requires_openai_auth = false
             .mount(&server)
             .await;
 
-        let provider = init_grok_provider(&VersionSelector::Latest, omni_core::CatalogMode::Extended).expect("custom Grok provider from env");
+        let provider =
+            init_grok_provider(&VersionSelector::Latest, omni_core::CatalogMode::Extended)
+                .expect("custom Grok provider from env");
         let response = provider
             .send(omni_core::CanonicalRequest {
                 model: "grok".into(),
@@ -3916,8 +3936,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         let _stats_guard = TempStats(stats_path.clone());
         let stats = Arc::new(Stats::open(&stats_path).unwrap());
         stats.record_request("claude:claude-sonnet-4-6", None);
-        let upstream =
-            futures_util::stream::iter(vec![Err(ProviderError::upstream("raw boom"))]);
+        let upstream = futures_util::stream::iter(vec![Err(ProviderError::upstream("raw boom"))]);
         let resp = anthropic_sse_response(
             Box::pin(upstream),
             Some(stats.clone()),

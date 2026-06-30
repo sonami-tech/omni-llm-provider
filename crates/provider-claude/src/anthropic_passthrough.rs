@@ -779,8 +779,9 @@ mod tests {
             "max_tokens": 10,
             "messages": [{"role": "user", "content": "hi"}]
         });
-        let err = prepare_client_messages_request(bad_model, default_profile(), &empty_repl(), true)
-            .expect_err("unrecognized model must reject");
+        let err =
+            prepare_client_messages_request(bad_model, default_profile(), &empty_repl(), true)
+                .expect_err("unrecognized model must reject");
         assert!(
             matches!(err, ProviderError::BadRequest(_)),
             "unrecognized model must be a client BadRequest, got {err:?}"
@@ -793,8 +794,9 @@ mod tests {
             "max_tokens": "not-a-number",
             "messages": [{"role": "user", "content": "hi"}]
         });
-        let err = prepare_client_messages_request(malformed, default_profile(), &empty_repl(), true)
-            .expect_err("malformed body must reject");
+        let err =
+            prepare_client_messages_request(malformed, default_profile(), &empty_repl(), true)
+                .expect_err("malformed body must reject");
         assert!(
             matches!(err, ProviderError::BadRequest(_)),
             "malformed body must be a client BadRequest, got {err:?}"

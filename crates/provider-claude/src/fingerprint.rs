@@ -1170,8 +1170,7 @@ pub fn is_claude_code_billing_header(text: &str) -> bool {
     // Two accepted shapes:
     //   <= 2.1.175: ...; cc_entrypoint=<ep>; cch=<checksum>;
     //   >= 2.1.186: ...; cc_entrypoint=<ep>;     (no trailing cch field)
-    text.starts_with("x-anthropic-billing-header: cc_version=")
-        && text.contains("; cc_entrypoint=")
+    text.starts_with("x-anthropic-billing-header: cc_version=") && text.contains("; cc_entrypoint=")
 }
 
 /// What kind of request this is - controls minor header variations.
@@ -2077,7 +2076,9 @@ mod tests {
         );
         // The 2.1.175 profile still emits the cch placeholder form.
         assert_eq!(
-            resolve_profile("2.1.175").unwrap().billing_header_text("Say OK"),
+            resolve_profile("2.1.175")
+                .unwrap()
+                .billing_header_text("Say OK"),
             "x-anthropic-billing-header: cc_version=2.1.175.174; cc_entrypoint=sdk-cli; cch=00000;"
         );
     }
@@ -2204,7 +2205,9 @@ mod tests {
         let cch_json =
             String::from_utf8(cch_profile.finalize_body_json(&cch_body, &ctx).unwrap()).unwrap();
         let marker = "cc_entrypoint=sdk-cli; cch=";
-        let idx = cch_json.find(marker).expect("snapshot body missing cch marker");
+        let idx = cch_json
+            .find(marker)
+            .expect("snapshot body missing cch marker");
         let got = &cch_json[idx + marker.len()..idx + marker.len() + 5];
         assert_eq!(
             got, "527d7",

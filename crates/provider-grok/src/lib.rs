@@ -66,8 +66,8 @@ use omni_core::{
     CanonicalToolCall, CanonicalToolChoice, CanonicalUsage, CatalogMode, CatalogModel, LlmProvider,
     ProviderError, ProviderVersion,
 };
-use reqwest::header;
 use reqwest::Client;
+use reqwest::header;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, error, warn};
@@ -654,9 +654,9 @@ impl GrokProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::upstream(redactor.redact(&format!(
-                    "network error calling grok conservative: {e}"
-                )))
+                ProviderError::upstream(
+                    redactor.redact(&format!("network error calling grok conservative: {e}")),
+                )
             })?;
 
         let status = resp.status();
@@ -666,10 +666,13 @@ impl GrokProvider {
             )
         })?;
         if !status.is_success() {
-            return Err(ProviderError::upstream_status(status.as_u16(), redactor.redact(&format!(
-                "grok conservative {status}: {}",
-                String::from_utf8_lossy(&bytes)
-            ))));
+            return Err(ProviderError::upstream_status(
+                status.as_u16(),
+                redactor.redact(&format!(
+                    "grok conservative {status}: {}",
+                    String::from_utf8_lossy(&bytes)
+                )),
+            ));
         }
 
         let value: Value = serde_json::from_slice(&bytes).map_err(|e| {
@@ -1784,9 +1787,11 @@ impl LlmProvider for GrokProvider {
                         );
                         conservative_fallback = true;
                     }
-                    Err(e) => return Err(ProviderError::Auth(format!(
-                        "failed to load Grok conservative credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {e}"
-                    ))),
+                    Err(e) => {
+                        return Err(ProviderError::Auth(format!(
+                            "failed to load Grok conservative credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {e}"
+                        )));
+                    }
                 }
             }
         }
@@ -1826,10 +1831,10 @@ impl LlmProvider for GrokProvider {
                     .unwrap_or_else(|_| "<no body>".to_string()),
             );
             error!(%status, body = %err_body, "xAI upstream error");
-            return Err(ProviderError::upstream_status(status.as_u16(), format!(
-                "xAI {}: {}",
-                status, err_body
-            )));
+            return Err(ProviderError::upstream_status(
+                status.as_u16(),
+                format!("xAI {}: {}", status, err_body),
+            ));
         }
 
         let raw: XaiChatCompletion = http_resp.json().await.map_err(|e| {
@@ -1884,9 +1889,11 @@ impl LlmProvider for GrokProvider {
                         );
                         conservative_fallback = true;
                     }
-                    Err(e) => return Err(ProviderError::Auth(format!(
-                        "failed to load Grok conservative credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {e}"
-                    ))),
+                    Err(e) => {
+                        return Err(ProviderError::Auth(format!(
+                            "failed to load Grok conservative credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {e}"
+                        )));
+                    }
                 }
             }
         }
@@ -3645,7 +3652,8 @@ mod tests {
         // maps content/tool_call deltas to canonical events (see the dedicated
         // SSE parser test). Pin the builder flags here so the non-stream tool path
         // above and the stream path stay distinct.
-        let stream_body = to_xai_chat_stream_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let stream_body =
+            to_xai_chat_stream_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         assert_eq!(stream_body["stream"], true);
         assert_eq!(stream_body["stream_options"]["include_usage"], true);
         assert_eq!(body["stream"], false);
@@ -3827,7 +3835,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        let stream_body = to_xai_chat_stream_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let stream_body =
+            to_xai_chat_stream_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
         assert_eq!(stream_body["stream"], true);
         assert_eq!(stream_body["stream_options"]["include_usage"], true);
 
@@ -4403,11 +4412,16 @@ mod tests {
         // = the optimal api.x.ai working surface (superset). A regression that
         // leaked an extended-only id (e.g. grok-4.3) into conservative, or dropped
         // one from extended, would misrepresent the catalog the user asked for.
-        let cons = GrokProvider::new(None).unwrap().with_mode(CatalogMode::Conservative);
+        let cons = GrokProvider::new(None)
+            .unwrap()
+            .with_mode(CatalogMode::Conservative);
         let ids: Vec<String> = cons.models_list().into_iter().map(|m| m.id).collect();
         assert_eq!(
             ids,
-            vec!["grok-build".to_string(), "grok-composer-2.5-fast".to_string()],
+            vec![
+                "grok-build".to_string(),
+                "grok-composer-2.5-fast".to_string()
+            ],
             "conservative must be exactly the advertised cli-chat-proxy ids"
         );
         assert!(!ids.iter().any(|id| id == "grok-4.3"));
@@ -4423,20 +4437,20 @@ mod tests {
     fn conservative_mode_resolves_only_its_own_aliases() {
         // The wire body model id must come from the active catalog. In conservative
         // mode, an extended-only alias must NOT resolve to an extended id.
-        let cons = GrokProvider::new(None).unwrap().with_mode(CatalogMode::Conservative);
+        let cons = GrokProvider::new(None)
+            .unwrap()
+            .with_mode(CatalogMode::Conservative);
         let mut req = CanonicalRequest {
             model: "grok".into(), // alias of grok-4.3 (extended-only)
             ..base_req()
         };
-        let body =
-            to_xai_chat_request(&req, &empty_repl(), cons.active_catalog()).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), cons.active_catalog()).unwrap();
         // "grok" is not in conservative -> forwarded verbatim, not mapped to grok-4.3.
         assert_eq!(body["model"], "grok");
 
         // But "composer" (in conservative) resolves to its canonical id.
         req.model = "composer".into();
-        let body =
-            to_xai_chat_request(&req, &empty_repl(), cons.active_catalog()).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), cons.active_catalog()).unwrap();
         assert_eq!(body["model"], "grok-composer-2.5-fast");
     }
 
@@ -4506,11 +4520,13 @@ mod tests {
             }),
             ..Default::default()
         };
-        let body =
-            to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_60, false).unwrap();
+        let body = to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_60, false).unwrap();
 
         // No Codex-only / CLI-preference keys.
-        assert!(body.get("instructions").is_none(), "must NOT hoist system to instructions");
+        assert!(
+            body.get("instructions").is_none(),
+            "must NOT hoist system to instructions"
+        );
         assert!(body.get("include").is_none(), "must not replay CLI include");
         assert!(body.get("store").is_none(), "must not replay CLI store");
 
@@ -4529,8 +4545,14 @@ mod tests {
         assert_eq!(body["temperature"], 0.5);
         assert_eq!(body["top_p"], 0.25);
         assert_eq!(body["reasoning"], json!({"effort": "high"}));
-        assert!(body.get("reasoning_effort").is_none(), "chat-shape reasoning_effort is wrong here");
-        assert!(body.get("tools").is_none(), "no user tools -> omit tools entirely");
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "chat-shape reasoning_effort is wrong here"
+        );
+        assert!(
+            body.get("tools").is_none(),
+            "no user tools -> omit tools entirely"
+        );
         assert!(body.get("tool_choice").is_none());
     }
 
@@ -4556,15 +4578,20 @@ mod tests {
             }),
             ..Default::default()
         };
-        let body =
-            to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_60, true).unwrap();
+        let body = to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_60, true).unwrap();
 
         assert_eq!(body["stream"], true);
         let tools = body["tools"].as_array().expect("tools is an array");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");
-        assert_eq!(tools[0]["name"], "get_weather", "name is FLAT, not nested under function");
-        assert!(tools[0].get("function").is_none(), "must NOT nest under a function key");
+        assert_eq!(
+            tools[0]["name"], "get_weather",
+            "name is FLAT, not nested under function"
+        );
+        assert!(
+            tools[0].get("function").is_none(),
+            "must NOT nest under a function key"
+        );
         assert_eq!(tools[0]["parameters"]["type"], "object");
         assert_eq!(tools[0]["description"], "look up weather");
         assert_eq!(
@@ -4629,8 +4656,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let body =
-            to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_60, false).unwrap();
+        let body = to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_60, false).unwrap();
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0]["type"], "function_call");
         assert_eq!(input[0]["call_id"], "call_1");
@@ -4648,7 +4674,9 @@ mod tests {
         // intended target (non-override); any other base is a deliberate redirect
         // reported as an override. Getting this wrong either sends conservative to
         // api.x.ai or warns on every default request.
-        let default_p = GrokProvider::new(None).unwrap().with_mode(CatalogMode::Conservative);
+        let default_p = GrokProvider::new(None)
+            .unwrap()
+            .with_mode(CatalogMode::Conservative);
         assert_eq!(
             default_p.conservative_base(),
             (CONSERVATIVE_BASE_URL.to_string(), false),
@@ -4715,7 +4743,10 @@ mod tests {
             }],
             ..Default::default()
         };
-        let resp = provider.send(req).await.expect("conservative send must succeed");
+        let resp = provider
+            .send(req)
+            .await
+            .expect("conservative send must succeed");
         assert_eq!(resp.content, "ok");
 
         let requests = server.received_requests().await.unwrap();
@@ -4724,9 +4755,15 @@ mod tests {
         let val = |name: &str| h.get(name).map(|v| v.to_str().unwrap().to_string());
 
         assert_eq!(val("x-xai-token-auth").as_deref(), Some("xai-grok-cli"));
-        assert_eq!(val("x-authenticateresponse").as_deref(), Some("authenticate-response"));
+        assert_eq!(
+            val("x-authenticateresponse").as_deref(),
+            Some("authenticate-response")
+        );
         assert_eq!(val("x-grok-client-version").as_deref(), Some("0.2.60"));
-        assert_eq!(val("x-grok-client-identifier").as_deref(), Some("grok-shell"));
+        assert_eq!(
+            val("x-grok-client-identifier").as_deref(),
+            Some("grok-shell")
+        );
         assert_eq!(
             val("user-agent").as_deref(),
             Some("grok-shell/0.2.60 (linux; x86_64)"),
@@ -4735,7 +4772,10 @@ mod tests {
         assert_eq!(val("x-grok-model-override").as_deref(), Some("grok-build"));
         assert_eq!(val("accept").as_deref(), Some("text/event-stream"));
         assert_eq!(val("content-type").as_deref(), Some("application/json"));
-        assert_eq!(val("authorization").as_deref(), Some("Bearer eyJ-fake-jwt-not-real"));
+        assert_eq!(
+            val("authorization").as_deref(),
+            Some("Bearer eyJ-fake-jwt-not-real")
+        );
         assert_eq!(
             val("x-grok-user-id").as_deref(),
             Some("11111111-2222-3333-4444-555555555555"),
@@ -4767,8 +4807,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider =
-            GrokProvider::new_for_test_conservative("eyJ-fake", None, server.uri());
+        let provider = GrokProvider::new_for_test_conservative("eyJ-fake", None, server.uri());
         let resp = provider.send(base_req_model("grok-build")).await.unwrap();
         assert_eq!(resp.content, "ok");
         let requests = server.received_requests().await.unwrap();
@@ -4778,7 +4817,12 @@ mod tests {
         );
         // The Bearer is still present even without a user_id.
         assert_eq!(
-            requests[0].headers.get("authorization").unwrap().to_str().unwrap(),
+            requests[0]
+                .headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "Bearer eyJ-fake"
         );
     }
@@ -4809,8 +4853,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider =
-            GrokProvider::new_for_test_conservative("eyJ-fake", None, server.uri());
+        let provider = GrokProvider::new_for_test_conservative("eyJ-fake", None, server.uri());
         let resp = provider.send(base_req_model("grok-build")).await.unwrap();
         assert_eq!(resp.content, "hello");
         assert_eq!(resp.tool_calls.len(), 1);
@@ -4845,15 +4888,12 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
             .expect(1)
             .mount(&server)
             .await;
 
-        let provider =
-            GrokProvider::new_for_test_conservative("eyJ-fake", None, server.uri());
+        let provider = GrokProvider::new_for_test_conservative("eyJ-fake", None, server.uri());
         let stream = provider
             .send_stream(base_req_model("grok-build"))
             .await
@@ -4863,7 +4903,9 @@ mod tests {
 
         // ResponseMetadata(id) may lead; assert the content/usage/finish core and tag.
         assert!(
-            events.iter().any(|e| matches!(e, CanonicalStreamEvent::TextDelta(t) if t == "Hello")),
+            events
+                .iter()
+                .any(|e| matches!(e, CanonicalStreamEvent::TextDelta(t) if t == "Hello")),
             "expected a Hello TextDelta, got {events:?}"
         );
         assert!(events.iter().any(|e| matches!(
@@ -4987,7 +5029,9 @@ mod tests {
                 msg.contains("failed to load Grok credentials"),
                 "must be the EXTENDED-path auth error (proves fall-through), got: {msg}"
             ),
-            other => panic!("expected the extended-path Auth error after fall-through, got {other:?}"),
+            other => {
+                panic!("expected the extended-path Auth error after fall-through, got {other:?}")
+            }
         }
     }
 
@@ -5005,9 +5049,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
-            .respond_with(ResponseTemplate::new(401).set_body_string(format!(
-                "{{\"error\":\"invalid bearer {SECRET}\"}}"
-            )))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(format!("{{\"error\":\"invalid bearer {SECRET}\"}}")),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -5019,7 +5064,10 @@ mod tests {
             .expect_err("401 must surface an error")
             .to_string();
         assert!(!err.contains(SECRET), "non-prefixed bearer leaked: {err}");
-        assert!(err.contains("<redacted>"), "redaction marker missing: {err}");
+        assert!(
+            err.contains("<redacted>"),
+            "redaction marker missing: {err}"
+        );
     }
 
     #[tokio::test]
@@ -5034,9 +5082,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
-            .respond_with(ResponseTemplate::new(401).set_body_string(format!(
-                "{{\"error\":\"invalid bearer {SECRET}\"}}"
-            )))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(format!("{{\"error\":\"invalid bearer {SECRET}\"}}")),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -5052,8 +5101,14 @@ mod tests {
             .expect("an event")
             .expect_err("401 must surface an error")
             .to_string();
-        assert!(!err.contains(SECRET), "non-prefixed bearer leaked in stream: {err}");
-        assert!(err.contains("<redacted>"), "redaction marker missing: {err}");
+        assert!(
+            !err.contains(SECRET),
+            "non-prefixed bearer leaked in stream: {err}"
+        );
+        assert!(
+            err.contains("<redacted>"),
+            "redaction marker missing: {err}"
+        );
     }
 
     #[tokio::test]
@@ -5085,7 +5140,13 @@ mod tests {
             .expect("an event")
             .expect_err("429 must surface an error");
         assert!(
-            matches!(err, ProviderError::Upstream { status: Some(429), .. }),
+            matches!(
+                err,
+                ProviderError::Upstream {
+                    status: Some(429),
+                    ..
+                }
+            ),
             "conservative stream HTTP error must carry the upstream status, got {err:?}"
         );
     }

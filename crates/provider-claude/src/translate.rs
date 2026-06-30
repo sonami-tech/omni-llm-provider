@@ -1629,8 +1629,7 @@ mod tests {
         // WHY: the Chat Completions surface does not normalize `developer` to
         // `system` (omni-common chat_message_to_canonical clones the role), so
         // the Claude path must handle `developer` identically or it 400s.
-        let anth =
-            build_haiku(vec![sys_msg("developer", "Be precise."), user_msg("hi")]).unwrap();
+        let anth = build_haiku(vec![sys_msg("developer", "Be precise."), user_msg("hi")]).unwrap();
         assert_eq!(system_texts(&anth), vec!["Be precise.".to_string()]);
         assert!(anth.messages.iter().all(|m| m.role != "developer"));
     }

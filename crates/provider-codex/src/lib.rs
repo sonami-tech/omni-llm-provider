@@ -236,10 +236,13 @@ impl CodexProvider {
             )))
         })?;
         if !status.is_success() {
-            return Err(ProviderError::upstream_status(status.as_u16(), redactor.redact(&format!(
-                "codex conservative models preflight HTTP {status}: {}",
-                String::from_utf8_lossy(&bytes)
-            ))));
+            return Err(ProviderError::upstream_status(
+                status.as_u16(),
+                redactor.redact(&format!(
+                    "codex conservative models preflight HTTP {status}: {}",
+                    String::from_utf8_lossy(&bytes)
+                )),
+            ));
         }
 
         let ws_url = config.conservative_responses_ws_url()?;
@@ -401,10 +404,13 @@ impl LlmProvider for CodexProvider {
             )
         })?;
         if !status.is_success() {
-            return Err(ProviderError::upstream_status(status.as_u16(), error_redactor.redact(&format!(
-                "codex HTTP {status}: {}",
-                String::from_utf8_lossy(&bytes)
-            ))));
+            return Err(ProviderError::upstream_status(
+                status.as_u16(),
+                error_redactor.redact(&format!(
+                    "codex HTTP {status}: {}",
+                    String::from_utf8_lossy(&bytes)
+                )),
+            ));
         }
 
         let value: Value = serde_json::from_slice(&bytes)
