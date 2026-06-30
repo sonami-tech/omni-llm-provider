@@ -219,6 +219,10 @@ struct ProviderEntry {
 #[derive(Clone, Debug, Default)]
 struct ModelCatalog {
     aliases: HashMap<String, String>,
+    /// Claude profile catalog for substring/family resolution that a static
+    /// alias map can't express (e.g. `claude-opus-4-6` -> `claude-opus-4-8`).
+    /// `None` for non-Claude providers.
+    claude_models: Option<&'static [provider_claude::models::ModelDef]>,
 }
 
 #[derive(Clone)]
@@ -743,6 +747,7 @@ fn claude_model_catalog(profile: &provider_claude::FingerprintProfile) -> ModelC
     for model in profile.model_wire_overrides {
         catalog.insert(model.model, model.model);
     }
+    catalog.claude_models = Some(profile.models);
     catalog
 }
 
@@ -776,7 +781,14 @@ impl ModelCatalog {
     }
 
     fn resolve(&self, model: &str) -> Option<&str> {
-        self.aliases.get(model).map(String::as_str)
+        if let Some(canonical) = self.aliases.get(model) {
+            return Some(canonical.as_str());
+        }
+        // Claude family aliases (e.g. `claude-opus-4-6`) aren't in the static
+        // alias map but resolve via the provider's substring matcher. Normalize
+        // only on a real match; unknown input is left for the caller to pass raw.
+        self.claude_models
+            .and_then(|models| provider_claude::models::canonical_if_known(model, models))
     }
 }
 
@@ -2019,10 +2031,19 @@ mod tests {
     #[test]
     fn test_resolve_prefix_claude() {
         let catalogs = catalogs_claude_grok();
+        // A dated id containing a cli_name substring (`sonnet`) resolves to the
+        // canonical model it actually routes to upstream, so echo/stats match the
+        // wire. (Claude's substring matcher already sends this to claude-sonnet-4-6.)
         let (k, m) =
             resolve_provider_and_model("CLAUDE:claude-3-5-sonnet-20241022", &catalogs).unwrap();
         assert_eq!(k, "claude");
-        assert_eq!(m, "claude-3-5-sonnet-20241022");
+        assert_eq!(m, "claude-sonnet-4-6");
+
+        // A model id matching no family substring is left raw (Codex's guard:
+        // unknown input is not silently rewritten to the profile default).
+        let (k, m) = resolve_provider_and_model("CLAUDE:claude-2.1", &catalogs).unwrap();
+        assert_eq!(k, "claude");
+        assert_eq!(m, "claude-2.1");
     }
 
     #[test]
@@ -2074,6 +2095,34 @@ mod tests {
         let (k, m) = resolve_provider_and_model("gpt", &catalogs).unwrap();
         assert_eq!(k.as_str(), "codex");
         assert!(!m.is_empty());
+    }
+
+    #[test]
+    fn test_claude_family_aliases_normalize_to_canonical() {
+        // Family aliases (dropped from the static catalog in 2.1.154+) resolve
+        // upstream via Claude's substring matcher. They MUST also normalize here
+        // so the echoed `model` and the stats/billing key are the canonical id,
+        // not the raw alias. Otherwise one physical model fragments across
+        // buckets (e.g. claude-opus-4-6 mis-attributing spend to a retired id).
+        let catalogs = catalogs_claude_grok_codex();
+        for (input, expected) in [
+            ("claude:claude-opus", "claude-opus-4-8"),
+            ("claude:claude-opus-4-6", "claude-opus-4-8"),
+            ("claude:claude-sonnet", "claude-sonnet-4-6"),
+            ("claude:claude-haiku", "claude-haiku-4-5-20251001"),
+        ] {
+            let (k, m) = resolve_provider_and_model(input, &catalogs).unwrap();
+            assert_eq!(
+                (k.as_str(), m.as_str()),
+                ("claude", expected),
+                "{input} should normalize to {expected}"
+            );
+        }
+
+        // Codex's guard: an unrecognized model must NOT be silently rewritten to
+        // the profile default. It stays raw so attribution isn't misdirected.
+        let (k, m) = resolve_provider_and_model("claude:totally-unknown-zzz", &catalogs).unwrap();
+        assert_eq!((k.as_str(), m.as_str()), ("claude", "totally-unknown-zzz"));
     }
 
     #[test]

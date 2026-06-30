@@ -182,6 +182,28 @@ pub fn resolve_model_in_catalog(
     default_model_def(models, default_model)
 }
 
+/// Resolve `input` to a canonical id ONLY when it matches a real catalog entry
+/// (exact canonical, exact alias, or substring family). Returns `None` on the
+/// default-fallback path so callers can preserve un-normalized input instead of
+/// silently rewriting an unknown model to the profile default.
+pub fn canonical_if_known(input: &str, models: &'static [ModelDef]) -> Option<&'static str> {
+    for m in models {
+        if m.canonical == input {
+            return Some(m.canonical);
+        }
+    }
+
+    for m in models {
+        for alias in m.aliases {
+            if *alias == input {
+                return Some(m.canonical);
+            }
+        }
+    }
+
+    match_by_substring(input, models).map(|m| m.canonical)
+}
+
 fn match_by_substring(input: &str, models: &'static [ModelDef]) -> Option<&'static ModelDef> {
     models
         .iter()
