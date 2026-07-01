@@ -19,21 +19,21 @@ pub static CATALOG_CC_2_1_142: &[ModelDef] = &[
     ModelDef {
         canonical: "claude-opus-4-7",
         cli_name: "opus",
-        aliases: &["opus", "claude-opus", "claude-opus-4-6"],
+        aliases: &["opus"],
         context_window: 1_000_000,
         max_tokens: 128_000,
     },
     ModelDef {
         canonical: "claude-sonnet-4-6",
         cli_name: "sonnet",
-        aliases: &["sonnet", "claude-sonnet"],
+        aliases: &["sonnet"],
         context_window: 1_000_000,
         max_tokens: 64_000,
     },
     ModelDef {
         canonical: "claude-haiku-4-5",
         cli_name: "haiku",
-        aliases: &["haiku", "claude-haiku"],
+        aliases: &["haiku"],
         context_window: 200_000,
         max_tokens: 64_000,
     },
@@ -43,21 +43,21 @@ pub static CATALOG_CC_2_1_150: &[ModelDef] = &[
     ModelDef {
         canonical: "claude-opus-4-7",
         cli_name: "opus",
-        aliases: &["opus", "claude-opus", "claude-opus-4-6"],
+        aliases: &["opus"],
         context_window: 1_000_000,
         max_tokens: 128_000,
     },
     ModelDef {
         canonical: "claude-sonnet-4-6",
         cli_name: "sonnet",
-        aliases: &["sonnet", "claude-sonnet"],
+        aliases: &["sonnet"],
         context_window: 1_000_000,
         max_tokens: 64_000,
     },
     ModelDef {
         canonical: "claude-haiku-4-5-20251001",
         cli_name: "haiku",
-        aliases: &["haiku", "claude-haiku", "claude-haiku-4-5"],
+        aliases: &["haiku"],
         context_window: 200_000,
         max_tokens: 64_000,
     },
@@ -427,6 +427,46 @@ mod tests {
     }
 
     #[test]
+    fn family_longforms_pass_through_on_every_profile() {
+        // WHY: family long-forms (`claude-opus`/`claude-sonnet`/`claude-haiku`)
+        // and the retired dated id `claude-opus-4-6` must pass through raw on
+        // EVERY profile, including the legacy 2.1.142/2.1.150 pins whose catalogs
+        // historically carried them as explicit aliases. They were pruned so the
+        // pass-through rule is uniform across versions (no active-vs-legacy split).
+        // The short forms still resolve on every profile.
+        for p in &[
+            crate::fingerprint::PROFILE_CLAUDE_2_1_165_SDK_CLI,
+            crate::fingerprint::PROFILE_CLAUDE_2_1_162_SDK_CLI,
+            crate::fingerprint::PROFILE_CLAUDE_2_1_158_SDK_CLI,
+            crate::fingerprint::PROFILE_CLAUDE_2_1_154_SDK_CLI,
+            crate::fingerprint::PROFILE_CLAUDE_2_1_150_SDK_CLI,
+            crate::fingerprint::PROFILE_CLAUDE_2_1_142_SDK_CLI,
+        ] {
+            // NB: `claude-haiku-4-5` is deliberately NOT in this list - it is the
+            // exact CANONICAL id on the 2.1.142 pin (and a wire-override id
+            // elsewhere), so it legitimately resolves via tier 1 on some profiles.
+            // Only the bare family long-forms and the retired `claude-opus-4-6`
+            // (never a canonical) must pass through raw everywhere.
+            for longform in [
+                "claude-opus",
+                "claude-sonnet",
+                "claude-haiku",
+                "claude-opus-4-6",
+            ] {
+                assert!(
+                    p.resolve_model(longform).is_none(),
+                    "{longform} must pass through raw on {}",
+                    p.name
+                );
+            }
+            // Short forms still resolve on every profile.
+            assert!(p.resolve_model("opus").is_some(), "opus on {}", p.name);
+            assert!(p.resolve_model("sonnet").is_some(), "sonnet on {}", p.name);
+            assert!(p.resolve_model("haiku").is_some(), "haiku on {}", p.name);
+        }
+    }
+
+    #[test]
     fn resolve_unknown_returns_none_for_all_profiles() {
         // WHY: no profile falls back to a default model any more; an unknown id
         // returns None everywhere so the caller forwards it raw.
@@ -435,6 +475,8 @@ mod tests {
             crate::fingerprint::PROFILE_CLAUDE_2_1_162_SDK_CLI,
             crate::fingerprint::PROFILE_CLAUDE_2_1_158_SDK_CLI,
             crate::fingerprint::PROFILE_CLAUDE_2_1_154_SDK_CLI,
+            crate::fingerprint::PROFILE_CLAUDE_2_1_150_SDK_CLI,
+            crate::fingerprint::PROFILE_CLAUDE_2_1_142_SDK_CLI,
         ] {
             assert!(
                 p.resolve_model("nonexistent-xyz").is_none(),
