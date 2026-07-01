@@ -110,7 +110,7 @@ const GROK_CONSERVATIVE_0_2_60: &[CatalogModel] = &[
 ];
 
 const GROK_EXTENDED_0_2_60: &[CatalogModel] = &[
-    CatalogModel::new("grok-4.3", &["grok", "grok-latest"]),
+    CatalogModel::new("grok-4.3", &["grok"]),
     CatalogModel::new("grok-build-0.1", &[]),
     CatalogModel::new("grok-4.20-0309-reasoning", &[]),
     CatalogModel::new("grok-4.20-0309-non-reasoning", &[]),

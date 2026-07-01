@@ -50,7 +50,7 @@ const DEFAULT_AUTH_COMMAND_TIMEOUT_MS: u64 = 5_000;
 // This is plan-dependent: a platform sk- key / higher plan would likely expose
 // more, which a future version entry would capture.
 const CODEX_CATALOG_0_142_0: &[CatalogModel] = &[
-    CatalogModel::new("gpt-5.5", &["codex", "gpt"]),
+    CatalogModel::new("gpt-5.5", &["gpt"]),
     CatalogModel::new("gpt-5.4-mini", &["mini", "gpt-mini"]),
 ];
 
@@ -169,11 +169,10 @@ impl CodexProvider {
 
     pub fn model_aliases(&self) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = Vec::new();
-        // The configured model keeps the classic codex/gpt shorthands pointing at
-        // whatever is actually in use.
+        // The configured model keeps the `gpt` shorthand pointing at whatever is
+        // actually in use.
         if let Ok(configured) = self.current_model() {
             if !configured.is_empty() {
-                out.push(("codex".to_string(), configured.clone()));
                 out.push(("gpt".to_string(), configured.clone()));
                 out.push((configured.clone(), configured));
             }
@@ -2024,8 +2023,11 @@ model = "gpt-native"
         let models = provider.models_list();
         assert_eq!(models[0].id, "gpt-override");
         let aliases = provider.model_aliases();
-        assert!(aliases.contains(&("codex".into(), "gpt-override".into())));
+        // WHY: the legacy `codex` shorthand was pruned; only `gpt` maps to the
+        // configured model now. Asserting `codex` is absent locks in the removal
+        // so a re-added alias can't silently reintroduce the retired shorthand.
         assert!(aliases.contains(&("gpt".into(), "gpt-override".into())));
+        assert!(!aliases.iter().any(|(a, _)| a == "codex"));
     }
 
     #[test]

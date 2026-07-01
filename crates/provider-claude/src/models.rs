@@ -123,7 +123,7 @@ pub static CATALOG_CC_2_1_175: &[ModelDef] = &[
     ModelDef {
         canonical: "claude-fable-5",
         cli_name: "fable",
-        aliases: &["fable", "fable5", "fable-5"],
+        aliases: &["fable"],
         context_window: 1_000_000,
         max_tokens: 64_000,
     },

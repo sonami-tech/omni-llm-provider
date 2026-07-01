@@ -9,7 +9,7 @@ fingerprint logic remains isolated in provider crates.
 - `omni` - the only server binary. Routes by canonical upstream model id
   (`claude-sonnet-4-6`, `grok-4.3`, or the configured Codex model),
   documented shorthand alias (`sonnet`, `opus`, `haiku`, `fable`, `grok`,
-  `composer`, `codex`, `gpt`), or optional provider prefix (`claude:...`,
+  `composer`, `build`, `gpt`), or optional provider prefix (`claude:...`,
   `grok:...`, `codex:...`) when a caller needs to force a provider.
 
 ## Crates
@@ -98,9 +98,9 @@ Current shorthand aliases are resolved from provider-owned catalogs at startup:
 - `fable` -> `claude-fable-5`
 - `grok` -> `grok-4.3`
 - `composer` -> `grok-composer-2.5-fast`
-- `codex` -> the current Codex model from `$CODEX_HOME/config.toml` or
+- `build` -> `grok-build`
+- `gpt` -> the current Codex model from `$CODEX_HOME/config.toml` or
   `~/.codex/config.toml`, falling back to the provider default
-- `gpt` -> the same current Codex model as `codex`
 
 Credentials are read fresh per request, never cached. Claude reads
 `~/.claude/.credentials.json` or `$CLAUDE_CREDENTIALS_PATH`. Grok resolves
@@ -136,7 +136,7 @@ credentials:
   `$XAI_CREDENTIALS_PATH`, `~/.xai`, or `~/.grok` credentials.
 - Codex forced override: `OMNI_CODEX_BASE_URL` switches Codex to a custom
   Responses-compatible endpoint and wins over Codex config base URLs.
-  `OMNI_CODEX_MODEL` controls the catalog and `codex` / `gpt` aliases, falling
+  `OMNI_CODEX_MODEL` controls the catalog and the `gpt` alias, falling
   back to the Codex config model or provider default. `OMNI_CODEX_AUTH_TOKEN`
   sends `Authorization: Bearer ...`; otherwise `OMNI_CODEX_API_KEY` does.
   `OMNI_CODEX_CUSTOM_HEADERS` accepts one `Name: value` header per line.
