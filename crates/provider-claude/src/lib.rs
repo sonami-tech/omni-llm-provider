@@ -892,7 +892,6 @@ mod tests {
         let p154 =
             ClaudeProvider::new_for_test(crate::fingerprint::resolve_profile("2.1.154").unwrap());
         assert_eq!(p154.profile().name, "cc-2.1.154-sdk-cli");
-        assert_eq!(p154.profile().default_model, "sonnet");
     }
 
     #[test]

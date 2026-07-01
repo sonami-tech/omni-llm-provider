@@ -47,7 +47,6 @@ pub struct FingerprintProfile {
     pub model_beta_overrides: &'static [ModelBetaOverride],
     pub system_preamble: &'static str,
     pub models: &'static [ModelDef],
-    pub default_model: &'static str,
     pub preserve_explicit_model: bool,
     pub wire_defaults: WireDefaults,
     pub model_wire_overrides: &'static [ModelWireOverride],
@@ -929,7 +928,6 @@ pub const PROFILE_CLAUDE_2_1_142_SDK_CLI: FingerprintProfile = FingerprintProfil
     model_beta_overrides: &[],
     system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
     models: CATALOG_CC_2_1_142,
-    default_model: "sonnet",
     preserve_explicit_model: false,
     wire_defaults: WIRE_DEFAULTS_LEGACY,
     model_wire_overrides: &[],
@@ -947,7 +945,6 @@ pub const PROFILE_CLAUDE_2_1_150_SDK_CLI: FingerprintProfile = FingerprintProfil
     model_beta_overrides: &[],
     system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
     models: CATALOG_CC_2_1_150,
-    default_model: "sonnet",
     preserve_explicit_model: false,
     wire_defaults: WIRE_DEFAULTS_LEGACY,
     model_wire_overrides: &[],
@@ -965,7 +962,6 @@ pub const PROFILE_CLAUDE_2_1_154_SDK_CLI: FingerprintProfile = FingerprintProfil
     model_beta_overrides: MODEL_BETA_OVERRIDES_CC_2_1_154,
     system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
     models: CATALOG_CC_2_1_154,
-    default_model: "sonnet",
     preserve_explicit_model: true,
     wire_defaults: WIRE_DEFAULTS_CC_2_1_154,
     model_wire_overrides: MODEL_WIRE_OVERRIDES_CC_2_1_154,
@@ -983,7 +979,6 @@ pub const PROFILE_CLAUDE_2_1_158_SDK_CLI: FingerprintProfile = FingerprintProfil
     model_beta_overrides: MODEL_BETA_OVERRIDES_CC_2_1_158,
     system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
     models: CATALOG_CC_2_1_158,
-    default_model: "opus",
     preserve_explicit_model: true,
     wire_defaults: WIRE_DEFAULTS_CC_2_1_158,
     model_wire_overrides: MODEL_WIRE_OVERRIDES_CC_2_1_158,
@@ -1001,7 +996,6 @@ pub const PROFILE_CLAUDE_2_1_161_SDK_CLI: FingerprintProfile = FingerprintProfil
     model_beta_overrides: MODEL_BETA_OVERRIDES_CC_2_1_161,
     system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
     models: CATALOG_CC_2_1_158,
-    default_model: "opus",
     preserve_explicit_model: true,
     wire_defaults: WIRE_DEFAULTS_CC_2_1_161,
     model_wire_overrides: MODEL_WIRE_OVERRIDES_CC_2_1_161,
@@ -1031,7 +1025,6 @@ pub const PROFILE_CLAUDE_2_1_162_SDK_CLI: FingerprintProfile = FingerprintProfil
     model_beta_overrides: MODEL_BETA_OVERRIDES_CC_2_1_162,
     system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
     models: CATALOG_CC_2_1_158,
-    default_model: "opus",
     preserve_explicit_model: true,
     wire_defaults: WIRE_DEFAULTS_CC_2_1_162,
     model_wire_overrides: MODEL_WIRE_OVERRIDES_CC_2_1_162,
@@ -1064,7 +1057,6 @@ pub const PROFILE_CLAUDE_2_1_165_SDK_CLI: FingerprintProfile = FingerprintProfil
     model_beta_overrides: MODEL_BETA_OVERRIDES_CC_2_1_165,
     system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
     models: CATALOG_CC_2_1_158,
-    default_model: "opus",
     preserve_explicit_model: true,
     wire_defaults: WIRE_DEFAULTS_CC_2_1_165,
     model_wire_overrides: MODEL_WIRE_OVERRIDES_CC_2_1_165,
@@ -1086,7 +1078,6 @@ pub const PROFILE_CLAUDE_2_1_175_SDK_CLI: FingerprintProfile = FingerprintProfil
     model_beta_overrides: MODEL_BETA_OVERRIDES_CC_2_1_175,
     system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
     models: CATALOG_CC_2_1_175,
-    default_model: "opus",
     preserve_explicit_model: true,
     wire_defaults: WIRE_DEFAULTS_CC_2_1_175,
     model_wire_overrides: MODEL_WIRE_OVERRIDES_CC_2_1_175,
@@ -1119,7 +1110,6 @@ pub const PROFILE_CLAUDE_2_1_186_SDK_CLI: FingerprintProfile = FingerprintProfil
     model_beta_overrides: MODEL_BETA_OVERRIDES_CC_2_1_186,
     system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
     models: CATALOG_CC_2_1_175,
-    default_model: "opus",
     preserve_explicit_model: true,
     wire_defaults: WIRE_DEFAULTS_CC_2_1_186,
     model_wire_overrides: MODEL_WIRE_OVERRIDES_CC_2_1_175,
@@ -1918,7 +1908,6 @@ mod tests {
             profile.user_agent(),
             "claude-cli/2.1.186 (external, sdk-cli)"
         );
-        assert_eq!(profile.default_model, "opus");
         assert_eq!(
             profile.resolve_model("fable").unwrap().canonical,
             "claude-fable-5"
@@ -2031,9 +2020,6 @@ mod tests {
             assert!(!profile.aliases.contains(&LATEST_PROFILE_ALIAS));
             assert!(!profile.models.is_empty());
             assert!(crate::models::catalog_contains_unique_names(profile.models));
-            assert!(profile.models.iter().any(|model| {
-                model.cli_name == profile.default_model || model.canonical == profile.default_model
-            }));
             for other in FINGERPRINT_PROFILES.iter().skip(idx + 1) {
                 assert_ne!(profile.name, other.name);
                 for alias in profile.aliases {
@@ -2350,7 +2336,6 @@ mod tests {
             model_beta_overrides: &[],
             system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
             models: CATALOG_CC_2_1_142,
-            default_model: "sonnet",
             preserve_explicit_model: false,
             wire_defaults: WIRE_DEFAULTS_LEGACY,
             model_wire_overrides: &[],
