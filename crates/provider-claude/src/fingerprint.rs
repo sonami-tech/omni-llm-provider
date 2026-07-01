@@ -914,7 +914,7 @@ pub const WIRE_DEFAULTS_CC_2_1_186: WireDefaults = WireDefaults {
     output_effort: Some("high"),
 };
 
-pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.186-sdk-cli";
+pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.197-sdk-cli";
 pub const LATEST_PROFILE_ALIAS: &str = "latest";
 
 pub const PROFILE_CLAUDE_2_1_142_SDK_CLI: FingerprintProfile = FingerprintProfile {
@@ -1100,7 +1100,7 @@ pub const PROFILE_CLAUDE_2_1_175_SDK_CLI: FingerprintProfile = FingerprintProfil
 // Wire defaults, catalog, default model (opus -> claude-opus-4-8), and
 // preserve_explicit_model carry forward from 2.1.175 (all live-confirmed).
 pub const PROFILE_CLAUDE_2_1_186_SDK_CLI: FingerprintProfile = FingerprintProfile {
-    name: DEFAULT_PROFILE_NAME,
+    name: "cc-2.1.186-sdk-cli",
     aliases: &["2.1.186"],
     claude_cli_version: "2.1.186",
     stainless_package_version: "0.94.0",
@@ -1116,7 +1116,42 @@ pub const PROFILE_CLAUDE_2_1_186_SDK_CLI: FingerprintProfile = FingerprintProfil
     billing: BILLING_SCHEME_V1_NO_CCH,
 };
 
+// Captured 2026-07-01 against installed Claude Code 2.1.197 via the shared
+// tools.capture framework (mitmproxy reverse proxy + real claude CLI, clean tmpfs
+// HOME), for default/opus, explicit opus, sonnet, and haiku. This is now the
+// default `latest` profile. ONLY TWO fields drift vs 2.1.186:
+//   1. claude_cli_version 2.1.186 -> 2.1.197 (UA + billing cc_version).
+//   2. stainless_runtime_version v24.3.0 -> v26.3.0 (Node bump; SDK package stays
+//      0.94.0, anthropic-version stays 2023-06-01).
+// The cc_version suffix algorithm is UNCHANGED: the existing Sha256Utf16SampleV1
+// suffix reproduces the captured cc_version=2.1.197.c8e exactly (verified against
+// the live header, and against all eight prior captured suffixes), and the header
+// still carries no cch field. Per-model betas, wire defaults (adaptive thinking +
+// output_config.effort=high on opus/sonnet, enabled+budget on haiku), the catalog,
+// default model (opus -> claude-opus-4-8), and preserve_explicit_model are all
+// byte-identical to 2.1.186, so this profile reuses those 2.1.186/2.1.175 consts.
+// (claude-fable-5 stays in the catalog; upstream returned 404 "use Opus 4.8" for
+// this account on 2026-07-01, but that is account/upstream state, not a wire
+// change, so the pinned catalog is unchanged.)
+pub const PROFILE_CLAUDE_2_1_197_SDK_CLI: FingerprintProfile = FingerprintProfile {
+    name: DEFAULT_PROFILE_NAME,
+    aliases: &["2.1.197"],
+    claude_cli_version: "2.1.197",
+    stainless_package_version: "0.94.0",
+    stainless_runtime_version: "v26.3.0",
+    entrypoint: "sdk-cli",
+    beta_reply: BETA_CC_2_1_186_DEFAULT,
+    model_beta_overrides: MODEL_BETA_OVERRIDES_CC_2_1_186,
+    system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
+    models: CATALOG_CC_2_1_175,
+    preserve_explicit_model: true,
+    wire_defaults: WIRE_DEFAULTS_CC_2_1_186,
+    model_wire_overrides: MODEL_WIRE_OVERRIDES_CC_2_1_175,
+    billing: BILLING_SCHEME_V1_NO_CCH,
+};
+
 pub static FINGERPRINT_PROFILES: &[FingerprintProfile] = &[
+    PROFILE_CLAUDE_2_1_197_SDK_CLI,
     PROFILE_CLAUDE_2_1_186_SDK_CLI,
     PROFILE_CLAUDE_2_1_175_SDK_CLI,
     PROFILE_CLAUDE_2_1_165_SDK_CLI,
@@ -1900,13 +1935,13 @@ mod tests {
     #[test]
     fn default_profile_matches_refreshed_claude_code_baseline() {
         let profile = default_profile();
-        assert_eq!(profile.name, "cc-2.1.186-sdk-cli");
-        assert_eq!(profile.claude_cli_version, "2.1.186");
+        assert_eq!(profile.name, "cc-2.1.197-sdk-cli");
+        assert_eq!(profile.claude_cli_version, "2.1.197");
         assert_eq!(profile.stainless_package_version, "0.94.0");
-        assert_eq!(profile.stainless_runtime_version, "v24.3.0");
+        assert_eq!(profile.stainless_runtime_version, "v26.3.0");
         assert_eq!(
             profile.user_agent(),
-            "claude-cli/2.1.186 (external, sdk-cli)"
+            "claude-cli/2.1.197 (external, sdk-cli)"
         );
         assert_eq!(
             profile.resolve_model("fable").unwrap().canonical,
@@ -1930,7 +1965,7 @@ mod tests {
     fn profile_registry_resolves_known_selectors() {
         assert_eq!(
             resolve_profile("latest").unwrap().name,
-            "cc-2.1.186-sdk-cli"
+            "cc-2.1.197-sdk-cli"
         );
         assert_eq!(
             resolve_profile("cc-2.1.186-sdk-cli")
@@ -2060,11 +2095,15 @@ mod tests {
         // and prompt "Say OK" on 2026-06-22 (live shared-capture mitmproxy run:
         // the real billing header read `cc_version=2.1.186.a80`).
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.186"), "a80");
-        // 2.1.186 (the default) emits NO cch field - the header ends at the
-        // entrypoint. Verified byte-for-byte from two independent live captures.
+        // Captured from Claude Code 2.1.197 with CLAUDE_CODE_ENTRYPOINT=sdk-cli
+        // and prompt "Say OK" on 2026-07-01 (live shared-capture mitmproxy run:
+        // the real billing header read `cc_version=2.1.197.c8e`).
+        assert_eq!(claude_code_version_suffix("Say OK", "2.1.197"), "c8e");
+        // 2.1.197 (the default) emits NO cch field - the header ends at the
+        // entrypoint. Verified byte-for-byte from the live capture.
         assert_eq!(
             default_profile().billing_header_text("Say OK"),
-            "x-anthropic-billing-header: cc_version=2.1.186.a80; cc_entrypoint=sdk-cli;"
+            "x-anthropic-billing-header: cc_version=2.1.197.c8e; cc_entrypoint=sdk-cli;"
         );
         // The 2.1.175 profile still emits the cch placeholder form.
         assert_eq!(

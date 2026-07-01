@@ -25,8 +25,8 @@ except ImportError:
 	sys.exit(2)
 
 
-PINNED_VERSION = "2.1.186"
-PINNED_PROFILE = "cc-2.1.186-sdk-cli"
+PINNED_VERSION = "2.1.197"
+PINNED_PROFILE = "cc-2.1.197-sdk-cli"
 CCH_SEED = 0x4D659218E32A3268
 CCH_RE = re.compile(r"(cc_entrypoint=sdk-cli; cch=)([0-9a-f]{5})(;)")
 # 2.1.186+ emits the billing header with NO trailing cch field; it ends at the
@@ -35,7 +35,7 @@ NO_CCH_HEADER_RE = re.compile(
 	r"x-anthropic-billing-header: cc_version=([0-9.]+)\.([0-9a-f]{3}); cc_entrypoint=sdk-cli;(?!\s*cch=)"
 )
 # Versions whose billing header carries no cch field at all (BillingCchMode::None).
-NO_CCH_VERSIONS = {"2.1.186"}
+NO_CCH_VERSIONS = {"2.1.186", "2.1.197"}
 MODEL_RE = re.compile(rb'("model":")((?:\\.|[^"\\])*)(")')
 
 # --- Clean-room recovered-vector capture (--emit-vectors) ---------------------

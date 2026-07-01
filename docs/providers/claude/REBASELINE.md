@@ -126,14 +126,22 @@ upstream.
 - Recovered vectors are local to this repo and covered by Rust tests.
 - Default workspace tests pass without credentials or network.
 
-## Current 2.1.175 Status
+## Current 2.1.197 Status
 
-On 2026-06-12, Claude Code 2.1.175 was captured and model behavior was verified
-for default, `fable`, `opus`, `sonnet`, and `haiku` flows. Headers still use SDK
-package `0.94.0`, runtime `v24.3.0`, Anthropic version `2023-06-01`, and
-`claude-cli/2.1.175 (external, sdk-cli)`.
+On 2026-07-01, Claude Code 2.1.197 was captured and model behavior was verified
+for default, `opus`, `sonnet`, and `haiku` flows. Headers still use SDK package
+`0.94.0` and Anthropic version `2023-06-01`, but the Node runtime moved to
+`v26.3.0` (was `v24.3.0`), and the UA is `claude-cli/2.1.197 (external, sdk-cli)`.
 
-2.1.175 is the current `latest` profile. Its cch path is still xxHash64 seeded
-with `0x4d659218e32a3268`, but the hashed input removes model string values and
-the numeric `max_tokens` field before hashing. The transform is covered by
-clean-room vectors for Fable, Opus, Sonnet, and Haiku.
+2.1.197 is the current `latest` profile. Only two fields drift versus 2.1.186:
+the CLI version string and the stainless runtime version. Like 2.1.186 it emits
+the billing header with no `cch=` field, ending at `cc_entrypoint=sdk-cli;`. The
+`cc_version` suffix algorithm is unchanged: the existing Sha256Utf16SampleV1
+suffix reproduces the captured `cc_version=2.1.197.c8e` exactly, and the live
+drift checker agrees against the installed CLI. Because there is no checksum to
+recompute, this no-cch profile ships no clean-room cch vectors (matching 2.1.186).
+
+`claude-fable-5` remains pinned in the catalog. On 2026-07-01 upstream returned
+`404 not_found` ("Claude Fable 5 is not available. Please use Opus 4.8.") for
+this account, but that is account/upstream state, not a wire change, so the
+catalog is unchanged and the capture used `opus`, `sonnet`, and `haiku`.
