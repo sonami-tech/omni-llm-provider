@@ -152,81 +152,30 @@ pub static CATALOG_CC_2_1_175: &[ModelDef] = &[
 
 /// Resolve an input model string within one Claude Code profile catalog.
 ///
-/// Resolution intentionally mirrors Claude Code's alias-heavy model UX:
-/// exact canonical, exact alias, then substring family match. Unknown
-/// models fall back to the profile's configured default model.
+/// Resolution is exact-only: exact canonical, then exact alias. An unknown
+/// model returns `None` so callers forward it verbatim (pass-through) rather
+/// than rewriting it to a family canonical or a profile default. This is the
+/// deliberate replacement for the former substring/default-fallback behavior,
+/// which silently remapped ids like `claude-sonnet-5` onto another model.
 pub fn resolve_model_in_catalog(
     input: &str,
     models: &'static [ModelDef],
-    default_model: &'static str,
-) -> &'static ModelDef {
+) -> Option<&'static ModelDef> {
     for m in models {
         if m.canonical == input {
-            return m;
+            return Some(m);
         }
     }
 
     for m in models {
         for alias in m.aliases {
             if *alias == input {
-                return m;
+                return Some(m);
             }
         }
     }
 
-    if let Some(m) = match_by_substring(input, models) {
-        return m;
-    }
-
-    tracing::warn!(model = %input, "Unrecognized model, falling back to {}", default_model);
-    default_model_def(models, default_model)
-}
-
-/// Resolve `input` to a canonical id ONLY when it matches a real catalog entry
-/// (exact canonical, exact alias, or substring family). Returns `None` on the
-/// default-fallback path so callers can preserve un-normalized input instead of
-/// silently rewriting an unknown model to the profile default.
-pub fn canonical_if_known(input: &str, models: &'static [ModelDef]) -> Option<&'static str> {
-    for m in models {
-        if m.canonical == input {
-            return Some(m.canonical);
-        }
-    }
-
-    for m in models {
-        for alias in m.aliases {
-            if *alias == input {
-                return Some(m.canonical);
-            }
-        }
-    }
-
-    match_by_substring(input, models).map(|m| m.canonical)
-}
-
-fn match_by_substring(input: &str, models: &'static [ModelDef]) -> Option<&'static ModelDef> {
-    models
-        .iter()
-        .find(|&m| input.contains(m.cli_name))
-        .map(|v| v as _)
-}
-
-fn default_model_def(
-    models: &'static [ModelDef],
-    default_model: &'static str,
-) -> &'static ModelDef {
-    for m in models {
-        if m.cli_name == default_model || m.canonical == default_model {
-            return m;
-        }
-    }
-    tracing::error!(
-        default_model = default_model,
-        "Profile default model is not in its model catalog; falling back to first catalog entry"
-    );
-    models
-        .first()
-        .expect("fingerprint profile model catalog must not be empty")
+    None
 }
 
 /// Return the model list for GET /v1/models using one profile catalog.
@@ -321,96 +270,96 @@ mod tests {
     #[test]
     fn resolve_canonical_names() {
         assert_eq!(
-            profile().resolve_model("claude-opus-4-8").canonical,
+            profile()
+                .resolve_model("claude-opus-4-8")
+                .unwrap()
+                .canonical,
             "claude-opus-4-8"
         );
         assert_eq!(
-            profile().resolve_model("claude-sonnet-4-6").canonical,
+            profile()
+                .resolve_model("claude-sonnet-4-6")
+                .unwrap()
+                .canonical,
             "claude-sonnet-4-6"
         );
-        assert_eq!(
-            profile().resolve_model("claude-haiku-4-5").canonical,
-            "claude-haiku-4-5-20251001"
-        );
+        // Only the exact catalog canonical resolves; the non-dated short form
+        // `claude-haiku-4-5` is NOT a catalog entry (the canonical is dated) and
+        // is no longer rewritten by a substring match - it passes through raw.
+        assert!(profile().resolve_model("claude-haiku-4-5").is_none());
     }
 
     #[test]
     fn resolve_short_aliases() {
-        assert_eq!(profile().resolve_model("opus").canonical, "claude-opus-4-8");
         assert_eq!(
-            profile().resolve_model("sonnet").canonical,
-            "claude-sonnet-4-6"
-        );
-        assert_eq!(
-            profile().resolve_model("haiku").canonical,
-            "claude-haiku-4-5-20251001"
-        );
-    }
-
-    #[test]
-    fn resolve_claude_prefix_aliases() {
-        assert_eq!(
-            profile().resolve_model("claude-opus").canonical,
+            profile().resolve_model("opus").unwrap().canonical,
             "claude-opus-4-8"
         );
         assert_eq!(
-            profile().resolve_model("claude-sonnet").canonical,
+            profile().resolve_model("sonnet").unwrap().canonical,
             "claude-sonnet-4-6"
         );
         assert_eq!(
-            profile().resolve_model("claude-haiku").canonical,
+            profile().resolve_model("haiku").unwrap().canonical,
             "claude-haiku-4-5-20251001"
         );
     }
 
     #[test]
-    fn resolve_date_suffixed_via_substring() {
-        assert_eq!(
+    fn resolve_claude_prefix_longforms_pass_through() {
+        // WHY: `claude-opus`/`claude-sonnet`/`claude-haiku` are NOT catalog
+        // aliases (CATALOG_CC_2_1_175 has only the short forms). They resolved
+        // only via the deleted substring matcher. Under pure pass-through they
+        // return None and forward raw (owner-accepted: Anthropic 400s them).
+        assert!(profile().resolve_model("claude-opus").is_none());
+        assert!(profile().resolve_model("claude-sonnet").is_none());
+        assert!(profile().resolve_model("claude-haiku").is_none());
+    }
+
+    #[test]
+    fn resolve_date_suffixed_passes_through() {
+        // WHY: dated variants that are not an exact catalog canonical were only
+        // matched by substring; that matcher is deleted, so they return None and
+        // forward raw. The one exact canonical still resolves.
+        assert!(
             profile()
                 .resolve_model("claude-opus-4-8-20260101")
-                .canonical,
-            "claude-opus-4-8"
+                .is_none()
         );
-        assert_eq!(
+        assert!(
             profile()
                 .resolve_model("claude-opus-4-6-20260101")
-                .canonical,
-            "claude-opus-4-8"
+                .is_none()
         );
-        assert_eq!(
+        assert!(
             profile()
                 .resolve_model("claude-sonnet-4-6-20260101")
-                .canonical,
-            "claude-sonnet-4-6"
+                .is_none()
         );
         assert_eq!(
             profile()
                 .resolve_model("claude-haiku-4-5-20251001")
+                .unwrap()
                 .canonical,
             "claude-haiku-4-5-20251001"
         );
     }
 
     #[test]
-    fn old_opus_canonical_alias_resolves_to_profile_opus() {
-        assert_eq!(
-            profile().resolve_model("claude-opus-4-6").canonical,
-            "claude-opus-4-8"
-        );
+    fn old_opus_canonical_passes_through() {
+        // WHY: the retired dated id `claude-opus-4-6` is not in this profile's
+        // catalog; it only resolved via substring. Now it passes through raw.
+        assert!(profile().resolve_model("claude-opus-4-6").is_none());
     }
 
     #[test]
-    fn resolve_unknown_falls_back_to_default() {
-        // 2.1.158+ default_model is "opus" (captured); older profiles used "sonnet".
-        assert_eq!(
-            profile().resolve_model("gpt-4").canonical,
-            "claude-opus-4-8"
-        );
-        assert_eq!(
-            profile().resolve_model("unknown").canonical,
-            "claude-opus-4-8"
-        );
-        assert_eq!(profile().resolve_model("").canonical, "claude-opus-4-8");
+    fn resolve_unknown_returns_none() {
+        // WHY: an unknown model no longer falls back to a profile default; it
+        // returns None so callers forward it verbatim (pass-through). This is the
+        // fix for the silent-remap bug (`claude-sonnet-5` -> another model).
+        assert!(profile().resolve_model("gpt-4").is_none());
+        assert!(profile().resolve_model("unknown").is_none());
+        assert!(profile().resolve_model("").is_none());
     }
 
     #[test]
@@ -448,9 +397,15 @@ mod tests {
 
     #[test]
     fn resolve_canonical_exact() {
-        assert_eq!(profile().resolve_model("claude-opus-4-8").cli_name, "opus");
         assert_eq!(
-            profile().resolve_model("claude-sonnet-4-6").cli_name,
+            profile().resolve_model("claude-opus-4-8").unwrap().cli_name,
+            "opus"
+        );
+        assert_eq!(
+            profile()
+                .resolve_model("claude-sonnet-4-6")
+                .unwrap()
+                .cli_name,
             "sonnet"
         );
     }
@@ -458,35 +413,32 @@ mod tests {
     #[test]
     fn resolve_via_cli_name_direct() {
         // cli_name is the "spoken" alias in Claude Code UX.
-        assert_eq!(profile().resolve_model("opus").cli_name, "opus");
-        assert_eq!(profile().resolve_model("haiku").cli_name, "haiku");
+        assert_eq!(profile().resolve_model("opus").unwrap().cli_name, "opus");
+        assert_eq!(profile().resolve_model("haiku").unwrap().cli_name, "haiku");
     }
 
     #[test]
-    fn resolve_substring_family_haiku_dated_variants() {
-        // haiku dated is canonical in 158+ catalogs; substring must hit it.
-        assert_eq!(
-            profile().resolve_model("haiku-20251001").canonical,
-            "claude-haiku-4-5-20251001"
-        );
-        assert_eq!(
-            profile().resolve_model("something-haiku-dated").canonical,
-            "claude-haiku-4-5-20251001"
-        );
+    fn resolve_substring_family_variants_pass_through() {
+        // WHY: substring family matching is deleted. Ids that merely CONTAIN a
+        // cli_name (`haiku-20251001`, `something-haiku-dated`) are no longer
+        // rewritten to a family canonical; they return None and forward raw.
+        assert!(profile().resolve_model("haiku-20251001").is_none());
+        assert!(profile().resolve_model("something-haiku-dated").is_none());
     }
 
     #[test]
-    fn resolve_default_for_all_profiles() {
+    fn resolve_unknown_returns_none_for_all_profiles() {
+        // WHY: no profile falls back to a default model any more; an unknown id
+        // returns None everywhere so the caller forwards it raw.
         for p in &[
             crate::fingerprint::PROFILE_CLAUDE_2_1_165_SDK_CLI,
             crate::fingerprint::PROFILE_CLAUDE_2_1_162_SDK_CLI,
             crate::fingerprint::PROFILE_CLAUDE_2_1_158_SDK_CLI,
             crate::fingerprint::PROFILE_CLAUDE_2_1_154_SDK_CLI,
         ] {
-            let d = p.resolve_model("nonexistent-xyz");
             assert!(
-                d.cli_name == p.default_model || d.canonical.contains(p.default_model),
-                "default resolution failed for {}",
+                p.resolve_model("nonexistent-xyz").is_none(),
+                "unknown model must not resolve for {}",
                 p.name
             );
         }

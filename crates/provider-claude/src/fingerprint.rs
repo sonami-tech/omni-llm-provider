@@ -109,8 +109,8 @@ impl FingerprintProfile {
         )
     }
 
-    pub fn resolve_model(&self, input: &str) -> &'static ModelDef {
-        resolve_model_in_catalog(input, self.models, self.default_model)
+    pub fn resolve_model(&self, input: &str) -> Option<&'static ModelDef> {
+        resolve_model_in_catalog(input, self.models)
     }
 
     pub fn outbound_model(&self, input: &str, model: &ModelDef) -> String {
@@ -1770,7 +1770,7 @@ mod tests {
         ];
         for (alias, expected_beta, has_context_1m) in cases {
             // Mirror the handler: resolve + canonicalize before building headers.
-            let model_def = profile.resolve_model(alias);
+            let model_def = profile.resolve_model(alias).unwrap();
             let outbound = profile.outbound_model(alias, model_def);
             let ctx = RequestContext::new_reply().with_model(outbound);
             let beta = build_headers(&creds, &ctx, profile)
@@ -1919,14 +1919,20 @@ mod tests {
             "claude-cli/2.1.186 (external, sdk-cli)"
         );
         assert_eq!(profile.default_model, "opus");
-        assert_eq!(profile.resolve_model("fable").canonical, "claude-fable-5");
-        assert_eq!(profile.resolve_model("opus").canonical, "claude-opus-4-8");
         assert_eq!(
-            profile.resolve_model("sonnet").canonical,
+            profile.resolve_model("fable").unwrap().canonical,
+            "claude-fable-5"
+        );
+        assert_eq!(
+            profile.resolve_model("opus").unwrap().canonical,
+            "claude-opus-4-8"
+        );
+        assert_eq!(
+            profile.resolve_model("sonnet").unwrap().canonical,
             "claude-sonnet-4-6"
         );
         assert_eq!(
-            profile.resolve_model("haiku").canonical,
+            profile.resolve_model("haiku").unwrap().canonical,
             "claude-haiku-4-5-20251001"
         );
     }

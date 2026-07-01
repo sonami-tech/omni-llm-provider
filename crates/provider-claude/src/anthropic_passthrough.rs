@@ -14,10 +14,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::fingerprint::{FingerprintProfile, RequestContext};
-use crate::models::ModelDef;
 use crate::translate::{
-    Message, MessagesRequest, SystemField, Thinking, Tool, ToolChoice, apply_profile_wire_defaults,
-    prepend_claude_code_identity,
+    Message, MessagesRequest, SystemField, Thinking, Tool, ToolChoice, finalize_claude_wire_request,
 };
 use crate::upstream::RawFrame;
 use crate::{ClaudeProvider, ProviderError, UpstreamError};
@@ -150,7 +148,10 @@ pub fn prepare_client_messages_request(
     let mut req =
         reconcile_client_request(&client, profile, replacements, inject_identity, stream)?;
     let outbound_model = req.model.clone();
-    let model_canonical = profile.resolve_model(&client.model).canonical.to_string();
+    let model_canonical = profile
+        .resolve_model(&client.model)
+        .map(|d| d.canonical.to_string())
+        .unwrap_or_else(|| client.model.clone());
     let body = serde_json::to_value(&mut req)
         .map_err(|e| ProviderError::Other(anyhow::Error::msg(format!("anth serialize: {e}"))))?;
 
@@ -180,7 +181,10 @@ pub fn prepare_count_tokens_request(
     let mut req = reconcile_client_request(&client, profile, replacements, false, false)?;
     req.stream = None;
     let outbound_model = req.model.clone();
-    let model_canonical = profile.resolve_model(&client.model).canonical.to_string();
+    let model_canonical = profile
+        .resolve_model(&client.model)
+        .map(|d| d.canonical.to_string())
+        .unwrap_or_else(|| client.model.clone());
     let mut body = serde_json::to_value(&mut req)
         .map_err(|e| ProviderError::Other(anyhow::Error::msg(format!("anth serialize: {e}"))))?;
     if let Some(obj) = body.as_object_mut() {
@@ -216,64 +220,29 @@ fn reconcile_client_request(
     stream: bool,
 ) -> Result<MessagesRequest, ProviderError> {
     let mut req = client.to_messages_request();
-    let model_def = resolve_strict_claude_model(&client.model, profile)?;
-    req.model = profile.outbound_model(&client.model, model_def);
-
-    apply_prompt_replacements(&mut req, replacements);
-    apply_native_wire_defaults(&mut req, profile, client.max_tokens.is_some());
-    enforce_thinking_budget(&mut req, model_def);
+    // Pure pass-through: resolve exact canonical/alias, otherwise forward the id
+    // raw (no strict-family reject). The shared forge tail applies the model id,
+    // this door's real prompt replacements, the thinking-budget bump, wire
+    // defaults, and identity - in that order.
+    let resolved = profile.resolve_model(&client.model);
+    finalize_claude_wire_request(
+        &mut req,
+        &client.model,
+        resolved,
+        profile,
+        replacements,
+        inject_identity,
+    );
+    // `stream` is owned by this door, not the tail: a native body that omitted
+    // stream must serialize `"stream": false`, not null. count_tokens clears it
+    // afterward.
     req.stream = Some(stream);
-    prepend_claude_code_identity(&mut req, profile, inject_identity);
     Ok(req)
 }
 
-fn resolve_strict_claude_model(
-    input: &str,
-    profile: &'static FingerprintProfile,
-) -> Result<&'static ModelDef, ProviderError> {
-    let model_def = profile.resolve_model(input);
-    let is_claude_family = input.starts_with("claude-")
-        || input.eq_ignore_ascii_case(model_def.cli_name)
-        || model_def
-            .aliases
-            .iter()
-            .any(|alias| alias.eq_ignore_ascii_case(input));
-    if !is_claude_family {
-        return Err(ProviderError::BadRequest(format!(
-            "model: {input} is not a recognized Anthropic model"
-        )));
-    }
-    Ok(model_def)
-}
-
-fn apply_native_wire_defaults(
-    req: &mut MessagesRequest,
-    profile: &FingerprintProfile,
-    client_set_max_tokens: bool,
-) {
-    if client_set_max_tokens {
-        let max_tokens = req.max_tokens;
-        apply_profile_wire_defaults(req, profile);
-        req.max_tokens = max_tokens;
-    } else {
-        apply_profile_wire_defaults(req, profile);
-    }
-}
-
-fn enforce_thinking_budget(req: &mut MessagesRequest, model_def: &ModelDef) {
-    if let Some(budget) = req
-        .thinking
-        .as_ref()
-        .filter(|thinking| thinking.kind == "enabled")
-        .and_then(|thinking| thinking.budget_tokens)
-        && req.max_tokens <= budget
-    {
-        let ceiling = model_def.max_tokens.min(u32::MAX as u64) as u32;
-        req.max_tokens = budget.saturating_add(1024).min(ceiling);
-    }
-}
-
-fn apply_prompt_replacements(req: &mut MessagesRequest, replacements: &Replacements) {
+// Shared with the forge tail in translate.rs (finalize_claude_wire_request):
+// Door 2 applies its prompt replacements through the tail, which calls this.
+pub(crate) fn apply_prompt_replacements(req: &mut MessagesRequest, replacements: &Replacements) {
     if replacements.is_empty() {
         return;
     }
@@ -728,11 +697,20 @@ mod tests {
     }
 
     #[test]
-    fn model_resolution_accepts_claude_aliases_and_rejects_non_claude() {
+    fn model_resolution_resolves_known_and_passes_through_the_rest() {
+        // WHY: /v1/messages is now pure pass-through. Exact canonical/alias
+        // resolve to the canonical; everything else (family long-forms, non-Claude
+        // ids) forwards RAW instead of being rewritten or rejected. The former
+        // strict-family reject is deliberately gone (owner-decided pass-through).
         for (input, expected) in [
+            // exact canonical -> canonical
             ("claude-opus-4-8", "claude-opus-4-8"),
-            ("claude-sonnet", "claude-sonnet-4-6"),
+            // short alias -> canonical
             ("sonnet", "claude-sonnet-4-6"),
+            // family long-form: NOT a catalog alias -> forwards raw
+            ("claude-sonnet", "claude-sonnet"),
+            // non-Claude id: no reject -> forwards raw (Anthropic will 400 it)
+            ("grok-4.3", "grok-4.3"),
         ] {
             let body = serde_json::json!({
                 "model": input,
@@ -742,53 +720,19 @@ mod tests {
             let client = parse_client(body);
             let req =
                 reconcile_client_request(&client, default_profile(), &empty_repl(), false, false)
-                    .expect("reconcile ok");
-            assert_eq!(req.model, expected);
+                    .expect("reconcile ok (pass-through never rejects on model)");
+            assert_eq!(req.model, expected, "input {input:?}");
         }
-
-        let body = serde_json::json!({
-            "model": "grok-4.3",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": "Say OK"}]
-        });
-        let err = reconcile_client_request(
-            &parse_client(body),
-            default_profile(),
-            &empty_repl(),
-            false,
-            false,
-        )
-        .expect_err("grok must not resolve through fallback");
-        assert!(err.to_string().contains("not a recognized Anthropic model"));
-        // Issue #3 regression guard: this is client-input validation and MUST be
-        // a BadRequest (-> 400), not an Upstream (-> 502 via classify_upstream).
-        assert!(
-            matches!(err, ProviderError::BadRequest(_)),
-            "unrecognized model is a client error (400), got {err:?}"
-        );
     }
 
     #[test]
     fn prepare_surfaces_client_validation_as_bad_request() {
-        // WHY (Rule 9 / issue #3): on /v1/messages, a malformed body and an
-        // unrecognized model are CLIENT faults. Before the error-type was unified
-        // these rode the prepare route's accidental 400; the fix types them as
-        // ProviderError::BadRequest so they stay 400 instead of regressing to 502.
-        let bad_model = serde_json::json!({
-            "model": "grok-4.3",
-            "max_tokens": 10,
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let err =
-            prepare_client_messages_request(bad_model, default_profile(), &empty_repl(), true)
-                .expect_err("unrecognized model must reject");
-        assert!(
-            matches!(err, ProviderError::BadRequest(_)),
-            "unrecognized model must be a client BadRequest, got {err:?}"
-        );
-
-        // A body that does not match the Anthropic request schema (max_tokens as a
-        // string) -> serde failure -> client BadRequest, not an upstream 502.
+        // WHY (Rule 9): a body that does not match the Anthropic request schema
+        // (max_tokens as a string) is a CLIENT fault -> serde failure -> it must
+        // stay a ProviderError::BadRequest (-> 400), not regress to an Upstream
+        // 502 via classify_upstream. This is the surviving half of issue #3's
+        // guard; the bare-unrecognized-model 400 was intentionally dropped when
+        // /v1/messages became pure pass-through (see the pass-through note below).
         let malformed = serde_json::json!({
             "model": "claude-sonnet-4-6",
             "max_tokens": "not-a-number",
@@ -801,6 +745,25 @@ mod tests {
             matches!(err, ProviderError::BadRequest(_)),
             "malformed body must be a client BadRequest, got {err:?}"
         );
+    }
+
+    #[test]
+    fn prepare_passes_through_unrecognized_model_without_local_reject() {
+        // WHY: dropping resolve_strict_claude_model means an unrecognized (non-
+        // Claude) model on /v1/messages is no longer 400'd locally; it forwards
+        // RAW to Anthropic (which returns its own 400). This is the deliberate
+        // pass-through decision (issue #3's bare-model guard removed on purpose).
+        let unknown_model = serde_json::json!({
+            "model": "grok-4.3",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let prepared =
+            prepare_client_messages_request(unknown_model, default_profile(), &empty_repl(), true)
+                .expect("pass-through must not reject an unrecognized model");
+        // Forwarded verbatim, not rewritten to a Claude canonical.
+        assert_eq!(prepared.outbound_model, "grok-4.3");
+        assert_eq!(prepared.requested_model, "grok-4.3");
     }
 
     #[test]
@@ -855,6 +818,61 @@ mod tests {
         )
         .expect("reconcile ok");
         assert!(req.max_tokens > 4096);
+    }
+
+    #[test]
+    fn door2_thinking_bump_converges_onto_door1_algorithm() {
+        // WHY (forge-tail unification, intended CHANGE): Door 2 now runs the
+        // thinking-budget bump BEFORE wire defaults (via the shared tail), same
+        // as Door 1. Previously Door 2 filled the wire default (32000) first, so a
+        // budget BELOW 32000 with an omitted max_tokens emitted 32000. Now it
+        // emits budget+1024 = 17408, converging onto Door 1's result. Both are
+        // valid (> budget). This test locks the convergence so a regression that
+        // reordered the tail (wire-defaults-first) would fail here.
+        let body = serde_json::json!({
+            "model": "sonnet",
+            "messages": [{"role": "user", "content": "Say OK"}],
+            "thinking": {"type": "enabled", "budget_tokens": 16384}
+        });
+        let req = reconcile_client_request(
+            &parse_client(body),
+            default_profile(),
+            &empty_repl(),
+            false,
+            false,
+        )
+        .expect("reconcile ok");
+        assert_eq!(
+            req.max_tokens, 17408,
+            "budget 16384 + omitted max_tokens must bump to budget+1024, not the wire default 32000"
+        );
+    }
+
+    #[test]
+    fn door2_prompt_replacements_apply_before_identity_suffix() {
+        // WHY (forge-tail unification): Door 2 passes its REAL replacements to the
+        // shared tail, which must apply them BEFORE identity injection so the
+        // billing suffix is computed over the REPLACED first-user text. If the tail
+        // dropped replacements or ran them after identity, the suffix would be
+        // computed over the original text and drift from the wire body.
+        let repl = Replacements::parse(
+            r#"rule = [{ scope = "prompt", search = "PLAIN", replace = "OK" }]"#,
+        )
+        .unwrap();
+        let body = serde_json::json!({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "PLAIN"}]
+        });
+        let client = parse_client(body);
+        let req = reconcile_client_request(&client, default_profile(), &repl, true, false)
+            .expect("reconcile ok");
+        // The first user message text was replaced PLAIN -> OK.
+        let texts = system_texts(&req);
+        // Billing header (texts[0]) must be computed over the REPLACED text "OK",
+        // not the original "PLAIN".
+        assert_eq!(texts[0], default_profile().billing_header_text("OK"));
+        assert_ne!(texts[0], default_profile().billing_header_text("PLAIN"));
     }
 
     #[test]

@@ -597,7 +597,7 @@ mod tests {
     #[test]
     fn resolve_via_profile_still_claude_specific() {
         let p = ClaudeProvider::new().unwrap();
-        let m = p.profile().resolve_model("sonnet");
+        let m = p.profile().resolve_model("sonnet").unwrap();
         assert_eq!(m.canonical, "claude-sonnet-4-6");
     }
 
@@ -938,25 +938,30 @@ mod tests {
     fn model_resolution_all_cases_via_provider_profile() {
         let p = ClaudeProvider::new().unwrap();
         let prof = p.profile();
-        // canonical
+        // canonical -> resolves
         assert_eq!(
-            prof.resolve_model("claude-sonnet-4-6").canonical,
+            prof.resolve_model("claude-sonnet-4-6").unwrap().canonical,
             "claude-sonnet-4-6"
         );
-        // alias
-        assert_eq!(prof.resolve_model("sonnet").canonical, "claude-sonnet-4-6");
-        // substring
+        // alias -> resolves
         assert_eq!(
-            prof.resolve_model("foo-sonnet-bar").canonical,
+            prof.resolve_model("sonnet").unwrap().canonical,
             "claude-sonnet-4-6"
         );
-        // cli
-        assert_eq!(prof.resolve_model("opus").canonical, "claude-opus-4-8");
-        // default
-        assert_eq!(prof.resolve_model("weird").canonical, "claude-opus-4-8");
-        // haiku dated
+        // substring -> NO LONGER resolves (matcher deleted): passes through raw
+        assert!(prof.resolve_model("foo-sonnet-bar").is_none());
+        // cli alias -> resolves
         assert_eq!(
-            prof.resolve_model("claude-haiku-4-5-20251001").canonical,
+            prof.resolve_model("opus").unwrap().canonical,
+            "claude-opus-4-8"
+        );
+        // unknown -> NO LONGER defaults: passes through raw
+        assert!(prof.resolve_model("weird").is_none());
+        // exact dated canonical -> resolves
+        assert_eq!(
+            prof.resolve_model("claude-haiku-4-5-20251001")
+                .unwrap()
+                .canonical,
             "claude-haiku-4-5-20251001"
         );
     }

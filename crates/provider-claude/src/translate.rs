@@ -23,6 +23,7 @@ use omni_core::{
     CanonicalTool, CanonicalToolCall, CanonicalToolChoice, CanonicalUsage,
 };
 
+use crate::anthropic_passthrough::apply_prompt_replacements;
 use crate::fingerprint::FingerprintProfile;
 use crate::models::ModelDef;
 // UpstreamError kept commented for future use in count_tokens etc; no current non-test refs.
@@ -261,7 +262,7 @@ pub struct Usage {
 /// resolved model_def for defaults. This is the Claude-specific path.
 pub fn build_messages_request_from_canonical(
     req: &CanonicalRequest,
-    model_def: &ModelDef,
+    model_def: Option<&ModelDef>,
     repl: &Replacements,
 ) -> Result<MessagesRequest, String> {
     // Apply prompt-scope replacements to the canonical texts (and tool surfaces).
@@ -368,26 +369,14 @@ pub fn build_messages_request_from_canonical(
     };
 
     // Leave max_tokens at the sentinel 0 when the client supplied neither an
-    // explicit value nor (below) a thinking budget. apply_profile_wire_defaults
-    // then fills the captured Claude Code wire value (64k/32k per model), which
-    // is what real Claude Code bodies carry. Using the catalog default here
-    // instead would deviate from the fingerprint baseline. See
-    // apply_profile_wire_defaults + FingerprintProfile::wire_defaults_for_model.
-    let mut max_tokens = req.max_tokens.unwrap_or(0);
+    // explicit value nor a thinking budget. The provider-level forge tail
+    // (finalize_claude_wire_request) runs the thinking-budget bump and then
+    // apply_profile_wire_defaults, so the sentinel must survive this build
+    // untouched. Filling a concrete value here would pre-empt the tail and
+    // deviate from the fingerprint baseline.
+    let max_tokens = req.max_tokens.unwrap_or(0);
 
-    let thinking = derive_thinking_from_canonical(req.reasoning.as_ref(), model_def);
-
-    if let Some(t) = thinking.as_ref()
-        && let Some(budget) = t.budget_tokens
-        && max_tokens <= budget
-    {
-        // Thinking is active: max_tokens must exceed the budget. This is a
-        // different request shape than a default reply, so we compute a concrete
-        // value here (non-zero, so the wire-default gate below leaves it alone).
-        max_tokens = budget
-            .saturating_add(1024)
-            .min(default_max_tokens(model_def));
-    }
+    let thinking = derive_thinking_from_canonical(req.reasoning.as_ref());
 
     let thinking_active = thinking
         .as_ref()
@@ -424,7 +413,13 @@ pub fn build_messages_request_from_canonical(
     };
 
     Ok(MessagesRequest {
-        model: model_def.canonical.to_string(),
+        // Known model -> its canonical id; unknown -> the raw requested model.
+        // In the provider path this is immediately overwritten by
+        // outbound_model (which re-decides verbatim-vs-canonical), so this only
+        // matters to the direct test callers of this builder.
+        model: model_def
+            .map(|d| d.canonical.to_string())
+            .unwrap_or_else(|| req.model.clone()),
         max_tokens,
         messages,
         system,
@@ -534,20 +529,13 @@ fn parse_tool_arguments(arguments: &str) -> Result<Value, String> {
     }
 }
 
-fn default_max_tokens(model_def: &ModelDef) -> u32 {
-    model_def.max_tokens.min(u32::MAX as u64) as u32
-}
-
-fn derive_thinking_from_canonical(
-    reasoning: Option<&CanonicalReasoning>,
-    model_def: &ModelDef,
-) -> Option<Thinking> {
+fn derive_thinking_from_canonical(reasoning: Option<&CanonicalReasoning>) -> Option<Thinking> {
     match reasoning {
         Some(CanonicalReasoning {
             effort: Some(e),
             budget_tokens,
         }) if !e.is_empty() => {
-            let budget = budget_tokens.or_else(|| Some(budget_for_effort(e, model_def)));
+            let budget = budget_tokens.or_else(|| Some(budget_for_effort(e)));
             Some(Thinking {
                 kind: "enabled".into(),
                 budget_tokens: budget,
@@ -557,7 +545,7 @@ fn derive_thinking_from_canonical(
     }
 }
 
-fn budget_for_effort(effort: &str, _model_def: &ModelDef) -> u32 {
+fn budget_for_effort(effort: &str) -> u32 {
     match effort {
         "low" => 1024,
         "medium" => 8192,
@@ -803,24 +791,86 @@ pub fn prepare_anthropic_request(
     repl: &Replacements,
     inject_identity: bool,
 ) -> Result<MessagesRequest, String> {
-    let model_def = profile.resolve_model(&canon.model);
-    let mut anth = build_messages_request_from_canonical(canon, model_def, repl)?;
-
-    // Emit the outbound model exactly as Claude Code would: an explicit version
-    // pin is forwarded verbatim, otherwise the profile canonical. This is part
-    // of the wire fingerprint (per-model betas key off this value upstream).
-    anth.model = profile.outbound_model(&canon.model, model_def);
-
-    // Apply the captured Claude Code wire defaults (max_tokens / temperature /
-    // output_config.effort) for any field the client did not specify, so a
-    // default-shaped request matches the real Claude Code body byte-for-byte on
-    // these fields rather than deviating. Must run BEFORE identity injection so
-    // the billing suffix is computed over the final body shape.
-    apply_profile_wire_defaults(&mut anth, profile);
-
-    // Important: identity uses the (post-repl) first user text for the suffix.
-    prepend_claude_code_identity(&mut anth, profile, inject_identity);
+    let resolved = profile.resolve_model(&canon.model);
+    // Door 1 applies prompt replacements during the canonical build (repl is
+    // threaded into build_messages_request_from_canonical), so the shared tail
+    // must NOT re-apply them or the billing suffix would be computed over
+    // double-replaced text. Pass an empty Replacements to the tail.
+    let mut anth = build_messages_request_from_canonical(canon, resolved, repl)?;
+    finalize_claude_wire_request(
+        &mut anth,
+        &canon.model,
+        resolved,
+        profile,
+        &Replacements::empty(),
+        inject_identity,
+    );
     Ok(anth)
+}
+
+/// The single provider-level "forge tail" shared by both Claude-bound doors
+/// (OpenAI->Anthropic translate and native /v1/messages). It finalizes an
+/// already-built MessagesRequest into the exact outbound wire shape.
+///
+/// Ordering is load-bearing and MUST NOT be reordered:
+/// 1. outbound model id (verbatim pin vs profile canonical)
+/// 2. prompt replacements (before identity, so the billing suffix sees final text)
+/// 3. thinking-budget bump (before wire defaults, so it sees the sentinel 0)
+/// 4. wire defaults (fills only still-unset fields)
+/// 5. identity injection (LAST: the billing suffix is computed over the final body)
+///
+/// `stream` is intentionally NOT handled here; each door owns it (a native
+/// request forces `stream: false` when omitted, which the tail must not clobber).
+pub fn finalize_claude_wire_request(
+    req: &mut MessagesRequest,
+    input: &str,
+    resolved: Option<&ModelDef>,
+    profile: &FingerprintProfile,
+    replacements: &Replacements,
+    inject_identity: bool,
+) {
+    // 1. Emit the outbound model exactly as Claude Code would: an explicit
+    // version pin is forwarded verbatim, an alias/canonical maps to the profile
+    // canonical, and a truly unknown id passes through raw. Part of the wire
+    // fingerprint (per-model betas key off this value upstream).
+    req.model = match resolved {
+        Some(def) => profile.outbound_model(input, def),
+        None => input.to_string(),
+    };
+
+    // 2. Prompt-scope replacements. Door 1 passes an empty set (it already
+    // applied them in the build); Door 2 passes its real replacements here.
+    apply_prompt_replacements(req, replacements);
+
+    // 3. Thinking-budget bump. Runs against the CURRENT max_tokens (still the
+    // sentinel 0 when the client omitted it) so it must precede wire defaults.
+    // Ceiling = catalog max_tokens for a known model (unchanged from today);
+    // a fixed 64k for an unknown model. Effort-derived budgets top out at 32768
+    // (< 64000), so this can only produce an invalid (<=budget) result when a
+    // native client supplies an explicit budget >= ceiling (pre-existing).
+    if let Some(budget) = req
+        .thinking
+        .as_ref()
+        .filter(|t| t.kind == "enabled")
+        .and_then(|t| t.budget_tokens)
+        && req.max_tokens <= budget
+    {
+        let ceiling = resolved
+            .map(|d| d.max_tokens.min(u32::MAX as u64) as u32)
+            .unwrap_or(64_000);
+        req.max_tokens = budget.saturating_add(1024).min(ceiling);
+    }
+
+    // 4. Fill the captured Claude Code wire defaults for any field the client
+    // left unset (max_tokens sentinel 0, temperature None, output_config None).
+    // Step 3 already wrote a non-zero max_tokens when thinking is active, so
+    // this leaves that alone. NOTE: this is NOT a no-op wrapper - it also
+    // re-defaults an explicit max_tokens:0, intentionally.
+    apply_profile_wire_defaults(req, profile);
+
+    // 5. Identity LAST: the billing suffix is computed over the final body and
+    // uses the (post-replacement) first user text.
+    prepend_claude_code_identity(req, profile, inject_identity);
 }
 
 /// Fill the fingerprint wire defaults for any field the client left unset, so a
@@ -1300,6 +1350,47 @@ mod tests {
             anth.output_config.as_ref().map(|o| o.effort.as_str()),
             Some("high")
         );
+    }
+
+    #[test]
+    fn door1_thinking_budget_bump_locks_effort_derived_max_tokens() {
+        // WHY (forge-tail unification): the thinking-budget bump was moved out of
+        // build_messages_request_from_canonical into the shared forge tail, and it
+        // MUST run BEFORE apply_profile_wire_defaults so it still sees the sentinel
+        // 0 and reproduces today's Door-1 result. The ceiling stays the CATALOG max
+        // (64000), NOT the wire-default 32000 - using 32000 would (a) silently
+        // change the high-effort result 17408->32000 and (b) emit an INVALID
+        // request at max effort (32000 <= 32768 budget). These exact values lock
+        // both: high -> budget+1024=17408; max -> 32768+1024=33792 (> budget).
+        let profile = crate::fingerprint::default_profile();
+        let repl = empty_repl();
+        for (effort, expected_max) in [("high", 17408u32), ("max", 33792u32)] {
+            let canon = CanonicalRequest {
+                model: "sonnet".into(),
+                messages: vec![CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Text("hi".into()),
+                }],
+                reasoning: Some(CanonicalReasoning {
+                    effort: Some(effort.into()),
+                    budget_tokens: None,
+                }),
+                ..Default::default()
+            };
+            let anth = prepare_anthropic_request(&canon, profile, &repl, false).unwrap();
+            assert_eq!(
+                anth.max_tokens, expected_max,
+                "sonnet effort={effort}: max_tokens must be budget+1024 under the catalog ceiling"
+            );
+            // Sanity: max_tokens must strictly exceed the thinking budget, else
+            // Anthropic rejects the request.
+            let budget = anth.thinking.as_ref().unwrap().budget_tokens.unwrap();
+            assert!(
+                anth.max_tokens > budget,
+                "max_tokens {} must exceed thinking budget {budget}",
+                anth.max_tokens
+            );
+        }
     }
 
     #[test]

@@ -219,10 +219,6 @@ struct ProviderEntry {
 #[derive(Clone, Debug, Default)]
 struct ModelCatalog {
     aliases: HashMap<String, String>,
-    /// Claude profile catalog for substring/family resolution that a static
-    /// alias map can't express (e.g. `claude-opus-4-6` -> `claude-opus-4-8`).
-    /// `None` for non-Claude providers.
-    claude_models: Option<&'static [provider_claude::models::ModelDef]>,
 }
 
 #[derive(Clone)]
@@ -747,7 +743,6 @@ fn claude_model_catalog(profile: &provider_claude::FingerprintProfile) -> ModelC
     for model in profile.model_wire_overrides {
         catalog.insert(model.model, model.model);
     }
-    catalog.claude_models = Some(profile.models);
     catalog
 }
 
@@ -781,14 +776,7 @@ impl ModelCatalog {
     }
 
     fn resolve(&self, model: &str) -> Option<&str> {
-        if let Some(canonical) = self.aliases.get(model) {
-            return Some(canonical.as_str());
-        }
-        // Claude family aliases (e.g. `claude-opus-4-6`) aren't in the static
-        // alias map but resolve via the provider's substring matcher. Normalize
-        // only on a real match; unknown input is left for the caller to pass raw.
-        self.claude_models
-            .and_then(|models| provider_claude::models::canonical_if_known(model, models))
+        self.aliases.get(model).map(String::as_str)
     }
 }
 
@@ -796,7 +784,7 @@ fn format_aliases_for_log(providers: &HashMap<String, ProviderEntry>) -> Option<
     let catalogs = provider_catalogs(providers);
     let mut pairs = Vec::new();
     for alias in [
-        "sonnet", "opus", "haiku", "fable", "grok", "composer", "codex", "gpt",
+        "sonnet", "opus", "haiku", "fable", "grok", "composer", "build", "gpt",
     ] {
         let matches = model_matches(alias, &catalogs);
         if matches.len() == 1 {
@@ -853,7 +841,7 @@ fn startup_summary_lines(
         format!("try: curl http://{addr}/health"),
         format!("models endpoint: curl http://{addr}/v1/models"),
         format!("stats endpoint: curl http://{addr}/stats"),
-        "completions example: model=grok, codex, or claude-sonnet-4-6".to_string(),
+        "completions example: model=grok, gpt, or claude-sonnet-4-6".to_string(),
     ]
 }
 
@@ -975,6 +963,25 @@ fn resolve_provider_and_model(
                 model
             ));
         }
+    }
+
+    // Route an unknown id by its leading token. Every real model id across all
+    // provider catalogs (current and historic) starts with claude/grok/gpt, so
+    // the prefix IS the routing key - no custom `provider:` prefix needed. The
+    // model forwards verbatim (pass-through); resolution never rewrites it.
+    // Case-sensitive: all real ids are lowercase. Only routes if that provider
+    // is enabled, otherwise falls through to the errors below.
+    let token = model.split('-').next().unwrap_or("");
+    let provider_for_token = match token {
+        "claude" => Some("claude"),
+        "grok" => Some("grok"),
+        "gpt" => Some("codex"),
+        _ => None,
+    };
+    if let Some(provider) = provider_for_token
+        && catalogs.contains_key(provider)
+    {
+        return Ok((provider.to_string(), model.to_string()));
     }
 
     if catalogs.len() == 1
@@ -2031,16 +2038,16 @@ mod tests {
     #[test]
     fn test_resolve_prefix_claude() {
         let catalogs = catalogs_claude_grok();
-        // A dated id containing a cli_name substring (`sonnet`) resolves to the
-        // canonical model it actually routes to upstream, so echo/stats match the
-        // wire. (Claude's substring matcher already sends this to claude-sonnet-4-6.)
+        // WHY (pass-through): the substring matcher is deleted. A dated id that is
+        // not an exact catalog canonical/alias (`claude-3-5-sonnet-20241022`) is no
+        // longer rewritten to claude-sonnet-4-6; the explicit provider prefix pins
+        // it to claude and forwards the model RAW so echo/stats match the wire.
         let (k, m) =
             resolve_provider_and_model("CLAUDE:claude-3-5-sonnet-20241022", &catalogs).unwrap();
         assert_eq!(k, "claude");
-        assert_eq!(m, "claude-sonnet-4-6");
+        assert_eq!(m, "claude-3-5-sonnet-20241022");
 
-        // A model id matching no family substring is left raw (Codex's guard:
-        // unknown input is not silently rewritten to the profile default).
+        // A model id matching no alias is likewise left raw.
         let (k, m) = resolve_provider_and_model("CLAUDE:claude-2.1", &catalogs).unwrap();
         assert_eq!(k, "claude");
         assert_eq!(m, "claude-2.1");
@@ -2059,6 +2066,60 @@ mod tests {
         let catalogs = catalogs_claude_grok();
         let err = resolve_provider_and_model("bare-model", &catalogs).unwrap_err();
         assert!(err.contains("unknown model"));
+    }
+
+    #[test]
+    fn test_token_routing_sends_unknown_id_to_its_provider_raw() {
+        // WHY (id-token routing): every real model id starts with claude/grok/gpt,
+        // so an unknown id's leading token IS its routing key. In a multi-provider
+        // catalog an unmatched id must route to the provider its token names and
+        // forward RAW (pass-through), not error and not get rewritten. This is what
+        // lets a NEW pinned id (e.g. claude-sonnet-5, a future grok) work before we
+        // add a catalog entry, and is the fix for the silent-remap bug's sibling:
+        // OpenAI-door requests for unknown ids now have a defined destination.
+        let catalogs = catalogs_claude_grok_codex();
+        for (input, provider) in [
+            ("claude-sonnet-5", "claude"),
+            ("claude-future-9", "claude"),
+            ("grok-9-future", "grok"),
+            ("gpt-9-future", "codex"),
+        ] {
+            let (k, m) = resolve_provider_and_model(input, &catalogs).unwrap();
+            assert_eq!(
+                (k.as_str(), m.as_str()),
+                (provider, input),
+                "{input} must route to {provider} and forward raw"
+            );
+        }
+    }
+
+    #[test]
+    fn test_token_routing_requires_the_provider_enabled() {
+        // WHY (P4): token routing only fires for an ENABLED provider. With codex
+        // disabled but >1 provider still enabled (so the single-provider fallback
+        // does NOT catch it), a `gpt-`prefixed id has no destination and must 4xx.
+        // Written in a multi-provider catalog on purpose: in single-provider mode
+        // the fallback would route it to the sole provider instead of erroring.
+        let catalogs = catalogs_claude_grok(); // codex intentionally absent
+        assert!(!catalogs.contains_key("codex"));
+        let err = resolve_provider_and_model("gpt-9-future", &catalogs).unwrap_err();
+        assert!(
+            err.contains("unknown model"),
+            "gpt-* with codex disabled must be unroutable: {err}"
+        );
+    }
+
+    #[test]
+    fn test_unroutable_non_token_id_errors() {
+        // WHY: an id whose leading token is none of claude/grok/gpt (e.g. a
+        // mistral id) has no routing key and no single-provider fallback in a
+        // multi-provider catalog -> it must 4xx with guidance to use a prefix.
+        let catalogs = catalogs_claude_grok_codex();
+        let err = resolve_provider_and_model("mistral-large", &catalogs).unwrap_err();
+        assert!(
+            err.contains("unknown model") || err.contains("provider prefix"),
+            "unroutable id must error: {err}"
+        );
     }
 
     #[test]
@@ -2088,9 +2149,15 @@ mod tests {
         let (k, m) = resolve_provider_and_model("composer", &catalogs).unwrap();
         assert_eq!((k.as_str(), m.as_str()), ("grok", "grok-composer-2.5-fast"));
 
-        let (k, m) = resolve_provider_and_model("codex", &catalogs).unwrap();
-        assert_eq!(k.as_str(), "codex");
-        assert!(!m.is_empty());
+        // WHY (Step 0 prune): the bare `codex` alias was removed. In a
+        // multi-provider catalog it no longer matches any alias, and its leading
+        // token `codex` is not a routing token (claude/grok/gpt), so it is now
+        // unroutable -> error. Callers use `gpt` (below) or `codex:<model>`.
+        let err = resolve_provider_and_model("codex", &catalogs).unwrap_err();
+        assert!(
+            err.contains("unknown model"),
+            "bare codex must be unroutable: {err}"
+        );
 
         let (k, m) = resolve_provider_and_model("gpt", &catalogs).unwrap();
         assert_eq!(k.as_str(), "codex");
@@ -2098,31 +2165,30 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_family_aliases_normalize_to_canonical() {
-        // Family aliases (dropped from the static catalog in 2.1.154+) resolve
-        // upstream via Claude's substring matcher. They MUST also normalize here
-        // so the echoed `model` and the stats/billing key are the canonical id,
-        // not the raw alias. Otherwise one physical model fragments across
-        // buckets (e.g. claude-opus-4-6 mis-attributing spend to a retired id).
+    fn test_claude_family_longforms_pass_through_raw() {
+        // WHY (Rule 9; reverses commit e407bdb, owner-decided): family long-forms
+        // (`claude-opus`, `claude-sonnet`, `claude-haiku`) and the retired dated id
+        // `claude-opus-4-6` are NOT catalog aliases; they resolved only via the
+        // now-deleted substring matcher. Under pure pass-through they forward RAW
+        // (Anthropic will 400 the long-forms). Stats/billing therefore bucket under
+        // the raw wire id - the intentional consequence of pass-through, not the
+        // prior canonicalizing behavior.
         let catalogs = catalogs_claude_grok_codex();
-        for (input, expected) in [
-            ("claude:claude-opus", "claude-opus-4-8"),
-            ("claude:claude-opus-4-6", "claude-opus-4-8"),
-            ("claude:claude-sonnet", "claude-sonnet-4-6"),
-            ("claude:claude-haiku", "claude-haiku-4-5-20251001"),
+        for input in [
+            "claude:claude-opus",
+            "claude:claude-opus-4-6",
+            "claude:claude-sonnet",
+            "claude:claude-haiku",
+            "claude:totally-unknown-zzz",
         ] {
+            let stripped = input.strip_prefix("claude:").unwrap();
             let (k, m) = resolve_provider_and_model(input, &catalogs).unwrap();
             assert_eq!(
                 (k.as_str(), m.as_str()),
-                ("claude", expected),
-                "{input} should normalize to {expected}"
+                ("claude", stripped),
+                "{input} must forward raw (no substring normalization)"
             );
         }
-
-        // Codex's guard: an unrecognized model must NOT be silently rewritten to
-        // the profile default. It stays raw so attribution isn't misdirected.
-        let (k, m) = resolve_provider_and_model("claude:totally-unknown-zzz", &catalogs).unwrap();
-        assert_eq!((k.as_str(), m.as_str()), ("claude", "totally-unknown-zzz"));
     }
 
     #[test]
@@ -2140,7 +2206,7 @@ mod tests {
             "fable=claude-fable-5",
             "grok=grok-4.3",
             "composer=grok-composer-2.5-fast",
-            "codex=",
+            "build=grok-build",
             "gpt=",
         ] {
             assert!(
@@ -2148,6 +2214,11 @@ mod tests {
                 "startup alias log missing {expected}: {text}"
             );
         }
+        // WHY (Step 0 prune): the retired `codex` alias must no longer appear.
+        assert!(
+            !text.contains("codex="),
+            "startup alias log must not advertise the pruned codex alias: {text}"
+        );
     }
 
     #[test]
