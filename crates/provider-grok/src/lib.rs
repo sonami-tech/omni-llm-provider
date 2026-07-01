@@ -87,15 +87,16 @@ const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
 const CONSERVATIVE_BASE_URL: &str = "https://cli-chat-proxy.grok.com";
 
 /// User-Agent template for conservative-mode requests. `{version}` is filled from
-/// the pinned catalog version (`self.version.version`, e.g. "0.2.60") so the UA
+/// the pinned catalog version (`self.version.version`, e.g. "0.2.77") so the UA
 /// and `x-grok-client-version` cannot drift from the catalog the request claims.
-/// Verified live against grok-shell 0.2.60 (2026-06-23).
+/// Verified live against grok-shell 0.2.77 (2026-07-01; first captured 0.2.60 on
+/// 2026-06-23, wire unchanged across the bump).
 const CONSERVATIVE_USER_AGENT_TEMPLATE: &str = "grok-shell/{version} (linux; x86_64)";
 
 // Grok catalogs, verified 2026-06-22 via live capture (see
 // docs/providers/grok/README.md and the grok-codex-live-catalog-probe memory).
 //
-// CONSERVATIVE = what the installed grok-shell 0.2.60 CLI advertises on its own
+// CONSERVATIVE = what the installed grok-shell CLI advertises on its own
 // surface (cli-chat-proxy.grok.com /v1/models): exactly these two. Byte-exact CLI
 // protocol parity for this list lands in Phase 2.
 //
@@ -104,12 +105,22 @@ const CONSERVATIVE_USER_AGENT_TEMPLATE: &str = "grok-shell/{version} (linux; x86
 // verified union of api.x.ai advertised+chat-OK ids and ids that returned 200 on
 // chat/completions but are not advertised (work-but-unlisted). Aliases are
 // inbound-only conveniences (never emitted from /v1/models).
-const GROK_CONSERVATIVE_0_2_60: &[CatalogModel] = &[
+//
+// Version bumped to 0.2.77 on 2026-07-01. The conservative /v1/responses wire was
+// re-captured live from grok-shell 0.2.77 against cli-chat-proxy.grok.com: header
+// names+values, body key shape, and SSE events are unchanged from 0.2.60 (only
+// x-grok-client-version and the user-agent version moved), and the conservative
+// catalog below still matches the two models the CLI exercised. The multi-turn
+// capture also carried an x-grok-turn-idx header; like x-grok-conv-id it is
+// turn-tracking state that is empty/absent on Omni's single-shot request, so it
+// stays intentionally omitted alongside the other session headers. The extended
+// api.x.ai catalog is CLI-version-independent and was not re-probed this cycle.
+const GROK_CONSERVATIVE_0_2_77: &[CatalogModel] = &[
     CatalogModel::new("grok-build", &["build"]),
     CatalogModel::new("grok-composer-2.5-fast", &["composer"]),
 ];
 
-const GROK_EXTENDED_0_2_60: &[CatalogModel] = &[
+const GROK_EXTENDED_0_2_77: &[CatalogModel] = &[
     CatalogModel::new("grok-4.3", &["grok"]),
     CatalogModel::new("grok-build-0.1", &[]),
     CatalogModel::new("grok-4.20-0309-reasoning", &[]),
@@ -124,9 +135,9 @@ const GROK_EXTENDED_0_2_60: &[CatalogModel] = &[
 /// Grok version catalog, newest-first. The version string is the installed
 /// grok-shell CLI version this catalog was verified against.
 static GROK_VERSIONS: &[ProviderVersion] = &[ProviderVersion {
-    version: "0.2.60",
-    conservative: GROK_CONSERVATIVE_0_2_60,
-    extended: GROK_EXTENDED_0_2_60,
+    version: "0.2.77",
+    conservative: GROK_CONSERVATIVE_0_2_77,
+    extended: GROK_EXTENDED_0_2_77,
     default_model: "grok-4.3",
 }];
 
@@ -564,11 +575,11 @@ impl GrokProvider {
         Ok(creds)
     }
 
-    /// Build the conservative (grok-shell 0.2.60) request headers for
+    /// Build the conservative (grok-shell 0.2.77) request headers for
     /// `cli-chat-proxy.grok.com /v1/responses`.
     ///
     /// Header NAMES + VALUES are the fingerprint surface; order does not matter
-    /// (reqwest sets them). The 0.2.60 version string and the UA are both derived
+    /// (reqwest sets them). The 0.2.77 version string and the UA are both derived
     /// from `self.version.version`, so they cannot drift from the catalog the
     /// request claims.
     ///
@@ -1198,7 +1209,7 @@ fn to_xai_chat_stream_request(
 // --- Conservative mode (grok-shell CLI parity): OpenAI Responses request body ----------------
 //
 // In conservative mode Grok talks the OpenAI *Responses* wire to
-// cli-chat-proxy.grok.com (verified live against grok-shell 0.2.60). The HEADERS
+// cli-chat-proxy.grok.com (verified live against grok-shell 0.2.77). The HEADERS
 // are the fingerprint surface (see `conservative_headers`); the BODY only needs a
 // valid Responses shape carrying the USER's request, NOT a byte-replay of the
 // CLI's private content/tools. So this builder is deliberately minimal and
@@ -2044,7 +2055,7 @@ mod tests {
             provider_extras: Some(json!({"service_tier": "priority"})),
         };
 
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         assert_eq!(body["model"], "grok-4.3");
         assert_eq!(body["messages"].as_array().unwrap().len(), 2);
         assert_eq!(body["max_completion_tokens"], 128);
@@ -2082,7 +2093,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         assert_eq!(body["model"], "grok-composer-2.5-fast");
     }
 
@@ -2379,7 +2390,7 @@ mod tests {
             provider_extras: None,
         };
 
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "get_weather");
@@ -2419,7 +2430,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         let messages = body["messages"].as_array().unwrap();
 
         // The assistant message keeps its Text sibling as `content` AND carries
@@ -2474,7 +2485,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         let messages = body["messages"].as_array().unwrap();
         let asst_idx = messages.iter().position(|m| m["role"] == "assistant");
         let tool_idx = messages.iter().position(|m| m["role"] == "tool");
@@ -2502,7 +2513,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         let messages = body["messages"].as_array().unwrap();
         let assistant = messages
             .iter()
@@ -2618,7 +2629,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &repl, GROK_EXTENDED_0_2_60).unwrap();
+        let body = to_xai_chat_request(&req, &repl, GROK_EXTENDED_0_2_77).unwrap();
         let msg0 = &body["messages"][0];
         assert_eq!(msg0["content"], "tell REDACTED");
     }
@@ -2648,7 +2659,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "look");
@@ -2682,7 +2693,7 @@ mod tests {
             metadata: Default::default(),
             provider_extras: Some(serde_json::json!({"service_tier": "standard"})),
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         assert_eq!(body["model"], "grok-4.3");
         assert!(body.get("tools").is_some());
         assert_eq!(body["tool_choice"], "auto");
@@ -2905,7 +2916,7 @@ mod tests {
         let mut r = base.clone();
         r.temperature = Some(0.2);
         r.max_tokens = Some(64);
-        let b = to_xai_chat_request(&r, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let b = to_xai_chat_request(&r, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         let t = b["temperature"].as_f64().unwrap();
         assert!((t - 0.2).abs() < 1e-6, "temp float json: {}", t);
         assert_eq!(b["max_completion_tokens"], 64);
@@ -2913,7 +2924,7 @@ mod tests {
         // top_p only
         let mut r = base.clone();
         r.top_p = Some(0.95);
-        let b = to_xai_chat_request(&r, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let b = to_xai_chat_request(&r, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         let tp = b["top_p"].as_f64().unwrap();
         assert!((tp - 0.95).abs() < 1e-6, "top_p float json approx: {}", tp);
 
@@ -2923,7 +2934,7 @@ mod tests {
             effort: Some("low".into()),
             budget_tokens: Some(50),
         });
-        let b = to_xai_chat_request(&r, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let b = to_xai_chat_request(&r, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         assert_eq!(b["reasoning_effort"], "low");
 
         // all together
@@ -2936,7 +2947,7 @@ mod tests {
             budget_tokens: None,
         });
         r.provider_extras = Some(json!({"service_tier": "priority"}));
-        let b = to_xai_chat_request(&r, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let b = to_xai_chat_request(&r, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         assert_eq!(b["temperature"], 1.0);
         assert_eq!(b["max_completion_tokens"], 10);
         assert_eq!(b["reasoning_effort"], "high");
@@ -2961,7 +2972,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         assert_eq!(body["parallel_tool_calls"], true);
         assert_eq!(body["response_format"]["type"], "json_object");
         assert_eq!(body["seed"], 42);
@@ -2983,7 +2994,7 @@ mod tests {
             provider_extras: Some(json!({"user": "u123"})),
             ..Default::default()
         };
-        let err = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60)
+        let err = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_77)
             .expect_err("gateway user must reject as provider extra");
         assert!(
             err.to_string().contains("user"),
@@ -3010,7 +3021,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let err = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60)
+        let err = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_77)
             .expect_err("unsupported Responses extras must reject");
         let msg = err.to_string();
         assert!(
@@ -3033,7 +3044,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         assert!(body.get("input").is_none(), "no responses 'input' shape");
         assert!(body.get("messages").is_some());
         assert_eq!(body["stream"], false);
@@ -3061,7 +3072,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         // extras "tools" wins (last write)
         let tools = &body["tools"];
         assert!(tools.is_array());
@@ -3085,7 +3096,7 @@ mod tests {
             tool_choice: Some(CanonicalToolChoice::Required),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         assert_eq!(body["tool_choice"], "required");
     }
 
@@ -3111,7 +3122,7 @@ mod tests {
             }]),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &repl, GROK_EXTENDED_0_2_60).unwrap();
+        let body = to_xai_chat_request(&req, &repl, GROK_EXTENDED_0_2_77).unwrap();
         assert_eq!(body["messages"][0]["content"], "tell REDACTED");
         // desc gets prompt apply (name currently does not per mapper)
         assert_eq!(
@@ -3611,7 +3622,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         assert_eq!(body["tools"][0]["function"]["name"], "adder");
         assert_eq!(body["tool_choice"]["function"]["name"], "adder");
 
@@ -3653,7 +3664,7 @@ mod tests {
         // SSE parser test). Pin the builder flags here so the non-stream tool path
         // above and the stream path stay distinct.
         let stream_body =
-            to_xai_chat_stream_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+            to_xai_chat_stream_request(&req, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         assert_eq!(stream_body["stream"], true);
         assert_eq!(stream_body["stream_options"]["include_usage"], true);
         assert_eq!(body["stream"], false);
@@ -3836,12 +3847,12 @@ mod tests {
             ..Default::default()
         };
         let stream_body =
-            to_xai_chat_stream_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+            to_xai_chat_stream_request(&req, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         assert_eq!(stream_body["stream"], true);
         assert_eq!(stream_body["stream_options"]["include_usage"], true);
 
         // The non-stream builder is unchanged: still stream: false, no stream_options.
-        let plain_body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_60).unwrap();
+        let plain_body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_77).unwrap();
         assert_eq!(plain_body["stream"], false);
         assert!(plain_body.get("stream_options").is_none());
     }
@@ -4457,7 +4468,7 @@ mod tests {
     #[test]
     fn version_pin_is_exact_or_fails() {
         // Exact known version pins.
-        let p = GrokProvider::new(None).unwrap().with_version("0.2.60");
+        let p = GrokProvider::new(None).unwrap().with_version("0.2.77");
         assert!(p.is_ok());
         // Unknown version is a hard error (exact-or-fail), not a silent newest.
         let err = GrokProvider::new(None).unwrap().with_version("0.0.1");
@@ -4475,7 +4486,7 @@ mod tests {
         }
     }
 
-    // ── Conservative mode (grok-shell 0.2.60 CLI parity) ──────────────────────
+    // ── Conservative mode (grok-shell 0.2.77 CLI parity) ──────────────────────
     //
     // WHY this block exists: conservative mode is a SECOND transport mimicking the
     // installed grok-shell CLI wire to cli-chat-proxy.grok.com /v1/responses
@@ -4520,7 +4531,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let body = to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_60, false).unwrap();
+        let body = to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_77, false).unwrap();
 
         // No Codex-only / CLI-preference keys.
         assert!(
@@ -4578,7 +4589,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let body = to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_60, true).unwrap();
+        let body = to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_77, true).unwrap();
 
         assert_eq!(body["stream"], true);
         let tools = body["tools"].as_array().expect("tools is an array");
@@ -4617,7 +4628,7 @@ mod tests {
             tool_choice: Some(CanonicalToolChoice::Auto),
             ..Default::default()
         };
-        let body = to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_60, false).unwrap();
+        let body = to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_77, false).unwrap();
         assert!(
             body.get("tool_choice").is_none(),
             "tool_choice must be omitted when there are no tools (endpoint rejects it)"
@@ -4656,7 +4667,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let body = to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_60, false).unwrap();
+        let body = to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_77, false).unwrap();
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0]["type"], "function_call");
         assert_eq!(input[0]["call_id"], "call_1");
@@ -4711,7 +4722,7 @@ mod tests {
         // version/identifier, UA derived from the pinned version, model-override,
         // authenticate-response, Bearer, and x-grok-user-id when creds provide it)
         // and the /v1/responses path. A drift in any of these breaks fingerprint
-        // parity with grok-shell 0.2.60. No real credentials: a fake JWT + fake
+        // parity with grok-shell 0.2.77. No real credentials: a fake JWT + fake
         // uuid are injected via the test constructor.
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4759,14 +4770,14 @@ mod tests {
             val("x-authenticateresponse").as_deref(),
             Some("authenticate-response")
         );
-        assert_eq!(val("x-grok-client-version").as_deref(), Some("0.2.60"));
+        assert_eq!(val("x-grok-client-version").as_deref(), Some("0.2.77"));
         assert_eq!(
             val("x-grok-client-identifier").as_deref(),
             Some("grok-shell")
         );
         assert_eq!(
             val("user-agent").as_deref(),
-            Some("grok-shell/0.2.60 (linux; x86_64)"),
+            Some("grok-shell/0.2.77 (linux; x86_64)"),
             "UA must be derived from the pinned catalog version"
         );
         assert_eq!(val("x-grok-model-override").as_deref(), Some("grok-build"));
