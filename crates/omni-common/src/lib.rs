@@ -10,6 +10,7 @@ pub mod replacements;
 pub mod responses;
 pub mod responses_upstream;
 pub mod session;
+pub mod span_stream;
 pub mod stats;
 #[cfg(feature = "test-support")]
 pub mod test_support;

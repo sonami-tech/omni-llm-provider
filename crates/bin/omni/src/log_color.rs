@@ -207,10 +207,11 @@ fn is_log_metadata_field(name: &str) -> bool {
 }
 
 /// Escape the control characters an attacker could use for terminal injection,
-/// rendering them as visible `\xNN` / `\u{..}` sequences. Byte-for-byte matches
-/// `tracing_subscriber`'s internal `EscapeGuard` (its `escape.rs`): C0 controls
-/// used in escape sequences (ESC/BEL/BS/FF/DEL) plus the C1 range (0x80-0x9f).
-/// Ordinary text (including normal whitespace like `\n`/`\t`) is untouched.
+/// rendering them as visible `\xNN` / `\u{..}` sequences. Covers everything
+/// `tracing_subscriber`'s internal `EscapeGuard` does -- C0 controls used in
+/// escape sequences (ESC/BEL/BS/FF/DEL) plus the C1 range (0x80-0x9f) -- and
+/// additionally escapes `\r`, which upstream leaves alone. Ordinary text,
+/// including `\n` and `\t`, is untouched.
 fn sanitize_ansi(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -219,6 +220,12 @@ fn sanitize_ansi(input: &str) -> String {
             '\x07' => out.push_str("\\x07"),
             '\x08' => out.push_str("\\x08"),
             '\x0c' => out.push_str("\\x0c"),
+            // Carriage return moves the cursor to column 0, letting a logged value
+            // overwrite text already printed on the line (log spoofing). Escaping
+            // it exceeds upstream EscapeGuard; it is part of the deliberate
+            // stronger-than-upstream sanitization. `\n` is left alone -- it is
+            // legitimate in multi-line values and cannot rewrite prior output.
+            '\r' => out.push_str("\\r"),
             '\x7f' => out.push_str("\\x7f"),
             ch if (ch as u32) >= 0x80 && (ch as u32) <= 0x9f => {
                 let _ = write!(out, "\\u{{{:x}}}", ch as u32);
@@ -558,8 +565,9 @@ mod tests {
         struct Evil;
         impl std::fmt::Display for Evil {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                // Raw CSI that Display emits verbatim (no self-escaping).
-                write!(f, "boom\x1b[2Jclear")
+                // Raw CSI + a carriage return, both emitted verbatim by Display
+                // (no self-escaping). `\r` alone can overwrite the log line.
+                write!(f, "boom\x1b[2Jclear\rSPOOF")
             }
         }
         for mode in [ColorMode::Off, ColorMode::On] {
@@ -575,11 +583,21 @@ mod tests {
             let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
             // The Display ESC must be escaped to text and must NOT survive raw
             // (after removing the formatter's own SGR, which never wraps `error`).
-            assert!(out.contains("\\x1b"), "{mode:?}: not sanitized: {out:?}");
+            // Both the ESC and the CR must be escaped to visible text.
+            assert!(
+                out.contains("\\x1b"),
+                "{mode:?}: ESC not sanitized: {out:?}"
+            );
+            assert!(out.contains("\\r"), "{mode:?}: CR not sanitized: {out:?}");
             let residual = strip_formatter_sgr(&out);
+            // No raw ESC and no raw CR from the value may survive.
             assert!(
                 !residual.contains('\u{1b}'),
                 "{mode:?}: raw ESC from a %-Display value survived: {residual:?}"
+            );
+            assert!(
+                !residual.contains('\r'),
+                "{mode:?}: raw CR from a %-Display value survived: {residual:?}"
             );
         }
     }

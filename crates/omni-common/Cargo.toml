@@ -24,3 +24,8 @@ toml.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 async-stream.workspace = true
+
+[dev-dependencies]
+# The SpannedStream isolation test installs a capturing subscriber to prove no
+# cross-stream span bleed.
+tracing-subscriber.workspace = true

@@ -1403,40 +1403,9 @@ fn wrap_stream_for_stats(
             }
         }
     });
-    Box::pin(SpannedStream::new(inner, span))
-}
-
-/// Wraps a boxed stream so the request span is entered for the duration of each
-/// `poll_next` and exited before the poll returns. This keeps request_id /
-/// session_id / provider on any operational log emitted while polling the
-/// stream (including provider-side logs mid-stream) WITHOUT holding a
-/// `Span::enter` guard across an `.await` — doing that would leave the span
-/// entered on the worker thread while the task is suspended, so an unrelated
-/// task resuming on that thread would inherit this request's correlation fields
-/// (see the `Span::enter` warning in the tracing docs). The inner
-/// `Pin<Box<dyn Stream>>` is `Unpin`, so no pin projection is needed.
-struct SpannedStream<S> {
-    inner: std::pin::Pin<Box<S>>,
-    span: tracing::Span,
-}
-
-impl<S> SpannedStream<S> {
-    fn new(inner: std::pin::Pin<Box<S>>, span: tracing::Span) -> Self {
-        Self { inner, span }
-    }
-}
-
-impl<S: futures_util::Stream> futures_util::Stream for SpannedStream<S> {
-    type Item = <S as futures_util::Stream>::Item;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        let _entered = this.span.enter();
-        this.inner.as_mut().poll_next(cx)
-    }
+    // Enter the request span per-poll (never across an await) so mid-stream logs
+    // keep request_id/session_id/provider. Shared adapter lives in omni-common.
+    Box::pin(omni_common::span_stream::SpannedStream::new(inner, span))
 }
 
 fn stats_model_key(provider: &str, model: &str) -> String {
@@ -1936,9 +1905,9 @@ fn anthropic_sse_response(
             );
         }
     };
-    // Enter the request span per-poll (see SpannedStream) rather than holding an
-    // Entered guard across the stream's awaits.
-    let stream = SpannedStream::new(Box::pin(stream), span);
+    // Enter the request span per-poll rather than holding an Entered guard across
+    // the stream's awaits. Shared adapter lives in omni-common.
+    let stream = omni_common::span_stream::SpannedStream::new(Box::pin(stream), span);
     let sse = Sse::new(stream).keep_alive(KeepAlive::default());
     let mut response = sse.into_response();
     response.headers_mut().insert(
@@ -4737,9 +4706,14 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         // asserts each mid-stream event sees only its own request_id. It fails on
         // a `span.enter()`-across-await wrapper and passes on SpannedStream.
         //
-        // Built as a sync test owning a 2-worker runtime so the subscriber can be
-        // installed via with_default around block_on (a #[tokio::test] would nest
-        // runtimes when we block_on inside it).
+        // Built as a sync test owning a CURRENT-THREAD runtime so the subscriber
+        // installed via with_default is the one both streams' events see: on a
+        // single thread with join!, when stream A suspends at .await the executor
+        // polls stream B on that same thread, which is exactly when a
+        // guard-across-await wrapper would bleed A's span into B. (A multi-thread
+        // runtime would run the spawned work on threads with no default subscriber
+        // set, capturing nothing.) A #[tokio::test] is avoided because block_on
+        // inside it would nest runtimes.
         use futures_util::StreamExt as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -4818,6 +4792,108 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                  a concurrent request's span bled onto this thread"
             );
         }
+    }
+
+    // A provider whose stream yields an Err mid-flight, so the SSE serializers in
+    // omni-common hit their `canonical stream error mid-flight` warn! path.
+    #[derive(Debug)]
+    struct ErrMidStreamProvider;
+    #[async_trait::async_trait]
+    impl LlmProvider for ErrMidStreamProvider {
+        fn id(&self) -> &'static str {
+            "errmid"
+        }
+        async fn send(
+            &self,
+            _req: omni_core::CanonicalRequest,
+        ) -> Result<CanonicalResponse, ProviderError> {
+            unreachable!("error-stream test uses send_stream")
+        }
+        async fn send_stream(
+            &self,
+            _req: omni_core::CanonicalRequest,
+        ) -> Result<CanonicalStream, ProviderError> {
+            Ok(Box::pin(async_stream::stream! {
+                yield Ok(CanonicalStreamEvent::TextDelta("partial".into()));
+                yield Err(ProviderError::Other(anyhow::anyhow!("boom")));
+            }))
+        }
+    }
+
+    fn err_mid_stream_app() -> axum::Router {
+        let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
+        providers.insert(
+            "grok".into(),
+            ProviderEntry {
+                provider: Arc::new(ErrMidStreamProvider),
+                claude_native: None,
+                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
+                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+            },
+        );
+        mk_app_with(providers, Arc::new(HashSet::new()))
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_serializer_mid_stream_error_log_is_correlated() {
+        // WHY: the SSE serializers (sse_from_canonical_stream /
+        // _responses) re-wrap the span-aware canonical stream in their OWN
+        // generator, which emits a `canonical stream error mid-flight` warn! after
+        // the inner poll returns. Without spanning that outer generator, the warn
+        // loses request_id/session_id -- the exact regression this feature fixes.
+        // Drive an error stream through BOTH the chat and responses SSE paths and
+        // assert the serializer's warn line carries request_id.
+        use tower::ServiceExt;
+
+        for (path, body) in [
+            ("/v1/chat/completions", chat_request_json(true)),
+            (
+                "/v1/responses",
+                serde_json::json!({
+                    "model": "grok:grok-4.3",
+                    "input": "hi",
+                    "stream": true,
+                })
+                .to_string(),
+            ),
+        ] {
+            let app = err_mid_stream_app();
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .header("x-session-id", "sess-err")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(resp.status(), StatusCode::OK);
+            // Drain the body so the serializer generator runs to the Err item.
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+        }
+
+        // Both serializers' warn lines must carry request_id (and session_id).
+        logs_assert(|lines: &[&str]| {
+            let errs: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("canonical stream error mid-flight"))
+                .collect();
+            if errs.is_empty() {
+                return Err("no serializer mid-stream error log captured".into());
+            }
+            for l in &errs {
+                if !l.contains("request_id=") {
+                    return Err(format!("serializer error line missing request_id: {l}"));
+                }
+            }
+            Ok(())
+        });
     }
 
     #[tokio::test]

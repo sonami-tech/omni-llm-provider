@@ -624,8 +624,13 @@ pub fn sse_from_canonical_stream_responses(
     response_id: String,
     created_at: u64,
 ) -> Sse<ResponsesSseStream> {
+    // Keep the caller's request span entered while this body is polled, so the
+    // mid-stream error logs in `responses_sse_events` retain the request's
+    // correlation fields (the inner stream's own poll-span does not cover logs
+    // this outer generator emits). See omni_common::span_stream::SpannedStream.
     let body = responses_sse_events(stream, requested_model, response_id, created_at);
-    Sse::new(Box::pin(body) as ResponsesSseStream)
+    let spanned = crate::span_stream::SpannedStream::current(Box::pin(body));
+    Sse::new(Box::pin(spanned) as ResponsesSseStream)
 }
 
 /// One SSE frame: `event:`-named with the JSON `type` and a stamped

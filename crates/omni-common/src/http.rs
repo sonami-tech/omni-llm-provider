@@ -682,8 +682,13 @@ pub fn sse_from_canonical_stream(
     chat_id: String,
     created: u64,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    // Keep the caller's request span entered while this body is polled, so the
+    // mid-stream error log below (and any other log emitted here) retains the
+    // request's correlation fields. The inner `stream` may already be span-aware,
+    // but this generator adds its OWN logs outside that stream's poll, so it must
+    // be spanned too.
     let body = async_stream_chunks(stream, requested_model, chat_id, created);
-    Sse::new(body)
+    Sse::new(crate::span_stream::SpannedStream::current(Box::pin(body)))
 }
 
 fn async_stream_chunks(
