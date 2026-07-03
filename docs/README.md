@@ -50,6 +50,9 @@ The go-forward implementation tracker is
 [`compatibility-roadmap.md`](compatibility-roadmap.md).
 Current per-provider support status is tracked in
 [`compatibility-matrix.md`](compatibility-matrix.md).
+Cross-provider consolidation and simplification opportunities, plus the approved
+observability track (correlation-ID logging + colorized logs), are catalogued in
+[`consolidation-2026-07-02.md`](consolidation-2026-07-02.md).
 
 ## Build, Run, Test
 

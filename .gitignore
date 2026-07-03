@@ -1,4 +1,5 @@
 /target
+/executables
 **/*.rs.bk
 *.pdb
 __pycache__/
