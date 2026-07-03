@@ -2140,12 +2140,13 @@ mod tests {
     use tracing_test::traced_test; // correlation-span assertions capture log output
 
     // A tracing Layer that records, for every event, the event's own `probe`
-    // field alongside the `request_id` of the CURRENT span as the subscriber's
-    // span stack sees it. This is the instrument that detects cross-task span
-    // bleed: if request B's event is emitted while request A's span is still
-    // (incorrectly) entered on the worker thread, this captures probe="B" with
-    // request_id="A". Reads the live span context, unlike tracing-test which
-    // reads the event's own registered scope.
+    // field alongside the `request_id` of the span the registry resolves as the
+    // event's scope (`ctx.event_scope`). That scope follows the subscriber's
+    // current-span stack, which is exactly what a `Span::enter` guard held across
+    // an await corrupts: when request A's guard is still on the stack while
+    // request B's event fires, B's resolved scope walks to A's span, so this
+    // captures probe="B" with request_id="A". The isolation test asserts that
+    // never happens.
     #[derive(Clone, Default)]
     struct SpanProbeLayer {
         // (probe_value, current_request_id) per captured event.

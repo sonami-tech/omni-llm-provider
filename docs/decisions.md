@@ -83,6 +83,26 @@ Codex OpenAI inbound supports non-streaming and `stream:true` paths. Streaming
 uses native Responses SSE parsing in `provider-codex`, not buffered
 pseudo-streaming.
 
+## Observability
+
+- Every request runs inside an `info_span!("request", request_id, session_id,
+  provider)` opened by a middleware layer in `crates/bin/omni`. `request_id` is
+  generated once in the layer and shared via a request extension so the span id,
+  the response id, and the conversation-log `request` all derive from one value.
+  `session_id` and `provider` are recorded late by the handlers.
+- SSE streams outlive the handler, so the span is attached to them with a
+  per-poll adapter (`SpannedStream`), NOT by holding a `Span::enter` guard across
+  the stream's awaits. Holding a guard across `.await` leaves the span entered on
+  the worker thread while the task is suspended, so a different concurrent request
+  resuming on that thread would log under the wrong `request_id`. A concurrency
+  test asserts no such cross-request bleed.
+- `OMNI_LOG_COLOR` (`auto|always|never`, plus `NO_COLOR` and stderr TTY
+  detection) gates colorized log fields (`crates/bin/omni/src/log_color.rs`):
+  `request_id`/`session_id` get stable hashed hues, each provider a fixed color.
+  The formatter sanitizes ANSI escapes in every value (matching upstream
+  `tracing-subscriber`), so a provider echoing raw upstream bytes cannot inject
+  terminal control sequences into the operator's log.
+
 ## Tests
 
 - Default tests are hermetic and must not call live providers.
