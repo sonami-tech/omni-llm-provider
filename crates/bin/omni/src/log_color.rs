@@ -69,24 +69,35 @@ pub enum ColorMode {
 }
 
 impl ColorMode {
-    /// Resolve color policy from env + TTY detection.
-    ///
-    /// Precedence: `NO_COLOR` (any non-empty value) forces off -- this is the
-    /// de-facto convention. Then `OMNI_LOG_COLOR=always|never|auto` (case
-    /// insensitive). Then `auto`: on iff stderr is a TTY.
+    /// Resolve color policy from the process environment + stderr TTY detection.
+    /// Thin wrapper over the pure [`ColorMode::resolve`] so the precedence logic
+    /// is unit-testable without mutating global env (which would race the
+    /// parallel test harness).
     pub fn from_env() -> Self {
-        if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+        let no_color = std::env::var("NO_COLOR").ok();
+        let omni_log_color = std::env::var("OMNI_LOG_COLOR").unwrap_or_default();
+        Self::resolve(no_color.as_deref(), &omni_log_color, || {
+            std::io::stderr().is_terminal()
+        })
+    }
+
+    /// Pure resolver. Precedence: `NO_COLOR` (any non-empty value) forces off --
+    /// the de-facto convention. Then `OMNI_LOG_COLOR=always|never|auto` (case
+    /// insensitive). Then `auto`: on iff `is_tty()` (only consulted in the auto
+    /// case, so callers need not evaluate it eagerly).
+    fn resolve(
+        no_color: Option<&str>,
+        omni_log_color: &str,
+        is_tty: impl FnOnce() -> bool,
+    ) -> Self {
+        if no_color.is_some_and(|v| !v.is_empty()) {
             return ColorMode::Off;
         }
-        match std::env::var("OMNI_LOG_COLOR")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
+        match omni_log_color.to_ascii_lowercase().as_str() {
             "always" => ColorMode::On,
             "never" | "off" | "no" | "false" | "0" => ColorMode::Off,
             _ => {
-                if std::io::stderr().is_terminal() {
+                if is_tty() {
                     ColorMode::On
                 } else {
                     ColorMode::Off
@@ -206,12 +217,20 @@ fn is_log_metadata_field(name: &str) -> bool {
     name.starts_with("log.")
 }
 
-/// Escape the control characters an attacker could use for terminal injection,
-/// rendering them as visible `\xNN` / `\u{..}` sequences. Covers everything
-/// `tracing_subscriber`'s internal `EscapeGuard` does -- C0 controls used in
-/// escape sequences (ESC/BEL/BS/FF/DEL) plus the C1 range (0x80-0x9f) -- and
-/// additionally escapes `\r`, which upstream leaves alone. Ordinary text,
-/// including `\n` and `\t`, is untouched.
+/// Escape the control characters an attacker could use for terminal injection
+/// or log-line forging, rendering them as visible `\xNN` / `\u{..}` / `\r` /
+/// `\n` sequences. Covers everything `tracing_subscriber`'s internal
+/// `EscapeGuard` does -- C0 controls used in escape sequences (ESC/BEL/BS/FF/DEL)
+/// plus the C1 range (0x80-0x9f) -- and additionally escapes `\r` and `\n`,
+/// which upstream leaves alone.
+///
+/// Rationale for exceeding upstream: `\r` returns the cursor to column 0, so a
+/// value can overwrite text already on the line (spoofing what the operator
+/// sees); `\n` starts a new line, so an attacker-controlled value (e.g. a
+/// provider echoing raw bytes into `warn!(error = %e)`) could forge an entire
+/// fake log line. No log call in this codebase emits intentional multi-line
+/// values, so escaping `\n` costs nothing here. `\t` is left untouched -- it is
+/// horizontal, common in legitimate values, and cannot rewrite or forge output.
 fn sanitize_ansi(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -220,12 +239,8 @@ fn sanitize_ansi(input: &str) -> String {
             '\x07' => out.push_str("\\x07"),
             '\x08' => out.push_str("\\x08"),
             '\x0c' => out.push_str("\\x0c"),
-            // Carriage return moves the cursor to column 0, letting a logged value
-            // overwrite text already printed on the line (log spoofing). Escaping
-            // it exceeds upstream EscapeGuard; it is part of the deliberate
-            // stronger-than-upstream sanitization. `\n` is left alone -- it is
-            // legitimate in multi-line values and cannot rewrite prior output.
             '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
             '\x7f' => out.push_str("\\x7f"),
             ch if (ch as u32) >= 0x80 && (ch as u32) <= 0x9f => {
                 let _ = write!(out, "\\u{{{:x}}}", ch as u32);
@@ -565,9 +580,10 @@ mod tests {
         struct Evil;
         impl std::fmt::Display for Evil {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                // Raw CSI + a carriage return, both emitted verbatim by Display
-                // (no self-escaping). `\r` alone can overwrite the log line.
-                write!(f, "boom\x1b[2Jclear\rSPOOF")
+                // Raw CSI, a carriage return, and a newline, all emitted verbatim
+                // by Display. `\r` overwrites the line; `\n` would forge a whole
+                // fake log line ("FORGED ERROR ...") if not escaped.
+                write!(f, "boom\x1b[2Jclear\rSPOOF\nFORGED ERROR line")
             }
         }
         for mode in [ColorMode::Off, ColorMode::On] {
@@ -581,48 +597,62 @@ mod tests {
                 info!(error = %Evil, "display-sigil");
             });
             let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-            // The Display ESC must be escaped to text and must NOT survive raw
-            // (after removing the formatter's own SGR, which never wraps `error`).
-            // Both the ESC and the CR must be escaped to visible text.
+            // ESC, CR, and LF from the value must all be escaped to visible text.
             assert!(
                 out.contains("\\x1b"),
                 "{mode:?}: ESC not sanitized: {out:?}"
             );
             assert!(out.contains("\\r"), "{mode:?}: CR not sanitized: {out:?}");
-            let residual = strip_formatter_sgr(&out);
-            // No raw ESC and no raw CR from the value may survive.
-            assert!(
-                !residual.contains('\u{1b}'),
-                "{mode:?}: raw ESC from a %-Display value survived: {residual:?}"
+            assert!(out.contains("\\n"), "{mode:?}: LF not sanitized: {out:?}");
+            // The whole event must be ONE physical line: the only real newline is
+            // the formatter's trailing terminator, so the value's `\n` did not
+            // forge a second line. (A forged line would make this 2 lines of
+            // content.)
+            let content_lines: Vec<&str> = out.trim_end_matches('\n').split('\n').collect();
+            assert_eq!(
+                content_lines.len(),
+                1,
+                "{mode:?}: value's newline forged an extra log line: {out:?}"
             );
+            // "FORGED ERROR line" must appear only inline (never at line start).
             assert!(
-                !residual.contains('\r'),
-                "{mode:?}: raw CR from a %-Display value survived: {residual:?}"
+                !out.contains("\nFORGED"),
+                "{mode:?}: forged line reached output: {out:?}"
             );
+            let residual = strip_formatter_sgr(out.trim_end_matches('\n'));
+            // No raw ESC / CR / LF from the value may survive in the content.
+            for (bad, name) in [('\u{1b}', "ESC"), ('\r', "CR"), ('\n', "LF")] {
+                assert!(
+                    !residual.contains(bad),
+                    "{mode:?}: raw {name} from a %-Display value survived: {residual:?}"
+                );
+            }
         }
     }
 
     #[test]
-    fn no_color_env_disables() {
-        // Save and restore env for hermetic test.
-        let prev_no = std::env::var("NO_COLOR").ok();
-        let prev_omni = std::env::var("OMNI_LOG_COLOR").ok();
-        // SAFETY: tests run single-threaded by default per crate test harness;
-        // these env reads happen before the formatter is initialized in main.
-        unsafe {
-            std::env::set_var("NO_COLOR", "1");
-            std::env::set_var("OMNI_LOG_COLOR", "always");
-        }
-        assert_eq!(ColorMode::from_env(), ColorMode::Off);
-        unsafe {
-            match prev_no {
-                Some(v) => std::env::set_var("NO_COLOR", v),
-                None => std::env::remove_var("NO_COLOR"),
-            }
-            match prev_omni {
-                Some(v) => std::env::set_var("OMNI_LOG_COLOR", v),
-                None => std::env::remove_var("OMNI_LOG_COLOR"),
-            }
-        }
+    fn color_mode_resolution_precedence() {
+        // Pure resolver: no process-env mutation, so this is safe under the
+        // parallel test harness (the previous env-mutating version raced other
+        // tests and relied on a false single-threaded assumption).
+        // NO_COLOR wins over everything, including OMNI_LOG_COLOR=always.
+        assert_eq!(
+            ColorMode::resolve(Some("1"), "always", || true),
+            ColorMode::Off
+        );
+        // Empty NO_COLOR does NOT force off (de-facto convention: any non-empty).
+        assert_eq!(
+            ColorMode::resolve(Some(""), "always", || false),
+            ColorMode::On
+        );
+        // OMNI_LOG_COLOR explicit values, case-insensitive.
+        assert_eq!(ColorMode::resolve(None, "always", || false), ColorMode::On);
+        assert_eq!(ColorMode::resolve(None, "ALWAYS", || false), ColorMode::On);
+        assert_eq!(ColorMode::resolve(None, "never", || true), ColorMode::Off);
+        assert_eq!(ColorMode::resolve(None, "off", || true), ColorMode::Off);
+        // auto (unset/unknown) follows the TTY probe, which is only consulted here.
+        assert_eq!(ColorMode::resolve(None, "", || true), ColorMode::On);
+        assert_eq!(ColorMode::resolve(None, "", || false), ColorMode::Off);
+        assert_eq!(ColorMode::resolve(None, "auto", || true), ColorMode::On);
     }
 }

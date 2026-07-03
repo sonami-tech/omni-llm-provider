@@ -2176,16 +2176,20 @@ mod tests {
             event.record(&mut g);
             let Some(probe) = g.0 else { return };
 
-            // Read request_id from the CURRENT span's typed extension.
-            let mut rid = String::new();
+            // Collect EVERY request_id in the event's span scope, root-to-leaf.
+            // Recording the whole set (not just the leaf) means a leaked ancestor
+            // span shows up as an extra id, so the test can assert the scope is
+            // EXACTLY the request's own id -- catching contamination that a
+            // keep-last probe would hide.
+            let mut ids = Vec::new();
             if let Some(scope) = ctx.event_scope(event) {
                 for span in scope.from_root() {
                     if let Some(captured) = span.extensions().get::<CapturedRequestId>() {
-                        rid = captured.0.clone();
+                        ids.push(captured.0.clone());
                     }
                 }
             }
-            self.seen.lock().unwrap().push((probe, rid));
+            self.seen.lock().unwrap().push((probe, ids.join(",")));
         }
     }
 
@@ -4780,16 +4784,19 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             !events.is_empty(),
             "probe layer captured no events; test would be vacuous"
         );
-        for (probe_tag, request_id) in events.iter() {
+        for (probe_tag, scope_ids) in events.iter() {
+            // scope_ids is the comma-joined set of request_ids in the event's
+            // span scope. Correct behavior => EXACTLY the request's own id; any
+            // extra id means another request's span bled onto this thread.
             let expected = match probe_tag.as_str() {
                 "A" => "aaaaaaaa",
                 "B" => "bbbbbbbb",
                 other => panic!("unexpected probe tag {other:?}"),
             };
             assert_eq!(
-                request_id, expected,
-                "event probe={probe_tag} saw request_id={request_id}, expected {expected}: \
-                 a concurrent request's span bled onto this thread"
+                scope_ids, expected,
+                "event probe={probe_tag} saw span scope ids [{scope_ids}], expected exactly \
+                 [{expected}]: a concurrent request's span bled onto this thread"
             );
         }
     }
@@ -4878,7 +4885,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                 .unwrap();
         }
 
-        // Both serializers' warn lines must carry request_id (and session_id).
+        // Both serializers' warn lines must carry the FULL correlation set:
+        // request_id, session_id, and provider. Asserting only request_id would
+        // let a regression that drops session_id/provider pass silently.
         logs_assert(|lines: &[&str]| {
             let errs: Vec<&&str> = lines
                 .iter()
@@ -4888,8 +4897,10 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                 return Err("no serializer mid-stream error log captured".into());
             }
             for l in &errs {
-                if !l.contains("request_id=") {
-                    return Err(format!("serializer error line missing request_id: {l}"));
+                for field in ["request_id=", "session_id=", "provider="] {
+                    if !l.contains(field) {
+                        return Err(format!("serializer error line missing {field}: {l}"));
+                    }
                 }
             }
             Ok(())

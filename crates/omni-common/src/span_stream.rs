@@ -115,15 +115,17 @@ mod tests {
                 let mut g = G(None);
                 event.record(&mut g);
                 let Some(probe) = g.0 else { return };
-                let mut rid = String::new();
+                // Collect the WHOLE id-set in scope so a leaked ancestor shows up
+                // as an extra id (a keep-last probe would hide it).
+                let mut ids = Vec::new();
                 if let Some(scope) = ctx.event_scope(event) {
                     for span in scope.from_root() {
                         if let Some(c) = span.extensions().get::<CapturedId>() {
-                            rid = c.0.clone();
+                            ids.push(c.0.clone());
                         }
                     }
                 }
-                self.0.lock().unwrap().push((probe, rid));
+                self.0.lock().unwrap().push((probe, ids.join(",")));
             }
         }
 
@@ -160,13 +162,17 @@ mod tests {
 
         let seen = probe.0.lock().unwrap();
         assert!(!seen.is_empty(), "probe captured nothing; test is vacuous");
-        for (probe_tag, rid) in seen.iter() {
+        for (probe_tag, scope_ids) in seen.iter() {
+            // Exactly the request's own id must be in scope; any extra means bleed.
             let expected = match probe_tag.as_str() {
                 "A" => "aaaa",
                 "B" => "bbbb",
                 other => panic!("unexpected probe {other:?}"),
             };
-            assert_eq!(rid, expected, "span bled: probe={probe_tag} saw rid={rid}");
+            assert_eq!(
+                scope_ids, expected,
+                "span bled: probe={probe_tag} saw scope ids [{scope_ids}], expected [{expected}]"
+            );
         }
     }
 }
