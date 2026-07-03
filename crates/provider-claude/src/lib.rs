@@ -305,12 +305,13 @@ impl ClaudeProvider {
     }
 
     /// Whether to inject Anthropic top-level automatic caching for this request.
-    /// True only when the feature flag is on AND this provider targets first-party
-    /// Anthropic (default OAuth/Claude Code path). A custom gateway uses custom
-    /// auth and may front Bedrock/Vertex, where automatic caching is unsupported,
-    /// so it is always excluded regardless of the flag.
+    /// This is only ever called from `send`/`send_stream`, which serve the
+    /// OpenAI-compatible inbound door exclusively (the native Anthropic passthrough
+    /// never reaches here). That door has no Claude Code fingerprint contract to
+    /// preserve, so caching is injected automatically and unconditionally — the
+    /// only escape is the `OMNI_CLAUDE_NO_AUTO_CACHE` opt-out.
     fn supports_auto_cache(&self) -> bool {
-        auto_cache_enabled() && !self.client.uses_custom_auth()
+        !auto_cache_disabled()
     }
 
     pub(crate) async fn credentials_for_request(
@@ -336,15 +337,13 @@ fn env_nonempty(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// Feature gate for injecting Anthropic top-level automatic caching on the
-/// first-party Claude path. OFF by default (ships dark): set
-/// `OMNI_CLAUDE_AUTO_CACHE` to a truthy value (`1`/`true`/`yes`/`on`,
-/// case-insensitive) to enable. The gate is ANDed with a first-party check at
-/// the call site, so a custom gateway (which may front Bedrock/Vertex, where
-/// automatic caching is unsupported) never gets the marker even when this is on.
-fn auto_cache_enabled() -> bool {
+/// Opt-out for Anthropic automatic caching on the OpenAI-inbound Claude path.
+/// Caching is ON by default there (it has no fingerprint contract and injecting
+/// the marker is harmless). Set `OMNI_CLAUDE_NO_AUTO_CACHE` to a truthy value
+/// (`1`/`true`/`yes`/`on`, case-insensitive) to disable injection.
+fn auto_cache_disabled() -> bool {
     matches!(
-        env_nonempty("OMNI_CLAUDE_AUTO_CACHE")
+        env_nonempty("OMNI_CLAUDE_NO_AUTO_CACHE")
             .map(|v| v.to_ascii_lowercase())
             .as_deref(),
         Some("1" | "true" | "yes" | "on")
@@ -626,35 +625,15 @@ mod tests {
     }
 
     #[test]
-    fn auto_cache_gate_off_by_default_and_requires_first_party() {
-        // WHY: the auto-cache feature must ship DARK (off unless explicitly
-        // enabled) and must NEVER fire on a custom gateway, which may front
-        // Bedrock/Vertex where Anthropic automatic caching is unsupported and the
-        // marker would be wasted or rejected. This test locks in both halves of
-        // the gate: the env default, and the first-party AND-condition.
+    fn auto_cache_on_by_default_with_opt_out() {
+        // WHY: `send`/`send_stream` serve ONLY the OpenAI-inbound door, which has
+        // no Claude Code fingerprint contract, so caching is injected automatically
+        // with no flag to remember. The single escape is OMNI_CLAUDE_NO_AUTO_CACHE.
+        // This locks in: on by default, opt-out disables, non-truthy is ignored,
+        // and the opt-out applies regardless of first-party vs custom gateway.
         let _guard = CREDS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let old = std::env::var_os("OMNI_CLAUDE_AUTO_CACHE");
-
-        // 1. Unset -> disabled (ships dark).
-        unsafe { std::env::remove_var("OMNI_CLAUDE_AUTO_CACHE") };
-        assert!(
-            !auto_cache_enabled(),
-            "auto-cache must be OFF when OMNI_CLAUDE_AUTO_CACHE is unset"
-        );
-
-        // 2. Truthy -> the flag itself is on...
-        unsafe { std::env::set_var("OMNI_CLAUDE_AUTO_CACHE", "1") };
-        assert!(auto_cache_enabled(), "\"1\" must enable the flag");
-
-        // ...and a first-party provider (default OAuth path) opts in.
+        let old = std::env::var_os("OMNI_CLAUDE_NO_AUTO_CACHE");
         let first_party = ClaudeProvider::new().unwrap();
-        assert!(
-            first_party.supports_auto_cache(),
-            "first-party provider with the flag on must inject auto-cache"
-        );
-
-        // ...but a custom gateway stays OFF even with the flag on (Bedrock/Vertex
-        // safety): custom auth => arbitrary backend => never auto-cache.
         let custom = ClaudeProvider::new_for_custom_gateway(
             default_profile(),
             "https://claude-proxy.example.com",
@@ -662,19 +641,46 @@ mod tests {
             vec![],
         )
         .unwrap();
+
+        // 1. Unset -> ON by default (both provider kinds; the door, not the
+        // backend, decides — a custom Claude gateway still has no fingerprint).
+        unsafe { std::env::remove_var("OMNI_CLAUDE_NO_AUTO_CACHE") };
         assert!(
-            !custom.supports_auto_cache(),
-            "custom gateway must NOT auto-cache even when the flag is on"
+            !auto_cache_disabled(),
+            "on by default when opt-out is unset"
+        );
+        assert!(
+            first_party.supports_auto_cache(),
+            "first-party caches by default"
+        );
+        assert!(
+            custom.supports_auto_cache(),
+            "custom gateway caches by default"
         );
 
-        // 3. An unrecognized value stays off (only explicit truthy strings enable).
-        unsafe { std::env::set_var("OMNI_CLAUDE_AUTO_CACHE", "maybe") };
-        assert!(!auto_cache_enabled(), "non-truthy value must not enable");
+        // 2. Opt-out truthy -> injection disabled everywhere.
+        unsafe { std::env::set_var("OMNI_CLAUDE_NO_AUTO_CACHE", "1") };
+        assert!(auto_cache_disabled(), "\"1\" opts out");
+        assert!(
+            !first_party.supports_auto_cache(),
+            "opt-out disables first-party"
+        );
+        assert!(
+            !custom.supports_auto_cache(),
+            "opt-out disables custom gateway"
+        );
+
+        // 3. Non-truthy value is ignored -> stays ON (fail-open on typos).
+        unsafe { std::env::set_var("OMNI_CLAUDE_NO_AUTO_CACHE", "maybe") };
+        assert!(
+            !auto_cache_disabled(),
+            "non-truthy opt-out value is ignored"
+        );
 
         unsafe {
             match old {
-                Some(v) => std::env::set_var("OMNI_CLAUDE_AUTO_CACHE", v),
-                None => std::env::remove_var("OMNI_CLAUDE_AUTO_CACHE"),
+                Some(v) => std::env::set_var("OMNI_CLAUDE_NO_AUTO_CACHE", v),
+                None => std::env::remove_var("OMNI_CLAUDE_NO_AUTO_CACHE"),
             }
         }
     }
