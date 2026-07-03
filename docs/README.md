@@ -79,7 +79,10 @@ If `--stats-db` is omitted, Omni writes stats to a fixed temp-file path
 (`omni-stats.redb` under the OS temp directory). Use `--stats-db` for durable
 stats or when running more than one server instance.
 
-`OMNI_API_KEYS` enables bearer-token auth when set to a comma-separated key list.
+`OMNI_API_KEYS` enables gateway auth when set to a comma-separated key list.
+Clients send the key as `Authorization: Bearer <key>`; on the native Anthropic
+paths (`/v1/messages`, `/v1/messages/count_tokens`) the key is also accepted via
+`x-api-key: <key>`, so stock Anthropic SDKs work unchanged.
 On startup, Omni logs its banner and current package version before serving
 requests.
 
