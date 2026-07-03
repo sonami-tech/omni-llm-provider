@@ -653,6 +653,16 @@ async fn omni_auth_layer(
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
+        // Anthropic's official SDKs authenticate with `x-api-key`, not
+        // `Authorization: Bearer`, so on the native Anthropic paths accept the
+        // gateway key from that header too (both may arrive together; the
+        // `Authorization: Bearer` value takes precedence).
+        .or_else(|| {
+            is_anthropic
+                .then(|| req.headers().get("x-api-key"))
+                .flatten()
+                .and_then(|value| value.to_str().ok())
+        })
         .map(str::trim)
         .map(str::to_string);
 
@@ -665,7 +675,8 @@ async fn omni_auth_layer(
             anthropic_error_response(AppError::Unauthorized("Invalid API key".into()))
         }
         None if is_anthropic => anthropic_error_response(AppError::Unauthorized(
-            "Missing API key. Include 'Authorization: Bearer <key>' header.".into(),
+            "Missing API key. Include an 'x-api-key: <key>' or 'Authorization: Bearer <key>' header."
+                .into(),
         )),
         Some(_) => AppError::Unauthorized("Invalid API key".into()).into_response(),
         None => AppError::Unauthorized(
@@ -5478,6 +5489,24 @@ rule = [
         let v = omni_common::test_support::parse_json(&out_anth.body);
         assert_eq!(v["type"], "error");
         assert_eq!(v["error"]["type"], "authentication_error");
+        // Anthropic's official SDKs authenticate with `x-api-key`, so the gateway
+        // key supplied that way MUST pass auth on /v1/messages (else stock
+        // Anthropic clients cannot use the proxy). The request then proceeds to
+        // the handler; we only assert it is NOT the auth failure above.
+        let out_anth_xapikey = omni_common::test_support::http_post_json_with_headers(
+            format!("http://127.0.0.1:{}/v1/messages", port),
+            &[("x-api-key", "secret123")],
+            r#"{"model":"sonnet","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        assert_ne!(
+            out_anth_xapikey.status, 401,
+            "valid x-api-key must not be rejected as unauthorized on /v1/messages"
+        );
+        let vx = omni_common::test_support::parse_json(&out_anth_xapikey.body);
+        assert_ne!(
+            vx["error"]["type"], "authentication_error",
+            "x-api-key auth must pass the gateway, not surface an authentication_error"
+        );
         drop(child);
 
         // without keys (empty or --no-auth) -> 200 even no header
