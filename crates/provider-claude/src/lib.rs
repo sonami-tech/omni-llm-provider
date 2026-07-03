@@ -333,23 +333,14 @@ impl Default for ClaudeProvider {
     }
 }
 
-/// Prefix scrubber for Claude secrets in an upstream error body. Scans for the
-/// marker prefixes and replaces from the marker to the next delimiter
-/// (whitespace / quote / comma) with `<redacted>`. `sk-` also covers Claude
-/// OAuth tokens (`sk-ant-oat01-...`) and custom-gateway `sk-...` keys since both
-/// start with `sk-`; `eyJ` covers JWT bearers. Mirrors grok's `redact`.
+/// Prefix scrubber for Claude secrets in an upstream error body. Delegates to
+/// the shared [`omni_common::responses_upstream::redact_prefixed_secrets`] with
+/// Claude's marker set: `sk-` also covers Claude OAuth tokens
+/// (`sk-ant-oat01-...`) and custom-gateway `sk-...` keys since both start with
+/// `sk-`, and `eyJ` covers JWT bearers. No xAI (`xai-`) keys reach the Anthropic
+/// path, so that marker is intentionally omitted.
 fn redact(input: &str) -> String {
-    let mut out = input.to_string();
-    for marker in ["sk-", "eyJ"] {
-        while let Some(pos) = out.find(marker) {
-            let end = out[pos..]
-                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',')
-                .map(|i| pos + i)
-                .unwrap_or(out.len());
-            out.replace_range(pos..end, "<redacted>");
-        }
-    }
-    out
+    omni_common::responses_upstream::redact_prefixed_secrets(input, &["sk-", "eyJ"])
 }
 
 /// Layered redactor for Claude error bodies: the prefix scrubber [`redact`]

@@ -898,17 +898,7 @@ fn parse_custom_headers(raw: &str) -> Result<Vec<(String, String)>, String> {
 }
 
 fn redact(input: &str) -> String {
-    let mut out = input.to_string();
-    for marker in ["sk-", "xai-", "eyJ"] {
-        while let Some(pos) = out.find(marker) {
-            let end = out[pos..]
-                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',')
-                .map(|i| pos + i)
-                .unwrap_or(out.len());
-            out.replace_range(pos..end, "<redacted>");
-        }
-    }
-    out
+    responses_upstream::redact_prefixed_secrets(input, &["sk-", "xai-", "eyJ"])
 }
 
 /// `ErrorRedactor` for the shared Responses machinery (conservative mode).
