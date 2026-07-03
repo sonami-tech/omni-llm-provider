@@ -149,35 +149,82 @@ impl<'a> ColorVisitor<'a> {
 
     /// Render a single field=value pair, applying value coloring when this
     /// field name is one we care about.
+    ///
+    /// Field/message values are ANSI-sanitized before emission, matching
+    /// upstream `DefaultFields` (which wraps values in an `EscapeGuard`). This
+    /// prevents terminal-escape injection from any value we log that carries
+    /// attacker- or upstream-controlled text (e.g. a provider echoing raw SSE
+    /// bytes). Our own color escapes are added AFTER sanitization, so they are
+    /// never stripped.
     fn write_field(&mut self, name: &str, value: &dyn fmt::Debug) -> fmt::Result {
         self.write_separator()?;
+
+        // Format the value once, then sanitize control sequences out of it.
+        let mut raw = String::new();
+        write!(&mut raw, "{:?}", value)?;
+        let safe = sanitize_ansi(&raw);
 
         // The "message" field of an event is rendered without a key prefix
         // by the default formatter. Keep that contract.
         if name == "message" {
-            return write!(self.writer, "{:?}", value);
+            return write!(self.writer, "{}", safe);
         }
 
         write!(self.writer, "{}=", name)?;
 
-        // Non-color path: short-circuit to default Debug rendering.
+        // Non-color path: emit the sanitized value verbatim.
         if matches!(self.mode, ColorMode::Off) {
-            return write!(self.writer, "{:?}", value);
+            return write!(self.writer, "{}", safe);
         }
 
-        // We need the value as a string to (a) decide how to color it and
-        // (b) apply the style. Format into a small buffer, strip surrounding
-        // quotes that Debug adds for &str, then color.
-        let mut buf = String::new();
-        write!(&mut buf, "{:?}", value)?;
-        let style = style_for(name, &buf);
-        match style {
-            Some(s) => write!(self.writer, "{}", s.paint(buf.as_str())),
-            None => write!(self.writer, "{}", buf),
+        // Color path: style the already-sanitized value. style_for keys on the
+        // sanitized text (unchanged for the identifiers/providers we color).
+        match style_for(name, &safe) {
+            Some(s) => write!(self.writer, "{}", s.paint(safe.as_str())),
+            None => write!(self.writer, "{}", safe),
         }
     }
 }
 
+/// Escape the control characters an attacker could use for terminal injection,
+/// rendering them as visible `\xNN` / `\u{..}` sequences. Byte-for-byte matches
+/// `tracing_subscriber`'s internal `EscapeGuard` (its `escape.rs`): C0 controls
+/// used in escape sequences (ESC/BEL/BS/FF/DEL) plus the C1 range (0x80-0x9f).
+/// Ordinary text (including normal whitespace like `\n`/`\t`) is untouched.
+fn sanitize_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\x1b' => out.push_str("\\x1b"),
+            '\x07' => out.push_str("\\x07"),
+            '\x08' => out.push_str("\\x08"),
+            '\x0c' => out.push_str("\\x0c"),
+            '\x7f' => out.push_str("\\x7f"),
+            ch if (ch as u32) >= 0x80 && (ch as u32) <= 0x9f => {
+                let _ = write!(out, "\\u{{{:x}}}", ch as u32);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+// `ColorVisitor` implements only `record_debug`. Upstream `DefaultVisitor` also
+// special-cases `record_str` (message-without-quotes), `record_error`
+// (`.sources=` chain), `log.*` field skipping, and `r#` raw-ident stripping. We
+// deliberately do NOT reimplement those, and it is safe here:
+//   - The security-relevant behavior (ANSI sanitization) is applied uniformly in
+//     `write_field` to EVERY value, so no path can leak a raw escape.
+//   - `record_str` for non-message fields falls through to the default trait
+//     method, which calls our `record_debug` (`&value` -> Debug + sanitize),
+//     matching upstream's non-message `record_debug(&value)`.
+//   - `record_error`, `r#` fields, and `log.*` fields never occur in this
+//     codebase: all `error=` logs use the `%`/Display sigil (never `&dyn Error`),
+//     there are no raw-ident log fields, and `tracing-log`/`LogTracer` is not
+//     installed (only the `env-filter` feature is enabled), so no `log.*` fields
+//     are ever emitted. Reimplementing them would be dead code (see Rule 2).
+// If any of those preconditions change (a `LogTracer`, a `&dyn Error` field, a
+// raw-ident field), revisit this and mirror the corresponding upstream branch.
 impl Visit for ColorVisitor<'_> {
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
         if self.result.is_err() {
@@ -361,6 +408,62 @@ mod tests {
         // quotes Debug adds around &str values.
         assert!(plain.contains("session_id=\"sess-xyz\""), "got: {plain:?}");
         assert!(plain.contains("provider=\"grok\""), "got: {plain:?}");
+    }
+
+    /// Render an event whose message and a field value carry a raw ESC, and
+    /// return the captured bytes.
+    fn render_with_escape(mode: ColorMode) -> String {
+        use tracing::info;
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(matches!(mode, ColorMode::On))
+            .fmt_fields(ColorFields::new(mode))
+            .with_writer(BufWriter(buf.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            // A provider echoing upstream bytes could inject this into a log.
+            let evil = "before\x1b[31mRED\x1b[0mafter";
+            info!(data = evil, "upstream said: {evil}");
+        });
+        String::from_utf8(buf.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn ansi_escapes_in_values_are_neutralized_in_both_modes() {
+        // WHY: values we log can carry attacker/upstream-controlled text (e.g.
+        // provider-claude logs raw SSE bytes on a parse failure). A raw ESC in
+        // such a value would let the source drive the operator's terminal
+        // (cursor moves, color, clear-screen). Upstream DefaultFields sanitizes
+        // these via EscapeGuard; our custom formatter must match. The raw ESC
+        // byte (0x1b) must NEVER reach output as an in-value control; it must be
+        // escaped to the visible text "\x1b".
+        for mode in [ColorMode::Off, ColorMode::On] {
+            let out = render_with_escape(mode);
+            // The injected value's ESC must appear only in escaped textual form.
+            assert!(
+                out.contains("\\x1b"),
+                "{mode:?}: sanitized \\x1b text missing, got: {out:?}"
+            );
+            // In Off mode there must be NO raw ESC byte at all. In On mode the
+            // ONLY raw ESC bytes permitted are our own color codes wrapping the
+            // colored id/provider fields -- never from the injected `data`/message
+            // value. Assert the injected payload did not smuggle a raw sequence:
+            // the literal "RED" must not be immediately preceded by a raw ESC-[.
+            assert!(
+                !out.contains("\x1b[31mRED"),
+                "{mode:?}: raw injected ANSI reached output: {out:?}"
+            );
+            assert!(
+                !out.contains("RED\x1b[0mafter"),
+                "{mode:?}: raw injected ANSI reset reached output: {out:?}"
+            );
+        }
+        // Off mode: the entire line is free of raw ESC bytes.
+        let off = render_with_escape(ColorMode::Off);
+        assert!(
+            !off.contains('\u{1b}'),
+            "Off mode must contain no raw ESC byte, got: {off:?}"
+        );
     }
 
     #[test]

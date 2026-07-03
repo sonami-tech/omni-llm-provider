@@ -232,10 +232,13 @@ struct AppState {
     conversation_log: Option<Arc<ConversationLog>>,
 }
 
-/// Per-request correlation id, generated once in `request_span_layer` and read
-/// by the handlers via a request extension. Carrying the full UUID here (not the
-/// 8-char short form) guarantees the id on the operational span matches the id
-/// the handler threads into the conversation log.
+/// Per-request correlation id (full UUID), generated once in `request_span_layer`
+/// and read by the handlers via a request extension. The full UUID is the single
+/// root each handler derives from: it forms the response ids (`chatcmpl-{uuid}` /
+/// `resp_{uuid}`), and its 8-char prefix (`short_request_id`) is what appears in
+/// BOTH the operational span (`request_id=`) and the conversation log. Because
+/// both come from this one value, the span's `request_id` and the conversation
+/// log's `request` always match (on the short form).
 #[derive(Clone)]
 struct RequestId(String);
 
@@ -732,14 +735,24 @@ async fn request_span_layer(mut req: Request<Body>, next: middleware::Next) -> R
 /// Read the correlation id that `request_span_layer` stashed in the request
 /// extensions. The Anthropic handlers take the raw `Request` (rather than an
 /// `Extension` extractor) because they consume the body themselves, so they pull
-/// the id out here. Falls back to a fresh id if the layer did not run (e.g. a
-/// handler exercised directly in a unit test).
+/// the id out here.
+///
+/// In production every route goes through `request_span_layer` (see
+/// `build_router`), so the extension is always present. The fallback exists only
+/// for handlers exercised directly in unit tests, which build a bare `Request`.
+/// If it ever fires in production it means a route was mounted without the span
+/// layer — a bug — so it emits a `warn!` rather than silently forging a
+/// mismatched id. (The chat/responses handlers can't reach this: they use an
+/// `Extension<RequestId>` extractor, which 500s outright when the layer is
+/// absent. This is the raw-`Request` equivalent of that loud failure.)
 fn request_id_from(request: &Request<Body>) -> String {
-    request
-        .extensions()
-        .get::<RequestId>()
-        .map(|id| id.0.clone())
-        .unwrap_or_else(|| Uuid::new_v4().to_string())
+    match request.extensions().get::<RequestId>() {
+        Some(id) => id.0.clone(),
+        None => {
+            warn!("request without RequestId extension; span layer missing on this route?");
+            Uuid::new_v4().to_string()
+        }
+    }
 }
 
 fn auth_key_id(key: &str) -> String {
@@ -1311,8 +1324,7 @@ fn wrap_stream_for_stats(
     // request_id/session_id fields. The stream outlives the handler, so the span
     // must be entered inside the generator body, not relied upon ambiently.
     let span = tracing::Span::current();
-    Box::pin(async_stream::stream! {
-        let _span_guard = span.enter();
+    let inner = Box::pin(async_stream::stream! {
         let _active = stats.as_deref().map(ActiveRequestGuard::new);
         let started = Instant::now();
         let mut usage = TokenUsage::default();
@@ -1390,7 +1402,41 @@ fn wrap_stream_for_stats(
                 );
             }
         }
-    })
+    });
+    Box::pin(SpannedStream::new(inner, span))
+}
+
+/// Wraps a boxed stream so the request span is entered for the duration of each
+/// `poll_next` and exited before the poll returns. This keeps request_id /
+/// session_id / provider on any operational log emitted while polling the
+/// stream (including provider-side logs mid-stream) WITHOUT holding a
+/// `Span::enter` guard across an `.await` — doing that would leave the span
+/// entered on the worker thread while the task is suspended, so an unrelated
+/// task resuming on that thread would inherit this request's correlation fields
+/// (see the `Span::enter` warning in the tracing docs). The inner
+/// `Pin<Box<dyn Stream>>` is `Unpin`, so no pin projection is needed.
+struct SpannedStream<S> {
+    inner: std::pin::Pin<Box<S>>,
+    span: tracing::Span,
+}
+
+impl<S> SpannedStream<S> {
+    fn new(inner: std::pin::Pin<Box<S>>, span: tracing::Span) -> Self {
+        Self { inner, span }
+    }
+}
+
+impl<S: futures_util::Stream> futures_util::Stream for SpannedStream<S> {
+    type Item = <S as futures_util::Stream>::Item;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let _entered = this.span.enter();
+        this.inner.as_mut().poll_next(cx)
+    }
 }
 
 fn stats_model_key(provider: &str, model: &str) -> String {
@@ -1645,7 +1691,10 @@ async fn anthropic_count_tokens_inner(
         api_key.as_ref().map(|key| key.0.0.as_str()),
         &short_request_id,
     );
-    tracing::Span::current().record("session_id", session_id.as_str());
+    // The native Anthropic count_tokens route only ever delegates to claude.
+    let span = tracing::Span::current();
+    span.record("session_id", session_id.as_str());
+    span.record("provider", "claude");
 
     let claude = claude_native_for_anthropic(&state, &requested_model)?;
     let raw_body = strip_claude_model_prefix(raw_body)?;
@@ -1775,9 +1824,9 @@ fn anthropic_sse_response(
     let response_request_id = request_id.clone();
     // Keep the request span active across the SSE stream so provider-side logs
     // emitted while relaying Anthropic frames retain request_id/session_id.
+    // Entered per-poll via SpannedStream (below), never held across an await.
     let span = tracing::Span::current();
     let stream = async_stream::stream! {
-        let _span_guard = span.enter();
         let _active = stats.as_deref().map(ActiveRequestGuard::new);
         let started = Instant::now();
         let mut usage = TokenUsage::default();
@@ -1887,6 +1936,9 @@ fn anthropic_sse_response(
             );
         }
     };
+    // Enter the request span per-poll (see SpannedStream) rather than holding an
+    // Entered guard across the stream's awaits.
+    let stream = SpannedStream::new(Box::pin(stream), span);
     let sse = Sse::new(stream).keep_alive(KeepAlive::default());
     let mut response = sse.into_response();
     response.headers_mut().insert(
@@ -2086,6 +2138,86 @@ mod tests {
     use omni_common::ChatMessage; // test constructors build requests literally
     use omni_core::LlmProvider; // for the smoke
     use tracing_test::traced_test; // correlation-span assertions capture log output
+
+    // A tracing Layer that records, for every event, the event's own `probe`
+    // field alongside the `request_id` of the CURRENT span as the subscriber's
+    // span stack sees it. This is the instrument that detects cross-task span
+    // bleed: if request B's event is emitted while request A's span is still
+    // (incorrectly) entered on the worker thread, this captures probe="B" with
+    // request_id="A". Reads the live span context, unlike tracing-test which
+    // reads the event's own registered scope.
+    #[derive(Clone, Default)]
+    struct SpanProbeLayer {
+        // (probe_value, current_request_id) per captured event.
+        seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    // Typed value stashed in each request span's extensions at creation, read
+    // back at event time. Avoids parsing formatted-field strings.
+    struct CapturedRequestId(String);
+
+    impl<S> tracing_subscriber::Layer<S> for SpanProbeLayer
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct GrabId(Option<String>);
+            impl tracing::field::Visit for GrabId {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    if f.name() == "request_id" {
+                        self.0 = Some(format!("{v:?}").trim_matches('"').to_string());
+                    }
+                }
+            }
+            let mut g = GrabId(None);
+            attrs.record(&mut g);
+            if let Some(rid) = g.0 {
+                if let Some(span) = ctx.span(id) {
+                    span.extensions_mut().insert(CapturedRequestId(rid));
+                }
+            }
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            // Pull the `probe` field off the event.
+            struct Grab(Option<String>);
+            impl tracing::field::Visit for Grab {
+                fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                    if f.name() == "probe" {
+                        self.0 = Some(v.to_string());
+                    }
+                }
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    if f.name() == "probe" && self.0.is_none() {
+                        self.0 = Some(format!("{v:?}").trim_matches('"').to_string());
+                    }
+                }
+            }
+            let mut g = Grab(None);
+            event.record(&mut g);
+            let Some(probe) = g.0 else { return };
+
+            // Read request_id from the CURRENT span's typed extension.
+            let mut rid = String::new();
+            if let Some(scope) = ctx.event_scope(event) {
+                for span in scope.from_root() {
+                    if let Some(captured) = span.extensions().get::<CapturedRequestId>() {
+                        rid = captured.0.clone();
+                    }
+                }
+            }
+            self.seen.lock().unwrap().push((probe, rid));
+        }
+    }
 
     fn catalogs_claude_grok() -> HashMap<String, ModelCatalog> {
         HashMap::from([
@@ -4591,6 +4723,100 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             }
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_streamed_spans_do_not_bleed_across_concurrent_requests() {
+        // WHY: the stream wrappers must NOT hold a `Span::enter` guard across an
+        // `.await` — doing so leaves the span entered on the worker thread while
+        // the task is suspended, so an event from a DIFFERENT concurrent request
+        // resuming on that thread would render with THIS request's request_id.
+        // That silently corrupts the very correlation this feature adds. This
+        // test drives two streams under distinct request spans concurrently and
+        // asserts each mid-stream event sees only its own request_id. It fails on
+        // a `span.enter()`-across-await wrapper and passes on SpannedStream.
+        //
+        // Built as a sync test owning a 2-worker runtime so the subscriber can be
+        // installed via with_default around block_on (a #[tokio::test] would nest
+        // runtimes when we block_on inside it).
+        use futures_util::StreamExt as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let probe = SpanProbeLayer::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::TRACE)
+            .with(tracing_subscriber::fmt::layer())
+            .with(probe.clone());
+
+        // A provider stream that yields between two awaits and emits a
+        // `probe`-tagged event in the gap, so the event fires while the stream
+        // is mid-flight and subject to interleaving with the other task.
+        fn probe_stream(tag: &'static str) -> CanonicalStream {
+            Box::pin(async_stream::stream! {
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                    tracing::info!(probe = tag, "mid-stream");
+                    tokio::task::yield_now().await;
+                    yield Ok(CanonicalStreamEvent::TextDelta("x".into()));
+                }
+                yield Ok(CanonicalStreamEvent::Finish { finish_reason: Some("stop".into()) });
+            })
+        }
+
+        async fn drive(tag: &'static str, id: &'static str) {
+            let span = tracing::info_span!("request", request_id = %id);
+            // Construct the wrapper INSIDE the span so it captures this span,
+            // exactly as a handler does before returning the streamed body.
+            let mut wrapped = span.in_scope(|| {
+                wrap_stream_for_stats(
+                    probe_stream(tag),
+                    None,
+                    "m".into(),
+                    None,
+                    format!("s-{id}"),
+                    id.into(),
+                    "L",
+                )
+            });
+            while wrapped.next().await.is_some() {}
+        }
+
+        // Drive both streams CONCURRENTLY on a single-thread runtime via join!,
+        // with the subscriber set as the current-thread default. This is the
+        // decisive setup: a span guard held across `.await` stays entered while
+        // stream A is suspended, so when the executor polls stream B on THIS SAME
+        // thread, B's mid-stream event renders under A's request_id. join! on one
+        // thread guarantees they interleave on the subscriber's thread; spawning
+        // onto other worker threads would run events where no default subscriber
+        // is set and capture nothing.
+        let seen = probe.seen.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            rt.block_on(async {
+                tokio::join!(drive("A", "aaaaaaaa"), drive("B", "bbbbbbbb"));
+            });
+        });
+
+        let events = seen.lock().unwrap();
+        assert!(
+            !events.is_empty(),
+            "probe layer captured no events; test would be vacuous"
+        );
+        for (probe_tag, request_id) in events.iter() {
+            let expected = match probe_tag.as_str() {
+                "A" => "aaaaaaaa",
+                "B" => "bbbbbbbb",
+                other => panic!("unexpected probe tag {other:?}"),
+            };
+            assert_eq!(
+                request_id, expected,
+                "event probe={probe_tag} saw request_id={request_id}, expected {expected}: \
+                 a concurrent request's span bled onto this thread"
+            );
+        }
     }
 
     #[tokio::test]
