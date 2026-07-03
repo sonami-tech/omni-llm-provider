@@ -778,7 +778,7 @@ mod tests {
 
     fn sample_req(text: &str) -> CanonicalRequest {
         CanonicalRequest {
-            model: "claude-sonnet-4-5".into(),
+            model: "claude-sonnet-4-6".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text(text.into()),
@@ -1028,12 +1028,21 @@ mod tests {
         //     exact prefix bytes are a prefix of Turn 2's request. A cache READ on
         //     Turn 2 is therefore only possible if that shared prefix (including our
         //     injected billing + preamble) was byte-identical across the two builds.
-        //   - The shared message is padded far past the model floor (Sonnet = 1024
-        //     tokens). Below the floor Anthropic silently declines to cache and
-        //     cache_creation would be 0 -> so requiring cache_creation > 0 on Turn 1
-        //     simultaneously proves we cleared the floor (#2) and that the marker is
-        //     live. Padding is deterministic (fixed string), so no clock/nonce leaks
-        //     into the prefix.
+        //   - The shared message is padded far past the model floor. This uses
+        //     Haiku 4.5, whose floor is 4096 tokens (the highest of the family), so
+        //     the padding targets ~9k tokens to clear it with margin. Below the floor
+        //     Anthropic silently declines to cache and cache_creation would be 0 ->
+        //     so requiring cache_creation > 0 on Turn 1 simultaneously proves we
+        //     cleared the floor (#2) and that the marker is live. Padding is
+        //     deterministic (fixed string), so no clock/nonce leaks into the prefix.
+        //   - Model choice: Haiku 4.5 (claude-haiku-4-5-20251001), the current
+        //     catalog's canonical Haiku. NOT Sonnet: the active 2.1.197 profile's
+        //     wire override injects output_config.effort="high" for opus/sonnet/fable,
+        //     and the live Anthropic API rejects `effort` on the current Sonnet
+        //     (claude-sonnet-4-6) with a 400 ("This model does not support the effort
+        //     parameter"). Haiku's wire override sets output_effort=None, so its
+        //     request is valid. (The stale effort injection on the Opus/Sonnet
+        //     overrides is a separate issue, out of scope here.)
         //
         // Guarded exactly like claude_send_exercises_full_fingerprint_path: opt-in
         // via OMNI_LIVE_TESTS=1, real creds required, CLAUDE_CREDENTIALS_PATH
@@ -1070,20 +1079,20 @@ mod tests {
             return;
         }
 
-        // Deterministic padding well past the 1024-token Sonnet floor. ~4 chars/token
-        // => ~12k chars targets ~3k tokens, comfortably clearing the floor with
+        // Deterministic padding well past Haiku's 4096-token floor. ~4 chars/token
+        // => ~36k chars targets ~9k tokens, comfortably clearing the floor with
         // margin for tokenizer variance. Fixed content: identical bytes every turn.
         let big_context = format!(
             "You are reviewing the following reference material. \
              Answer only from it. Reference block repeated for length:\n{}",
-            "The quick brown fox jumps over the lazy dog near the riverbank. ".repeat(200)
+            "The quick brown fox jumps over the lazy dog near the riverbank. ".repeat(600)
         );
 
         let p = ClaudeProvider::new().expect("ctor");
 
         // ---- Turn 1: single user message carrying the big shared context. ----
         let turn1 = CanonicalRequest {
-            model: "claude-sonnet-4-5".into(),
+            model: "claude-haiku-4-5-20251001".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text(big_context.clone()),
@@ -1095,11 +1104,19 @@ mod tests {
             .await
             .expect("turn 1 send must succeed with creds");
 
-        // Turn 1 must CREATE cache. Non-zero creation proves two things at once:
-        // the prefix cleared the model floor (#2), and the top-level marker is live.
+        // Turn 1's prefix must ENGAGE caching. Cold-start it creates
+        // (cache_creation > 0); but Anthropic's cache has a ~5-minute TTL, so a
+        // recent prior run (incl. a previous execution of this very test) can leave
+        // the identical prefix warm, and turn 1 then READS it (cache_creation == 0,
+        // cache_read > 0). Either outcome proves the same two things: the marker is
+        // live and the prefix cleared the model floor (#2). Asserting creation-only
+        // would be flaky across back-to-back runs. What must NOT happen is both
+        // zero - that means the prefix never cached at all.
+        let turn1_cached = r1.usage.cache_creation.max(r1.usage.cache_read);
         assert!(
-            r1.usage.cache_creation > 0,
-            "turn 1 must create cache (proves marker live + prefix above floor); got creation={} read={}",
+            turn1_cached > 0,
+            "turn 1 must engage cache (create when cold OR read when warm); \
+             both zero means the marker did not cache above the floor. got creation={} read={}",
             r1.usage.cache_creation,
             r1.usage.cache_read
         );
@@ -1112,7 +1129,7 @@ mod tests {
             r1.content.clone()
         };
         let turn2 = CanonicalRequest {
-            model: "claude-sonnet-4-5".into(),
+            model: "claude-haiku-4-5-20251001".into(),
             messages: vec![
                 CanonicalMessage {
                     role: "user".into(),
@@ -1147,16 +1164,17 @@ mod tests {
         );
 
         // Cross-check the hit is substantive, not a degenerate few-token match: the
-        // bytes cached on turn 1 should be reflected in turn 2's read. Allow slack
-        // for Anthropic block-boundary rounding, but require the read to be within a
-        // sane fraction of what turn 1 created rather than a trivial prefix.
-        let created = r1.usage.cache_creation;
+        // bytes cached on turn 1 should be reflected in turn 2's read. Compare
+        // against turn 1's cached-prefix size (creation when cold, read when warm -
+        // whichever was nonzero), allowing slack for Anthropic block-boundary
+        // rounding. A tiny read against a large prefix would signal partial
+        // instability.
         assert!(
-            r2.usage.cache_read >= created / 2,
+            r2.usage.cache_read >= turn1_cached / 2,
             "turn 2 cache_read ({}) should cover most of turn 1's cached prefix ({}); a tiny read \
              suggests only a fragment matched, i.e. partial prefix instability",
             r2.usage.cache_read,
-            created
+            turn1_cached
         );
     }
 
@@ -1427,7 +1445,7 @@ mod tests {
             .expect("test provider against mock base");
 
         let req = CanonicalRequest {
-            model: "claude-sonnet-4-5".into(),
+            model: "claude-sonnet-4-6".into(),
             messages: vec![
                 CanonicalMessage {
                     role: "system".into(),
