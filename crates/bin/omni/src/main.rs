@@ -87,6 +87,9 @@ use provider_claude::ClaudeProvider;
 use provider_codex::CodexProvider;
 use provider_grok::GrokProvider;
 
+mod log_color;
+use log_color::{ColorFields, ColorMode};
+
 const OMNI_ASCII_BANNER: &str = r#"
    ___  __  __ _   _ ___
   / _ \|  \/  | \ | |_ _|
@@ -238,10 +241,17 @@ struct RequestId(String);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Resolve color policy once (env + stderr TTY), then install a field
+    // formatter that gives request_id/session_id stable per-value hues and each
+    // provider a fixed color. with_ansi gates the level/timestamp escape codes to
+    // the same decision so a redirected or piped stream stays plain.
+    let color_mode = ColorMode::from_env();
     tracing_subscriber::fmt()
         .with_env_filter(
             "info,omni=debug,provider_claude=debug,provider_grok=debug,provider_codex=debug",
         )
+        .with_ansi(matches!(color_mode, ColorMode::On))
+        .fmt_fields(ColorFields::new(color_mode))
         .init();
 
     let cli = Cli::parse();
@@ -713,6 +723,7 @@ async fn request_span_layer(mut req: Request<Body>, next: middleware::Next) -> R
         "request",
         request_id = %short_request_id,
         session_id = tracing::field::Empty,
+        provider = tracing::field::Empty,
     );
     req.extensions_mut().insert(RequestId(request_id));
     next.run(req).instrument(span).await
@@ -1165,6 +1176,7 @@ async fn chat_completions_handler(
     let catalogs = provider_catalogs(&state.providers);
     let (prov_key, stripped_model) = resolve_provider_and_model(&requested_model, &catalogs)
         .map_err(|e| record_bad_request(&state, &requested_model, e))?;
+    tracing::Span::current().record("provider", prov_key.as_str());
     let stats_key = stats_model_key(&prov_key, &stripped_model);
 
     let entry = state
@@ -1492,7 +1504,10 @@ async fn anthropic_messages_inner(
         api_key.as_ref().map(|key| key.0.0.as_str()),
         &short_request_id,
     );
-    tracing::Span::current().record("session_id", session_id.as_str());
+    // The native Anthropic route only ever delegates to claude.
+    let span = tracing::Span::current();
+    span.record("session_id", session_id.as_str());
+    span.record("provider", "claude");
     log_json(
         &state,
         &session_id,
@@ -1982,6 +1997,7 @@ async fn responses_handler(
     let catalogs = provider_catalogs(&state.providers);
     let (prov_key, stripped_model) = resolve_provider_and_model(&requested_model, &catalogs)
         .map_err(|e| record_bad_request(&state, &requested_model, e))?;
+    tracing::Span::current().record("provider", prov_key.as_str());
     let stats_key = stats_model_key(&prov_key, &stripped_model);
 
     let entry = state
