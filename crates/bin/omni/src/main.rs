@@ -70,7 +70,7 @@ use axum::{
 };
 use clap::Parser;
 use futures_util::StreamExt;
-use tracing::{info, warn};
+use tracing::{Instrument, info, warn};
 use uuid::Uuid;
 
 use omni_common::{
@@ -228,6 +228,13 @@ struct AppState {
     stats: Option<Arc<Stats>>,
     conversation_log: Option<Arc<ConversationLog>>,
 }
+
+/// Per-request correlation id, generated once in `request_span_layer` and read
+/// by the handlers via a request extension. Carrying the full UUID here (not the
+/// 8-char short form) guarantees the id on the operational span matches the id
+/// the handler threads into the conversation log.
+#[derive(Clone)]
+struct RequestId(String);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -635,6 +642,10 @@ fn build_router(state: Arc<AppState>, auth_keys: Arc<HashSet<String>>) -> Router
             let keys = auth_keys.clone();
             move |req, next| omni_auth_layer(keys.clone(), req, next)
         }))
+        // Outermost: opens the correlation span before auth runs, so even an
+        // auth rejection is logged with a request_id. Layers apply bottom-up,
+        // so this must come after the auth layer to wrap it.
+        .layer(middleware::from_fn(request_span_layer))
 }
 
 async fn omni_auth_layer(
@@ -684,6 +695,40 @@ async fn omni_auth_layer(
         )
         .into_response(),
     }
+}
+
+/// Open a correlation span for the request and run the whole downstream inside
+/// it, so every `tracing` line (including `warn!`/`error!` emitted from within a
+/// provider mid-stream) carries `request_id`. `session_id` is not known until a
+/// handler parses the body, so it starts `Empty` and each inference handler
+/// records it late via `Span::current().record(...)`.
+///
+/// The full `request_id` is stashed in a request extension for the handlers to
+/// read, so the id in this span and the id in the conversation log are the same
+/// value from a single source.
+async fn request_span_layer(mut req: Request<Body>, next: middleware::Next) -> Response {
+    let request_id = Uuid::new_v4().to_string();
+    let short_request_id: String = request_id.chars().take(8).collect();
+    let span = tracing::info_span!(
+        "request",
+        request_id = %short_request_id,
+        session_id = tracing::field::Empty,
+    );
+    req.extensions_mut().insert(RequestId(request_id));
+    next.run(req).instrument(span).await
+}
+
+/// Read the correlation id that `request_span_layer` stashed in the request
+/// extensions. The Anthropic handlers take the raw `Request` (rather than an
+/// `Extension` extractor) because they consume the body themselves, so they pull
+/// the id out here. Falls back to a fresh id if the layer did not run (e.g. a
+/// handler exercised directly in a unit test).
+fn request_id_from(request: &Request<Body>) -> String {
+    request
+        .extensions()
+        .get::<RequestId>()
+        .map(|id| id.0.clone())
+        .unwrap_or_else(|| Uuid::new_v4().to_string())
 }
 
 fn auth_key_id(key: &str) -> String {
@@ -1101,11 +1146,12 @@ async fn chat_completions_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     api_key: Option<Extension<ApiKeyId>>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
     Json(body): Json<ChatCompletionRequest>,
 ) -> Result<axum::response::Response, AppError> {
-    let request_id = Uuid::new_v4().to_string();
     let short_request_id = request_id.chars().take(8).collect::<String>();
     let session_id = chat_session_id(&headers, &body, api_key.as_ref().map(|k| k.0.0.as_str()));
+    tracing::Span::current().record("session_id", session_id.as_str());
     log_json(
         &state,
         &session_id,
@@ -1248,7 +1294,13 @@ fn wrap_stream_for_stats(
     request_id: String,
     label: &'static str,
 ) -> CanonicalStream {
+    // Capture the request span so operational logs emitted while polling the
+    // provider stream (including provider-side warn!/error! mid-stream) keep the
+    // request_id/session_id fields. The stream outlives the handler, so the span
+    // must be entered inside the generator body, not relied upon ambiently.
+    let span = tracing::Span::current();
     Box::pin(async_stream::stream! {
+        let _span_guard = span.enter();
         let _active = stats.as_deref().map(ActiveRequestGuard::new);
         let started = Instant::now();
         let mut usage = TokenUsage::default();
@@ -1423,7 +1475,7 @@ async fn anthropic_messages_inner(
     api_key: Option<Extension<ApiKeyId>>,
     request: Request<Body>,
 ) -> Result<Response, AppError> {
-    let request_id = Uuid::new_v4().to_string();
+    let request_id = request_id_from(&request);
     let short_request_id = request_id.chars().take(8).collect::<String>();
     let raw_body = read_anthropic_body(request).await?;
     let requested_model = raw_body
@@ -1440,6 +1492,7 @@ async fn anthropic_messages_inner(
         api_key.as_ref().map(|key| key.0.0.as_str()),
         &short_request_id,
     );
+    tracing::Span::current().record("session_id", session_id.as_str());
     log_json(
         &state,
         &session_id,
@@ -1560,7 +1613,7 @@ async fn anthropic_count_tokens_inner(
     api_key: Option<Extension<ApiKeyId>>,
     request: Request<Body>,
 ) -> Result<Response, AppError> {
-    let request_id = Uuid::new_v4().to_string();
+    let request_id = request_id_from(&request);
     let short_request_id = request_id.chars().take(8).collect::<String>();
     let raw_body = read_anthropic_body(request).await?;
     let requested_model = raw_body
@@ -1577,6 +1630,7 @@ async fn anthropic_count_tokens_inner(
         api_key.as_ref().map(|key| key.0.0.as_str()),
         &short_request_id,
     );
+    tracing::Span::current().record("session_id", session_id.as_str());
 
     let claude = claude_native_for_anthropic(&state, &requested_model)?;
     let raw_body = strip_claude_model_prefix(raw_body)?;
@@ -1704,7 +1758,11 @@ fn anthropic_sse_response(
     replacements: Replacements,
 ) -> Response {
     let response_request_id = request_id.clone();
+    // Keep the request span active across the SSE stream so provider-side logs
+    // emitted while relaying Anthropic frames retain request_id/session_id.
+    let span = tracing::Span::current();
     let stream = async_stream::stream! {
+        let _span_guard = span.enter();
         let _active = stats.as_deref().map(ActiveRequestGuard::new);
         let started = Instant::now();
         let mut usage = TokenUsage::default();
@@ -1904,12 +1962,13 @@ async fn responses_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     api_key: Option<Extension<ApiKeyId>>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
     Json(body): Json<omni_common::ResponsesRequest>,
 ) -> Result<axum::response::Response, AppError> {
-    let request_id = Uuid::new_v4().to_string();
     let short_request_id = request_id.chars().take(8).collect::<String>();
     let session_id =
         responses_session_id(&headers, &body, api_key.as_ref().map(|k| k.0.0.as_str()));
+    tracing::Span::current().record("session_id", session_id.as_str());
     log_json(
         &state,
         &session_id,
@@ -2010,6 +2069,7 @@ mod tests {
     use super::*;
     use omni_common::ChatMessage; // test constructors build requests literally
     use omni_core::LlmProvider; // for the smoke
+    use tracing_test::traced_test; // correlation-span assertions capture log output
 
     fn catalogs_claude_grok() -> HashMap<String, ModelCatalog> {
         HashMap::from([
@@ -2951,11 +3011,25 @@ requires_openai_auth = false
         omni_common::test_support::http_post_json(format!("http://127.0.0.1:{port}{path}"), body)
     }
 
+    // Handlers now take a RequestId extension (normally injected by
+    // request_span_layer). These helpers call handlers directly, bypassing the
+    // layer, so they supply a fixed test id.
+    fn test_request_id() -> Extension<RequestId> {
+        Extension(RequestId("test-request-0000".to_string()))
+    }
+
     async fn call_chat_handler(
         state: Arc<AppState>,
         req: ChatCompletionRequest,
     ) -> Result<axum::response::Response, AppError> {
-        chat_completions_handler(State(state), HeaderMap::new(), None, Json(req)).await
+        chat_completions_handler(
+            State(state),
+            HeaderMap::new(),
+            None,
+            test_request_id(),
+            Json(req),
+        )
+        .await
     }
 
     async fn call_chat_handler_with_session(
@@ -2965,14 +3039,21 @@ requires_openai_auth = false
     ) -> Result<axum::response::Response, AppError> {
         let mut headers = HeaderMap::new();
         headers.insert("x-session-id", session_id.parse().unwrap());
-        chat_completions_handler(State(state), headers, None, Json(req)).await
+        chat_completions_handler(State(state), headers, None, test_request_id(), Json(req)).await
     }
 
     async fn call_responses_handler(
         state: Arc<AppState>,
         req: omni_common::ResponsesRequest,
     ) -> Result<axum::response::Response, AppError> {
-        responses_handler(State(state), HeaderMap::new(), None, Json(req)).await
+        responses_handler(
+            State(state),
+            HeaderMap::new(),
+            None,
+            test_request_id(),
+            Json(req),
+        )
+        .await
     }
 
     async fn call_anthropic_messages_handler(
@@ -4331,6 +4412,169 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         assert_eq!(v["models"]["grok:grok-4.3"]["requests"], 1);
         assert_eq!(v["models"]["grok:grok-4.3"]["input_tokens"], 3);
         assert_eq!(v["models"]["grok:grok-4.3"]["output_tokens"], 2);
+    }
+
+    /// A provider stub that emits a `warn!` from deep inside the request path:
+    /// during `send` (non-stream) and mid-stream (after the handler has already
+    /// returned the SSE body). The message is a fixed sentinel so the correlation
+    /// test can find exactly that line and inspect its span fields.
+    #[derive(Debug)]
+    struct WarningProvider;
+    #[async_trait::async_trait]
+    impl LlmProvider for WarningProvider {
+        fn id(&self) -> &'static str {
+            "warning"
+        }
+
+        async fn send(
+            &self,
+            req: omni_core::CanonicalRequest,
+        ) -> Result<CanonicalResponse, ProviderError> {
+            warn!("correlation-sentinel-nonstream");
+            Ok(CanonicalResponse {
+                model: req.model,
+                content: "ok".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: omni_core::CanonicalUsage::default(),
+                id: None,
+                refusal: None,
+                ..Default::default()
+            })
+        }
+
+        async fn send_stream(
+            &self,
+            _req: omni_core::CanonicalRequest,
+        ) -> Result<CanonicalStream, ProviderError> {
+            Ok(Box::pin(async_stream::stream! {
+                // Emitted while wrap_stream_for_stats polls this stream, i.e.
+                // after the handler future has returned. Proves the span is
+                // carried into the streamed body, not just the handler.
+                warn!("correlation-sentinel-stream");
+                yield Ok(CanonicalStreamEvent::TextDelta("hi".into()));
+                yield Ok(CanonicalStreamEvent::Finish {
+                    finish_reason: Some("stop".into()),
+                });
+            }))
+        }
+    }
+
+    fn warning_provider_app() -> axum::Router {
+        let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
+        providers.insert(
+            "grok".into(),
+            ProviderEntry {
+                provider: Arc::new(WarningProvider),
+                claude_native: None,
+                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
+                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+            },
+        );
+        mk_app_with(providers, Arc::new(HashSet::new()))
+    }
+
+    fn chat_request_json(stream: bool) -> String {
+        serde_json::json!({
+            "model": "grok:grok-4.3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": stream,
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_correlation_fields_on_nonstream_log_line() {
+        // WHY: the regression this fixes is that operational logs emitted deep in
+        // the request path (here, inside the provider's `send`) lost the request
+        // and session correlation. Driving a real request THROUGH THE ROUTER
+        // exercises request_span_layer; a direct handler call would bypass it and
+        // prove nothing. x-session-id makes the derived session deterministic.
+        use tower::ServiceExt;
+        let app = warning_provider_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("x-session-id", "sess-nonstream")
+                    .body(Body::from(chat_request_json(false)))
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The sentinel warn! must carry request_id (set at span open) and the
+        // session_id recorded late by the handler.
+        logs_assert(|lines: &[&str]| {
+            let sentinel: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("correlation-sentinel-nonstream"))
+                .collect();
+            if sentinel.is_empty() {
+                return Err("sentinel log line was never captured".into());
+            }
+            for line in &sentinel {
+                if !line.contains("request_id=") {
+                    return Err(format!("line missing request_id: {line}"));
+                }
+                if !line.contains("session_id=") {
+                    return Err(format!("line missing session_id: {line}"));
+                }
+            }
+            Ok(())
+        });
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_correlation_fields_on_streamed_log_line() {
+        // WHY: SSE streams outlive the handler. Without instrumenting the stream
+        // body in wrap_stream_for_stats, a provider warn! emitted mid-stream would
+        // lose the correlation fields. This drives a streaming request through the
+        // router and consumes the body so the mid-stream warn! actually fires.
+        use tower::ServiceExt;
+        let app = warning_provider_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("x-session-id", "sess-stream")
+                    .body(Body::from(chat_request_json(true)))
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Drain the SSE body: the mid-stream warn! only fires when the stream is
+        // polled, which happens as the body is read.
+        let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+
+        logs_assert(|lines: &[&str]| {
+            let sentinel: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("correlation-sentinel-stream"))
+                .collect();
+            if sentinel.is_empty() {
+                return Err("streamed sentinel log line was never captured".into());
+            }
+            for line in &sentinel {
+                if !line.contains("request_id=") {
+                    return Err(format!("streamed line missing request_id: {line}"));
+                }
+                if !line.contains("session_id=") {
+                    return Err(format!("streamed line missing session_id: {line}"));
+                }
+            }
+            Ok(())
+        });
     }
 
     #[tokio::test]
