@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use omni_common::env_nonempty;
 use omni_common::responses_upstream::{
     self, ErrorRedactor, ResponsesSseBuffer, ResponsesSseEvent, ResponsesStreamParser,
 };
@@ -1085,13 +1086,6 @@ fn warn_codex_conservative_fallback(config: &CodexRequestConfig) {
         reason,
         "codex conservative mode parity is not exact; using the configured REST Responses path instead"
     );
-}
-
-fn env_nonempty(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 fn headers_from_env(env_name: &str) -> Result<Vec<(String, String)>, ProviderError> {

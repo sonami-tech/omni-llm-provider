@@ -75,7 +75,7 @@ use uuid::Uuid;
 
 use omni_common::{
     ActiveRequestGuard, ApiKeyId, AppError, ChatCompletionRequest, ConversationLog, Replacements,
-    Stats, TokenUsage, from_canonical, to_canonical,
+    Stats, TokenUsage, env_nonempty, from_canonical, to_canonical,
 };
 use omni_core::{
     CanonicalResponse, CanonicalStream, CanonicalStreamEvent, LlmProvider, ProviderError,
@@ -528,13 +528,6 @@ fn resolve_claude_profile(
             }))
         }
     }
-}
-
-fn env_nonempty(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 /// Build a [`VersionSelector`] for one provider from the CLI flags.

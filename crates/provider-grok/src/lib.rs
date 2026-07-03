@@ -57,6 +57,7 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use omni_common::Replacements;
+use omni_common::env_nonempty;
 use omni_common::responses_upstream::{
     self, ErrorRedactor, ResponsesSseBuffer, ResponsesStreamParser,
 };
@@ -943,13 +944,6 @@ impl ErrorRedactor for GrokErrorRedactor {
         }
         out
     }
-}
-
-fn env_nonempty(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 /// Map a CanonicalRequest (after light replacements hook) to the JSON body for xAI /v1/chat/completions.

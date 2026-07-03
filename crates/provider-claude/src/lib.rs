@@ -38,6 +38,7 @@ pub use upstream::{UpstreamClient, UpstreamError};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use omni_common::Replacements;
+use omni_common::env_nonempty;
 use omni_core::{
     CanonicalRequest, CanonicalResponse, CanonicalStream, CanonicalStreamEvent, CanonicalUsage,
     LlmProvider, ProviderError,
@@ -318,13 +319,6 @@ impl ClaudeProvider {
                 .map_err(map_upstream_err)
         }
     }
-}
-
-fn env_nonempty(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 impl Default for ClaudeProvider {
