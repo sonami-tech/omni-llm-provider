@@ -6,10 +6,10 @@
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use omni_common::env_nonempty;
 use omni_common::responses_upstream::{
     self, ErrorRedactor, ResponsesSseBuffer, ResponsesSseEvent, ResponsesStreamParser,
 };
+use omni_common::{env_nonempty, headers_from_env};
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
     CanonicalResponse, CanonicalStream, CanonicalStreamEvent, CanonicalToolCall,
@@ -883,7 +883,9 @@ impl CodexRequestConfig {
         }
         for (name, env_name) in &self.env_http_headers {
             if name == "__omni_custom_headers__" {
-                for (header_name, header_value) in headers_from_env(env_name)? {
+                for (header_name, header_value) in
+                    headers_from_env(env_name).map_err(ProviderError::Auth)?
+                {
                     insert_header(&mut headers, &header_name, &header_value)?;
                 }
             } else if let Ok(value) = std::env::var(env_name)
@@ -1086,29 +1088,6 @@ fn warn_codex_conservative_fallback(config: &CodexRequestConfig) {
         reason,
         "codex conservative mode parity is not exact; using the configured REST Responses path instead"
     );
-}
-
-fn headers_from_env(env_name: &str) -> Result<Vec<(String, String)>, ProviderError> {
-    let Some(raw) = env_nonempty(env_name) else {
-        return Ok(Vec::new());
-    };
-    parse_custom_headers(&raw).map_err(ProviderError::Auth)
-}
-
-fn parse_custom_headers(raw: &str) -> Result<Vec<(String, String)>, String> {
-    let mut headers = Vec::new();
-    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| "custom header must be formatted as `Name: value`".to_string())?;
-        let name = name.trim();
-        let value = value.trim();
-        if name.is_empty() || value.is_empty() {
-            return Err("custom header name and value must both be non-empty".into());
-        }
-        headers.push((name.to_string(), value.to_string()));
-    }
-    Ok(headers)
 }
 
 impl AuthCommand {

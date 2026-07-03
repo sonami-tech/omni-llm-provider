@@ -17,7 +17,7 @@ pub mod test_support;
 
 pub use auth::{ApiKeyId, auth_layer};
 pub use conversation_log::{ConversationLog, DEFAULT_LOG_BACKUPS, DEFAULT_LOG_MAX_BYTES};
-pub use env::env_nonempty;
+pub use env::{env_nonempty, headers_from_env, parse_custom_headers};
 pub use error::{AppError, classify_upstream};
 pub use http::{
     ChatCompletionRequest, ChatCompletionResponse, ChatContentPart, ChatImageUrl, ChatMessage,
