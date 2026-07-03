@@ -304,6 +304,15 @@ impl ClaudeProvider {
         self.profile
     }
 
+    /// Whether to inject Anthropic top-level automatic caching for this request.
+    /// True only when the feature flag is on AND this provider targets first-party
+    /// Anthropic (default OAuth/Claude Code path). A custom gateway uses custom
+    /// auth and may front Bedrock/Vertex, where automatic caching is unsupported,
+    /// so it is always excluded regardless of the flag.
+    fn supports_auto_cache(&self) -> bool {
+        auto_cache_enabled() && !self.client.uses_custom_auth()
+    }
+
     pub(crate) async fn credentials_for_request(
         &self,
     ) -> Result<credentials::Credentials, ProviderError> {
@@ -325,6 +334,21 @@ fn env_nonempty(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// Feature gate for injecting Anthropic top-level automatic caching on the
+/// first-party Claude path. OFF by default (ships dark): set
+/// `OMNI_CLAUDE_AUTO_CACHE` to a truthy value (`1`/`true`/`yes`/`on`,
+/// case-insensitive) to enable. The gate is ANDed with a first-party check at
+/// the call site, so a custom gateway (which may front Bedrock/Vertex, where
+/// automatic caching is unsupported) never gets the marker even when this is on.
+fn auto_cache_enabled() -> bool {
+    matches!(
+        env_nonempty("OMNI_CLAUDE_AUTO_CACHE")
+            .map(|v| v.to_ascii_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 impl Default for ClaudeProvider {
@@ -445,6 +469,7 @@ impl LlmProvider for ClaudeProvider {
             self.profile,
             &repl,
             true, // always inject for the gate (callers that want --no-preamble use a different path)
+            self.supports_auto_cache(),
         )
         // Request-shaping failures (unrepresentable content, malformed tool args,
         // bad image URL, unsupported role) are the client's fault -> 400, not 500.
@@ -498,9 +523,15 @@ impl LlmProvider for ClaudeProvider {
         // the non-stream path. Build, serialize, then set stream=true on the
         // JSON value (the typed builder set Some(false)).
         let repl = Replacements::empty();
-        let anth_req = translate::prepare_anthropic_request(&req, self.profile, &repl, true)
-            // Request-shaping failures are client faults -> 400, not 500.
-            .map_err(ProviderError::BadRequest)?;
+        let anth_req = translate::prepare_anthropic_request(
+            &req,
+            self.profile,
+            &repl,
+            true,
+            self.supports_auto_cache(),
+        )
+        // Request-shaping failures are client faults -> 400, not 500.
+        .map_err(ProviderError::BadRequest)?;
         let mut body_val = serde_json::to_value(&anth_req).map_err(|e| {
             ProviderError::Other(anyhow::Error::msg(format!("anth serialize: {e}")))
         })?;
@@ -595,6 +626,60 @@ mod tests {
     }
 
     #[test]
+    fn auto_cache_gate_off_by_default_and_requires_first_party() {
+        // WHY: the auto-cache feature must ship DARK (off unless explicitly
+        // enabled) and must NEVER fire on a custom gateway, which may front
+        // Bedrock/Vertex where Anthropic automatic caching is unsupported and the
+        // marker would be wasted or rejected. This test locks in both halves of
+        // the gate: the env default, and the first-party AND-condition.
+        let _guard = CREDS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let old = std::env::var_os("OMNI_CLAUDE_AUTO_CACHE");
+
+        // 1. Unset -> disabled (ships dark).
+        unsafe { std::env::remove_var("OMNI_CLAUDE_AUTO_CACHE") };
+        assert!(
+            !auto_cache_enabled(),
+            "auto-cache must be OFF when OMNI_CLAUDE_AUTO_CACHE is unset"
+        );
+
+        // 2. Truthy -> the flag itself is on...
+        unsafe { std::env::set_var("OMNI_CLAUDE_AUTO_CACHE", "1") };
+        assert!(auto_cache_enabled(), "\"1\" must enable the flag");
+
+        // ...and a first-party provider (default OAuth path) opts in.
+        let first_party = ClaudeProvider::new().unwrap();
+        assert!(
+            first_party.supports_auto_cache(),
+            "first-party provider with the flag on must inject auto-cache"
+        );
+
+        // ...but a custom gateway stays OFF even with the flag on (Bedrock/Vertex
+        // safety): custom auth => arbitrary backend => never auto-cache.
+        let custom = ClaudeProvider::new_for_custom_gateway(
+            default_profile(),
+            "https://claude-proxy.example.com",
+            Some("sk-ant-oat01-example".into()),
+            vec![],
+        )
+        .unwrap();
+        assert!(
+            !custom.supports_auto_cache(),
+            "custom gateway must NOT auto-cache even when the flag is on"
+        );
+
+        // 3. An unrecognized value stays off (only explicit truthy strings enable).
+        unsafe { std::env::set_var("OMNI_CLAUDE_AUTO_CACHE", "maybe") };
+        assert!(!auto_cache_enabled(), "non-truthy value must not enable");
+
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("OMNI_CLAUDE_AUTO_CACHE", v),
+                None => std::env::remove_var("OMNI_CLAUDE_AUTO_CACHE"),
+            }
+        }
+    }
+
+    #[test]
     fn resolve_via_profile_still_claude_specific() {
         let p = ClaudeProvider::new().unwrap();
         let m = p.profile().resolve_model("sonnet").unwrap();
@@ -619,7 +704,7 @@ mod tests {
         };
         let profile = default_profile();
         let repl = Replacements::empty();
-        let anth = translate::prepare_anthropic_request(&req, profile, &repl, true).unwrap();
+        let anth = translate::prepare_anthropic_request(&req, profile, &repl, true, false).unwrap();
         // system has the two identity blocks
         let sys = anth.system.expect("system after identity");
         match sys {
@@ -899,7 +984,7 @@ mod tests {
         let req = sample_req("inv");
         let profile = default_profile();
         let repl = Replacements::empty();
-        let anth = translate::prepare_anthropic_request(&req, profile, &repl, true).unwrap();
+        let anth = translate::prepare_anthropic_request(&req, profile, &repl, true, false).unwrap();
         let sys = match anth.system.expect("sys") {
             translate::SystemField::Blocks(b) => b,
             _ => panic!(),
@@ -920,7 +1005,7 @@ mod tests {
         // force model that hits haiku path etc
         req.model = "haiku".into();
         let profile = default_profile();
-        let anth = translate::prepare_anthropic_request(&req, profile, &repl, true).unwrap();
+        let anth = translate::prepare_anthropic_request(&req, profile, &repl, true, false).unwrap();
         let blocks = match anth.system.unwrap() {
             translate::SystemField::Blocks(b) => b,
             _ => panic!(),
@@ -972,8 +1057,10 @@ mod tests {
         let req = sample_req("x");
         let profile = default_profile();
         let repl = Replacements::empty();
-        let with_id = translate::prepare_anthropic_request(&req, profile, &repl, true).unwrap();
-        let without = translate::prepare_anthropic_request(&req, profile, &repl, false).unwrap();
+        let with_id =
+            translate::prepare_anthropic_request(&req, profile, &repl, true, false).unwrap();
+        let without =
+            translate::prepare_anthropic_request(&req, profile, &repl, false, false).unwrap();
         assert!(with_id.system.is_some());
         assert!(without.system.is_none());
     }

@@ -69,6 +69,15 @@ pub struct MessagesRequest {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<OutputConfig>,
+
+    /// Top-level Anthropic *automatic* caching marker. When set, the server
+    /// places one cache breakpoint on the last cacheable block and moves it
+    /// forward as the conversation grows (the documented analog of OpenAI's
+    /// server-side caching). Serialized LAST so it never lands inside the
+    /// cached prefix. Only ever `Some` on first-party routes with auto-cache
+    /// enabled; `None` reproduces the captured Claude Code baseline byte-for-byte.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// `system` may be a flat string OR an array of typed text blocks. The block
@@ -433,6 +442,10 @@ pub fn build_messages_request_from_canonical(
         metadata,
         thinking,
         output_config: None,
+        // Auto-cache marker is injected later by finalize_claude_wire_request
+        // (step 6), gated on the first-party + enabled check. None here keeps
+        // the direct-builder output identical to the fingerprint baseline.
+        cache_control: None,
     })
 }
 
@@ -790,6 +803,7 @@ pub fn prepare_anthropic_request(
     profile: &FingerprintProfile,
     repl: &Replacements,
     inject_identity: bool,
+    supports_auto_cache: bool,
 ) -> Result<MessagesRequest, String> {
     let resolved = profile.resolve_model(&canon.model);
     // Door 1 applies prompt replacements during the canonical build (repl is
@@ -804,6 +818,7 @@ pub fn prepare_anthropic_request(
         profile,
         &Replacements::empty(),
         inject_identity,
+        supports_auto_cache,
     );
     Ok(anth)
 }
@@ -817,7 +832,13 @@ pub fn prepare_anthropic_request(
 /// 2. prompt replacements (before identity, so the billing suffix sees final text)
 /// 3. thinking-budget bump (before wire defaults, so it sees the sentinel 0)
 /// 4. wire defaults (fills only still-unset fields)
-/// 5. identity injection (LAST: the billing suffix is computed over the final body)
+/// 5. identity injection (the billing suffix is computed over the final body)
+/// 6. auto-cache marker (LAST: a pure top-level appendage; it does not touch the
+///    system/message prefix identity computed by step 5)
+///
+/// `supports_auto_cache` gates step 6: it is only true on first-party Anthropic
+/// routes with auto-caching enabled (Bedrock/Vertex and custom gateways pass
+/// false). See the caller in lib.rs for the gate.
 ///
 /// `stream` is intentionally NOT handled here; each door owns it (a native
 /// request forces `stream: false` when omitted, which the tail must not clobber).
@@ -828,6 +849,7 @@ pub fn finalize_claude_wire_request(
     profile: &FingerprintProfile,
     replacements: &Replacements,
     inject_identity: bool,
+    supports_auto_cache: bool,
 ) {
     // 1. Emit the outbound model exactly as Claude Code would: an explicit
     // version pin is forwarded verbatim, an alias/canonical maps to the profile
@@ -868,9 +890,26 @@ pub fn finalize_claude_wire_request(
     // re-defaults an explicit max_tokens:0, intentionally.
     apply_profile_wire_defaults(req, profile);
 
-    // 5. Identity LAST: the billing suffix is computed over the final body and
+    // 5. Identity: the billing suffix is computed over the final body and
     // uses the (post-replacement) first user text.
     prepend_claude_code_identity(req, profile, inject_identity);
+
+    // 6. Auto-cache marker LAST. A single top-level `cache_control` puts Anthropic
+    // in automatic-caching mode: the server anchors one breakpoint on the last
+    // cacheable block and advances it as the conversation grows. This is a pure
+    // sibling field (serialized after everything else), so it does NOT alter the
+    // tools->system->messages prefix that identity just finalized; the sha-stable
+    // billing header at system[0] means the cached prefix is byte-stable across
+    // turns as long as the client keeps the first user message identical.
+    // Gated to first-party routes only (Bedrock/Vertex do not support automatic
+    // caching); the per-model minimum-token floor makes a sub-floor prefix a
+    // silent zero-cost no-op, so no size gate is needed here.
+    if supports_auto_cache {
+        req.cache_control = Some(CacheControl {
+            kind: "ephemeral".into(),
+            ttl: None,
+        });
+    }
 }
 
 /// Fill the fingerprint wire defaults for any field the client left unset, so a
@@ -1014,6 +1053,7 @@ mod tests {
             metadata: None,
             thinking: None,
             output_config: None,
+            cache_control: None,
         };
         let profile = crate::fingerprint::default_profile();
         prepend_claude_code_identity(&mut req, profile, true);
@@ -1069,7 +1109,7 @@ mod tests {
             ..Default::default()
         };
         let profile = crate::fingerprint::default_profile();
-        let anth = prepare_anthropic_request(&canon, profile, &repl, true).unwrap();
+        let anth = prepare_anthropic_request(&canon, profile, &repl, true, false).unwrap();
         // first user text was replaced before billing suffix
         let blocks = match anth.system.unwrap() {
             SystemField::Blocks(b) => b,
@@ -1083,6 +1123,140 @@ mod tests {
             MessageContent::Text(t) => assert_eq!(t, "tell REDACTED"),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn auto_cache_true_emits_top_level_ephemeral_marker() {
+        // WHY: this is the PR's whole behavior — a single top-level cache_control
+        // marker puts Anthropic in automatic-caching mode. It MUST serialize as a
+        // sibling of model/system/messages (NOT inside a content block; a block
+        // marker is a different, manual mode), with exactly {"type":"ephemeral"}
+        // and no ttl (automatic caching uses the default 5m TTL).
+        let canon = CanonicalRequest {
+            model: "sonnet".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hello".into()),
+            }],
+            ..Default::default()
+        };
+        let profile = crate::fingerprint::default_profile();
+        let anth = prepare_anthropic_request(&canon, profile, &empty_repl(), true, true).unwrap();
+        assert_eq!(
+            anth.cache_control.as_ref().map(|c| c.kind.as_str()),
+            Some("ephemeral"),
+            "top-level cache_control must be ephemeral when auto-cache is on"
+        );
+        assert!(
+            anth.cache_control.as_ref().is_some_and(|c| c.ttl.is_none()),
+            "automatic caching uses the default TTL (no ttl field on the wire)"
+        );
+        // The marker is a TOP-LEVEL sibling; the wire form is {"type":"ephemeral"}.
+        let val = serde_json::to_value(&anth).unwrap();
+        assert_eq!(
+            val.get("cache_control")
+                .and_then(|c| c.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("ephemeral"),
+            "cache_control must be a top-level sibling serialized as {{\"type\":\"ephemeral\"}}"
+        );
+        // And it must NOT have leaked into any content block or the system field
+        // (those are the manual-mode placements this PR deliberately does not use).
+        for m in &anth.messages {
+            if let MessageContent::Blocks(blocks) = &m.content {
+                for b in blocks {
+                    if let ContentBlock::Text { cache_control, .. } = b {
+                        assert!(cache_control.is_none(), "no block-level marker in PR1");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn auto_cache_false_is_byte_identical_to_baseline() {
+        // WHY: the feature ships dark. With auto-cache off the outbound body must
+        // be byte-for-byte identical to today's captured Claude Code baseline, so
+        // the default path keeps fingerprint parity (and the cch checksum, which is
+        // computed over the whole body, is unchanged). Proven by serializing the
+        // SAME request with the flag off vs on and asserting the off form has no
+        // cache_control key at all while the on form differs by exactly that key.
+        let canon = CanonicalRequest {
+            model: "sonnet".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text("hello".into()),
+            }],
+            ..Default::default()
+        };
+        let profile = crate::fingerprint::default_profile();
+        let off = prepare_anthropic_request(&canon, profile, &empty_repl(), true, false).unwrap();
+        let on = prepare_anthropic_request(&canon, profile, &empty_repl(), true, true).unwrap();
+        assert!(off.cache_control.is_none(), "off => no marker");
+
+        let off_bytes = serde_json::to_vec(&off).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&off_bytes).contains("cache_control"),
+            "off body must not contain the cache_control key (skip_serializing_if, not null)"
+        );
+        // The ONLY difference between off and on is the added top-level key: clear
+        // it on the `on` form and the two serialize identically.
+        let mut on_cleared = on;
+        on_cleared.cache_control = None;
+        assert_eq!(
+            serde_json::to_vec(&on_cleared).unwrap(),
+            off_bytes,
+            "on and off must differ by exactly the cache_control key, nothing else"
+        );
+    }
+
+    #[test]
+    fn auto_cache_prefix_is_byte_stable_across_turns() {
+        // WHY: automatic caching only pays off if the cached prefix is byte-stable
+        // turn over turn. The billing header at system[0] is derived from the FIRST
+        // user message; this test locks in that a later conversation turn (same
+        // first message, more messages appended) reproduces byte-identical
+        // system[0] (billing) and system[1] (preamble). If the sha-billing suffix
+        // ever became per-request (a timestamp/nonce leak), this fails and the
+        // cache would silently never hit.
+        let profile = crate::fingerprint::default_profile();
+        let mk = |msgs: Vec<CanonicalMessage>| {
+            let canon = CanonicalRequest {
+                model: "sonnet".into(),
+                messages: msgs,
+                ..Default::default()
+            };
+            let anth =
+                prepare_anthropic_request(&canon, profile, &empty_repl(), true, true).unwrap();
+            match anth.system.unwrap() {
+                SystemField::Blocks(b) => b,
+                _ => panic!("expected system blocks"),
+            }
+        };
+        let user = |t: &str| CanonicalMessage {
+            role: "user".into(),
+            content: CanonicalContent::Text(t.into()),
+        };
+        let assistant = |t: &str| CanonicalMessage {
+            role: "assistant".into(),
+            content: CanonicalContent::Text(t.into()),
+        };
+        // Turn 1: single user message.
+        let turn1 = mk(vec![user("what is the capital of France?")]);
+        // Turn 3: SAME first user message, plus an assistant reply and a follow-up.
+        let turn3 = mk(vec![
+            user("what is the capital of France?"),
+            assistant("Paris."),
+            user("and of Germany?"),
+        ]);
+        assert_eq!(
+            turn1[0].text, turn3[0].text,
+            "billing header (system[0]) must be byte-identical across turns of the same conversation"
+        );
+        assert_eq!(
+            turn1[1].text, turn3[1].text,
+            "system preamble (system[1]) must be byte-identical across turns"
+        );
     }
 
     #[test]
@@ -1133,6 +1307,7 @@ mod tests {
             metadata: None,
             thinking: None,
             output_config: None,
+            cache_control: None,
         };
         let profile = crate::fingerprint::default_profile();
         prepend_claude_code_identity(&mut req, profile, true);
@@ -1235,7 +1410,7 @@ mod tests {
             ..Default::default()
         };
         let profile = crate::fingerprint::default_profile();
-        let anth = prepare_anthropic_request(&canon, profile, &repl, true).unwrap();
+        let anth = prepare_anthropic_request(&canon, profile, &repl, true, false).unwrap();
         let blocks = match anth.system.unwrap() {
             SystemField::Blocks(b) => b,
             _ => panic!(),
@@ -1304,7 +1479,7 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            let anth = prepare_anthropic_request(&canon, profile, &repl, false).unwrap();
+            let anth = prepare_anthropic_request(&canon, profile, &repl, false, false).unwrap();
             assert_eq!(anth.model, *exp_model, "outbound model for {alias}");
             assert_eq!(
                 anth.max_tokens, *exp_max,
@@ -1338,7 +1513,7 @@ mod tests {
             temperature: Some(0.3),
             ..Default::default()
         };
-        let anth = prepare_anthropic_request(&canon, profile, &repl, false).unwrap();
+        let anth = prepare_anthropic_request(&canon, profile, &repl, false, false).unwrap();
         assert_eq!(anth.max_tokens, 7, "client max_tokens must be preserved");
         assert_eq!(
             anth.temperature,
@@ -1377,7 +1552,7 @@ mod tests {
                 }),
                 ..Default::default()
             };
-            let anth = prepare_anthropic_request(&canon, profile, &repl, false).unwrap();
+            let anth = prepare_anthropic_request(&canon, profile, &repl, false, false).unwrap();
             assert_eq!(
                 anth.max_tokens, expected_max,
                 "sonnet effort={effort}: max_tokens must be budget+1024 under the catalog ceiling"
@@ -1542,7 +1717,7 @@ mod tests {
         let mdef = profile.resolve_model("haiku");
         let mut built = build_messages_request_from_canonical(&canon, mdef, &repl).unwrap();
         prepend_claude_code_identity(&mut built, profile, true);
-        let prepped = prepare_anthropic_request(&canon, profile, &repl, true).unwrap();
+        let prepped = prepare_anthropic_request(&canon, profile, &repl, true, false).unwrap();
         // compare key identity + model
         let bsys = match built.system {
             Some(SystemField::Blocks(b)) => b,

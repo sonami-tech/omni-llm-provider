@@ -68,6 +68,10 @@ impl ClientMessagesRequest {
             metadata: None,
             thinking: self.thinking.clone(),
             output_config: None,
+            // Native passthrough never injects a gateway-owned top-level marker
+            // (deferred: see PR1 scope). The client's own block-level markers
+            // ride inside messages/system/tools and are preserved untouched.
+            cache_control: None,
         }
     }
 }
@@ -232,6 +236,12 @@ fn reconcile_client_request(
         profile,
         replacements,
         inject_identity,
+        // Door 2 (native passthrough) does not inject a gateway-owned auto-cache
+        // marker in PR1: deciding this correctly needs the position-vs-content-hash
+        // question resolved (our identity prepend shifts client block indices), and
+        // whether to forward a client's own top-level cache_control is a separate
+        // allowlist change. Deferred -> always false here.
+        false,
     );
     // `stream` is owned by this door, not the tail: a native body that omitted
     // stream must serialize `"stream": false`, not null. count_tokens clears it
