@@ -978,6 +978,159 @@ mod tests {
         assert!(!resp.content.is_empty() || resp.tool_calls.is_empty()); // basic shape
     }
 
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn claude_auto_cache_creates_then_reads_across_turns_live() {
+        // Live test (#1 prefix-stability + #2 above-floor engagement): proves the
+        // OpenAI-inbound auto-cache marker ACTUALLY caches against the real
+        // Anthropic upstream, not just that we emit the right bytes offline.
+        //
+        // WHY this is the only test that can catch the feature silently no-op'ing:
+        // the gateway injects a billing suffix (Sha256 of message[0]) and a
+        // version-pinned identity preamble into the cacheable prefix. If either
+        // varied byte-for-byte between turns, every turn would MISS and we'd pay
+        // full input price with caching "on". Offline tests pin the wire bytes but
+        // cannot observe whether Anthropic's server-side content hash matched across
+        // two real turns. This does.
+        //
+        // Construction that makes the assertion meaningful:
+        //   - Turn 2's prefix is a strict superset of Turn 1's: same big user
+        //     message, then an assistant reply, then a new user message. So Turn 1's
+        //     exact prefix bytes are a prefix of Turn 2's request. A cache READ on
+        //     Turn 2 is therefore only possible if that shared prefix (including our
+        //     injected billing + preamble) was byte-identical across the two builds.
+        //   - The shared message is padded far past the model floor (Sonnet = 1024
+        //     tokens). Below the floor Anthropic silently declines to cache and
+        //     cache_creation would be 0 -> so requiring cache_creation > 0 on Turn 1
+        //     simultaneously proves we cleared the floor (#2) and that the marker is
+        //     live. Padding is deterministic (fixed string), so no clock/nonce leaks
+        //     into the prefix.
+        //
+        // Guarded exactly like claude_send_exercises_full_fingerprint_path: opt-in
+        // via OMNI_LIVE_TESTS=1, real creds required, CLAUDE_CREDENTIALS_PATH
+        // override forces a skip (a dummy creds file must never drive a real call),
+        // and CREDS_ENV_LOCK is held across gate+sends so a concurrent hermetic test
+        // cannot repoint default_path() mid-call.
+        let _guard = CREDS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        if !omni_common::test_support::live_tests_enabled() {
+            eprintln!(
+                "skipping claude_auto_cache_creates_then_reads_across_turns_live: set OMNI_LIVE_TESTS=1"
+            );
+            return;
+        }
+        if std::env::var_os("CLAUDE_CREDENTIALS_PATH").is_some() {
+            eprintln!(
+                "skipping claude_auto_cache_creates_then_reads_across_turns_live: CLAUDE_CREDENTIALS_PATH override is set"
+            );
+            return;
+        }
+        if !crate::credentials::Credentials::default_path().exists() {
+            eprintln!(
+                "skipping claude_auto_cache_creates_then_reads_across_turns_live: no Claude credentials at {}",
+                crate::credentials::Credentials::default_path().display()
+            );
+            return;
+        }
+        // Also require auto-cache to be ON (its default). If a developer exported the
+        // opt-out in their shell, this test cannot observe caching -> skip loudly
+        // rather than fail spuriously.
+        if auto_cache_disabled() {
+            eprintln!(
+                "skipping claude_auto_cache_creates_then_reads_across_turns_live: OMNI_CLAUDE_NO_AUTO_CACHE is set (auto-cache off)"
+            );
+            return;
+        }
+
+        // Deterministic padding well past the 1024-token Sonnet floor. ~4 chars/token
+        // => ~12k chars targets ~3k tokens, comfortably clearing the floor with
+        // margin for tokenizer variance. Fixed content: identical bytes every turn.
+        let big_context = format!(
+            "You are reviewing the following reference material. \
+             Answer only from it. Reference block repeated for length:\n{}",
+            "The quick brown fox jumps over the lazy dog near the riverbank. ".repeat(200)
+        );
+
+        let p = ClaudeProvider::new().expect("ctor");
+
+        // ---- Turn 1: single user message carrying the big shared context. ----
+        let turn1 = CanonicalRequest {
+            model: "claude-sonnet-4-5".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Text(big_context.clone()),
+            }],
+            ..Default::default()
+        };
+        let r1 = p
+            .send(turn1)
+            .await
+            .expect("turn 1 send must succeed with creds");
+
+        // Turn 1 must CREATE cache. Non-zero creation proves two things at once:
+        // the prefix cleared the model floor (#2), and the top-level marker is live.
+        assert!(
+            r1.usage.cache_creation > 0,
+            "turn 1 must create cache (proves marker live + prefix above floor); got creation={} read={}",
+            r1.usage.cache_creation,
+            r1.usage.cache_read
+        );
+
+        // ---- Turn 2: same big context, plus the assistant reply, plus a follow-up.
+        // Turn 1's exact prefix bytes are a prefix of this request. ----
+        let assistant_reply = if r1.content.is_empty() {
+            "Understood.".to_string()
+        } else {
+            r1.content.clone()
+        };
+        let turn2 = CanonicalRequest {
+            model: "claude-sonnet-4-5".into(),
+            messages: vec![
+                CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Text(big_context.clone()),
+                },
+                CanonicalMessage {
+                    role: "assistant".into(),
+                    content: CanonicalContent::Text(assistant_reply),
+                },
+                CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Text("Briefly, what did I ask you to do?".into()),
+                },
+            ],
+            ..Default::default()
+        };
+        let r2 = p
+            .send(turn2)
+            .await
+            .expect("turn 2 send must succeed with creds");
+
+        // THE assertion (#1): Turn 2 reads the cache Turn 1 wrote. This is only
+        // possible if the shared prefix - INCLUDING our injected billing suffix and
+        // identity preamble - was byte-identical across both builds. A wobble in
+        // either would drop cache_read to 0 and fail here.
+        assert!(
+            r2.usage.cache_read > 0,
+            "turn 2 must READ cache written by turn 1 (proves prefix byte-stable across turns); \
+             got read={} creation={}. read==0 means the injected prefix (billing/preamble) drifted.",
+            r2.usage.cache_read,
+            r2.usage.cache_creation
+        );
+
+        // Cross-check the hit is substantive, not a degenerate few-token match: the
+        // bytes cached on turn 1 should be reflected in turn 2's read. Allow slack
+        // for Anthropic block-boundary rounding, but require the read to be within a
+        // sane fraction of what turn 1 created rather than a trivial prefix.
+        let created = r1.usage.cache_creation;
+        assert!(
+            r2.usage.cache_read >= created / 2,
+            "turn 2 cache_read ({}) should cover most of turn 1's cached prefix ({}); a tiny read \
+             suggests only a fragment matched, i.e. partial prefix instability",
+            r2.usage.cache_read,
+            created
+        );
+    }
+
     #[test]
     fn claude_parity_note() {
         // Full parity with grok via common trait + core canonical + replacements is verified in:

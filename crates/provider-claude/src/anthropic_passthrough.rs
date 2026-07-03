@@ -886,6 +886,66 @@ mod tests {
     }
 
     #[test]
+    fn door2_forwards_client_cache_control_and_injects_no_gateway_marker() {
+        // WHY (#3, native-passthrough caching contract): the OpenAI-inbound door
+        // auto-injects a top-level `cache_control`, but the Anthropic-inbound door
+        // must NOT. Instead it forwards the CLIENT's own block-level markers
+        // untouched. Two independent invariants, both load-bearing:
+        //   (a) no gateway-owned TOP-LEVEL marker is added here (that is Door 1's
+        //       job; adding it here would be an unrequested wire deviation on the
+        //       fingerprint-contracted native path), and
+        //   (b) a client-set cache_control on a SYSTEM block survives to the wire,
+        //       so a passthrough client that caches keeps caching. Our identity
+        //       prepend pushes the client block behind billing+preamble (index
+        //       shift), but the marker itself must be preserved, not dropped.
+        // A regression that either injected a top-level marker on Door 2 or stripped
+        // the client's block marker during reconciliation would fail here.
+        let body = serde_json::json!({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Say OK"}],
+            "system": [{
+                "type": "text",
+                "text": "client cached system",
+                "cache_control": {"type": "ephemeral"}
+            }]
+        });
+        let client = parse_client(body);
+        let req = reconcile_client_request(&client, default_profile(), &empty_repl(), true, false)
+            .expect("reconcile ok");
+
+        // (a) No gateway-owned top-level marker on the native door.
+        assert!(
+            req.cache_control.is_none(),
+            "Door 2 must not inject a top-level auto-cache marker; that is Door 1 only"
+        );
+
+        // (b) The client's own system-block marker is preserved. After identity
+        // injection the system is blocks: [billing, preamble, ...client blocks].
+        let SystemField::Blocks(blocks) = req.system.as_ref().expect("system present") else {
+            panic!("identity injection must force system blocks");
+        };
+        let marked: Vec<_> = blocks
+            .iter()
+            .filter(|b| b.cache_control.is_some())
+            .collect();
+        assert_eq!(
+            marked.len(),
+            1,
+            "exactly the client's one cached system block should carry a marker (identity blocks carry none)"
+        );
+        assert_eq!(
+            marked[0].text, "client cached system",
+            "the preserved marker must ride the client's block, not a gateway block"
+        );
+        assert_eq!(
+            marked[0].cache_control.as_ref().map(|c| c.kind.as_str()),
+            Some("ephemeral"),
+            "client's ephemeral marker must survive reconciliation unchanged"
+        );
+    }
+
+    #[test]
     fn closed_allowlist_drops_fingerprint_fields() {
         let body = serde_json::json!({
             "model": "claude-haiku-4-5",
