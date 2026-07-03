@@ -167,7 +167,7 @@ impl ConversationLog {
         label: &str,
         content: &str,
     ) {
-        let timestamp = crate::time_util::time_of_day_now();
+        let timestamp = chrono::Utc::now().format("%H:%M:%S").to_string();
         let header = format!(
             "[{}] session={} request={} {} {}",
             timestamp, session_id, request_id, direction, label
