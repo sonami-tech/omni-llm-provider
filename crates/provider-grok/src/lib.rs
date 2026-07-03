@@ -60,6 +60,7 @@ use omni_common::Replacements;
 use omni_common::responses_upstream::{
     self, ErrorRedactor, ResponsesSseBuffer, ResponsesStreamParser,
 };
+use omni_common::{env_nonempty, headers_from_env};
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
     CanonicalResponse, CanonicalResponseMetadata, CanonicalStream, CanonicalStreamEvent,
@@ -491,7 +492,7 @@ impl GrokProvider {
             } => {
                 let mut headers = extra_headers.clone();
                 if let Some(env_name) = custom_headers_env {
-                    headers.extend(headers_from_env(env_name)?);
+                    headers.extend(headers_from_env(env_name).map_err(ProviderError::Auth)?);
                 }
                 let token = token_env_key
                     .as_ref()
@@ -866,49 +867,8 @@ impl GrokProvider {
     }
 }
 
-fn headers_from_env(env_name: &str) -> Result<Vec<(String, String)>, ProviderError> {
-    let Some(raw) = std::env::var(env_name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(Vec::new());
-    };
-    parse_custom_headers(&raw).map_err(ProviderError::Auth)
-}
-
-fn parse_custom_headers(raw: &str) -> Result<Vec<(String, String)>, String> {
-    let mut headers = Vec::new();
-    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| "custom header must be formatted as `Name: value`".to_string())?;
-        let name = name.trim();
-        let value = value.trim();
-        if name.is_empty() || value.is_empty() {
-            return Err("custom header name and value must both be non-empty".into());
-        }
-        reqwest::header::HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| format!("invalid custom header name `{name}`"))?;
-        reqwest::header::HeaderValue::from_str(value)
-            .map_err(|_| format!("invalid custom header value for `{name}`"))?;
-        headers.push((name.to_string(), value.to_string()));
-    }
-    Ok(headers)
-}
-
 fn redact(input: &str) -> String {
-    let mut out = input.to_string();
-    for marker in ["sk-", "xai-", "eyJ"] {
-        while let Some(pos) = out.find(marker) {
-            let end = out[pos..]
-                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',')
-                .map(|i| pos + i)
-                .unwrap_or(out.len());
-            out.replace_range(pos..end, "<redacted>");
-        }
-    }
-    out
+    responses_upstream::redact_prefixed_secrets(input, &["sk-", "xai-", "eyJ"])
 }
 
 /// `ErrorRedactor` for the shared Responses machinery (conservative mode).
@@ -953,13 +913,6 @@ impl ErrorRedactor for GrokErrorRedactor {
         }
         out
     }
-}
-
-fn env_nonempty(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 /// Map a CanonicalRequest (after light replacements hook) to the JSON body for xAI /v1/chat/completions.

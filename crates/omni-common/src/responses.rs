@@ -26,6 +26,7 @@ use axum::response::sse::{Event, Sse};
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 
+use crate::canonical_mapping::{provider_metadata_json, usage_detail_json};
 use crate::http::gateway_only_extra_keys;
 
 use omni_core::{
@@ -454,7 +455,7 @@ pub fn responses_from_canonical(
 ) -> ResponsesResponse {
     let response_id = canon.id.clone().unwrap_or(response_id);
     let metadata = canon.metadata.clone();
-    let provider_metadata = responses_provider_metadata_json(&canon);
+    let provider_metadata = provider_metadata_json(&canon, false);
     let (status, incomplete_details, error) =
         if responses_error_reason(canon.finish_reason.as_deref()).is_some() {
             (
@@ -570,41 +571,6 @@ fn responses_usage_from_canonical(usage: &omni_core::CanonicalUsage, total: u64)
             ),
         ]),
     }
-}
-
-fn usage_detail_json(fields: &[(&str, u64)]) -> Option<serde_json::Value> {
-    let mut details = serde_json::Map::new();
-    for (key, value) in fields {
-        if *value != 0 {
-            details.insert((*key).to_string(), serde_json::Value::from(*value));
-        }
-    }
-    (!details.is_empty()).then_some(serde_json::Value::Object(details))
-}
-
-fn responses_provider_metadata_json(canon: &CanonicalResponse) -> Option<serde_json::Value> {
-    let mut metadata = serde_json::Map::new();
-    if let Some(meta) = &canon.metadata {
-        if let Some(provider) = &meta.provider {
-            metadata.insert(
-                "provider".into(),
-                serde_json::Value::String(provider.clone()),
-            );
-        }
-        if let Some(raw) = &meta.raw {
-            metadata.insert("raw".into(), raw.clone());
-        }
-    }
-    if canon.usage.num_sources_used != 0 {
-        metadata.insert(
-            "num_sources_used".into(),
-            serde_json::Value::from(canon.usage.num_sources_used),
-        );
-    }
-    if !canon.reasoning.is_empty() {
-        metadata.insert("reasoning".into(), serde_json::json!(canon.reasoning));
-    }
-    (!metadata.is_empty()).then_some(serde_json::Value::Object(metadata))
 }
 
 /// Frame a canonical event stream as Responses SSE.

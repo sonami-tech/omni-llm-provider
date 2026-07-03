@@ -744,6 +744,8 @@ use reqwest::{Client, header::HeaderMap};
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use omni_common::{headers_from_env, parse_custom_headers};
+
 use crate::credentials::Credentials;
 use crate::fingerprint::{FingerprintProfile, RequestContext, build_headers, default_profile};
 
@@ -1212,7 +1214,9 @@ impl UpstreamClient {
                     insert_custom_header(&mut headers, name, value);
                 }
                 if let Some(env_name) = custom_headers_env {
-                    for (name, value) in headers_from_env(env_name)? {
+                    for (name, value) in
+                        headers_from_env(env_name).map_err(UpstreamError::Decode)?
+                    {
                         insert_custom_header(&mut headers, &name, &value);
                     }
                 }
@@ -1267,31 +1271,6 @@ fn validate_auth_config(auth: &ClaudeAuthConfig) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn parse_custom_headers(raw: &str) -> Result<Vec<(String, String)>, String> {
-    let mut headers = Vec::new();
-    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| "custom header must be formatted as `Name: value`".to_string())?;
-        let name = name.trim();
-        let value = value.trim();
-        if name.is_empty() || value.is_empty() {
-            return Err("custom header name and value must both be non-empty".into());
-        }
-        validate_custom_header(name, value)?;
-        headers.push((name.to_string(), value.to_string()));
-    }
-    Ok(headers)
-}
-
-fn headers_from_env(env_name: &str) -> Result<Vec<(String, String)>, UpstreamError> {
-    std::env::var(env_name)
-        .ok()
-        .map(|raw| parse_custom_headers(&raw).map_err(UpstreamError::Decode))
-        .transpose()
-        .map(Option::unwrap_or_default)
 }
 
 fn validate_custom_header(name: &str, value: &str) -> Result<(), String> {

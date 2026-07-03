@@ -9,6 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use omni_common::responses_upstream::{
     self, ErrorRedactor, ResponsesSseBuffer, ResponsesSseEvent, ResponsesStreamParser,
 };
+use omni_common::{env_nonempty, headers_from_env};
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
     CanonicalResponse, CanonicalStream, CanonicalStreamEvent, CanonicalToolCall,
@@ -882,7 +883,9 @@ impl CodexRequestConfig {
         }
         for (name, env_name) in &self.env_http_headers {
             if name == "__omni_custom_headers__" {
-                for (header_name, header_value) in headers_from_env(env_name)? {
+                for (header_name, header_value) in
+                    headers_from_env(env_name).map_err(ProviderError::Auth)?
+                {
                     insert_header(&mut headers, &header_name, &header_value)?;
                 }
             } else if let Ok(value) = std::env::var(env_name)
@@ -1085,36 +1088,6 @@ fn warn_codex_conservative_fallback(config: &CodexRequestConfig) {
         reason,
         "codex conservative mode parity is not exact; using the configured REST Responses path instead"
     );
-}
-
-fn env_nonempty(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn headers_from_env(env_name: &str) -> Result<Vec<(String, String)>, ProviderError> {
-    let Some(raw) = env_nonempty(env_name) else {
-        return Ok(Vec::new());
-    };
-    parse_custom_headers(&raw).map_err(ProviderError::Auth)
-}
-
-fn parse_custom_headers(raw: &str) -> Result<Vec<(String, String)>, String> {
-    let mut headers = Vec::new();
-    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| "custom header must be formatted as `Name: value`".to_string())?;
-        let name = name.trim();
-        let value = value.trim();
-        if name.is_empty() || value.is_empty() {
-            return Err("custom header name and value must both be non-empty".into());
-        }
-        headers.push((name.to_string(), value.to_string()));
-    }
-    Ok(headers)
 }
 
 impl AuthCommand {
@@ -1679,17 +1652,7 @@ fn is_sensitive_name(name: &str) -> bool {
 }
 
 fn redact(input: &str) -> String {
-    let mut out = input.to_string();
-    for marker in ["sk-", "xai-", "eyJ"] {
-        while let Some(pos) = out.find(marker) {
-            let end = out[pos..]
-                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',')
-                .map(|i| pos + i)
-                .unwrap_or(out.len());
-            out.replace_range(pos..end, "<redacted>");
-        }
-    }
-    out
+    responses_upstream::redact_prefixed_secrets(input, &["sk-", "xai-", "eyJ"])
 }
 
 #[cfg(test)]

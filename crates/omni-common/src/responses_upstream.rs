@@ -53,6 +53,30 @@ pub trait ErrorRedactor: Clone + Default + std::fmt::Debug {
     fn redact(&self, input: &str) -> String;
 }
 
+/// Prefix scrubber for secrets in an upstream error body. Scans for each marker
+/// prefix and replaces from the marker to the next delimiter (whitespace /
+/// quote / comma) with `<redacted>`. This catches known-prefix secrets even when
+/// no resolved credentials are in scope; providers layer their exact captured
+/// secrets on top for tokens that carry no known prefix.
+///
+/// Each provider passes its own marker set: Grok and Codex scrub
+/// `["sk-", "xai-", "eyJ"]`; Claude scrubs `["sk-", "eyJ"]` (no xAI keys reach
+/// the Anthropic path, and `sk-` already covers Claude OAuth `sk-ant-oat01-...`
+/// and custom-gateway `sk-...` keys). `eyJ` covers JWT bearers.
+pub fn redact_prefixed_secrets(input: &str, markers: &[&str]) -> String {
+    let mut out = input.to_string();
+    for marker in markers {
+        while let Some(pos) = out.find(marker) {
+            let end = out[pos..]
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',')
+                .map(|i| pos + i)
+                .unwrap_or(out.len());
+            out.replace_range(pos..end, "<redacted>");
+        }
+    }
+    out
+}
+
 /// Map a non-stream OpenAI-Responses payload to a [`CanonicalResponse`].
 ///
 /// `fallback_model` is used when the payload omits `model`. `provider_tag` is
@@ -1008,6 +1032,28 @@ mod tests {
 
     fn parser() -> ResponsesStreamParser<TokenRedactor> {
         ResponsesStreamParser::new(TAG, TokenRedactor)
+    }
+
+    #[test]
+    fn redact_prefixed_secrets_honors_marker_set_and_delimiter() {
+        // WHY: providers pass different marker sets (Claude omits `xai-`). A
+        // marker NOT in the set must survive verbatim, or Claude would scrub
+        // substrings it never intended to. Present markers must scrub from the
+        // prefix up to the next delimiter (space/quote/comma), no further.
+        let markers = ["sk-", "eyJ"];
+        let out = redact_prefixed_secrets(
+            r#"{"a":"sk-leak","b":"xai-keep","c":"eyJtok end"}"#,
+            &markers,
+        );
+        assert!(!out.contains("sk-leak"), "prefixed secret leaked: {out}");
+        assert!(!out.contains("eyJtok"), "jwt bearer leaked: {out}");
+        assert!(
+            out.contains("xai-keep"),
+            "marker not in set must be untouched: {out}"
+        );
+        // Non-secret structure around the scrubbed spans is preserved.
+        assert!(out.contains("<redacted>"));
+        assert!(out.contains(r#""b":"xai-keep""#));
     }
 
     /// Feed a single SSE event (by name + JSON data) through a fresh framer and
