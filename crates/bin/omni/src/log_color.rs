@@ -340,8 +340,10 @@ fn palette_style(value: &str) -> Style {
     Style::new().fg(Color::Fixed(PALETTE[idx]))
 }
 
-/// FNV-1a 64-bit, identical to `session::fnv1a_64`. Duplicated to avoid a
-/// public re-export and to keep the log layer self-contained.
+/// FNV-1a 64-bit (canonical offset basis `0xcbf29ce484222325`, prime
+/// `0x100000001b3`). Kept local to keep the log layer self-contained; the color
+/// palette only needs a stable, well-distributed hash of the value bytes, so the
+/// exact algorithm is not shared with any other module.
 fn fnv1a_64(bytes: &[u8]) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x100_0000_01b3;
