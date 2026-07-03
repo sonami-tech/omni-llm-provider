@@ -66,6 +66,8 @@ struct ClaudeStreamConverter {
     stop_reason: Option<String>,
     input_tokens: Option<u32>,
     output_tokens: Option<u32>,
+    cache_read_input_tokens: Option<u32>,
+    cache_creation_input_tokens: Option<u32>,
     usage_emitted: bool,
     /// Set once a terminal `Finish` has been emitted by ANY path (`finish_events`
     /// for `message_stop`, or the `Error` arm). The `send_stream` EOF guard checks
@@ -81,6 +83,8 @@ impl ClaudeStreamConverter {
                 id,
                 input_tokens,
                 output_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
                 ..
             } => {
                 let out = vec![CanonicalStreamEvent::ResponseMetadata(
@@ -94,6 +98,16 @@ impl ClaudeStreamConverter {
                 }
                 if output_tokens.is_some() {
                     self.output_tokens = output_tokens;
+                }
+                // Cache token counts ride the message_start usage object (Anthropic
+                // reports them once, up front). Capture so finish_events surfaces
+                // them in the terminal Usage - otherwise streamed responses would
+                // report zero cache usage even when the prefix cached.
+                if cache_read_input_tokens.is_some() {
+                    self.cache_read_input_tokens = cache_read_input_tokens;
+                }
+                if cache_creation_input_tokens.is_some() {
+                    self.cache_creation_input_tokens = cache_creation_input_tokens;
                 }
                 out
             }
@@ -165,11 +179,18 @@ impl ClaudeStreamConverter {
     /// Emit the trailing Usage (once) + terminal Finish for message_stop / EOF.
     fn finish_events(&mut self) -> Vec<CanonicalStreamEvent> {
         let mut out = Vec::new();
-        if !self.usage_emitted && (self.input_tokens.is_some() || self.output_tokens.is_some()) {
+        if !self.usage_emitted
+            && (self.input_tokens.is_some()
+                || self.output_tokens.is_some()
+                || self.cache_read_input_tokens.is_some()
+                || self.cache_creation_input_tokens.is_some())
+        {
             self.usage_emitted = true;
             out.push(CanonicalStreamEvent::Usage(CanonicalUsage {
                 input_tokens: self.input_tokens.unwrap_or(0) as u64,
                 output_tokens: self.output_tokens.unwrap_or(0) as u64,
+                cache_read: self.cache_read_input_tokens.unwrap_or(0) as u64,
+                cache_creation: self.cache_creation_input_tokens.unwrap_or(0) as u64,
                 ..Default::default()
             }));
         }
@@ -528,6 +549,9 @@ impl LlmProvider for ClaudeProvider {
         body_val["stream"] = serde_json::Value::Bool(true);
 
         let ctx = RequestContext::new_reply().with_model(anth_req.model.clone());
+        // Owned copy for the (potentially long-lived) stream closure to tag the
+        // trailing cache-usage log; `anth_req` is consumed by serialization above.
+        let log_model = anth_req.model.clone();
 
         let creds = self.credentials_for_request().await?;
         // Build the redactor BEFORE the stream closure: `creds` is borrowed by the
@@ -553,6 +577,18 @@ impl LlmProvider for ClaudeProvider {
             while let Some(item) = upstream.next().await {
                 let event = item.map_err(|e| map_upstream_err_with(e, &stream_redactor))?;
                 for canon_event in conv.on_event(event) {
+                    // Mirror the non-stream cache-usage log on the streaming path.
+                    // The terminal Usage event carries the final cache counts;
+                    // repeated cache_creation with zero cache_read signals prefix
+                    // instability defeating the cache.
+                    if let CanonicalStreamEvent::Usage(u) = &canon_event {
+                        debug!(
+                            model = %log_model,
+                            cache_read = u.cache_read,
+                            cache_creation = u.cache_creation,
+                            "claude stream usage"
+                        );
+                    }
                     yield canon_event;
                 }
             }
@@ -768,6 +804,10 @@ mod tests {
             model: "claude-haiku-4-5-20251001".into(),
             input_tokens: Some(11),
             output_tokens: Some(0),
+            // Cache counts arrive here on a cached streamed request; they must
+            // survive into the terminal Usage event (asserted below).
+            cache_read_input_tokens: Some(9),
+            cache_creation_input_tokens: Some(2),
         }));
         out.extend(conv.on_event(StreamEvent::ContentBlockStart {
             index: 0,
@@ -844,11 +884,15 @@ mod tests {
             }
         );
         // Usage then terminal Finish with mapped reason (tool_use -> tool_calls).
+        // Cache counts from message_start must be present here, else streamed
+        // clients would see zero cache usage on a cached request.
         assert_eq!(
             out[6],
             CanonicalStreamEvent::Usage(CanonicalUsage {
                 input_tokens: 11,
                 output_tokens: 7,
+                cache_read: 9,
+                cache_creation: 2,
                 ..Default::default()
             })
         );

@@ -172,6 +172,8 @@ pub mod stream {
             model: String,
             input_tokens: Option<u32>,
             output_tokens: Option<u32>,
+            cache_read_input_tokens: Option<u32>,
+            cache_creation_input_tokens: Option<u32>,
         },
         ContentBlockStart {
             index: u32,
@@ -250,6 +252,10 @@ pub mod stream {
         input_tokens: Option<u32>,
         #[serde(default)]
         output_tokens: Option<u32>,
+        #[serde(default)]
+        cache_read_input_tokens: Option<u32>,
+        #[serde(default)]
+        cache_creation_input_tokens: Option<u32>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -277,7 +283,9 @@ pub mod stream {
                     id: inner.id,
                     model: inner.model,
                     input_tokens: usage.as_ref().and_then(|u| u.input_tokens),
-                    output_tokens: usage.and_then(|u| u.output_tokens),
+                    output_tokens: usage.as_ref().and_then(|u| u.output_tokens),
+                    cache_read_input_tokens: usage.as_ref().and_then(|u| u.cache_read_input_tokens),
+                    cache_creation_input_tokens: usage.and_then(|u| u.cache_creation_input_tokens),
                 }
             }
             "content_block_start" => {
@@ -642,7 +650,12 @@ pub mod stream {
 
         #[test]
         fn parse_message_start() {
-            let json = r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-haiku-4-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}"#;
+            // WHY the cache_* fields are here: Anthropic reports cache read/creation
+            // token counts in the message_start usage object on a streamed request.
+            // The parser must carry them through; a regression that dropped them
+            // (as an earlier version did) would silently zero the cache usage we
+            // report to streaming clients. This asserts they survive the parse.
+            let json = r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-haiku-4-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":7,"cache_creation_input_tokens":3}}}"#;
             let ev = parse_event_data(json).unwrap();
             match ev {
                 StreamEvent::MessageStart {
@@ -650,11 +663,15 @@ pub mod stream {
                     model,
                     input_tokens,
                     output_tokens,
+                    cache_read_input_tokens,
+                    cache_creation_input_tokens,
                 } => {
                     assert_eq!(id, "msg_1");
                     assert_eq!(model, "claude-haiku-4-5");
                     assert_eq!(input_tokens, Some(10));
                     assert_eq!(output_tokens, Some(1));
+                    assert_eq!(cache_read_input_tokens, Some(7));
+                    assert_eq!(cache_creation_input_tokens, Some(3));
                 }
                 _ => panic!("wrong variant"),
             }
