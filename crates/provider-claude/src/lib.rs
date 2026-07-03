@@ -502,7 +502,13 @@ impl LlmProvider for ClaudeProvider {
         // 6. Map back to canonical + apply response-scope replacements hook.
         let canon = translate::build_canonical_response(&anth_resp, &req.model, &repl);
 
-        debug!(model = %canon.model, finish = ?canon.finish_reason, "claude response mapped to canonical");
+        debug!(
+            model = %canon.model,
+            finish = ?canon.finish_reason,
+            cache_read = canon.usage.cache_read,
+            cache_creation = canon.usage.cache_creation,
+            "claude response mapped to canonical"
+        );
 
         Ok(canon)
     }
