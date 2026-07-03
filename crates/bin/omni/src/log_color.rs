@@ -74,7 +74,17 @@ impl ColorMode {
     /// is unit-testable without mutating global env (which would race the
     /// parallel test harness).
     pub fn from_env() -> Self {
-        let no_color = std::env::var("NO_COLOR").ok();
+        // Read NO_COLOR via var_os so a present-but-non-UTF8 value still forces
+        // off (the de-facto convention keys on presence + non-emptiness, not on
+        // the value being valid UTF-8). Map it to a stable non-empty sentinel for
+        // the pure resolver, which only checks emptiness.
+        let no_color = std::env::var_os("NO_COLOR").map(|v| {
+            if v.is_empty() {
+                String::new()
+            } else {
+                "1".to_string()
+            }
+        });
         let omni_log_color = std::env::var("OMNI_LOG_COLOR").unwrap_or_default();
         Self::resolve(no_color.as_deref(), &omni_log_color, || {
             std::io::stderr().is_terminal()
@@ -217,32 +227,34 @@ fn is_log_metadata_field(name: &str) -> bool {
     name.starts_with("log.")
 }
 
-/// Escape the control characters an attacker could use for terminal injection
+/// Escape every control character an attacker could use for terminal injection
 /// or log-line forging, rendering them as visible `\xNN` / `\u{..}` / `\r` /
-/// `\n` sequences. Covers everything `tracing_subscriber`'s internal
-/// `EscapeGuard` does -- C0 controls used in escape sequences (ESC/BEL/BS/FF/DEL)
-/// plus the C1 range (0x80-0x9f) -- and additionally escapes `\r` and `\n`,
-/// which upstream leaves alone.
+/// `\n` sequences. This is deliberately STRONGER than `tracing_subscriber`'s
+/// internal `EscapeGuard` (which escapes only ESC/BEL/BS/FF/DEL + the C1 range
+/// and leaves the rest, including `\r`/`\n`/other C0, raw).
 ///
-/// Rationale for exceeding upstream: `\r` returns the cursor to column 0, so a
-/// value can overwrite text already on the line (spoofing what the operator
-/// sees); `\n` starts a new line, so an attacker-controlled value (e.g. a
-/// provider echoing raw bytes into `warn!(error = %e)`) could forge an entire
-/// fake log line. No log call in this codebase emits intentional multi-line
-/// values, so escaping `\n` costs nothing here. `\t` is left untouched -- it is
-/// horizontal, common in legitimate values, and cannot rewrite or forge output.
+/// Policy: escape ALL C0 controls (`0x00`-`0x1f`) EXCEPT horizontal tab, escape
+/// DEL (`0x7f`), and escape the C1 range (`0x80`-`0x9f`). Escaping the whole C0
+/// block -- not just the handful that introduce escape sequences -- is defense
+/// in depth: e.g. `\x0e`/`\x0f` (SO/SI) can switch a terminal's character set,
+/// VT (`\x0b`) moves the cursor, and NUL can truncate downstream tooling. `\t`
+/// is the sole exception: it is horizontal, common in legitimate values, and
+/// cannot rewrite or forge output. `\r` and `\n` get readable `\r`/`\n`
+/// spellings rather than `\x0d`/`\x0a`. No log call in this codebase emits
+/// intentional multi-line values, so escaping `\n` costs nothing here.
 fn sanitize_ansi(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
         match ch {
-            '\x1b' => out.push_str("\\x1b"),
-            '\x07' => out.push_str("\\x07"),
-            '\x08' => out.push_str("\\x08"),
-            '\x0c' => out.push_str("\\x0c"),
+            '\t' => out.push(ch), // sole C0 kept raw (horizontal, harmless)
             '\r' => out.push_str("\\r"),
             '\n' => out.push_str("\\n"),
-            '\x7f' => out.push_str("\\x7f"),
-            ch if (ch as u32) >= 0x80 && (ch as u32) <= 0x9f => {
+            // All other C0 controls (0x00-0x1f) and DEL (0x7f) as \xNN.
+            ch if (ch as u32) < 0x20 || (ch as u32) == 0x7f => {
+                let _ = write!(out, "\\x{:02x}", ch as u32);
+            }
+            // C1 controls (0x80-0x9f) as \u{..}.
+            ch if (0x80..=0x9f).contains(&(ch as u32)) => {
                 let _ = write!(out, "\\u{{{:x}}}", ch as u32);
             }
             _ => out.push(ch),
@@ -628,6 +640,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sanitize_escapes_all_c0_controls_except_tab() {
+        // WHY: the hardening goal is "no control byte from a value can drive the
+        // terminal". Escaping only the escape-sequence introducers would leave
+        // SO/SI (charset switch), VT (cursor down), NUL (truncation), etc. raw.
+        // Policy: every C0 (0x00-0x1f) + DEL + C1 is escaped, tab alone stays raw.
+        for b in 0u32..=0x1f {
+            let ch = char::from_u32(b).unwrap();
+            let out = sanitize_ansi(&ch.to_string());
+            if ch == '\t' {
+                assert_eq!(out, "\t", "tab must stay raw");
+            } else {
+                assert!(!out.contains(ch), "C0 {b:#04x} left raw in {out:?}");
+                // Readable spellings for CR/LF, \xNN for the rest.
+                let expected = match ch {
+                    '\r' => "\\r".to_string(),
+                    '\n' => "\\n".to_string(),
+                    _ => format!("\\x{b:02x}"),
+                };
+                assert_eq!(out, expected, "C0 {b:#04x} wrong escaping");
+            }
+        }
+        // DEL and a representative C1.
+        assert_eq!(sanitize_ansi("\x7f"), "\\x7f");
+        assert_eq!(sanitize_ansi("\u{9b}"), "\\u{9b}");
+        // Ordinary printable text and tab are untouched.
+        assert_eq!(sanitize_ansi("hello\tworld"), "hello\tworld");
     }
 
     #[test]

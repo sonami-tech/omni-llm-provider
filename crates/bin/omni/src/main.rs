@@ -4885,23 +4885,31 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                 .unwrap();
         }
 
-        // Both serializers' warn lines must carry the FULL correlation set:
-        // request_id, session_id, and provider. Asserting only request_id would
-        // let a regression that drops session_id/provider pass silently.
+        // BOTH serializers must be independently proven correlated. The chat
+        // serializer (omni_common::http) logs "canonical stream error mid-flight";
+        // the responses serializer logs the same with a "(responses)" suffix. We
+        // require a line from EACH, and each must carry the full correlation set
+        // (request_id + session_id + provider). Merely "some matching line has the
+        // fields" would pass even if one path dropped its warning entirely.
         logs_assert(|lines: &[&str]| {
-            let errs: Vec<&&str> = lines
-                .iter()
-                .filter(|l| l.contains("canonical stream error mid-flight"))
-                .collect();
-            if errs.is_empty() {
-                return Err("no serializer mid-stream error log captured".into());
+            let has_all_fields = |l: &str| {
+                ["request_id=", "session_id=", "provider="]
+                    .iter()
+                    .all(|f| l.contains(f))
+            };
+            let chat_ok = lines.iter().any(|l| {
+                l.contains("canonical stream error mid-flight")
+                    && !l.contains("(responses)")
+                    && has_all_fields(l)
+            });
+            let responses_ok = lines.iter().any(|l| {
+                l.contains("canonical stream error mid-flight (responses)") && has_all_fields(l)
+            });
+            if !chat_ok {
+                return Err("no correlated chat serializer error line".into());
             }
-            for l in &errs {
-                for field in ["request_id=", "session_id=", "provider="] {
-                    if !l.contains(field) {
-                        return Err(format!("serializer error line missing {field}: {l}"));
-                    }
-                }
+            if !responses_ok {
+                return Err("no correlated responses serializer error line".into());
             }
             Ok(())
         });
