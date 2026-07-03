@@ -3,6 +3,7 @@
 //! Extracted/adapted from the original claude-code-provider common pieces.
 
 pub mod auth;
+pub mod canonical_mapping;
 pub mod conversation_log;
 pub mod env;
 pub mod error;

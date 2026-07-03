@@ -18,6 +18,8 @@ use omni_core::{
     CanonicalToolChoice,
 };
 
+use crate::canonical_mapping::{provider_metadata_json, usage_detail_json};
+
 /// OpenAI-compatible chat completion request (text messages, tools, and core
 /// sampling). Unknown fields are captured in `extras` so a client request never
 /// fails to deserialize on an unrecognized key.
@@ -459,7 +461,7 @@ pub fn from_canonical(
     created: u64,
 ) -> ChatCompletionResponse {
     let metadata = canon.metadata.clone();
-    let provider_metadata = provider_metadata_json(&canon);
+    let provider_metadata = provider_metadata_json(&canon, true);
     let tool_calls: Vec<ChatToolCall> = canon
         .tool_calls
         .into_iter()
@@ -547,44 +549,6 @@ fn chat_usage_from_canonical(usage: &omni_core::CanonicalUsage, total: u64) -> C
         prompt_tokens_details: prompt_details,
         completion_tokens_details: completion_details,
     }
-}
-
-fn usage_detail_json(fields: &[(&str, u64)]) -> Option<Value> {
-    let mut details = Map::new();
-    for (key, value) in fields {
-        if *value != 0 {
-            details.insert((*key).to_string(), Value::from(*value));
-        }
-    }
-    (!details.is_empty()).then_some(Value::Object(details))
-}
-
-fn provider_metadata_json(canon: &CanonicalResponse) -> Option<Value> {
-    let mut metadata = Map::new();
-    if let Some(meta) = &canon.metadata {
-        if let Some(provider) = &meta.provider {
-            metadata.insert("provider".into(), Value::String(provider.clone()));
-        }
-        if let Some(raw) = &meta.raw {
-            metadata.insert("raw".into(), raw.clone());
-        }
-    }
-    if canon.usage.num_sources_used != 0 {
-        metadata.insert(
-            "num_sources_used".into(),
-            Value::from(canon.usage.num_sources_used),
-        );
-    }
-    if !canon.annotations.is_empty() {
-        metadata.insert(
-            "annotations".into(),
-            Value::Array(canon.annotations.clone()),
-        );
-    }
-    if !canon.reasoning.is_empty() {
-        metadata.insert("reasoning".into(), serde_json::json!(canon.reasoning));
-    }
-    (!metadata.is_empty()).then_some(Value::Object(metadata))
 }
 
 /// Seconds since the Unix epoch, for the `created` field. Falls back to 0 on a
