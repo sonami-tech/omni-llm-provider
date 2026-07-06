@@ -191,9 +191,15 @@ impl<'a> ColorVisitor<'a> {
         self.write_separator()?;
 
         // Format the value once, then sanitize control sequences out of it.
+        // Message text (static format strings, including the startup banner) may
+        // span multiple lines; named field values stay on one physical log line.
         let mut raw = String::new();
         write!(&mut raw, "{:?}", value)?;
-        let safe = sanitize_ansi(&raw);
+        let safe = if name == "message" {
+            sanitize_message(&raw)
+        } else {
+            sanitize_field_value(&raw)
+        };
 
         // The "message" field of an event is rendered without a key prefix
         // by the default formatter. Keep that contract.
@@ -227,22 +233,35 @@ fn is_log_metadata_field(name: &str) -> bool {
     name.starts_with("log.")
 }
 
-/// Escape every control character an attacker could use for terminal injection
-/// or log-line forging, rendering them as visible `\xNN` / `\u{..}` / `\r` /
-/// `\n` sequences. This is deliberately STRONGER than `tracing_subscriber`'s
-/// internal `EscapeGuard` (which escapes only ESC/BEL/BS/FF/DEL + the C1 range
-/// and leaves the rest, including `\r`/`\n`/other C0, raw).
-///
-/// Policy: escape ALL C0 controls (`0x00`-`0x1f`) EXCEPT horizontal tab, escape
-/// DEL (`0x7f`), and escape the C1 range (`0x80`-`0x9f`). Escaping the whole C0
-/// block -- not just the handful that introduce escape sequences -- is defense
-/// in depth: e.g. `\x0e`/`\x0f` (SO/SI) can switch a terminal's character set,
-/// VT (`\x0b`) moves the cursor, and NUL can truncate downstream tooling. `\t`
-/// is the sole exception: it is horizontal, common in legitimate values, and
-/// cannot rewrite or forge output. `\r` and `\n` get readable `\r`/`\n`
-/// spellings rather than `\x0d`/`\x0a`. No log call in this codebase emits
-/// intentional multi-line values, so escaping `\n` costs nothing here.
-fn sanitize_ansi(input: &str) -> String {
+/// Sanitize an event `message` field. Matches upstream `EscapeGuard` for the
+/// message path (ESC/BEL/BS/FF/DEL + C1) and additionally escapes the remaining
+/// C0 controls except tab and line breaks, so the startup banner can span lines
+/// while NUL/VT/SO/SI still cannot reach the terminal.
+fn sanitize_message(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\t' | '\n' | '\r' => out.push(ch),
+            // All other C0 controls (0x00-0x1f) and DEL (0x7f) as \xNN.
+            ch if (ch as u32) < 0x20 || (ch as u32) == 0x7f => {
+                let _ = write!(out, "\\x{:02x}", ch as u32);
+            }
+            // C1 controls (0x80-0x9f) as \u{..}.
+            ch if (0x80..=0x9f).contains(&(ch as u32)) => {
+                let _ = write!(out, "\\u{{{:x}}}", ch as u32);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Sanitize a named field value. Deliberately STRONGER than `sanitize_message`:
+/// escape ALL C0 controls (`0x00`-`0x1f`) except horizontal tab, escape DEL
+/// (`0x7f`), and escape the C1 range (`0x80`-`0x9f`). `\r` and `\n` get
+/// readable spellings so a `%`/Display-sigil value (e.g. `warn!(error = %e)`)
+/// cannot forge extra log lines or overwrite the current one.
+fn sanitize_field_value(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
         match ch {
@@ -583,7 +602,7 @@ mod tests {
 
     #[test]
     fn display_sigil_value_is_sanitized() {
-        // WHY: this is the path where `sanitize_ansi` is the SOLE defense. A
+        // WHY: this is the path where `sanitize_field_value` is the SOLE defense. A
         // `&str` field goes through `{:?}`, which already escapes control bytes on
         // its own -- so the other ANSI test would pass even if sanitization were a
         // no-op for `&str`. But a `%`/Display-sigil field (used throughout the
@@ -645,14 +664,14 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_escapes_all_c0_controls_except_tab() {
+    fn sanitize_field_value_escapes_all_c0_controls_except_tab() {
         // WHY: the hardening goal is "no control byte from a value can drive the
         // terminal". Escaping only the escape-sequence introducers would leave
         // SO/SI (charset switch), VT (cursor down), NUL (truncation), etc. raw.
         // Policy: every C0 (0x00-0x1f) + DEL + C1 is escaped, tab alone stays raw.
         for b in 0u32..=0x1f {
             let ch = char::from_u32(b).unwrap();
-            let out = sanitize_ansi(&ch.to_string());
+            let out = sanitize_field_value(&ch.to_string());
             if ch == '\t' {
                 assert_eq!(out, "\t", "tab must stay raw");
             } else {
@@ -667,10 +686,16 @@ mod tests {
             }
         }
         // DEL and a representative C1.
-        assert_eq!(sanitize_ansi("\x7f"), "\\x7f");
-        assert_eq!(sanitize_ansi("\u{9b}"), "\\u{9b}");
+        assert_eq!(sanitize_field_value("\x7f"), "\\x7f");
+        assert_eq!(sanitize_field_value("\u{9b}"), "\\u{9b}");
         // Ordinary printable text and tab are untouched.
-        assert_eq!(sanitize_ansi("hello\tworld"), "hello\tworld");
+        assert_eq!(sanitize_field_value("hello\tworld"), "hello\tworld");
+    }
+
+    #[test]
+    fn sanitize_message_preserves_intentional_line_breaks() {
+        let out = sanitize_message("line1\nline2\rline3\tok\x0b\x1b");
+        assert_eq!(out, "line1\nline2\rline3\tok\\x0b\\x1b");
     }
 
     #[test]
