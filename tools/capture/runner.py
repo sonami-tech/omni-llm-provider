@@ -266,9 +266,14 @@ def run_capture(
                         text=True,
                     )
                     if result.returncode != 0:
-                        raise CaptureError(
+                        detail_parts = [
                             f"Provider command failed with exit {result.returncode}: {' '.join(cmd)}"
-                        )
+                        ]
+                        if result.stderr and result.stderr.strip():
+                            detail_parts.append(f"stderr:\n{result.stderr.strip()[-4000:]}")
+                        if result.stdout and result.stdout.strip():
+                            detail_parts.append(f"stdout:\n{result.stdout.strip()[-2000:]}")
+                        raise CaptureError("\n".join(detail_parts))
                 time.sleep(1)
             finally:
                 _restore_capture_signal_handlers(previous_handlers)

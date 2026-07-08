@@ -9,7 +9,7 @@
 //! - --providers claude,grok,codex   or   OMNI_PROVIDERS=... (comma sep, order preserved).
 //!   When omitted, Omni enables all locally detected providers.
 //! - --bind 127.0.0.1 by default, or --public as shorthand for --bind 0.0.0.0
-//! - Canonical model routing: real model ids (e.g. "claude-sonnet-4-6", "grok-4.3")
+//! - Canonical model routing: real model ids (e.g. "claude-sonnet-4-6", "grok-4.5")
 //!   route directly when they uniquely identify an enabled provider.
 //! - Alias routing: "fable", "opus", "sonnet", "haiku", "grok", "composer",
 //!   "codex", and "gpt"
@@ -2330,7 +2330,7 @@ mod tests {
         );
 
         let (k, m) = resolve_provider_and_model("grok", &catalogs).unwrap();
-        assert_eq!((k.as_str(), m.as_str()), ("grok", "grok-4.3"));
+        assert_eq!((k.as_str(), m.as_str()), ("grok", "grok-4.5"));
 
         let (k, m) = resolve_provider_and_model("composer", &catalogs).unwrap();
         assert_eq!((k.as_str(), m.as_str()), ("grok", "grok-composer-2.5-fast"));
@@ -2390,7 +2390,7 @@ mod tests {
             "opus=claude-opus-4-8",
             "haiku=claude-haiku-4-5-20251001",
             "fable=claude-fable-5",
-            "grok=grok-4.3",
+            "grok=grok-4.5",
             "composer=grok-composer-2.5-fast",
             "build=grok-build",
             "gpt=",
@@ -2419,7 +2419,7 @@ mod tests {
         assert!(text.contains("claude=["));
         assert!(text.contains("claude-sonnet-4-6"));
         assert!(text.contains("grok=["));
-        assert!(text.contains("grok-4.3"));
+        assert!(text.contains("grok-4.5"));
         assert!(text.contains("grok-composer-2.5-fast"));
         assert!(
             !text.contains("sonnet=") && !text.contains("composer="),
@@ -5881,7 +5881,7 @@ rule = [
         assert_eq!(kc, "claude");
         assert_eq!(mc, "y");
         let (kg, mg) = resolve_provider_and_model("grok", &catalogs).unwrap();
-        assert_eq!((kg.as_str(), mg.as_str()), ("grok", "grok-4.3"));
+        assert_eq!((kg.as_str(), mg.as_str()), ("grok", "grok-4.5"));
         assert!(resolve_provider_and_model("bare", &catalogs).is_err());
     }
 

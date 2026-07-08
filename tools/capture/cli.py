@@ -52,7 +52,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--models",
         nargs="*",
         default=[],
-        help="Optional model ids (Claude only; default includes one no-model capture)",
+        help=(
+            "Optional model ids (Claude and Grok). Default includes one no-model "
+            "capture, then one capture per listed model."
+        ),
     )
     run.add_argument("--prompt", default="Say OK")
     run.add_argument(

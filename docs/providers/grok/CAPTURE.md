@@ -112,16 +112,42 @@ wrapper around `tools.capture extract jsonl` for sanitized JSONL exports.
 
 ## Current Chat Model Findings
 
-Verified against xAI chat completions on 2026-06-12:
+Re-baselined against grok-shell **0.2.91** and xAI on **2026-07-08**.
 
-- `grok-4.3`
-- `grok-build`
-- `grok-build-0.1`
+### Conservative (cli-chat-proxy.grok.com `/v1/models`)
+
+- `grok-4.5` (CLI default; reasoning efforts `low`/`medium`/`high`, default `high`)
 - `grok-composer-2.5-fast`
+
+Wire notes from live MITM of `grok --single`:
+- Host: `cli-chat-proxy.grok.com`, path `POST /v1/responses`
+- UA / version: `grok-shell/0.2.91 (linux; x86_64)`, `x-grok-client-version: 0.2.91`
+- Fingerprint headers unchanged in shape from 0.2.77: `x-xai-token-auth`,
+  `x-authenticateresponse`, `x-grok-client-identifier`, `x-grok-model-override`,
+  `accept: text/event-stream`
+- Main chat body: `model: "grok-4.5"`, `reasoning: { "effort": "high", "summary": "concise" }`,
+  `include: ["reasoning.encrypted_content"]`, `store: false`, `stream: true`
+- Session-title side call still uses model `grok-build` (not advertised in `/v1/models`)
+
+### Extended (api.x.ai chat/completions, verified 200)
+
+- `grok-4.5` (default; alias `grok`)
+- `grok-4.3`
+- `grok-build-0.1`
 - `grok-4.20-0309-reasoning`
 - `grok-4.20-0309-non-reasoning`
+- work-but-unlisted: `grok-3`, `grok-4`, `grok-build` (alias `build`),
+  `grok-composer-2.5-fast` (alias `composer`)
 
-`grok-4.20-multi-agent-0309` rejected chat completions with a multi-agent-only
-error and is not listed by Omni's chat provider. Omni accepts `grok` as shorthand
-for `grok-4.3` and `composer` as shorthand for `grok-composer-2.5-fast`, but
+`grok-4.20-multi-agent-0309` is advertised on api.x.ai but is multi-agent-only and
+is not listed by Omni's chat provider. Omni accepts `grok` as shorthand for
+`grok-4.5` and `composer` as shorthand for `grok-composer-2.5-fast`, but
 `/v1/models` emits only canonical upstream ids.
+
+### Thinking / reasoning_effort
+
+- Chat completions: top-level `"reasoning_effort": "low"|"medium"|"high"`
+- Responses: nested `"reasoning": { "effort": "..." }`
+- On `grok-4.5`, default is `high` and reasoning cannot be disabled (xAI docs +
+  CLI model catalog). Omni maps `CanonicalReasoning.effort` when the client sets it;
+  it does not invent a default when the client omits reasoning.

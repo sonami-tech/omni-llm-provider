@@ -176,11 +176,11 @@ def build_provider_commands(
         return commands
 
     if provider == "grok":
-        return [
-            [
+        # Default (no --model) first so the extract records the CLI's current
+        # default model id; optional --models adds explicit overrides.
+        def _grok_cmd(model: str | None = None) -> list[str]:
+            cmd = [
                 "grok",
-                "--single",
-                prompt,
                 "--output-format",
                 "json",
                 "--always-approve",
@@ -188,7 +188,15 @@ def build_provider_commands(
                 "1",
                 "--no-memory",
             ]
-        ]
+            if model:
+                cmd.extend(["--model", model])
+            cmd.extend(["--single", prompt])
+            return cmd
+
+        commands: list[list[str]] = [_grok_cmd()]
+        for model in models:
+            commands.append(_grok_cmd(model))
+        return commands
 
     if provider == "codex":
         return [

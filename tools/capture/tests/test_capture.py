@@ -812,6 +812,31 @@ class ProviderCommandTests(unittest.TestCase):
         self.assertIn("--model", commands[1])
         self.assertEqual(commands[1][commands[1].index("--model") + 1], "claude-haiku-4-5")
 
+    def test_grok_command_plan_includes_default_and_models(self) -> None:
+        (self.source_home / ".grok").mkdir(exist_ok=True)
+        (self.source_home / ".grok" / "auth.json").write_text(
+            '{"https://auth.x.ai::x":{"key":"jwt","auth_mode":"oidc","expires_at":"2999-01-01T00:00:00Z"}}',
+            encoding="utf-8",
+        )
+        staged = stage_credentials(
+            provider="grok",
+            clean_home=self.clean_home,
+            clean_codex_home=None,
+            mode="general",
+            source_home=self.source_home,
+        )
+        commands = build_provider_commands(
+            provider="grok",
+            staged=staged,
+            port=12345,
+            models=["grok-4.5", "grok-4-3"],
+        )
+        self.assertEqual(len(commands), 3)
+        self.assertNotIn("--model", commands[0])
+        self.assertEqual(commands[0][commands[0].index("--single") + 1], "Say OK")
+        self.assertEqual(commands[1][commands[1].index("--model") + 1], "grok-4.5")
+        self.assertEqual(commands[2][commands[2].index("--model") + 1], "grok-4-3")
+
     def test_all_provider_dry_run_plans(self) -> None:
         for provider in ("claude", "grok", "codex"):
             with self.subTest(provider=provider):
@@ -942,8 +967,8 @@ class ProviderCommandTests(unittest.TestCase):
         self.assertEqual(len(commands), 1)
         cmd = commands[0]
         self.assertEqual(cmd[0], "grok")
-        self.assertEqual(cmd[1], "--single")
-        self.assertEqual(cmd[2], "Say OK")
+        self.assertIn("--single", cmd)
+        self.assertEqual(cmd[cmd.index("--single") + 1], "Say OK")
         self.assertIn("--output-format", cmd)
         self.assertIn("json", cmd)
         self.assertNotIn("-p", cmd)
