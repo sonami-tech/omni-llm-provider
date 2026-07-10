@@ -657,7 +657,7 @@ impl GrokProvider {
         let body = to_grok_responses_request(&req, self.active_catalog(), false)?;
         let headers = self.conservative_headers(&creds, &model)?;
         let url = format!("{}/v1/responses", base);
-        debug!(%url, "POST grok conservative responses");
+        tracing::trace!(%url, "POST grok conservative responses");
 
         // Redactor carries the EXACT resolved bearer/key so a non-prefixed operator
         // token cannot leak through an upstream error body (Finding 4).
@@ -1729,12 +1729,10 @@ impl LlmProvider for GrokProvider {
     }
 
     async fn send(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError> {
-        debug!(
+        // Fat start demoted: bin request_start/complete covers operator status.
+        tracing::trace!(
             provider = "grok",
             model = %req.model,
-            n_msgs = req.messages.len(),
-            n_tools = req.tools.as_ref().map(|t| t.len()).unwrap_or(0),
-            has_reasoning = req.reasoning.is_some(),
             "sending to xAI"
         );
 
@@ -1775,7 +1773,7 @@ impl LlmProvider for GrokProvider {
         let body = to_xai_chat_request(&req, &repl, catalog)?;
 
         let url = format!("{}/chat/completions", self.base_url);
-        debug!(%url, "POST xAI chat completions");
+        tracing::trace!(%url, "POST xAI chat completions");
 
         let mut request = self
             .client
@@ -1809,7 +1807,7 @@ impl LlmProvider for GrokProvider {
             ProviderError::upstream(format!("failed to decode xAI response: {}", e))
         })?;
 
-        debug!(
+        tracing::trace!(
             model = %raw.model.as_deref().unwrap_or("unknown"),
             choices = raw.choices.as_ref().map(|c| c.len()).unwrap_or(0),
             "xAI response received"
@@ -1833,12 +1831,9 @@ impl LlmProvider for GrokProvider {
     /// `async_stream::stream!`) so the call site gets the stream immediately and any upstream
     /// failure surfaces as the first `Err` item rather than from the `send_stream` call itself.
     async fn send_stream(&self, req: CanonicalRequest) -> Result<CanonicalStream, ProviderError> {
-        debug!(
+        tracing::trace!(
             provider = "grok",
             model = %req.model,
-            n_msgs = req.messages.len(),
-            n_tools = req.tools.as_ref().map(|t| t.len()).unwrap_or(0),
-            has_reasoning = req.reasoning.is_some(),
             "streaming to xAI"
         );
 

@@ -452,14 +452,13 @@ impl LlmProvider for ClaudeProvider {
     }
 
     async fn send(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError> {
-        debug!(
+        // Fat start fields (n_msgs/n_tools/has_reasoning) demoted: bin emits
+        // request_start + request_complete under the default operator filter.
+        tracing::trace!(
             provider = "claude",
             model = %req.model,
-            n_msgs = req.messages.len(),
-            n_tools = req.tools.as_ref().map(|t| t.len()).unwrap_or(0),
-            has_reasoning = req.reasoning.is_some(),
-            "sending via claude (fingerprint profile {})",
-            self.profile.name
+            profile = self.profile.name,
+            "sending via claude"
         );
 
         // 1. Replacements hook (omni-common) on prompt surface. Must happen
@@ -508,9 +507,12 @@ impl LlmProvider for ClaudeProvider {
         // 6. Map back to canonical + apply response-scope replacements hook.
         let canon = translate::build_canonical_response(&anth_resp, &req.model, &repl);
 
-        debug!(
+        // Finish/mapped line demoted: bin request_complete carries finish_reason
+        // and duration; cache presence is still plain u64 here so residual stays
+        // at trace only when operators need raw provider mapping.
+        tracing::trace!(
             model = %canon.model,
-            finish = ?canon.finish_reason,
+            finish_reason = ?canon.finish_reason,
             cache_read = canon.usage.cache_read,
             cache_creation = canon.usage.cache_creation,
             "claude response mapped to canonical"
@@ -520,12 +522,11 @@ impl LlmProvider for ClaudeProvider {
     }
 
     async fn send_stream(&self, req: CanonicalRequest) -> Result<CanonicalStream, ProviderError> {
-        debug!(
+        tracing::trace!(
             provider = "claude",
             model = %req.model,
-            n_msgs = req.messages.len(),
-            "streaming via claude (fingerprint profile {})",
-            self.profile.name
+            profile = self.profile.name,
+            "streaming via claude"
         );
 
         // Same outbound build as send(): replacements -> exact wire request ->
@@ -582,6 +583,9 @@ impl LlmProvider for ClaudeProvider {
                     // repeated cache_creation with zero cache_read signals prefix
                     // instability defeating the cache.
                     if let CanonicalStreamEvent::Usage(u) = &canon_event {
+                        // Cache fields are not always on the bin complete line
+                        // (plain u64 presence unknown → omit). Keep mid-stream
+                        // residual at debug for cache-prefix diagnosis.
                         debug!(
                             model = %log_model,
                             cache_read = u.cache_read,
