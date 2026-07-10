@@ -252,6 +252,31 @@ fn is_query_key_boundary(prev: u8) -> bool {
     prev == b'?' || prev == b'&' || prev == b'#' || prev == b' ' || prev == b'\t'
 }
 
+/// True only when `token` is exactly `REDACTED` (not `REDACTEDsuffix` glued on).
+fn is_exact_redacted_placeholder(token: &str) -> bool {
+    token == "REDACTED"
+}
+
+/// True when the value at `s` is the exact placeholder followed by end or a
+/// delimiter — not `REDACTED` glued to more secret material.
+fn is_exact_redacted_value_at(s: &str) -> bool {
+    if !s.starts_with("REDACTED") {
+        return false;
+    }
+    let rest = &s["REDACTED".len()..];
+    rest.is_empty()
+        || rest.starts_with(|c: char| {
+            c == '&'
+                || c == ' '
+                || c == '\t'
+                || c == '"'
+                || c == '\''
+                || c == ','
+                || c == '\n'
+                || c == '\r'
+        })
+}
+
 fn redact_url_query_secrets(input: &str) -> String {
     // Walk every occurrence of each secret key; advance past already-REDACTED
     // values so later duplicates (e.g. ?api_key=SEC1&api_key=SEC2) are scrubbed.
@@ -275,8 +300,8 @@ fn redact_url_query_secrets(input: &str) -> String {
                 }
             }
             let val_start = start + needle.len();
-            if out[val_start..].starts_with("REDACTED") {
-                // Already scrubbed; advance past this occurrence.
+            if is_exact_redacted_value_at(&out[val_start..]) {
+                // Already scrubbed (exact placeholder); advance past it.
                 search_from = val_start + "REDACTED".len();
                 continue;
             }
@@ -323,8 +348,8 @@ fn redact_auth_headers(input: &str) -> String {
             if value_part.is_empty() {
                 break;
             }
-            if value_part.starts_with("REDACTED") {
-                // Already scrubbed; advance past this occurrence.
+            if is_exact_redacted_value_at(value_part) {
+                // Already scrubbed (exact placeholder); advance past it.
                 search_from = value_start + "REDACTED".len();
                 continue;
             }
@@ -585,10 +610,8 @@ fn still_secret_shaped(s: &str) -> bool {
                 .chars()
                 .take_while(|c| !c.is_whitespace() && *c != '&' && *c != '"' && *c != '\'')
                 .collect();
-            if token.len() >= RESIDUAL_SECRET_MIN_LEN
-                && token != "REDACTED"
-                && !token.starts_with("REDACTED")
-            {
+            // Exact REDACTED only — REDACTEDgluedsecret is still secret-shaped.
+            if token.len() >= RESIDUAL_SECRET_MIN_LEN && !is_exact_redacted_placeholder(&token) {
                 return true;
             }
             search_from = start + needle.len() + token.len().max(1);
@@ -675,7 +698,8 @@ fn still_secret_shaped(s: &str) -> bool {
                 .take_while(|c| *c != '"' && *c != '\'' && *c != ',' && *c != '\n' && *c != '\r')
                 .collect();
             let token = token.trim();
-            if !token.is_empty() && token != "REDACTED" && !token.starts_with("REDACTED") {
+            // Exact REDACTED only — REDACTEDgluedsecret is still secret-shaped.
+            if !token.is_empty() && !is_exact_redacted_placeholder(token) {
                 return true;
             }
             search_from = idx + marker.len() + token.len().max(1);
@@ -1108,6 +1132,22 @@ mod tests {
         assert!(still_secret_shaped("#access_token=opaque_secret_123456"));
         assert!(!still_secret_shaped("?api_key=REDACTED&x=1"));
         assert!(!still_secret_shaped(r#"{"api_key":"REDACTED"}"#));
+    }
+
+    #[test]
+    fn redacted_prefix_glued_secret_is_not_treated_as_clean() {
+        // WHY: skipping any token that merely starts_with("REDACTED") fail-opens
+        // on api_key=REDACTEDactualsecret… — only the exact placeholder is clean.
+        let glued = "api_key=REDACTEDactualsecretvalue12345";
+        assert!(still_secret_shaped(glued), "residual must flag glued secret");
+        match redact_error_for_log(glued) {
+            Some(s) => assert!(
+                !s.contains("actualsecretvalue12345"),
+                "must scrub glued secret, got {s}"
+            ),
+            None => {} // fail-closed also OK
+        }
+        assert!(still_secret_shaped("authorization: REDACTEDactualsecretvalue12345"));
     }
 
     #[test]
