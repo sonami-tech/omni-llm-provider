@@ -484,8 +484,27 @@ fn redact_json_secret_fields(input: &str) -> String {
                         search_from = value_start + "\"REDACTED\"".len();
                     }
                 } else {
-                    // Non-string value; skip past the key.
-                    search_from = after_key;
+                    // Non-string JSON value after a secret key (number/bool/null
+                    // or bare token). Fail-closed: scrub the run rather than
+                    // leave e.g. {"api_key":123456789012345678} live.
+                    let bare_end = value_part
+                        .find(|c: char| {
+                            c == ','
+                                || c == '}'
+                                || c == ']'
+                                || c == ' '
+                                || c == '\t'
+                                || c == '\n'
+                                || c == '\r'
+                        })
+                        .map(|i| value_start + i)
+                        .unwrap_or(out.len());
+                    if bare_end > value_start {
+                        out.replace_range(value_start..bare_end, "REDACTED");
+                        search_from = value_start + "REDACTED".len();
+                    } else {
+                        search_from = after_key;
+                    }
                     continue;
                 }
                 guard += 1;
@@ -682,6 +701,30 @@ fn still_secret_shaped(s: &str) -> bool {
                         // Unterminated 'value after secret key → fail-closed.
                         return true;
                     }
+                } else if !value_part.is_empty() {
+                    // Non-string value after secret key — fail-closed unless exact REDACTED.
+                    let bare: String = value_part
+                        .chars()
+                        .take_while(|c| {
+                            *c != ','
+                                && *c != '}'
+                                && *c != ']'
+                                && *c != ' '
+                                && *c != '\t'
+                                && *c != '\n'
+                                && *c != '\r'
+                        })
+                        .collect();
+                    if !bare.is_empty()
+                        && bare.len() >= RESIDUAL_SECRET_MIN_LEN
+                        && !is_exact_redacted_placeholder(&bare)
+                    {
+                        return true;
+                    }
+                    search_from = after_colon
+                        + (s[after_colon..].len() - value_part.len())
+                        + bare.len().max(1);
+                    continue;
                 }
                 search_from = after_key;
             }
@@ -1132,6 +1175,18 @@ mod tests {
         assert!(still_secret_shaped("#access_token=opaque_secret_123456"));
         assert!(!still_secret_shaped("?api_key=REDACTED&x=1"));
         assert!(!still_secret_shaped(r#"{"api_key":"REDACTED"}"#));
+    }
+
+    #[test]
+    fn redact_json_non_string_secret_value_or_fail_closed() {
+        // WHY: bare number/bool after a secret key must not pass through as
+        // error= material (fail-open if only quoted strings are scrubbed).
+        let raw = r#"body {"api_key":123456789012345678}"#;
+        match redact_error_for_log(raw) {
+            Some(s) => assert!(!s.contains("123456789012345678"), "{s}"),
+            None => {}
+        }
+        assert!(still_secret_shaped(r#"{"api_key":123456789012345678}"#));
     }
 
     #[test]
