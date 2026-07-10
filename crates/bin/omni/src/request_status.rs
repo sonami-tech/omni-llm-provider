@@ -190,7 +190,10 @@ pub fn tokens_from_plain_usage(
 /// logs, then truncate. If residual text still looks secret-bearing, omit the
 /// field entirely.
 pub fn redact_error_for_log(raw: &str) -> Option<String> {
-    let mut s = raw.to_string();
+    // Unescape nested JSON dumps (e.g. body {\"api_key\":\"…\"}) so secret-key
+    // matchers see plain "key" forms. Cosmetic for non-secret text; required for
+    // fail-closed redaction of escaped-in-string JSON secrets.
+    let mut s = raw.replace("\\\"", "\"").replace("\\'", "'");
 
     // URL query secrets: ?token=...&api_key=...
     s = redact_url_query_secrets(&s);
@@ -1175,6 +1178,17 @@ mod tests {
         assert!(still_secret_shaped("#access_token=opaque_secret_123456"));
         assert!(!still_secret_shaped("?api_key=REDACTED&x=1"));
         assert!(!still_secret_shaped(r#"{"api_key":"REDACTED"}"#));
+    }
+
+    #[test]
+    fn redact_escaped_json_in_error_string_or_fail_closed() {
+        // WHY: nested JSON dumps in error text use \"key\" form; redactors that
+        // only match literal "key" would fail-open on opaque secrets.
+        let raw = r#"body {\"api_key\":\"opaque_secret_123456\"}"#;
+        match redact_error_for_log(raw) {
+            Some(s) => assert!(!s.contains("opaque_secret_123456"), "{s}"),
+            None => {}
+        }
     }
 
     #[test]
