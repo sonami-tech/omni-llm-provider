@@ -95,6 +95,7 @@ use log_color::{ColorFields, ColorMode};
 use request_status::{
     FinishSite, RequestCompleteParams, format_conv_log_finish_summary, log_request_complete,
     log_request_start, map_anthropic_stop_reason, requested_model_if_differs,
+    tokens_from_plain_usage,
 };
 
 const OMNI_ASCII_BANNER: &str = r#"
@@ -1246,18 +1247,19 @@ async fn chat_completions_handler(
         let open_started = Instant::now();
         let stream = provider.send_stream(canon).await.map_err(|e| {
             let err_msg = e.to_string();
+            // Complete twin only when record_* actually ran (stats present).
             if let Some(stats) = &state.stats {
                 stats.record_error(&stats_key, &err_msg);
+                log_terminal_error_complete(
+                    &stats_key,
+                    open_started.elapsed().as_secs_f64() * 1000.0,
+                    false, // pre-body: stream never opened
+                    false,
+                    None,
+                    Some(err_msg),
+                    Some(requested_model.as_str()),
+                );
             }
-            log_terminal_error_complete(
-                &stats_key,
-                open_started.elapsed().as_secs_f64() * 1000.0,
-                false, // pre-body: stream never opened
-                false,
-                None,
-                Some(err_msg),
-                Some(requested_model.as_str()),
-            );
             map_provider_err(e)
         })?;
         log_text(
@@ -1289,28 +1291,28 @@ async fn chat_completions_handler(
         let err_msg = e.to_string();
         if let Some(stats) = &state.stats {
             stats.record_error(&stats_key, &err_msg);
+            log_terminal_error_complete(
+                &stats_key,
+                started.elapsed().as_secs_f64() * 1000.0,
+                false, // send failed before a response body with finish_reason
+                false,
+                None,
+                Some(err_msg),
+                Some(requested_model.as_str()),
+            );
         }
-        log_terminal_error_complete(
-            &stats_key,
-            started.elapsed().as_secs_f64() * 1000.0,
-            false, // send failed before a response body with finish_reason
-            false,
-            None,
-            Some(err_msg),
-            Some(requested_model.as_str()),
-        );
         map_provider_err(e)
     })?;
 
     if let Some(stats) = &state.stats {
         record_response_stats(stats, &stats_key, &canon_resp, started);
+        log_nonstream_response_complete(
+            &stats_key,
+            &canon_resp,
+            started.elapsed().as_secs_f64() * 1000.0,
+            Some(requested_model.as_str()),
+        );
     }
-    log_nonstream_response_complete(
-        &stats_key,
-        &canon_resp,
-        started.elapsed().as_secs_f64() * 1000.0,
-        Some(requested_model.as_str()),
-    );
 
     // Echo the resolved canonical provider model, not shorthand aliases.
     let oai = from_canonical(canon_resp, stripped_model, chat_id, created);
@@ -1339,22 +1341,23 @@ fn map_provider_err(e: ProviderError) -> AppError {
 }
 
 fn record_bad_request(state: &AppState, model: &str, msg: String) -> AppError {
+    // Complete twin only when record_error actually ran (same gate as other sites).
     if let Some(stats) = &state.stats {
         stats.record_error(model, &msg);
+        // Pre-body client error: never entered a finish-capable body path.
+        let params = RequestCompleteParams::error(
+            model,
+            FinishSite {
+                entered_body: false,
+                incomplete: false,
+                no_finish_concept: false,
+                finish_latch: None,
+            },
+            0.0,
+        )
+        .with_error(Some(msg.clone()));
+        log_request_complete(&params);
     }
-    // Pre-body client error: never entered a finish-capable body path.
-    let params = RequestCompleteParams::error(
-        model,
-        FinishSite {
-            entered_body: false,
-            incomplete: false,
-            no_finish_concept: false,
-            finish_latch: None,
-        },
-        0.0,
-    )
-    .with_error(Some(msg.clone()));
-    log_request_complete(&params);
     AppError::BadRequest(msg)
 }
 
@@ -1375,6 +1378,7 @@ fn record_response_stats(
 }
 
 /// Twin complete line for non-stream success next to `record_response_stats`.
+/// Callers must only invoke when stats is Some (record_* actually ran).
 fn log_nonstream_response_complete(
     model: &str,
     canon_resp: &CanonicalResponse,
@@ -1387,10 +1391,16 @@ fn log_nonstream_response_complete(
         no_finish_concept: false,
         finish_latch: canon_resp.finish_reason.clone(),
     };
-    let mut params = RequestCompleteParams::ok(model, finish, duration_ms).with_tokens(
-        Some(canon_resp.usage.input_tokens),
-        Some(canon_resp.usage.output_tokens),
+    // Plain u64 usage: all-zero may mean "missing" (CanonicalUsage default).
+    // See tokens_from_plain_usage for the temporary presence heuristic.
+    let (in_tok, out_tok) = tokens_from_plain_usage(
+        canon_resp.usage.input_tokens,
+        canon_resp.usage.output_tokens,
+        canon_resp.usage.cache_read,
+        canon_resp.usage.cache_creation,
     );
+    let mut params =
+        RequestCompleteParams::ok(model, finish, duration_ms).with_tokens(in_tok, out_tok);
     // Cache presence is plain u64 without Option in CanonicalUsage; omit rather
     // than invent zeros (plan temporary rule).
     if let Some(raw) = requested_model {
@@ -1470,6 +1480,8 @@ fn wrap_stream_for_stats(
                     finish_latch = finish_reason.clone();
                     let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
                     let is_err = is_error_finish_reason(finish_reason.as_deref());
+                    // Complete + conv-log finish only with the same branch that
+                    // calls record_* (stats present). stats=None → no twin.
                     if is_err {
                         let msg = finish_reason
                             .as_deref()
@@ -1479,37 +1491,35 @@ fn wrap_stream_for_stats(
                             .to_string();
                         if let Some(stats) = stats.as_ref() {
                             stats.record_error(&model, &msg);
-                        }
-                        let params = RequestCompleteParams::error(
-                            model.clone(),
-                            FinishSite {
-                                entered_body: true,
-                                incomplete: false,
-                                no_finish_concept: false,
-                                finish_latch: finish_latch.clone(),
-                            },
-                            dur_ms,
-                        )
-                        .with_error(Some(msg));
-                        log_request_complete(&params);
-                        if let Some(log) = conversation_log.as_ref() {
-                            log.log(
-                                &session_id,
-                                &request_id,
-                                "<<<",
-                                &finished_label,
-                                &format_conv_log_finish_summary(&params),
-                            );
-                        }
-                    } else {
-                        if let Some(stats) = stats.as_ref() {
-                            stats.record_response(
-                                &model,
-                                usage,
-                                None,
+                            let params = RequestCompleteParams::error(
+                                model.clone(),
+                                FinishSite {
+                                    entered_body: true,
+                                    incomplete: false,
+                                    no_finish_concept: false,
+                                    finish_latch: finish_latch.clone(),
+                                },
                                 dur_ms,
-                            );
+                            )
+                            .with_error(Some(msg));
+                            log_request_complete(&params);
+                            if let Some(log) = conversation_log.as_ref() {
+                                log.log(
+                                    &session_id,
+                                    &request_id,
+                                    "<<<",
+                                    &finished_label,
+                                    &format_conv_log_finish_summary(&params),
+                                );
+                            }
                         }
+                    } else if let Some(stats) = stats.as_ref() {
+                        stats.record_response(
+                            &model,
+                            usage,
+                            None,
+                            dur_ms,
+                        );
                         let (in_tok, out_tok) = if usage_observed {
                             (Some(usage.input_tokens), Some(usage.output_tokens))
                         } else {
@@ -1548,27 +1558,27 @@ fn wrap_stream_for_stats(
                     let err_msg = e.to_string();
                     if let Some(stats) = stats.as_ref() {
                         stats.record_error(&model, &err_msg);
-                    }
-                    let params = RequestCompleteParams::error(
-                        model.clone(),
-                        FinishSite {
-                            entered_body: true,
-                            incomplete: false,
-                            no_finish_concept: false,
-                            finish_latch: finish_latch.clone(),
-                        },
-                        dur_ms,
-                    )
-                    .with_error(Some(err_msg));
-                    log_request_complete(&params);
-                    if let Some(log) = conversation_log.as_ref() {
-                        log.log(
-                            &session_id,
-                            &request_id,
-                            "<<<",
-                            &finished_label,
-                            &format_conv_log_finish_summary(&params),
-                        );
+                        let params = RequestCompleteParams::error(
+                            model.clone(),
+                            FinishSite {
+                                entered_body: true,
+                                incomplete: false,
+                                no_finish_concept: false,
+                                finish_latch: finish_latch.clone(),
+                            },
+                            dur_ms,
+                        )
+                        .with_error(Some(err_msg));
+                        log_request_complete(&params);
+                        if let Some(log) = conversation_log.as_ref() {
+                            log.log(
+                                &session_id,
+                                &request_id,
+                                "<<<",
+                                &finished_label,
+                                &format_conv_log_finish_summary(&params),
+                            );
+                        }
                     }
                     yield Err(e);
                 }
@@ -1579,27 +1589,27 @@ fn wrap_stream_for_stats(
             let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
             if let Some(stats) = stats.as_ref() {
                 stats.record_error(&model, "stream ended without Finish event");
-            }
-            let params = RequestCompleteParams::error(
-                model.clone(),
-                FinishSite {
-                    entered_body: true,
-                    incomplete: true,
-                    no_finish_concept: false,
-                    finish_latch: finish_latch.clone(),
-                },
-                dur_ms,
-            )
-            .with_error(Some("stream ended without Finish event".into()));
-            log_request_complete(&params);
-            if let Some(log) = conversation_log.as_ref() {
-                log.log(
-                    &session_id,
-                    &request_id,
-                    "<<<",
-                    &finished_label,
-                    &format_conv_log_finish_summary(&params),
-                );
+                let params = RequestCompleteParams::error(
+                    model.clone(),
+                    FinishSite {
+                        entered_body: true,
+                        incomplete: true,
+                        no_finish_concept: false,
+                        finish_latch: finish_latch.clone(),
+                    },
+                    dur_ms,
+                )
+                .with_error(Some("stream ended without Finish event".into()));
+                log_request_complete(&params);
+                if let Some(log) = conversation_log.as_ref() {
+                    log.log(
+                        &session_id,
+                        &request_id,
+                        "<<<",
+                        &finished_label,
+                        &format_conv_log_finish_summary(&params),
+                    );
+                }
             }
         }
     });
@@ -1771,16 +1781,16 @@ async fn anthropic_messages_inner(
                 let err_msg = error.to_string();
                 if let Some(stats) = &state.stats {
                     stats.record_error(&stats_key, &err_msg);
+                    log_terminal_error_complete(
+                        &stats_key,
+                        open_started.elapsed().as_secs_f64() * 1000.0,
+                        false,
+                        false,
+                        None,
+                        Some(err_msg),
+                        Some(prepared.requested_model.as_str()),
+                    );
                 }
-                log_terminal_error_complete(
-                    &stats_key,
-                    open_started.elapsed().as_secs_f64() * 1000.0,
-                    false,
-                    false,
-                    None,
-                    Some(err_msg),
-                    Some(prepared.requested_model.as_str()),
-                );
                 map_provider_err(error)
             })?;
         log_text(
@@ -1811,16 +1821,16 @@ async fn anthropic_messages_inner(
             let err_msg = error.to_string();
             if let Some(stats) = &state.stats {
                 stats.record_error(&stats_key, &err_msg);
+                log_terminal_error_complete(
+                    &stats_key,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    false,
+                    None,
+                    Some(err_msg),
+                    Some(prepared.requested_model.as_str()),
+                );
             }
-            log_terminal_error_complete(
-                &stats_key,
-                started.elapsed().as_secs_f64() * 1000.0,
-                false,
-                false,
-                None,
-                Some(err_msg),
-                Some(prepared.requested_model.as_str()),
-            );
             map_provider_err(error)
         })?;
     provider_claude::anthropic_passthrough::apply_response_replacements_raw(
@@ -1831,27 +1841,34 @@ async fn anthropic_messages_inner(
     let usage = provider_claude::anthropic_passthrough::token_usage_from_response(&value);
     if let Some(stats) = &state.stats {
         stats.record_response(&stats_key, usage, None, dur_ms);
+        let stop_plain = value
+            .get("stop_reason")
+            .and_then(|v| v.as_str())
+            .map(map_anthropic_stop_reason);
+        // Plain u64 usage may default missing fields to 0; omit all-zero.
+        let (in_tok, out_tok) = tokens_from_plain_usage(
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_read_input_tokens,
+            usage.cache_creation_input_tokens,
+        );
+        let params = RequestCompleteParams::ok(
+            stats_key.clone(),
+            FinishSite {
+                entered_body: true,
+                incomplete: false,
+                no_finish_concept: false,
+                finish_latch: stop_plain,
+            },
+            dur_ms,
+        )
+        .with_tokens(in_tok, out_tok)
+        .with_requested_model(requested_model_if_differs(
+            &stats_key,
+            &prepared.requested_model,
+        ));
+        log_request_complete(&params);
     }
-    let stop_plain = value
-        .get("stop_reason")
-        .and_then(|v| v.as_str())
-        .map(map_anthropic_stop_reason);
-    let params = RequestCompleteParams::ok(
-        stats_key.clone(),
-        FinishSite {
-            entered_body: true,
-            incomplete: false,
-            no_finish_concept: false,
-            finish_latch: stop_plain,
-        },
-        dur_ms,
-    )
-    .with_tokens(Some(usage.input_tokens), Some(usage.output_tokens))
-    .with_requested_model(requested_model_if_differs(
-        &stats_key,
-        &prepared.requested_model,
-    ));
-    log_request_complete(&params);
     log_json(
         &state,
         &session_id,
@@ -1931,19 +1948,20 @@ async fn anthropic_count_tokens_inner(
         .await
         .map_err(|error| {
             let err_msg = error.to_string();
+            // count_tokens error twin only when record_error ran (stats Some).
             if let Some(stats) = &state.stats {
                 stats.record_error(&stats_key, &err_msg);
+                // count_tokens has no finish concept; errors are pre-body style none.
+                log_terminal_error_complete(
+                    &stats_key,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    false,
+                    None,
+                    Some(err_msg),
+                    Some(prepared.requested_model.as_str()),
+                );
             }
-            // count_tokens has no finish concept; errors are pre-body style none.
-            log_terminal_error_complete(
-                &stats_key,
-                started.elapsed().as_secs_f64() * 1000.0,
-                false,
-                false,
-                None,
-                Some(err_msg),
-                Some(prepared.requested_model.as_str()),
-            );
             map_provider_err(error)
         })?;
     Ok((anthropic_request_id_header(&short_request_id), Json(value)).into_response())
@@ -2114,24 +2132,25 @@ fn anthropic_sse_response(
                     };
                     if let Some(message) = upstream_error_message {
                         stream_failed = true;
+                        // Complete only when record_* ran (stats Some).
                         if let Some(stats) = stats.as_ref() {
                             stats.record_error(&model, &message);
-                        }
-                        if complete_snapshot.is_none() {
-                            let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
-                            let params = RequestCompleteParams::error(
-                                model.clone(),
-                                FinishSite {
-                                    entered_body: true,
-                                    incomplete: false,
-                                    no_finish_concept: false,
-                                    finish_latch: stop_reason_latch.clone(),
-                                },
-                                dur_ms,
-                            )
-                            .with_error(Some(message));
-                            log_request_complete(&params);
-                            complete_snapshot = Some(params);
+                            if complete_snapshot.is_none() {
+                                let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
+                                let params = RequestCompleteParams::error(
+                                    model.clone(),
+                                    FinishSite {
+                                        entered_body: true,
+                                        incomplete: false,
+                                        no_finish_concept: false,
+                                        finish_latch: stop_reason_latch.clone(),
+                                    },
+                                    dur_ms,
+                                )
+                                .with_error(Some(message));
+                                log_request_complete(&params);
+                                complete_snapshot = Some(params);
+                            }
                         }
                     }
                     if frame.event == "message_stop"
@@ -2146,22 +2165,22 @@ fn anthropic_sse_response(
                                 stream_failed = true;
                                 if let Some(stats) = stats.as_ref() {
                                     stats.record_error(&model, &error);
-                                }
-                                if complete_snapshot.is_none() {
-                                    let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
-                                    let params = RequestCompleteParams::error(
-                                        model.clone(),
-                                        FinishSite {
-                                            entered_body: true,
-                                            incomplete: false,
-                                            no_finish_concept: false,
-                                            finish_latch: stop_reason_latch.clone(),
-                                        },
-                                        dur_ms,
-                                    )
-                                    .with_error(Some(error.clone()));
-                                    log_request_complete(&params);
-                                    complete_snapshot = Some(params);
+                                    if complete_snapshot.is_none() {
+                                        let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
+                                        let params = RequestCompleteParams::error(
+                                            model.clone(),
+                                            FinishSite {
+                                                entered_body: true,
+                                                incomplete: false,
+                                                no_finish_concept: false,
+                                                finish_latch: stop_reason_latch.clone(),
+                                            },
+                                            dur_ms,
+                                        )
+                                        .with_error(Some(error.clone()));
+                                        log_request_complete(&params);
+                                        complete_snapshot = Some(params);
+                                    }
                                 }
                                 yield Ok(anthropic_error_event(&error));
                                 break;
@@ -2174,22 +2193,22 @@ fn anthropic_sse_response(
                     stream_failed = true;
                     if let Some(stats) = stats.as_ref() {
                         stats.record_error(&model, &message);
-                    }
-                    if complete_snapshot.is_none() {
-                        let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
-                        let params = RequestCompleteParams::error(
-                            model.clone(),
-                            FinishSite {
-                                entered_body: true,
-                                incomplete: false,
-                                no_finish_concept: false,
-                                finish_latch: stop_reason_latch.clone(),
-                            },
-                            dur_ms,
-                        )
-                        .with_error(Some(message.clone()));
-                        log_request_complete(&params);
-                        complete_snapshot = Some(params);
+                        if complete_snapshot.is_none() {
+                            let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
+                            let params = RequestCompleteParams::error(
+                                model.clone(),
+                                FinishSite {
+                                    entered_body: true,
+                                    incomplete: false,
+                                    no_finish_concept: false,
+                                    finish_latch: stop_reason_latch.clone(),
+                                },
+                                dur_ms,
+                            )
+                            .with_error(Some(message.clone()));
+                            log_request_complete(&params);
+                            complete_snapshot = Some(params);
+                        }
                     }
                     for (event, data) in repl_state.flush_all(&replacements) {
                         if let Ok(event) = anthropic_sse_event(&event, &data) {
@@ -2212,22 +2231,22 @@ fn anthropic_sse_response(
             let message = "anthropic stream ended before message_stop";
             if let Some(stats) = stats.as_ref() {
                 stats.record_error(&model, message);
-            }
-            if complete_snapshot.is_none() {
-                let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
-                let params = RequestCompleteParams::error(
-                    model.clone(),
-                    FinishSite {
-                        entered_body: true,
-                        incomplete: true,
-                        no_finish_concept: false,
-                        finish_latch: stop_reason_latch.clone(),
-                    },
-                    dur_ms,
-                )
-                .with_error(Some(message.into()));
-                log_request_complete(&params);
-                complete_snapshot = Some(params);
+                if complete_snapshot.is_none() {
+                    let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    let params = RequestCompleteParams::error(
+                        model.clone(),
+                        FinishSite {
+                            entered_body: true,
+                            incomplete: true,
+                            no_finish_concept: false,
+                            finish_latch: stop_reason_latch.clone(),
+                        },
+                        dur_ms,
+                    )
+                    .with_error(Some(message.into()));
+                    log_request_complete(&params);
+                    complete_snapshot = Some(params);
+                }
             }
             yield Ok(anthropic_error_event(message));
         }
@@ -2240,27 +2259,27 @@ fn anthropic_sse_response(
                     ttft_ms,
                     dur_ms,
                 );
+                // Success twin only at AS5 (end-of-pump finalize), with record_*.
+                let (in_tok, out_tok) = if usage_observed {
+                    (Some(usage.input_tokens), Some(usage.output_tokens))
+                } else {
+                    (None, None)
+                };
+                let params = RequestCompleteParams::ok(
+                    model.clone(),
+                    FinishSite {
+                        entered_body: true,
+                        incomplete: false,
+                        no_finish_concept: false,
+                        finish_latch: stop_reason_latch.clone(),
+                    },
+                    dur_ms,
+                )
+                .with_tokens(in_tok, out_tok)
+                .with_ttft_ms(ttft_ms);
+                log_request_complete(&params);
+                complete_snapshot = Some(params);
             }
-            // Success twin only at AS5 (end-of-pump finalize).
-            let (in_tok, out_tok) = if usage_observed {
-                (Some(usage.input_tokens), Some(usage.output_tokens))
-            } else {
-                (None, None)
-            };
-            let params = RequestCompleteParams::ok(
-                model.clone(),
-                FinishSite {
-                    entered_body: true,
-                    incomplete: false,
-                    no_finish_concept: false,
-                    finish_latch: stop_reason_latch.clone(),
-                },
-                dur_ms,
-            )
-            .with_tokens(in_tok, out_tok)
-            .with_ttft_ms(ttft_ms);
-            log_request_complete(&params);
-            complete_snapshot = Some(params);
         }
         // Conv-log finish only when a terminal twin exists (stats-aligned).
         if let (Some(log), Some(params)) = (conversation_log.as_ref(), complete_snapshot.as_ref()) {
@@ -2417,16 +2436,16 @@ async fn responses_handler(
             let err_msg = e.to_string();
             if let Some(stats) = &state.stats {
                 stats.record_error(&stats_key, &err_msg);
+                log_terminal_error_complete(
+                    &stats_key,
+                    open_started.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    false,
+                    None,
+                    Some(err_msg),
+                    Some(requested_model.as_str()),
+                );
             }
-            log_terminal_error_complete(
-                &stats_key,
-                open_started.elapsed().as_secs_f64() * 1000.0,
-                false,
-                false,
-                None,
-                Some(err_msg),
-                Some(requested_model.as_str()),
-            );
             map_provider_err(e)
         })?;
         log_text(
@@ -2462,27 +2481,27 @@ async fn responses_handler(
         let err_msg = e.to_string();
         if let Some(stats) = &state.stats {
             stats.record_error(&stats_key, &err_msg);
+            log_terminal_error_complete(
+                &stats_key,
+                started.elapsed().as_secs_f64() * 1000.0,
+                false,
+                false,
+                None,
+                Some(err_msg),
+                Some(requested_model.as_str()),
+            );
         }
-        log_terminal_error_complete(
-            &stats_key,
-            started.elapsed().as_secs_f64() * 1000.0,
-            false,
-            false,
-            None,
-            Some(err_msg),
-            Some(requested_model.as_str()),
-        );
         map_provider_err(e)
     })?;
     if let Some(stats) = &state.stats {
         record_response_stats(stats, &stats_key, &canon_resp, started);
+        log_nonstream_response_complete(
+            &stats_key,
+            &canon_resp,
+            started.elapsed().as_secs_f64() * 1000.0,
+            Some(requested_model.as_str()),
+        );
     }
-    log_nonstream_response_complete(
-        &stats_key,
-        &canon_resp,
-        started.elapsed().as_secs_f64() * 1000.0,
-        Some(requested_model.as_str()),
-    );
     let resp =
         omni_common::responses_from_canonical(canon_resp, stripped_model, response_id, created_at);
     log_json(

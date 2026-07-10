@@ -166,10 +166,29 @@ pub fn map_anthropic_stop_reason(anth: &str) -> String {
     }
 }
 
+/// When only plain `u64` usage fields exist (no Option presence), all-zero is
+/// ambiguous: it may mean "usage missing" (`CanonicalUsage::default()`, Grok
+/// `from_xai` with `usage: None`). Emit `None` for both when every field is 0;
+/// otherwise emit `Some` for input/output (true zeros on a sibling field are OK
+/// once another field proves usage was present).
+pub fn tokens_from_plain_usage(
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_creation: u64,
+) -> (Option<u64>, Option<u64>) {
+    if input == 0 && output == 0 && cache_read == 0 && cache_creation == 0 {
+        (None, None)
+    } else {
+        (Some(input), Some(output))
+    }
+}
+
 /// Fail-closed error redactor for optional `error=` on complete lines.
 ///
-/// Redact known secret shapes first, then truncate. If residual text still
-/// looks secret-bearing, omit the field entirely.
+/// Redact known secret shapes first, sanitize control characters for single-line
+/// logs, then truncate. If residual text still looks secret-bearing, omit the
+/// field entirely.
 pub fn redact_error_for_log(raw: &str) -> Option<String> {
     let mut s = raw.to_string();
 
@@ -179,14 +198,35 @@ pub fn redact_error_for_log(raw: &str) -> Option<String> {
     s = redact_auth_headers(&s);
     // JSON body secret fields
     s = redact_json_secret_fields(&s);
-    // Bearer / basic / sk- style tokens when still present as bare values
+    // Bearer / basic / sk- / xai- style tokens when still present as bare values
     s = redact_bare_secrets(&s);
 
     if still_secret_shaped(&s) {
         return None;
     }
 
+    // After redaction, force a single log line (no embedded newlines/tabs).
+    s = sanitize_control_chars(&s);
     Some(truncate_chars(&s, 200))
+}
+
+/// Replace ASCII controls (0x00-0x1F, DEL) with spaces and collapse whitespace runs.
+fn sanitize_control_chars(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        let is_ctrl = c.is_control() || (c as u32) < 0x20;
+        if is_ctrl || c == ' ' {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out
 }
 
 fn redact_url_query_secrets(input: &str) -> String {
@@ -272,8 +312,10 @@ fn redact_url_query_secrets(input: &str) -> String {
 }
 
 fn redact_auth_headers(input: &str) -> String {
-    // Authorization: Bearer xxx / Basic xxx / raw header-like — redact the full
-    // credential material (scheme + token), not only the first whitespace token.
+    // Authorization: / x-api-key: / etc. — for ANY scheme (Bearer, Basic, Token,
+    // ApiKey, raw token), redact the full credential material in one shot from
+    // the first non-ws after the colon through end of the credential run
+    // (quote/comma/newline). Do not leave trailing scheme or token fragments.
     let markers = [
         "authorization:",
         "x-api-key:",
@@ -283,50 +325,31 @@ fn redact_auth_headers(input: &str) -> String {
     let mut out = input.to_string();
     for marker in markers {
         let mut guard = 0;
+        let mut search_from = 0;
         loop {
             let lower = out.to_ascii_lowercase();
-            let Some(idx) = lower.find(marker) else {
+            let Some(rel) = lower[search_from..].find(marker) else {
                 break;
             };
+            let idx = search_from + rel;
             let after = idx + marker.len();
-            // Skip whitespace after the colon, then take the rest of the
-            // credential run (until quote/comma/newline/end). Include scheme
-            // words like Bearer/Basic so the token cannot trail as bare text.
             let value_part = out[after..].trim_start();
             let ws = out[after..].len() - value_part.len();
             let value_start = after + ws;
+            if value_part.is_empty() {
+                break;
+            }
+            if value_part.starts_with("REDACTED") {
+                // Already scrubbed; advance past this occurrence.
+                search_from = value_start + "REDACTED".len();
+                continue;
+            }
             let value_end = value_part
                 .find(|c: char| c == '"' || c == '\'' || c == ',' || c == '\n' || c == '\r')
                 .map(|i| value_start + i)
                 .unwrap_or(out.len());
-            // Also stop at a trailing English word boundary when value continues
-            // with " leaked" style prose: keep space-separated residual after
-            // the credential by redacting scheme+token only (two tokens max).
-            let value_slice = &out[value_start..value_end];
-            let cred_end = {
-                let mut parts = value_slice.split_whitespace();
-                let first = parts.next().unwrap_or("");
-                let second = parts.next();
-                match second {
-                    Some(tok)
-                        if first.eq_ignore_ascii_case("bearer")
-                            || first.eq_ignore_ascii_case("basic") =>
-                    {
-                        // scheme + token
-                        value_start
-                            + first.len()
-                            + value_slice[first.len()..]
-                                .find(tok)
-                                .map(|i| i + tok.len())
-                                .unwrap_or(first.len())
-                    }
-                    _ => value_start + first.len(),
-                }
-            };
-            if out[value_start..cred_end].starts_with("REDACTED") {
-                break;
-            }
-            out.replace_range(value_start..cred_end, "REDACTED");
+            out.replace_range(value_start..value_end, "REDACTED");
+            search_from = value_start + "REDACTED".len();
             guard += 1;
             if guard > 16 {
                 break;
@@ -395,8 +418,9 @@ fn redact_bare_secrets(input: &str) -> String {
     out = replace_prefixed_token(&out, "bearer ");
     out = replace_prefixed_token(&out, "Basic ");
     out = replace_prefixed_token(&out, "basic ");
-    // sk-... OpenAI-style keys
-    out = replace_sk_tokens(&out);
+    // sk-... OpenAI-style keys and xai-... xAI keys
+    out = replace_dashed_key_tokens(&out, b"sk-", "sk-REDACTED", 12);
+    out = replace_dashed_key_tokens(&out, b"xai-", "xai-REDACTED", 12);
     out
 }
 
@@ -420,24 +444,31 @@ fn replace_prefixed_token(input: &str, prefix: &str) -> String {
     out
 }
 
-fn replace_sk_tokens(input: &str) -> String {
+/// Redact bare `sk-…` / `xai-…` keys: start boundary + min total length.
+fn replace_dashed_key_tokens(
+    input: &str,
+    prefix: &[u8],
+    replacement: &str,
+    min_total_len: usize,
+) -> String {
     let mut out = String::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if i + 3 <= bytes.len() && &bytes[i..i + 3] == b"sk-" {
-            // ensure start boundary
+        if i + prefix.len() <= bytes.len() && &bytes[i..i + prefix.len()] == prefix {
             let boundary_ok = i == 0
-                || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_' && bytes[i - 1] != b'-';
+                || (!bytes[i - 1].is_ascii_alphanumeric()
+                    && bytes[i - 1] != b'_'
+                    && bytes[i - 1] != b'-');
             if boundary_ok {
-                let mut j = i + 3;
+                let mut j = i + prefix.len();
                 while j < bytes.len()
                     && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
                 {
                     j += 1;
                 }
-                if j - i >= 12 {
-                    out.push_str("sk-REDACTED");
+                if j - i >= min_total_len {
+                    out.push_str(replacement);
                     i = j;
                     continue;
                 }
@@ -450,11 +481,15 @@ fn replace_sk_tokens(input: &str) -> String {
 }
 
 fn still_secret_shaped(s: &str) -> bool {
-    // Residual high-entropy secret indicators after redaction.
-    if s.contains("sk-") && s.contains("sk-REDACTED") {
-        // redacted form is fine
-    } else if s.contains("sk-") {
-        // unredacted sk- left
+    // Residual unredacted sk- / xai- key material (not the REDACTED form).
+    if has_unredacted_dashed_key(s, "sk-", "sk-REDACTED") {
+        return true;
+    }
+    if has_unredacted_dashed_key(s, "xai-", "xai-REDACTED") {
+        return true;
+    }
+    // Bare JWT-looking blobs (base64url header starting with eyJ, min ~20 chars).
+    if has_bare_jwt_blob(s) {
         return true;
     }
     // Long base64-ish token after auth keywords that we failed to scrub
@@ -470,6 +505,76 @@ fn still_secret_shaped(s: &str) -> bool {
                 return true;
             }
         }
+    }
+    // Colon-form header residuals: authorization: / x-api-key: with non-REDACTED material
+    for marker in ["authorization:", "x-api-key:", "api-key:", "x-auth-token:"] {
+        if let Some(idx) = lower.find(marker) {
+            let after = s[idx + marker.len()..].trim_start();
+            let token: String = after
+                .chars()
+                .take_while(|c| *c != '"' && *c != '\'' && *c != ',' && *c != '\n' && *c != '\r')
+                .collect();
+            let token = token.trim();
+            if !token.is_empty() && token != "REDACTED" && !token.starts_with("REDACTED") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn has_unredacted_dashed_key(s: &str, prefix: &str, redacted_form: &str) -> bool {
+    let mut rest = s;
+    while let Some(idx) = rest.find(prefix) {
+        let at = &rest[idx..];
+        if at.starts_with(redacted_form) {
+            rest = &rest[idx + redacted_form.len()..];
+            continue;
+        }
+        // Unredacted prefix: require enough key-shaped material after prefix.
+        let after_prefix = &at[prefix.len()..];
+        let key_len = after_prefix
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .count();
+        if prefix.len() + key_len >= 12 {
+            return true;
+        }
+        rest = &rest[idx + prefix.len()..];
+    }
+    false
+}
+
+fn has_bare_jwt_blob(s: &str) -> bool {
+    // JWT headers are base64url(`{"…}`) → typically start with `eyJ`.
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        if &bytes[i..i + 3] == b"eyJ" {
+            let boundary_ok = i == 0
+                || (!bytes[i - 1].is_ascii_alphanumeric()
+                    && bytes[i - 1] != b'_'
+                    && bytes[i - 1] != b'-'
+                    && bytes[i - 1] != b'.');
+            if boundary_ok {
+                let mut j = i;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_alphanumeric()
+                        || bytes[j] == b'_'
+                        || bytes[j] == b'-'
+                        || bytes[j] == b'.'
+                        || bytes[j] == b'+'
+                        || bytes[j] == b'/'
+                        || bytes[j] == b'=')
+                {
+                    j += 1;
+                }
+                if j - i >= 20 {
+                    return true;
+                }
+            }
+        }
+        i += 1;
     }
     false
 }
@@ -706,6 +811,7 @@ mod tests {
 
     #[test]
     fn format_emits_true_zero_tokens_when_observed() {
+        // WHY: when presence is known (stream Usage event), true zeros print.
         let params = RequestCompleteParams::ok(
             "m",
             FinishSite {
@@ -723,6 +829,35 @@ mod tests {
     }
 
     #[test]
+    fn plain_usage_all_zero_omits_token_keys() {
+        // WHY: CanonicalUsage defaults missing usage to 0; never print fake zeros.
+        let (inp, out) = tokens_from_plain_usage(0, 0, 0, 0);
+        assert_eq!((inp, out), (None, None));
+        let params = RequestCompleteParams::ok(
+            "m",
+            FinishSite {
+                entered_body: true,
+                finish_latch: Some("stop".into()),
+                ..Default::default()
+            },
+            1.0,
+        )
+        .with_tokens(inp, out);
+        let s = format_request_complete_fields(&params);
+        assert!(!s.contains("input_tokens"), "{s}");
+        assert!(!s.contains("output_tokens"), "{s}");
+    }
+
+    #[test]
+    fn plain_usage_nonzero_sibling_keeps_true_zero() {
+        // WHY: a non-zero field proves usage was present; sibling zeros are real.
+        let (inp, out) = tokens_from_plain_usage(0, 5, 0, 0);
+        assert_eq!((inp, out), (Some(0), Some(5)));
+        let (inp2, out2) = tokens_from_plain_usage(0, 0, 3, 0);
+        assert_eq!((inp2, out2), (Some(0), Some(0)));
+    }
+
+    #[test]
     fn redact_url_query_secrets() {
         let raw = "upstream https://api.example.com/v1?api_key=supersecret&x=1 failed";
         let redacted = redact_error_for_log(raw).expect("safe after redaction");
@@ -736,6 +871,45 @@ mod tests {
         let redacted = redact_error_for_log(raw).expect("safe after redaction");
         assert!(!redacted.contains("abcdefghijklmnop"), "{redacted}");
         assert!(redacted.contains("REDACTED"), "{redacted}");
+    }
+
+    #[test]
+    fn redact_authorization_token_scheme_fully() {
+        // WHY: non-Bearer schemes must not leave trailing credential material.
+        let raw = "upstream Authorization: Token ghp_abcdefghijklmnopqrstuv failed";
+        match redact_error_for_log(raw) {
+            Some(s) => {
+                assert!(!s.contains("ghp_"), "{s}");
+                assert!(!s.contains("abcdefghijklmnopqrstuv"), "{s}");
+            }
+            None => {} // fail-closed also acceptable
+        }
+    }
+
+    #[test]
+    fn redact_xai_key_or_fail_closed() {
+        let raw = "auth failed with xai-abcdefghijklmnopqrstuvwxyz012345";
+        match redact_error_for_log(raw) {
+            Some(s) => {
+                assert!(!s.contains("abcdefghijklmnopqrstuvwxyz012345"), "{s}");
+                assert!(s.contains("xai-REDACTED") || s.contains("REDACTED"), "{s}");
+            }
+            None => {} // residual still secret-shaped → omit error=
+        }
+    }
+
+    #[test]
+    fn redact_eyj_jwt_fail_closed_or_omit() {
+        // WHY: bare JWT blobs must not appear on complete lines.
+        let raw = "token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig leaked";
+        match redact_error_for_log(raw) {
+            Some(s) => assert!(!s.contains("eyJ"), "{s}"),
+            None => {} // fail-closed preferred for residual JWT shape
+        }
+        // Explicit residual path: still_secret_shaped must catch bare eyJ.
+        assert!(still_secret_shaped(
+            "token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig"
+        ));
     }
 
     #[test]
@@ -757,6 +931,27 @@ mod tests {
             Some(s) => assert!(!s.contains("this_is_a_long_secret_value_xx"), "{s}"),
             None => {}
         }
+    }
+
+    #[test]
+    fn error_field_strips_newlines_single_line() {
+        // WHY: error= must not forge multi-line log events.
+        let params = RequestCompleteParams::error(
+            "m",
+            FinishSite {
+                entered_body: false,
+                ..Default::default()
+            },
+            1.0,
+        )
+        .with_error(Some("upstream failed:\nbad\r\tstatus".into()));
+        let s = format_request_complete_fields(&params);
+        assert!(!s.contains('\n'), "{s}");
+        assert!(!s.contains('\r'), "{s}");
+        assert!(!s.contains('\t'), "{s}");
+        assert!(s.lines().count() == 1, "{s}");
+        assert!(s.contains("error="), "{s}");
+        assert!(s.contains("upstream failed"), "{s}");
     }
 
     #[test]
