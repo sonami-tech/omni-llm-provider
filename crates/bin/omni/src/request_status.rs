@@ -237,8 +237,11 @@ const URL_QUERY_SECRET_KEYS: &[&str] = &[
     "api_key",
     "apikey",
     "access_token",
+    "accesstoken", // camelCase OAuth forms (matched case-insensitively)
     "refresh_token",
+    "refreshtoken",
     "id_token",
+    "idtoken",
     "token",
     "key",
     "secret",
@@ -247,6 +250,7 @@ const URL_QUERY_SECRET_KEYS: &[&str] = &[
     "authorization",
     "auth",
     "client_secret",
+    "clientsecret",
     "x-api-key",
 ];
 
@@ -846,18 +850,31 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 /// Sanitize `finish_reason` for log / conv-log fields.
 ///
-/// Always strips control characters (single-line). For `error:`-prefixed latch
-/// values that may embed upstream detail, run the fail-closed error redactor;
-/// if residual still looks secret-bearing, collapse to the plain token `error`.
+/// Always strips control characters (single-line), then runs the fail-closed
+/// known-shape redactor (not only `error:`-prefixed values). Upstream/OpenAI-
+/// compatible finish strings can carry secret-shaped content; if residual still
+/// looks secret-bearing, collapse to a bounded token (`error` or `unknown`).
 fn sanitize_finish_reason(finish_reason: &str) -> String {
     let s = sanitize_control_chars(finish_reason);
-    if s.starts_with("error:") {
-        match redact_error_for_log(&s) {
-            Some(redacted) => redacted,
-            None => "error".to_string(),
+    match redact_error_for_log(&s) {
+        Some(redacted) => {
+            if still_secret_shaped(&redacted) {
+                if s.starts_with("error:") {
+                    "error".to_string()
+                } else {
+                    "unknown".to_string()
+                }
+            } else {
+                redacted
+            }
         }
-    } else {
-        s
+        None => {
+            if s.starts_with("error:") {
+                "error".to_string()
+            } else {
+                "unknown".to_string()
+            }
+        }
     }
 }
 
@@ -1608,5 +1625,45 @@ mod tests {
         );
         let conv = format_conv_log_finish_summary(&params);
         assert!(!conv.contains(secret), "{conv}");
+    }
+
+    #[test]
+    fn query_camelcase_oauth_keys_redact_or_fail_closed() {
+        // WHY: JSON redactor already knows camelCase OAuth keys; query/residual
+        // must match so accessToken= secrets cannot bypass fail-closed checks.
+        for raw in [
+            "accessToken=opaque_secret_123456",
+            "refreshToken=opaque_secret_123456",
+            "clientSecret=opaque_secret_123456",
+        ] {
+            match redact_error_for_log(raw) {
+                Some(s) => assert!(!s.contains("opaque_secret_123456"), "{s} from {raw}"),
+                None => {}
+            }
+        }
+    }
+
+    #[test]
+    fn finish_reason_scrubs_non_error_prefix_secret_shapes() {
+        // WHY: raw upstream finish values (not only error:) can be secret-shaped;
+        // sanitize_finish_reason must not pass them through unredacted.
+        let secret = "sk-abcdefghijklmnopqrstuv";
+        let params = RequestCompleteParams::ok(
+            "m",
+            FinishSite {
+                entered_body: true,
+                finish_latch: Some(secret.into()),
+                ..Default::default()
+            },
+            1.0,
+        );
+        let s = format_request_complete_fields(&params);
+        assert!(!s.contains(secret), "{s}");
+        assert!(
+            s.contains("finish_reason=unknown")
+                || s.contains("REDACTED")
+                || s.contains("sk-REDACTED"),
+            "{s}"
+        );
     }
 }
