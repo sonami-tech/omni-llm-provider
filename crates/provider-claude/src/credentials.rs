@@ -3,11 +3,11 @@
 //! Locked design: never cache. Always re-read per request so CLI or Omni write-back
 //! is picked up on the next call.
 //!
-//! When `OMNI_OAUTH_REFRESH` is truthy (`1`/`true`/`yes`/`on`), Omni may proactively
-//! refresh a near-expired or expired OAuth access token via the Claude token endpoint
-//! and **atomically write back** the rotated tokens to the same credentials path.
-//! When the flag is off (default), behavior matches the historical CLI-delegated
-//! model: re-read only, surface expiry.
+//! OAuth refresh is **on by default**: Omni may proactively refresh a near-expired
+//! or expired OAuth access token via the Claude token endpoint and **atomically
+//! write back** the rotated tokens to the same credentials path.
+//! Set `OMNI_OAUTH_REFRESH=0` (or `false`/`off`/`no`) to disable and keep the
+//! historical CLI-delegated model (re-read only, surface expiry).
 //!
 //! Ported from reference-src-claude/upstream/credentials.rs .
 //! All credential handling for the OAuth gate stays isolated here.
@@ -185,15 +185,18 @@ enum RefreshTrigger {
     Force,
 }
 
-/// Opt-in gate for in-Omni OAuth refresh (shared name across providers).
+/// Gate for in-Omni OAuth refresh (shared name across providers).
+/// Default **on**; set `OMNI_OAUTH_REFRESH=0`/`false`/`off`/`no` to disable.
 pub fn oauth_refresh_enabled() -> bool {
-    matches!(
-        std::env::var("OMNI_OAUTH_REFRESH")
-            .ok()
-            .map(|v| v.to_ascii_lowercase())
-            .as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
+    match std::env::var("OMNI_OAUTH_REFRESH")
+        .ok()
+        .map(|v| v.to_ascii_lowercase())
+        .as_deref()
+    {
+        None => true,
+        Some("0" | "false" | "off" | "no") => false,
+        Some(_) => true,
+    }
 }
 
 /// Effective Claude token endpoint. Production uses the captured host; tests may
@@ -627,7 +630,7 @@ mod tests {
         );
         let old = std::env::var_os("OMNI_OAUTH_REFRESH");
         unsafe {
-            std::env::remove_var("OMNI_OAUTH_REFRESH");
+            std::env::set_var("OMNI_OAUTH_REFRESH", "0");
         }
         let c = Credentials::load_fresh_async(&path).await.unwrap();
         unsafe {

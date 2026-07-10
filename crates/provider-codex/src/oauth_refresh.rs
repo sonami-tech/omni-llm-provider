@@ -1,9 +1,10 @@
 //! In-place ChatGPT OAuth refresh for `~/.codex/auth.json`.
 //!
-//! When `OMNI_OAUTH_REFRESH` is truthy, Omni may refresh a near-expired
+//! OAuth refresh is **on by default**: Omni may refresh a near-expired
 //! `tokens.access_token` (JWT `exp`) via the captured OpenAI auth endpoint and
-//! atomically write back `tokens.*` + `last_refresh`. Static `OPENAI_API_KEY`
-//! entries are never refreshed.
+//! atomically write back `tokens.*` + `last_refresh`. Set `OMNI_OAUTH_REFRESH=0`
+//! (or `false`/`off`/`no`) to disable. Static `OPENAI_API_KEY` entries are never
+//! refreshed.
 //!
 //! Wire contract: live capture codex 0.144.1 — see
 //! `/home/username/oauth-credential-renewal-handoff.md`.
@@ -37,15 +38,18 @@ pub struct CodexTokenGrant {
     pub expires_in: Option<i64>,
 }
 
-/// Opt-in gate for in-Omni OAuth refresh (shared name across providers).
+/// Gate for in-Omni OAuth refresh (shared name across providers).
+/// Default **on**; set `OMNI_OAUTH_REFRESH=0`/`false`/`off`/`no` to disable.
 pub fn oauth_refresh_enabled() -> bool {
-    matches!(
-        std::env::var("OMNI_OAUTH_REFRESH")
-            .ok()
-            .map(|v| v.to_ascii_lowercase())
-            .as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
+    match std::env::var("OMNI_OAUTH_REFRESH")
+        .ok()
+        .map(|v| v.to_ascii_lowercase())
+        .as_deref()
+    {
+        None => true,
+        Some("0" | "false" | "off" | "no") => false,
+        Some(_) => true,
+    }
 }
 
 /// Effective token endpoint. Tests may set `OMNI_CODEX_OAUTH_TOKEN_URL`.

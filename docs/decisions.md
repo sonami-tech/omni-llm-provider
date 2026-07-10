@@ -57,12 +57,13 @@ Credentials are read fresh per request.
 - Codex: `CODEX_API_KEY`, `OPENAI_API_KEY`, `CODEX_ACCESS_TOKEN`, or
   `$CODEX_HOME` / `~/.codex` config and auth state.
 
-When `OMNI_OAUTH_REFRESH=1` (opt-in), Omni may refresh Claude/Codex/Grok OAuth
-primary-login tokens in-place (atomic write-back of rotated refresh tokens).
-Static API keys are never refreshed. Default remains CLI-delegated re-read only.
-Write-back preserves file mode, requires a rotated `refresh_token` in the grant,
-and refuses to clobber if the on-disk RT changed mid-refresh (concurrent CLI/Omni).
-Full flock parity with vendor CLI lockfiles is not claimed.
+Omni refreshes Claude/Codex/Grok OAuth primary-login tokens in-place by default
+(atomic write-back of rotated refresh tokens). Set `OMNI_OAUTH_REFRESH=0` (or
+`false`/`off`/`no`) to disable and keep CLI-delegated re-read only. Static API
+keys are never refreshed. Write-back preserves file mode, requires a rotated
+`refresh_token` in the grant, and refuses to clobber if the on-disk RT changed
+mid-refresh (concurrent CLI/Omni). Full flock parity with vendor CLI lockfiles
+is not claimed.
 
 Custom upstream endpoint configuration owns provider auth and must not fall
 back to default credentials:

@@ -25,7 +25,7 @@ pub mod errors {
         CredentialsMissingToken,
 
         #[error(
-            "OAuth token expired (per credentials.json expiresAt). Enable OMNI_OAUTH_REFRESH=1 for in-process refresh, or run `claude` once to refresh."
+            "OAuth token expired (per credentials.json expiresAt). In-process refresh may have failed or is disabled (OMNI_OAUTH_REFRESH=0); run `claude` once to refresh."
         )]
         TokenExpired,
 
@@ -898,7 +898,7 @@ impl UpstreamClient {
                     };
 
                     // 401 on the default Claude Code path: re-read credentials
-                    // (and force OAuth refresh when OMNI_OAUTH_REFRESH is on).
+                    // (and force OAuth refresh unless OMNI_OAUTH_REFRESH=0).
                     // Custom gateways own their auth, so never fall back to the
                     // local OAuth file.
                     if status == Some(401) && !refreshed_credentials && !self.auth.is_custom() {

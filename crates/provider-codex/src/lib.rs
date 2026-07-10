@@ -4,8 +4,9 @@
 //! own `CODEX_HOME` / `~/.codex` config and auth state instead of inventing a
 //! parallel Omni-only setup.
 //!
-//! When `OMNI_OAUTH_REFRESH=1`, ChatGPT OAuth tokens in `auth.json` may be
-//! refreshed in-place (see [`oauth_refresh`]). Static API keys are never refreshed.
+//! ChatGPT OAuth tokens in `auth.json` are refreshed in-place by default
+//! (see [`oauth_refresh`]); set `OMNI_OAUTH_REFRESH=0` to disable. Static API
+//! keys are never refreshed.
 
 mod oauth_refresh;
 
