@@ -363,6 +363,15 @@ const JSON_SECRET_KEYS: &[&str] = &[
     "token",
 ];
 
+/// End index for an unterminated quote-started JSON secret value.
+/// Consumes through end of input, or a hard line boundary if present.
+fn unterminated_json_value_end(value_part: &str, value_start: usize) -> usize {
+    value_part
+        .find(|c: char| c == '\n' || c == '\r')
+        .map(|i| value_start + i)
+        .unwrap_or(value_start + value_part.len())
+}
+
 fn redact_json_secret_fields(input: &str) -> String {
     // Walk every occurrence case-insensitively; advance past already-REDACTED
     // values so later duplicates (e.g. "api_key":"a","API_KEY":"b") are scrubbed.
@@ -401,9 +410,13 @@ fn redact_json_secret_fields(input: &str) -> String {
                         out.replace_range(value_start..value_end, "\"REDACTED\"");
                         search_from = value_start + "\"REDACTED\"".len();
                     } else {
-                        // Unterminated string; skip this key occurrence.
-                        search_from = after_key;
-                        continue;
+                        // Unterminated string after a secret key: fail-closed —
+                        // redact from opening quote through end (or hard boundary).
+                        // Escaped-quote residuals that slip past simple scan are
+                        // caught by still_secret_shaped (omit error=).
+                        let value_end = unterminated_json_value_end(value_part, value_start);
+                        out.replace_range(value_start..value_end, "\"REDACTED\"");
+                        search_from = value_start + "\"REDACTED\"".len();
                     }
                 } else if value_part.starts_with('\'') {
                     if let Some(end_rel) = value_part[1..].find('\'') {
@@ -411,8 +424,9 @@ fn redact_json_secret_fields(input: &str) -> String {
                         out.replace_range(value_start..value_end, "\"REDACTED\"");
                         search_from = value_start + "\"REDACTED\"".len();
                     } else {
-                        search_from = after_key;
-                        continue;
+                        let value_end = unterminated_json_value_end(value_part, value_start);
+                        out.replace_range(value_start..value_end, "\"REDACTED\"");
+                        search_from = value_start + "\"REDACTED\"".len();
                     }
                 } else {
                     // Non-string value; skip past the key.
@@ -580,6 +594,9 @@ fn still_secret_shaped(s: &str) -> bool {
                             + end_rel
                             + 1;
                         continue;
+                    } else {
+                        // Unterminated "value after secret key → fail-closed.
+                        return true;
                     }
                 } else if value_part.starts_with('\'') {
                     if let Some(end_rel) = value_part[1..].find('\'') {
@@ -595,6 +612,9 @@ fn still_secret_shaped(s: &str) -> bool {
                             + end_rel
                             + 1;
                         continue;
+                    } else {
+                        // Unterminated 'value after secret key → fail-closed.
+                        return true;
                     }
                 }
                 search_from = after_key;
@@ -687,13 +707,31 @@ fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
+/// Sanitize `finish_reason` for log / conv-log fields.
+///
+/// Always strips control characters (single-line). For `error:`-prefixed latch
+/// values that may embed upstream detail, run the fail-closed error redactor;
+/// if residual still looks secret-bearing, collapse to the plain token `error`.
+fn sanitize_finish_reason(finish_reason: &str) -> String {
+    let s = sanitize_control_chars(finish_reason);
+    if s.starts_with("error:") {
+        match redact_error_for_log(&s) {
+            Some(redacted) => redacted,
+            None => "error".to_string(),
+        }
+    } else {
+        s
+    }
+}
+
 /// Format the complete line for tests / conv-log. Never panics.
 ///
-/// Client-controlled text (`model`, `requested_model`) is control-char sanitized
-/// so embedded newlines cannot forge extra log lines (unlike `sanitize_message`,
-/// which preserves `\n` for banners).
+/// Client-controlled text (`model`, `requested_model`, and error-prefixed
+/// `finish_reason`) is control-char sanitized so embedded newlines cannot forge
+/// extra log lines (unlike `sanitize_message`, which preserves `\n` for banners).
 pub fn format_request_complete_fields(params: &RequestCompleteParams) -> String {
-    let finish_reason = resolve_finish_reason(&params.finish, params.outcome);
+    let finish_reason =
+        sanitize_finish_reason(&resolve_finish_reason(&params.finish, params.outcome));
     let outcome = match params.outcome {
         Outcome::Ok => "ok",
         Outcome::Error => "error",
@@ -740,7 +778,8 @@ pub fn format_request_complete_fields(params: &RequestCompleteParams) -> String 
 /// present, never as Debug `Some(...)`. Client text in the message path is
 /// control-char sanitized so `sanitize_message` cannot re-emit forged newlines.
 pub fn log_request_complete(params: &RequestCompleteParams) {
-    let finish_reason = resolve_finish_reason(&params.finish, params.outcome);
+    let finish_reason =
+        sanitize_finish_reason(&resolve_finish_reason(&params.finish, params.outcome));
     let outcome = match params.outcome {
         Outcome::Ok => "ok",
         Outcome::Error => "error",
@@ -1263,5 +1302,75 @@ mod tests {
         assert_eq!(map_anthropic_stop_reason("tool_use"), "tool_calls");
         assert_eq!(map_anthropic_stop_reason("max_tokens"), "length");
         assert_eq!(map_anthropic_stop_reason("weird"), "weird");
+    }
+
+    #[test]
+    fn redact_unterminated_json_secret_or_fail_closed() {
+        // WHY: quote-started JSON secret values without a closing quote must not
+        // skip past the key and leak the residual secret into error= logs.
+        let raw = r#"body {"api_key":"opaque_secret_123456"#;
+        match redact_error_for_log(raw) {
+            Some(s) => {
+                assert!(!s.contains("opaque_secret_123456"), "{s}");
+                assert!(s.contains("REDACTED"), "{s}");
+            }
+            None => {} // fail-closed omit also acceptable
+        }
+        // Direct redactor must rewrite (not skip) the unterminated value.
+        let scrubbed = super::redact_json_secret_fields(raw);
+        assert!(!scrubbed.contains("opaque_secret_123456"), "{scrubbed}");
+        assert!(scrubbed.contains("REDACTED"), "{scrubbed}");
+        // Residual detector must catch unterminated secret-key:"value forms.
+        assert!(still_secret_shaped(raw));
+        assert!(still_secret_shaped(r#"{"API_KEY":"opaque_secret_123456"#));
+    }
+
+    #[test]
+    fn finish_reason_control_chars_single_line() {
+        // WHY: finish_reason (latch plain text) must not forge multi-line status
+        // or conv-log lines via embedded newlines/tabs.
+        let params = RequestCompleteParams::ok(
+            "m",
+            FinishSite {
+                entered_body: true,
+                finish_latch: Some("stop\nEVIL_FORGED_LINE".into()),
+                ..Default::default()
+            },
+            1.0,
+        );
+        let s = format_request_complete_fields(&params);
+        assert_eq!(s.lines().count(), 1, "multi-line status: {s}");
+        assert!(!s.contains('\n'), "{s}");
+        assert!(!s.contains('\r'), "{s}");
+        assert!(s.contains("finish_reason=stop EVIL_FORGED_LINE"), "{s}");
+        let conv = format_conv_log_finish_summary(&params);
+        assert_eq!(conv.lines().count(), 1, "multi-line conv: {conv}");
+        assert!(!conv.contains('\n'), "{conv}");
+    }
+
+    #[test]
+    fn finish_reason_error_prefix_redacts_secrets_or_collapses() {
+        // WHY: error:-prefixed finish latch may embed upstream detail with secrets;
+        // must redact or collapse to plain `error` so secrets never appear.
+        let secret = "secretvaluehere12345";
+        let params = RequestCompleteParams::error(
+            "m",
+            FinishSite {
+                entered_body: true,
+                finish_latch: Some(format!("error: kind: api_key={secret}")),
+                ..Default::default()
+            },
+            1.0,
+        );
+        let s = format_request_complete_fields(&params);
+        assert!(!s.contains(secret), "{s}");
+        // Either redacted in place or collapsed to the bounded token `error`.
+        assert!(
+            s.contains("finish_reason=error")
+                || s.contains("REDACTED"),
+            "expected redacted or collapsed finish_reason: {s}"
+        );
+        let conv = format_conv_log_finish_summary(&params);
+        assert!(!conv.contains(secret), "{conv}");
     }
 }
