@@ -203,12 +203,13 @@ impl ClaudeStreamConverter {
 }
 
 /// Map Anthropic stop_reason to the OpenAI-style finish_reason vocabulary so the
-/// canonical stream matches the non-stream path's mapping.
+/// canonical stream matches the non-stream path's mapping (translate.rs + bin).
 fn map_stop_reason(anth: &str) -> String {
     match anth {
-        "end_turn" | "stop_sequence" => "stop".into(),
+        "end_turn" | "stop_sequence" | "pause_turn" => "stop".into(),
         "max_tokens" => "length".into(),
         "tool_use" => "tool_calls".into(),
+        "refusal" => "content_filter".into(),
         other => other.into(),
     }
 }
@@ -943,6 +944,8 @@ mod tests {
         assert_eq!(map_stop_reason("max_tokens"), "length");
         assert_eq!(map_stop_reason("tool_use"), "tool_calls");
         assert_eq!(map_stop_reason("stop_sequence"), "stop");
+        assert_eq!(map_stop_reason("pause_turn"), "stop");
+        assert_eq!(map_stop_reason("refusal"), "content_filter");
         assert_eq!(map_stop_reason("weird_future"), "weird_future");
     }
 

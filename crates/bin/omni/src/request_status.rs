@@ -229,81 +229,64 @@ fn sanitize_control_chars(s: &str) -> String {
     out
 }
 
+/// Query/fragment secret keys (lowercase). Shared by redaction and residual checks.
+const URL_QUERY_SECRET_KEYS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "token",
+    "key",
+    "secret",
+    "password",
+    "passwd",
+    "authorization",
+    "auth",
+    "client_secret",
+    "x-api-key",
+];
+
+fn is_query_key_boundary(prev: u8) -> bool {
+    prev == b'?' || prev == b'&' || prev == b' ' || prev == b'\t'
+}
+
 fn redact_url_query_secrets(input: &str) -> String {
-    // Match query/fragment secret keys case-insensitively.
-    let keys = [
-        "api_key",
-        "apikey",
-        "access_token",
-        "refresh_token",
-        "id_token",
-        "token",
-        "key",
-        "secret",
-        "password",
-        "passwd",
-        "authorization",
-        "auth",
-        "client_secret",
-        "x-api-key",
-    ];
+    // Walk every occurrence of each secret key; advance past already-REDACTED
+    // values so later duplicates (e.g. ?api_key=SEC1&api_key=SEC2) are scrubbed.
     let mut out = input.to_string();
-    for key in keys {
-        // key=value until & or whitespace or end
-        let lower = out.to_ascii_lowercase();
+    for key in URL_QUERY_SECRET_KEYS {
         let needle = format!("{key}=");
         let mut search_from = 0;
-        while let Some(rel) = lower[search_from..].find(&needle) {
+        let mut guard = 0;
+        loop {
+            let lower = out.to_ascii_lowercase();
+            let Some(rel) = lower[search_from..].find(&needle) else {
+                break;
+            };
             let start = search_from + rel;
-            // require start-of-string, ? or & before key
+            // require start-of-string, ? or & (or whitespace) before key
             if start > 0 {
                 let prev = out.as_bytes()[start - 1];
-                if prev != b'?' && prev != b'&' && prev != b' ' && prev != b'\t' {
+                if !is_query_key_boundary(prev) {
                     search_from = start + needle.len();
                     continue;
                 }
             }
             let val_start = start + needle.len();
+            if out[val_start..].starts_with("REDACTED") {
+                // Already scrubbed; advance past this occurrence.
+                search_from = val_start + "REDACTED".len();
+                continue;
+            }
             let val_end = out[val_start..]
                 .find(|c: char| c == '&' || c == ' ' || c == '\t' || c == '"' || c == '\'')
                 .map(|i| val_start + i)
                 .unwrap_or(out.len());
             out.replace_range(val_start..val_end, "REDACTED");
-            // restart from after replacement (length changed)
-            break;
-        }
-        // multi-pass until stable for this key
-        let mut guard = 0;
-        loop {
-            let before = out.clone();
-            let lower = out.to_ascii_lowercase();
-            let needle = format!("{key}=");
-            if let Some(rel) = lower.find(&needle) {
-                let start = rel;
-                if start > 0 {
-                    let prev = out.as_bytes()[start - 1];
-                    if prev != b'?' && prev != b'&' && prev != b' ' && prev != b'\t' {
-                        // not a query key; stop trying this key to avoid loops
-                        break;
-                    }
-                }
-                let val_start = start + needle.len();
-                if out[val_start..].starts_with("REDACTED") {
-                    break;
-                }
-                let val_end = out[val_start..]
-                    .find(|c: char| c == '&' || c == ' ' || c == '\t' || c == '"' || c == '\'')
-                    .map(|i| val_start + i)
-                    .unwrap_or(out.len());
-                out.replace_range(val_start..val_end, "REDACTED");
-            } else {
-                break;
-            }
-            if out == before {
-                break;
-            }
+            search_from = val_start + "REDACTED".len();
             guard += 1;
-            if guard > 16 {
+            if guard > 64 {
                 break;
             }
         }
@@ -359,50 +342,76 @@ fn redact_auth_headers(input: &str) -> String {
     out
 }
 
+/// JSON object keys that carry secret material (both snake and camel forms).
+const JSON_SECRET_KEYS: &[&str] = &[
+    "api_key",
+    "apiKey",
+    "access_token",
+    "accessToken",
+    "refresh_token",
+    "authorization",
+    "password",
+    "secret",
+    "client_secret",
+    "token",
+];
+
 fn redact_json_secret_fields(input: &str) -> String {
-    let keys = [
-        "api_key",
-        "apiKey",
-        "access_token",
-        "accessToken",
-        "refresh_token",
-        "authorization",
-        "password",
-        "secret",
-        "client_secret",
-        "token",
-    ];
+    // Walk every occurrence; advance past already-REDACTED values so later
+    // duplicates (e.g. "api_key":"a","api_key":"b") are scrubbed.
     let mut out = input.to_string();
-    for key in keys {
-        // "key":"value" or "key": "value"
-        let patterns = [
-            format!("\"{key}\""),
-            format!("'{key}'"),
-        ];
+    for key in JSON_SECRET_KEYS {
+        // "key":"value" or 'key':'value'
+        let patterns = [format!("\"{key}\""), format!("'{key}'")];
         for pat in patterns {
+            let mut search_from = 0;
             let mut guard = 0;
-            while let Some(idx) = out.find(&pat) {
+            loop {
+                let Some(rel) = out[search_from..].find(&pat) else {
+                    break;
+                };
+                let idx = search_from + rel;
                 let after_key = idx + pat.len();
                 let rest = &out[after_key..];
                 let Some(colon_rel) = rest.find(':') else {
-                    break;
+                    search_from = after_key;
+                    continue;
                 };
                 let after_colon = after_key + colon_rel + 1;
                 let value_part = out[after_colon..].trim_start();
                 let ws = out[after_colon..].len() - value_part.len();
                 let value_start = after_colon + ws;
+                if value_part.starts_with("\"REDACTED\"") || value_part.starts_with("'REDACTED'") {
+                    // Already scrubbed; advance past this occurrence.
+                    search_from = value_start + "\"REDACTED\"".len();
+                    continue;
+                }
                 if value_part.starts_with('"') {
                     if let Some(end_rel) = value_part[1..].find('"') {
                         let value_end = value_start + 1 + end_rel + 1;
                         out.replace_range(value_start..value_end, "\"REDACTED\"");
+                        search_from = value_start + "\"REDACTED\"".len();
                     } else {
-                        break;
+                        // Unterminated string; skip this key occurrence.
+                        search_from = after_key;
+                        continue;
+                    }
+                } else if value_part.starts_with('\'') {
+                    if let Some(end_rel) = value_part[1..].find('\'') {
+                        let value_end = value_start + 1 + end_rel + 1;
+                        out.replace_range(value_start..value_end, "\"REDACTED\"");
+                        search_from = value_start + "\"REDACTED\"".len();
+                    } else {
+                        search_from = after_key;
+                        continue;
                     }
                 } else {
-                    break;
+                    // Non-string value; skip past the key.
+                    search_from = after_key;
+                    continue;
                 }
                 guard += 1;
-                if guard > 16 {
+                if guard > 64 {
                     break;
                 }
             }
@@ -480,6 +489,9 @@ fn replace_dashed_key_tokens(
     out
 }
 
+/// Minimum residual query/JSON value length that still looks like a secret.
+const RESIDUAL_SECRET_MIN_LEN: usize = 8;
+
 fn still_secret_shaped(s: &str) -> bool {
     // Residual unredacted sk- / xai- key material (not the REDACTED form).
     if has_unredacted_dashed_key(s, "sk-", "sk-REDACTED") {
@@ -492,23 +504,90 @@ fn still_secret_shaped(s: &str) -> bool {
     if has_bare_jwt_blob(s) {
         return true;
     }
-    // Long base64-ish token after auth keywords that we failed to scrub
     let lower = s.to_ascii_lowercase();
-    for marker in ["authorization=", "api_key=", "access_token=", "password="] {
-        if let Some(idx) = lower.find(marker) {
-            let after = &s[idx + marker.len()..];
+    // Residual query-key=value for every secret key (not just a short subset).
+    // Walk all occurrences so a later unredacted value after REDACTED is caught.
+    for key in URL_QUERY_SECRET_KEYS {
+        let needle = format!("{key}=");
+        let mut search_from = 0;
+        while let Some(rel) = lower[search_from..].find(&needle) {
+            let start = search_from + rel;
+            if start > 0 {
+                let prev = s.as_bytes()[start - 1];
+                if !is_query_key_boundary(prev) {
+                    search_from = start + needle.len();
+                    continue;
+                }
+            }
+            let after = &s[start + needle.len()..];
             let token: String = after
                 .chars()
                 .take_while(|c| !c.is_whitespace() && *c != '&' && *c != '"' && *c != '\'')
                 .collect();
-            if token.len() >= 16 && token != "REDACTED" && !token.starts_with("REDACTED") {
+            if token.len() >= RESIDUAL_SECRET_MIN_LEN
+                && token != "REDACTED"
+                && !token.starts_with("REDACTED")
+            {
                 return true;
+            }
+            search_from = start + needle.len() + token.len().max(1);
+        }
+    }
+    // Residual JSON "key":"value" for secret keys (non-REDACTED string values).
+    for key in JSON_SECRET_KEYS {
+        for quote in ['"', '\''] {
+            let pat = format!("{quote}{key}{quote}");
+            let mut search_from = 0;
+            while let Some(rel) = s[search_from..].find(&pat) {
+                let idx = search_from + rel;
+                let after_key = idx + pat.len();
+                let rest = &s[after_key..];
+                let Some(colon_rel) = rest.find(':') else {
+                    search_from = after_key;
+                    continue;
+                };
+                let after_colon = after_key + colon_rel + 1;
+                let value_part = s[after_colon..].trim_start();
+                if value_part.starts_with('"') {
+                    if let Some(end_rel) = value_part[1..].find('"') {
+                        let inner = &value_part[1..1 + end_rel];
+                        if inner != "REDACTED"
+                            && !inner.is_empty()
+                            && inner.len() >= RESIDUAL_SECRET_MIN_LEN
+                        {
+                            return true;
+                        }
+                        search_from = after_colon + (s[after_colon..].len() - value_part.len())
+                            + 1
+                            + end_rel
+                            + 1;
+                        continue;
+                    }
+                } else if value_part.starts_with('\'') {
+                    if let Some(end_rel) = value_part[1..].find('\'') {
+                        let inner = &value_part[1..1 + end_rel];
+                        if inner != "REDACTED"
+                            && !inner.is_empty()
+                            && inner.len() >= RESIDUAL_SECRET_MIN_LEN
+                        {
+                            return true;
+                        }
+                        search_from = after_colon + (s[after_colon..].len() - value_part.len())
+                            + 1
+                            + end_rel
+                            + 1;
+                        continue;
+                    }
+                }
+                search_from = after_key;
             }
         }
     }
     // Colon-form header residuals: authorization: / x-api-key: with non-REDACTED material
     for marker in ["authorization:", "x-api-key:", "api-key:", "x-auth-token:"] {
-        if let Some(idx) = lower.find(marker) {
+        let mut search_from = 0;
+        while let Some(rel) = lower[search_from..].find(marker) {
+            let idx = search_from + rel;
             let after = s[idx + marker.len()..].trim_start();
             let token: String = after
                 .chars()
@@ -518,6 +597,7 @@ fn still_secret_shaped(s: &str) -> bool {
             if !token.is_empty() && token != "REDACTED" && !token.starts_with("REDACTED") {
                 return true;
             }
+            search_from = idx + marker.len() + token.len().max(1);
         }
     }
     false
@@ -863,6 +943,58 @@ mod tests {
         let redacted = redact_error_for_log(raw).expect("safe after redaction");
         assert!(!redacted.contains("supersecret"), "{redacted}");
         assert!(redacted.contains("REDACTED"), "{redacted}");
+    }
+
+    #[test]
+    fn redact_repeated_url_query_secrets() {
+        // WHY: multi-occurrence query secrets must all scrub; early break left
+        // later api_key= values unredacted.
+        let raw = "upstream https://api.example.com/v1?api_key=SEC1&api_key=SEC2 failed";
+        match redact_error_for_log(raw) {
+            Some(s) => {
+                assert!(!s.contains("SEC1"), "{s}");
+                assert!(!s.contains("SEC2"), "{s}");
+                assert!(s.contains("REDACTED"), "{s}");
+            }
+            None => {} // fail-closed omit also acceptable
+        }
+        // Direct unit: both values become REDACTED even before residual check.
+        let scrubbed = super::redact_url_query_secrets(raw);
+        assert!(!scrubbed.contains("SEC1"), "{scrubbed}");
+        assert!(!scrubbed.contains("SEC2"), "{scrubbed}");
+    }
+
+    #[test]
+    fn redact_repeated_json_secret_fields() {
+        // WHY: repeated JSON secret keys must all scrub; re-finding the first
+        // already-REDACTED value must not stall before later keys.
+        let raw = r#"upstream body {"api_key":"sekrit-aaa","api_key":"sekrit-bbb"}"#;
+        match redact_error_for_log(raw) {
+            Some(s) => {
+                assert!(!s.contains("sekrit-aaa"), "{s}");
+                assert!(!s.contains("sekrit-bbb"), "{s}");
+                assert!(s.contains("REDACTED"), "{s}");
+            }
+            None => {} // fail-closed omit also acceptable
+        }
+        let scrubbed = super::redact_json_secret_fields(raw);
+        assert!(!scrubbed.contains("sekrit-aaa"), "{scrubbed}");
+        assert!(!scrubbed.contains("sekrit-bbb"), "{scrubbed}");
+    }
+
+    #[test]
+    fn still_secret_shaped_catches_residual_query_and_json() {
+        // WHY: residual detector must cover the same key list as the redactor.
+        assert!(still_secret_shaped("token=this_is_a_long_token_xx"));
+        assert!(still_secret_shaped("secret=this_is_a_long_secret_x"));
+        assert!(still_secret_shaped("client_secret=longclientsecretval"));
+        assert!(still_secret_shaped("refresh_token=longrefreshtokenval"));
+        assert!(still_secret_shaped("id_token=longidtokenvaluehere"));
+        // First already REDACTED, second still live.
+        assert!(still_secret_shaped("?api_key=REDACTED&api_key=stillsecretvalue"));
+        assert!(still_secret_shaped(r#"{"api_key":"stillsecretvalue"}"#));
+        assert!(!still_secret_shaped("?api_key=REDACTED&x=1"));
+        assert!(!still_secret_shaped(r#"{"api_key":"REDACTED"}"#));
     }
 
     #[test]
