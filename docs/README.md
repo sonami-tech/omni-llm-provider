@@ -108,7 +108,9 @@ Current shorthand aliases are resolved from provider-owned catalogs at startup:
 - `gpt` -> the current Codex model from `$CODEX_HOME/config.toml` or
   `~/.codex/config.toml`, falling back to the provider default
 
-Credentials are read fresh per request, never cached. Claude reads
+Credentials are read fresh per request, never cached. With
+`OMNI_OAUTH_REFRESH=1`, Omni can also refresh Claude/Codex/Grok OAuth
+tokens in-place (atomic write-back of rotated refresh tokens). Claude reads
 `~/.claude/.credentials.json` or `$CLAUDE_CREDENTIALS_PATH`. Grok resolves
 `$XAI_CREDENTIALS_PATH`, then a usable `~/.xai/.credentials.json`, then
 `~/.grok/auth.json`. Codex reads `CODEX_API_KEY`, `OPENAI_API_KEY`,

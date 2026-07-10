@@ -1,8 +1,8 @@
 //! Grok / xAI credentials loading, modeled exactly after the Claude Code Provider technique.
 //!
 //! Locked design (same as CCP): never cache. Always re-read per request.
-//! This picks up any background refresh or key rotation the user may have performed
-//! (e.g. the Grok CLI refreshing its login, or an updated console key).
+//! This picks up any background refresh or key rotation the user (or Omni write-back)
+//! may have performed (e.g. the Grok CLI refreshing its login, or an updated console key).
 //!
 //! ## Sources and precedence (highest first), all read fresh per request:
 //! 1. `$XAI_CREDENTIALS_PATH` (explicit override) — parsed as either shape below.
@@ -21,20 +21,35 @@
 //! ```json
 //! { "apiKey": "xai-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" }
 //! ```
-//! (a top-level `xaiApiKey` alias is also tolerated.)
+//! (a top-level `xaiApiKey` alias is also tolerated.) Static keys are never refreshed.
 //!
 //! Grok CLI OIDC (`~/.grok/auth.json`), keyed by `https://auth.x.ai::<client-id>`:
 //! ```json
 //! { "https://auth.x.ai::<id>": { "key": "<JWT>", "auth_mode": "oidc",
 //!     "refresh_token": "...", "expires_at": "2026-06-10T22:20:22.000000Z" } }
 //! ```
-//! The `key` JWT is a Bearer that authenticates `api.x.ai/v1` directly. We read it
-//! READ-ONLY: we never write this file or consume its single-use `refresh_token`;
-//! on expiry we surface a clear error so the user re-authenticates via the Grok CLI.
+//! The `key` JWT is a Bearer that authenticates `api.x.ai/v1` directly.
+//!
+//! When `OMNI_OAUTH_REFRESH` is truthy, Omni may proactively refresh a near-expired
+//! OIDC access token via `POST https://auth.x.ai/oauth2/token` (form-urlencoded,
+//! public client) and **atomically write back** the rotated `refresh_token` to the
+//! same path. RTs rotate with a short grace window then revoke — never leave the old
+//! RT on disk after a successful grant. When the flag is off (default), Omni only
+//! re-reads the file and surfaces expiry (CLI still owns refresh).
 
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use serde_json::Value;
+use tracing::warn;
+
+/// Captured Grok OIDC token endpoint (grok-shell 0.2.93).
+pub const GROK_OAUTH_TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
+/// User-Agent template prefix; full UA is `grok-shell/<ver> (linux; x86_64)`.
+pub const GROK_OAUTH_USER_AGENT: &str = "grok-shell/0.2.93 (linux; x86_64)";
+
+/// Refresh when access token expires within this many milliseconds (5 minutes).
+const NEAR_EXPIRY_SKEW_MS: i64 = 5 * 60 * 1000;
 
 // Local error for credentials (kept small; mapped by callers to ProviderError or AppError).
 #[derive(Debug, thiserror::Error)]
@@ -49,8 +64,12 @@ pub enum GrokCredentialsError {
     NoSource,
     #[error("credentials file present but held no usable key")]
     MissingToken,
-    #[error("token expired")]
+    #[error(
+        "token expired (enable OMNI_OAUTH_REFRESH=1 for in-process refresh, or re-login with the Grok CLI)"
+    )]
     Expired,
+    #[error("oauth refresh: {0}")]
+    Refresh(String),
 }
 
 /// On-disk shape of the simple static-key file.
@@ -75,6 +94,29 @@ struct GrokCliEntry {
     /// The OIDC subject (a uuid) the Grok CLI sends as `x-grok-user-id` in
     /// conservative mode. Absent on static-key files (None there).
     user_id: Option<String>,
+    /// Rotating refresh token (grace-then-revoke; must be persisted after use).
+    refresh_token: Option<String>,
+    /// OIDC client id (also appears in the object key).
+    oidc_client_id: Option<String>,
+    /// Principal id for the form grant (`principal_type=User`).
+    principal_id: Option<String>,
+}
+
+/// Material needed to POST a refresh_token grant for one OIDC entry.
+#[derive(Debug, Clone)]
+pub struct GrokOidcRefreshMaterial {
+    pub entry_key: String,
+    pub refresh_token: String,
+    pub client_id: String,
+    pub principal_id: String,
+}
+
+/// Parsed OIDC token grant response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GrokTokenGrant {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_in: Option<i64>,
 }
 
 /// In-memory parsed Grok credentials.
@@ -199,9 +241,56 @@ impl GrokCredentials {
     }
 
     /// Async read+parse of a specific file, not blocking the Tokio worker. Never cached.
+    /// When `OMNI_OAUTH_REFRESH` is on and this path holds a near-expired OIDC entry,
+    /// refreshes in-place then re-reads.
     pub async fn load_fresh_async(path: &Path) -> Result<Self, GrokCredentialsError> {
+        Self::load_fresh_async_with_refresh(path, false).await
+    }
+
+    /// Force OAuth refresh (if enabled) then re-read — for 401-once paths.
+    pub async fn load_fresh_async_force_refresh(
+        path: &Path,
+    ) -> Result<Self, GrokCredentialsError> {
+        Self::load_fresh_async_with_refresh(path, true).await
+    }
+
+    async fn load_fresh_async_with_refresh(
+        path: &Path,
+        force: bool,
+    ) -> Result<Self, GrokCredentialsError> {
         let bytes = tokio::fs::read(path).await?;
-        Self::from_bytes(&bytes)
+        let creds = Self::from_bytes(&bytes)?;
+
+        if !oauth_refresh_enabled() {
+            return Ok(creds);
+        }
+        // Static keys never refresh.
+        if creds.expires_at_ms.is_none() && !force {
+            return Ok(creds);
+        }
+        let should = force || needs_refresh(creds.expires_at_ms);
+        if !should {
+            return Ok(creds);
+        }
+        // Only OIDC files carry refresh material.
+        if extract_oidc_refresh_material(&bytes).is_err() {
+            return Ok(creds);
+        }
+
+        match refresh_oauth_inplace(path, &oauth_token_url()).await {
+            Ok(()) => {
+                let bytes = tokio::fs::read(path).await?;
+                Self::from_bytes(&bytes)
+            }
+            Err(e) => {
+                if creds.check_expired().is_ok() {
+                    warn!(error = %e, "grok OAuth refresh failed; using existing access token");
+                    Ok(creds)
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     /// Parse either credential shape from raw bytes: the Grok CLI OIDC file (an object whose entry
@@ -251,9 +340,8 @@ impl GrokCredentials {
     }
 
     /// Surface a clear error if an OIDC access token is past its expiry. Static keys
-    /// (no `expires_at`) are always OK. Callers should warn-but-continue (the upstream
-    /// will 401 if the token is truly dead) and tell the user to re-run the Grok CLI
-    /// login; we never refresh or rewrite the CLI's file ourselves.
+    /// (no `expires_at`) are always OK. When `OMNI_OAUTH_REFRESH` is enabled, callers
+    /// should attempt refresh before treating this as terminal.
     pub fn check_expired(&self) -> Result<(), GrokCredentialsError> {
         if let Some(exp) = self.expires_at_ms {
             let now_ms = chrono::Utc::now().timestamp_millis();
@@ -274,10 +362,278 @@ fn parse_iso8601_to_ms(s: &str) -> Option<i64> {
         .map(|dt| dt.timestamp_millis())
 }
 
+/// Opt-in gate for in-Omni OAuth refresh (shared name across providers).
+pub fn oauth_refresh_enabled() -> bool {
+    matches!(
+        std::env::var("OMNI_OAUTH_REFRESH")
+            .ok()
+            .map(|v| v.to_ascii_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Effective Grok token endpoint. Tests may set `OMNI_GROK_OAUTH_TOKEN_URL`.
+pub fn oauth_token_url() -> String {
+    std::env::var("OMNI_GROK_OAUTH_TOKEN_URL").unwrap_or_else(|_| GROK_OAUTH_TOKEN_URL.to_string())
+}
+
+pub fn needs_refresh(expires_at_ms: Option<i64>) -> bool {
+    match expires_at_ms {
+        None => false,
+        Some(exp) => {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            now_ms + NEAR_EXPIRY_SKEW_MS >= exp
+        }
+    }
+}
+
+/// Build form-urlencoded body for the Grok refresh_token grant (pure).
+pub fn build_refresh_form_body(material: &GrokOidcRefreshMaterial) -> String {
+    form_encode(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", &material.refresh_token),
+        ("client_id", &material.client_id),
+        ("principal_type", "User"),
+        ("principal_id", &material.principal_id),
+    ])
+}
+
+/// application/x-www-form-urlencoded encoding (no extra deps).
+fn form_encode(pairs: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        if i > 0 {
+            out.push('&');
+        }
+        out.push_str(&form_quote(k));
+        out.push('=');
+        out.push_str(&form_quote(v));
+    }
+    out
+}
+
+fn form_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{b:02X}"));
+            }
+        }
+    }
+    out
+}
+
+/// Apply grant onto the OIDC entry inside auth.json (pure).
+pub fn apply_grant_to_auth_json(
+    file: &mut Value,
+    entry_key: &str,
+    grant: &GrokTokenGrant,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), GrokCredentialsError> {
+    let entry = file
+        .get_mut(entry_key)
+        .and_then(|v| v.as_object_mut())
+        .ok_or_else(|| {
+            GrokCredentialsError::Refresh(format!("auth.json missing entry {entry_key}"))
+        })?;
+
+    entry.insert("key".into(), Value::String(grant.access_token.clone()));
+    if let Some(rt) = grant.refresh_token.as_ref().filter(|s| !s.is_empty()) {
+        entry.insert("refresh_token".into(), Value::String(rt.clone()));
+    }
+    if let Some(expires_in) = grant.expires_in {
+        let expires_at = now + chrono::Duration::seconds(expires_in);
+        // CLI writes ISO-8601 with fractional seconds and Z.
+        let formatted = expires_at.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
+        entry.insert("expires_at".into(), Value::String(formatted));
+    }
+    Ok(())
+}
+
+/// Atomically replace `path` with `bytes` via temp file + rename.
+/// Preserves the prior file mode when possible so RTs stay non-world-readable.
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), GrokCredentialsError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = parent.join(format!(
+        ".{}.omni-oauth-{}-{}.tmp",
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("auth.json"),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::write(&tmp, bytes)?;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// Pull refresh material from a Grok CLI auth.json document.
+pub fn extract_oidc_refresh_material(
+    bytes: &[u8],
+) -> Result<GrokOidcRefreshMaterial, GrokCredentialsError> {
+    let value: Value = serde_json::from_slice(bytes)?;
+    let obj = value
+        .as_object()
+        .ok_or(GrokCredentialsError::MissingToken)?;
+    for (entry_key, entry_val) in obj {
+        let entry: GrokCliEntry = match serde_json::from_value(entry_val.clone()) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if entry.auth_mode.as_deref() != Some("oidc") {
+            continue;
+        }
+        let refresh_token = entry
+            .refresh_token
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                GrokCredentialsError::Refresh(
+                    "OIDC entry has no refresh_token; re-login with the Grok CLI".into(),
+                )
+            })?;
+        // client_id: prefer field, else parse from key `https://auth.x.ai::<id>`.
+        let client_id = entry
+            .oidc_client_id
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                entry_key
+                    .rsplit("::")
+                    .next()
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty())
+            })
+            .ok_or_else(|| {
+                GrokCredentialsError::Refresh("OIDC entry missing client_id".into())
+            })?;
+        let principal_id = entry
+            .principal_id
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| entry.user_id.filter(|s| !s.trim().is_empty()))
+            .ok_or_else(|| {
+                GrokCredentialsError::Refresh("OIDC entry missing principal_id/user_id".into())
+            })?;
+        return Ok(GrokOidcRefreshMaterial {
+            entry_key: entry_key.clone(),
+            refresh_token,
+            client_id,
+            principal_id,
+        });
+    }
+    Err(GrokCredentialsError::MissingToken)
+}
+
+/// POST the form grant and atomically write back to `path`.
+pub async fn refresh_oauth_inplace(
+    path: &Path,
+    token_url: &str,
+) -> Result<(), GrokCredentialsError> {
+    let bytes = tokio::fs::read(path).await?;
+    let material = extract_oidc_refresh_material(&bytes)?;
+    let form = build_refresh_form_body(&material);
+
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| GrokCredentialsError::Refresh(e.to_string()))?;
+
+    let resp = client
+        .post(token_url)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .header(reqwest::header::USER_AGENT, GROK_OAUTH_USER_AGENT)
+        .body(form)
+        .send()
+        .await
+        .map_err(|e| GrokCredentialsError::Refresh(e.to_string()))?;
+
+    let status = resp.status();
+    let resp_bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| GrokCredentialsError::Refresh(e.to_string()))?;
+    if !status.is_success() {
+        let body_txt = String::from_utf8_lossy(&resp_bytes);
+        return Err(GrokCredentialsError::Refresh(format!(
+            "HTTP {status}: {body_txt}"
+        )));
+    }
+
+    let grant: GrokTokenGrant = serde_json::from_slice(&resp_bytes).map_err(|e| {
+        GrokCredentialsError::Refresh(format!("token response parse: {e}"))
+    })?;
+    if grant.access_token.is_empty() {
+        return Err(GrokCredentialsError::Refresh(
+            "token response missing access_token".into(),
+        ));
+    }
+    let new_rt = grant
+        .refresh_token
+        .as_ref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            GrokCredentialsError::Refresh(
+                "token response missing refresh_token; refusing write-back that would strand RT"
+                    .into(),
+            )
+        })?;
+
+    // CAS against concurrent writers: re-read and refuse to clobber a different RT.
+    let latest_bytes = tokio::fs::read(path).await?;
+    let mut latest: Value = serde_json::from_slice(&latest_bytes)?;
+    let disk_rt = latest
+        .get(&material.entry_key)
+        .and_then(|e| e.get("refresh_token"))
+        .and_then(|v| v.as_str());
+    match disk_rt {
+        Some(rt) if rt == material.refresh_token || rt == new_rt => {}
+        Some(_) => {
+            return Err(GrokCredentialsError::Refresh(
+                "auth.json refresh_token changed during OAuth refresh (concurrent writer); not clobbering"
+                    .into(),
+            ));
+        }
+        None => {}
+    }
+
+    let now = chrono::Utc::now();
+    apply_grant_to_auth_json(&mut latest, &material.entry_key, &grant, now)?;
+    let out = serde_json::to_vec_pretty(&latest)
+        .map_err(|e| GrokCredentialsError::Refresh(format!("serialize auth.json: {e}")))?;
+    atomic_write(path, &out)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    use serde_json::json;
 
     use crate::GROK_ENV_LOCK as ENV_LOCK;
 
@@ -460,13 +816,16 @@ mod tests {
     // ---- Grok CLI OIDC file (~/.grok/auth.json) ----
 
     /// A minimal but realistic ~/.grok/auth.json: object keyed by the auth URL+client,
-    /// value carries the JWT `key`, `auth_mode:"oidc"`, and an ISO 8601 `expires_at`.
+    /// value carries the JWT `key`, `auth_mode:"oidc"`, rotating `refresh_token`,
+    /// and an ISO 8601 `expires_at`.
     fn grok_cli_json(key: &str, expires_at: &str) -> String {
         format!(
             r#"{{ "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": {{
                 "key": "{key}",
                 "auth_mode": "oidc",
-                "refresh_token": "rt-single-use-rotating",
+                "refresh_token": "rt-rotating-grace",
+                "oidc_client_id": "b1a00492-073a-47ea-816f-4c329264a828",
+                "principal_id": "11111111-2222-3333-4444-555555555555",
                 "expires_at": "{expires_at}",
                 "user_id": "11111111-2222-3333-4444-555555555555"
             }} }}"#
@@ -795,5 +1154,185 @@ mod tests {
             "xai-static-only",
             "conservative must fall back to the static key when no CLI OIDC file exists"
         );
+    }
+
+    // ---- OAuth refresh (OMNI_OAUTH_REFRESH) ----
+
+    #[test]
+    fn build_refresh_form_body_matches_capture() {
+        // WHY: wire parity with grok-shell form grant; wrong fields yield invalid_grant.
+        let material = GrokOidcRefreshMaterial {
+            entry_key: "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828".into(),
+            refresh_token: "rt-abc".into(),
+            client_id: "b1a00492-073a-47ea-816f-4c329264a828".into(),
+            principal_id: "11111111-2222-3333-4444-555555555555".into(),
+        };
+        let form = build_refresh_form_body(&material);
+        assert!(form.contains("grant_type=refresh_token"));
+        assert!(form.contains("refresh_token=rt-abc"));
+        assert!(form.contains("client_id=b1a00492-073a-47ea-816f-4c329264a828"));
+        assert!(form.contains("principal_type=User"));
+        assert!(form.contains("principal_id=11111111-2222-3333-4444-555555555555"));
+        assert!(!form.contains('{'), "must be form-urlencoded, not JSON");
+    }
+
+    #[test]
+    fn apply_grant_rotates_refresh_token_on_disk_shape() {
+        // WHY: rotation-then-revoke — old RT must not remain after success.
+        let mut file: Value = serde_json::from_str(&grok_cli_json("old-jwt", "2000-01-01T00:00:00Z"))
+            .unwrap();
+        let entry_key = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828";
+        let grant = GrokTokenGrant {
+            access_token: "new-jwt".into(),
+            refresh_token: Some("rt-new-rotated".into()),
+            expires_in: Some(21600),
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-09T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        apply_grant_to_auth_json(&mut file, entry_key, &grant, now).unwrap();
+        let entry = &file[entry_key];
+        assert_eq!(entry["key"], "new-jwt");
+        assert_eq!(entry["refresh_token"], "rt-new-rotated");
+        assert!(
+            entry["expires_at"]
+                .as_str()
+                .unwrap()
+                .starts_with("2026-07-09T18:00:00")
+        );
+        assert_eq!(entry["auth_mode"], "oidc");
+        assert_eq!(
+            entry["user_id"],
+            "11111111-2222-3333-4444-555555555555"
+        );
+    }
+
+    #[test]
+    fn static_key_file_has_no_oidc_refresh_material() {
+        // WHY: static API keys must never enter the OAuth refresh path.
+        let bytes = br#"{"apiKey": "xai-static-key"}"#;
+        assert!(matches!(
+            extract_oidc_refresh_material(bytes),
+            Err(GrokCredentialsError::MissingToken)
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_oauth_inplace_posts_form_and_writes_rotated_rt() {
+        // WHY: shipped Grok refresh must use form-urlencoded grant + persist rotated RT.
+        use wiremock::matchers::{header, method, path as url_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(url_path("/oauth2/token"))
+            .and(header(
+                "content-type",
+                "application/x-www-form-urlencoded",
+            ))
+            .and(header("user-agent", GROK_OAUTH_USER_AGENT))
+            .and(wiremock::matchers::body_string_contains(
+                "grant_type=refresh_token",
+            ))
+            .and(wiremock::matchers::body_string_contains(
+                "refresh_token=rt-rotating-grace",
+            ))
+            .and(wiremock::matchers::body_string_contains(
+                "principal_type=User",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "jwt-new-access",
+                "token_type": "Bearer",
+                "expires_in": 21600,
+                "refresh_token": "rt-new-from-server",
+                "scope": "openid profile email offline_access grok-cli:access api:access"
+            })))
+            .mount(&server)
+            .await;
+
+        let path = temp_credentials_path();
+        write_temp_creds(&path, &grok_cli_json("jwt-old", "2000-01-01T00:00:00Z"));
+        let token_url = format!("{}/oauth2/token", server.uri());
+        refresh_oauth_inplace(&path, &token_url).await.unwrap();
+
+        let on_disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let entry = &on_disk["https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"];
+        assert_eq!(entry["key"], "jwt-new-access");
+        assert_eq!(entry["refresh_token"], "rt-new-from-server");
+        assert_ne!(entry["expires_at"], "2000-01-01T00:00:00Z");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn load_fresh_async_refreshes_oidc_when_flag_on_and_expired() {
+        use wiremock::matchers::{method, path as url_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(url_path("/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "jwt-after-load",
+                "refresh_token": "rt-after-load",
+                "expires_in": 21600
+            })))
+            .mount(&server)
+            .await;
+
+        let path = temp_credentials_path();
+        write_temp_creds(&path, &grok_cli_json("jwt-before", "2000-01-01T00:00:00Z"));
+        let token_url = format!("{}/oauth2/token", server.uri());
+        let old_flag = std::env::var_os("OMNI_OAUTH_REFRESH");
+        let old_url = std::env::var_os("OMNI_GROK_OAUTH_TOKEN_URL");
+        unsafe {
+            std::env::set_var("OMNI_OAUTH_REFRESH", "1");
+            std::env::set_var("OMNI_GROK_OAUTH_TOKEN_URL", &token_url);
+        }
+        let c = GrokCredentials::load_fresh_async(&path).await.unwrap();
+        unsafe {
+            match old_flag {
+                Some(v) => std::env::set_var("OMNI_OAUTH_REFRESH", v),
+                None => std::env::remove_var("OMNI_OAUTH_REFRESH"),
+            }
+            match old_url {
+                Some(v) => std::env::set_var("OMNI_GROK_OAUTH_TOKEN_URL", v),
+                None => std::env::remove_var("OMNI_GROK_OAUTH_TOKEN_URL"),
+            }
+        }
+        let on_disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(c.api_key, "jwt-after-load");
+        assert_eq!(
+            on_disk["https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"]["refresh_token"],
+            "rt-after-load"
+        );
+        assert!(c.check_expired().is_ok());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn static_key_load_never_attempts_refresh() {
+        // WHY: static API-key credential path must remain untouched by OAuth refresh.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let path = temp_credentials_path();
+        write_temp_creds(&path, r#"{"apiKey": "xai-never-refresh"}"#);
+        let old = std::env::var_os("OMNI_OAUTH_REFRESH");
+        unsafe {
+            std::env::set_var("OMNI_OAUTH_REFRESH", "1");
+        }
+        let c = GrokCredentials::load_fresh_async(&path).await.unwrap();
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("OMNI_OAUTH_REFRESH", v),
+                None => std::env::remove_var("OMNI_OAUTH_REFRESH"),
+            }
+        }
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(c.api_key, "xai-never-refresh");
+        assert_eq!(on_disk, r#"{"apiKey": "xai-never-refresh"}"#);
     }
 }

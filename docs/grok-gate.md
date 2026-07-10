@@ -59,7 +59,7 @@ Grok uses the same fresh credential read contract as the Claude provider:
         "refresh_token": "...", "expires_at": "2026-06-10T22:20:22.000000Z" } }
     ```
     The `key` JWT is a Bearer that authenticates `api.x.ai/v1` directly.
-- **OIDC tokens are read READ-ONLY.** We never write `~/.grok/auth.json` or consume its single-use `refresh_token`. The parsed `expires_at` drives a non-fatal expiry warning; on a genuinely dead token the upstream 401s and the user re-runs the Grok CLI login. Static keys carry no expiry and never warn.
+- **OIDC refresh (opt-in).** By default Omni re-reads `~/.grok/auth.json` only and does not write it; the Grok CLI may still refresh in the background. When `OMNI_OAUTH_REFRESH=1`, Omni may refresh a near-expired OIDC access token via `POST https://auth.x.ai/oauth2/token` (form-urlencoded, public client) and **atomically write back** the rotated `refresh_token` to the same file. RTs rotate with a short grace window then revoke — the rotated token must be persisted. Static API keys (`~/.xai/.credentials.json`) are never refreshed. The parsed `expires_at` still drives a non-fatal expiry warning when refresh is off or fails.
 
 The loader lives in `provider-grok::credentials::GrokCredentials` and keeps the same "fresh per request" contract, plus a real expiry check for OIDC tokens.
 

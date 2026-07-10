@@ -86,7 +86,7 @@ src/
 
 v2 does not invoke the Claude Code CLI per request. It translates OpenAI Chat Completions requests into Anthropic Messages API calls and sends them directly to `api.anthropic.com` with the OAuth token from `~/.claude/.credentials.json`.
 
-The credentials file is re-read for each request, and a 401 response triggers one fresh read and retry. CCP still depends on Claude Code for login and token refresh, but the CLI is not in the request path.
+The credentials file is re-read for each request, and a 401 response triggers one fresh read and retry (with optional in-process OAuth refresh when `OMNI_OAUTH_REFRESH=1`). Login still depends on Claude Code initially; the CLI is not in the request path.
 
 ### OAuth Gate Compatibility
 

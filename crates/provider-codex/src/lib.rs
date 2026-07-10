@@ -3,6 +3,11 @@
 //! Codex configuration backed provider. This crate intentionally reads Codex's
 //! own `CODEX_HOME` / `~/.codex` config and auth state instead of inventing a
 //! parallel Omni-only setup.
+//!
+//! When `OMNI_OAUTH_REFRESH=1`, ChatGPT OAuth tokens in `auth.json` may be
+//! refreshed in-place (see [`oauth_refresh`]). Static API keys are never refreshed.
+
+mod oauth_refresh;
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -220,7 +225,7 @@ impl CodexProvider {
         req: CanonicalRequest,
         config: CodexRequestConfig,
     ) -> Result<CanonicalStream, ProviderError> {
-        let auth = config.chatgpt_auth()?;
+        let auth = config.chatgpt_auth().await?;
         let models_url = config.conservative_models_url(self.version.version)?;
         let headers = conservative_codex_headers(self.version.version, &auth)?;
         let redactor = CodexErrorRedactor::for_secrets([auth.access_token.clone()]);
@@ -902,9 +907,11 @@ impl CodexRequestConfig {
         Ok(headers)
     }
 
-    fn chatgpt_auth(&self) -> Result<ChatGptAuth, ProviderError> {
+    async fn chatgpt_auth(&self) -> Result<ChatGptAuth, ProviderError> {
         let auth_path = self.home.join("auth.json");
-        let bytes = std::fs::read(&auth_path).map_err(|e| {
+        // Always consider OAuth tokens (even if a sibling OPENAI_API_KEY exists).
+        oauth_refresh::ensure_fresh_chatgpt_oauth_tokens(&auth_path).await;
+        let bytes = tokio::fs::read(&auth_path).await.map_err(|e| {
             ProviderError::Auth(format!(
                 "Codex conservative mode requires ChatGPT OAuth auth.json: failed to read auth.json: {e}"
             ))
@@ -957,7 +964,7 @@ impl CodexRequestConfig {
             return Ok(Some(token.to_string()));
         }
         if self.requires_openai_auth {
-            return self.openai_auth_token().map(Some);
+            return self.openai_auth_token().await.map(Some);
         }
         if let Some(env_key) = &self.env_key {
             let token = std::env::var(env_key)
@@ -972,7 +979,7 @@ impl CodexRequestConfig {
         // Custom gateway (requires_openai_auth=false) with no explicit source: mirror the real
         // Codex CLI, which still falls back to auth.json's OPENAI_API_KEY (then tokens.access_token,
         // then env) rather than sending no credential. Non-failing: None when nothing usable exists.
-        Ok(self.openai_auth_token_fallback())
+        Ok(self.openai_auth_token_fallback().await)
     }
 
     /// Optional auth.json-first credential lookup for the `requires_openai_auth=false` fallback.
@@ -980,9 +987,10 @@ impl CodexRequestConfig {
     /// `OPENAI_API_KEY`, auth.json `tokens.access_token`, then env `CODEX_API_KEY` /
     /// `OPENAI_API_KEY` / `CODEX_ACCESS_TOKEN`. Returns `None` when no source yields a token
     /// (never errors, unlike the strict `openai_auth_token`).
-    fn openai_auth_token_fallback(&self) -> Option<String> {
+    async fn openai_auth_token_fallback(&self) -> Option<String> {
         let auth_path = self.home.join("auth.json");
-        if let Ok(bytes) = std::fs::read(&auth_path)
+        oauth_refresh::ensure_fresh_chatgpt_tokens(&auth_path).await;
+        if let Ok(bytes) = tokio::fs::read(&auth_path).await
             && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
         {
             if let Some(token) = value
@@ -1011,7 +1019,7 @@ impl CodexRequestConfig {
         None
     }
 
-    fn openai_auth_token(&self) -> Result<String, ProviderError> {
+    async fn openai_auth_token(&self) -> Result<String, ProviderError> {
         for env_key in ["CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"] {
             if let Ok(token) = std::env::var(env_key)
                 && !token.trim().is_empty()
@@ -1020,7 +1028,8 @@ impl CodexRequestConfig {
             }
         }
         let auth_path = self.home.join("auth.json");
-        let bytes = std::fs::read(&auth_path).map_err(|e| {
+        oauth_refresh::ensure_fresh_chatgpt_tokens(&auth_path).await;
+        let bytes = tokio::fs::read(&auth_path).await.map_err(|e| {
             ProviderError::Auth(format!(
                 "Codex OpenAI auth unavailable: failed to read auth.json: {e}"
             ))
@@ -2393,8 +2402,9 @@ query_params = { api-version = "2026-01-01" }
         );
     }
 
-    #[test]
-    fn conservative_auth_requires_chatgpt_oauth_token_and_account_id() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn conservative_auth_requires_chatgpt_oauth_token_and_account_id() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _home = TempCodexHome::new(
             r#"model = "gpt-5.5""#,
@@ -2403,7 +2413,7 @@ query_params = { api-version = "2026-01-01" }
             ),
         );
         let cfg = CodexRequestConfig::load().unwrap();
-        let auth = cfg.chatgpt_auth().unwrap();
+        let auth = cfg.chatgpt_auth().await.unwrap();
         assert_eq!(auth.access_token, "eyJ-oauth");
         assert_eq!(auth.account_id, "acct-1");
     }

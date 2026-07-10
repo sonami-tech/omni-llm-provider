@@ -25,7 +25,7 @@ pub mod errors {
         CredentialsMissingToken,
 
         #[error(
-            "OAuth token expired (per credentials.json expiresAt). Run `claude` once to refresh."
+            "OAuth token expired (per credentials.json expiresAt). Enable OMNI_OAUTH_REFRESH=1 for in-process refresh, or run `claude` once to refresh."
         )]
         TokenExpired,
 
@@ -897,14 +897,18 @@ impl UpstreamClient {
                         _ => None,
                     };
 
-                    // 401 on the default Claude Code path means the CLI may
-                    // have refreshed credentials on disk. Custom gateways own
-                    // their auth, so never fall back to the local OAuth file.
+                    // 401 on the default Claude Code path: re-read credentials
+                    // (and force OAuth refresh when OMNI_OAUTH_REFRESH is on).
+                    // Custom gateways own their auth, so never fall back to the
+                    // local OAuth file.
                     if status == Some(401) && !refreshed_credentials && !self.auth.is_custom() {
                         refreshed_credentials = true;
-                        match Credentials::load_fresh_async(&Credentials::default_path()).await {
+                        let path = Credentials::default_path();
+                        match Credentials::load_fresh_async_force_refresh(&path).await {
                             Ok(fresh) => {
-                                warn!("upstream 401, re-reading credentials.json and retrying");
+                                warn!(
+                                    "upstream 401, re-reading credentials.json (oauth refresh if enabled) and retrying"
+                                );
                                 creds_owned = fresh;
                                 ctx_owned.next_attempt();
                                 continue;
@@ -980,9 +984,12 @@ impl UpstreamClient {
                     };
                     if status == Some(401) && !refreshed_credentials && !self.auth.is_custom() {
                         refreshed_credentials = true;
-                        match Credentials::load_fresh_async(&Credentials::default_path()).await {
+                        let path = Credentials::default_path();
+                        match Credentials::load_fresh_async_force_refresh(&path).await {
                             Ok(fresh) => {
-                                warn!("count_tokens 401, re-reading credentials.json and retrying");
+                                warn!(
+                                    "count_tokens 401, re-reading credentials.json (oauth refresh if enabled) and retrying"
+                                );
                                 creds_owned = fresh;
                                 ctx_owned.next_attempt();
                                 continue;
@@ -1084,10 +1091,13 @@ impl UpstreamClient {
                     };
                     if status == Some(401) && !refreshed_credentials && !self.auth.is_custom() {
                         refreshed_credentials = true;
+                        let path = Credentials::default_path();
                         if let Ok(fresh) =
-                            Credentials::load_fresh_async(&Credentials::default_path()).await
+                            Credentials::load_fresh_async_force_refresh(&path).await
                         {
-                            warn!("upstream 401 on stream open, re-reading credentials.json");
+                            warn!(
+                                "upstream 401 on stream open, re-reading credentials.json (oauth refresh if enabled)"
+                            );
                             creds_owned = fresh;
                             ctx_owned.next_attempt();
                             continue;
@@ -1156,10 +1166,13 @@ impl UpstreamClient {
                     };
                     if status == Some(401) && !refreshed_credentials && !self.auth.is_custom() {
                         refreshed_credentials = true;
+                        let path = Credentials::default_path();
                         if let Ok(fresh) =
-                            Credentials::load_fresh_async(&Credentials::default_path()).await
+                            Credentials::load_fresh_async_force_refresh(&path).await
                         {
-                            warn!("upstream 401 on raw stream open, re-reading credentials.json");
+                            warn!(
+                                "upstream 401 on raw stream open, re-reading credentials.json (oauth refresh if enabled)"
+                            );
                             creds_owned = fresh;
                             ctx_owned.next_attempt();
                             continue;
