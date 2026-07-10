@@ -6,8 +6,8 @@
 //! OAuth refresh is **on by default**: Omni may proactively refresh a near-expired
 //! or expired OAuth access token via the Claude token endpoint and **atomically
 //! write back** the rotated tokens to the same credentials path.
-//! Set `OMNI_OAUTH_REFRESH=0` (or `false`/`off`/`no`) to disable and keep the
-//! historical CLI-delegated model (re-read only, surface expiry).
+//! Disable with `OMNI_OAUTH_REFRESH=0` (or `false`/`off`/`no`),
+//! `OMNI_NO_OAUTH_REFRESH=1`, or the omni CLI flag `--no-oauth-refresh`.
 //!
 //! Ported from reference-src-claude/upstream/credentials.rs .
 //! All credential handling for the OAuth gate stays isolated here.
@@ -186,8 +186,12 @@ enum RefreshTrigger {
 }
 
 /// Gate for in-Omni OAuth refresh (shared name across providers).
-/// Default **on**; set `OMNI_OAUTH_REFRESH=0`/`false`/`off`/`no` to disable.
+/// Default **on**. Disable with `OMNI_OAUTH_REFRESH=0`/`false`/`off`/`no`,
+/// `OMNI_NO_OAUTH_REFRESH=1`/`true`/`yes`/`on`, or CLI `--no-oauth-refresh`.
 pub fn oauth_refresh_enabled() -> bool {
+    if env_flag_truthy("OMNI_NO_OAUTH_REFRESH") {
+        return false;
+    }
     match std::env::var("OMNI_OAUTH_REFRESH")
         .ok()
         .map(|v| v.to_ascii_lowercase())
@@ -197,6 +201,16 @@ pub fn oauth_refresh_enabled() -> bool {
         Some("0" | "false" | "off" | "no") => false,
         Some(_) => true,
     }
+}
+
+fn env_flag_truthy(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .ok()
+            .map(|v| v.to_ascii_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 /// Effective Claude token endpoint. Production uses the captured host; tests may

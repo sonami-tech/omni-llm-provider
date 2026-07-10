@@ -2,9 +2,10 @@
 //!
 //! OAuth refresh is **on by default**: Omni may refresh a near-expired
 //! `tokens.access_token` (JWT `exp`) via the captured OpenAI auth endpoint and
-//! atomically write back `tokens.*` + `last_refresh`. Set `OMNI_OAUTH_REFRESH=0`
-//! (or `false`/`off`/`no`) to disable. Static `OPENAI_API_KEY` entries are never
-//! refreshed.
+//! atomically write back `tokens.*` + `last_refresh`. Disable with
+//! `OMNI_OAUTH_REFRESH=0` (or `false`/`off`/`no`), `OMNI_NO_OAUTH_REFRESH=1`, or
+//! the omni CLI flag `--no-oauth-refresh`. Static `OPENAI_API_KEY` entries are
+//! never refreshed.
 //!
 //! Wire contract: live capture codex 0.144.1 — see
 //! `/home/username/oauth-credential-renewal-handoff.md`.
@@ -39,8 +40,12 @@ pub struct CodexTokenGrant {
 }
 
 /// Gate for in-Omni OAuth refresh (shared name across providers).
-/// Default **on**; set `OMNI_OAUTH_REFRESH=0`/`false`/`off`/`no` to disable.
+/// Default **on**. Disable with `OMNI_OAUTH_REFRESH=0`/`false`/`off`/`no`,
+/// `OMNI_NO_OAUTH_REFRESH=1`/`true`/`yes`/`on`, or CLI `--no-oauth-refresh`.
 pub fn oauth_refresh_enabled() -> bool {
+    if env_flag_truthy("OMNI_NO_OAUTH_REFRESH") {
+        return false;
+    }
     match std::env::var("OMNI_OAUTH_REFRESH")
         .ok()
         .map(|v| v.to_ascii_lowercase())
@@ -50,6 +55,16 @@ pub fn oauth_refresh_enabled() -> bool {
         Some("0" | "false" | "off" | "no") => false,
         Some(_) => true,
     }
+}
+
+fn env_flag_truthy(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .ok()
+            .map(|v| v.to_ascii_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 /// Effective token endpoint. Tests may set `OMNI_CODEX_OAUTH_TOKEN_URL`.

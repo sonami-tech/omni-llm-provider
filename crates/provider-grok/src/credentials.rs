@@ -34,8 +34,8 @@
 //! OIDC access token via `POST https://auth.x.ai/oauth2/token` (form-urlencoded,
 //! public client) and **atomically write back** the rotated `refresh_token` to the
 //! same path. RTs rotate with a short grace window then revoke — never leave the old
-//! RT on disk after a successful grant. Set `OMNI_OAUTH_REFRESH=0` (or `false`/
-//! `off`/`no`) to disable and only re-read the file / surface expiry.
+//! RT on disk after a successful grant. Disable with `OMNI_OAUTH_REFRESH=0`
+//! (or `false`/`off`/`no`), `OMNI_NO_OAUTH_REFRESH=1`, or `--no-oauth-refresh`.
 
 use std::path::{Path, PathBuf};
 
@@ -363,8 +363,12 @@ fn parse_iso8601_to_ms(s: &str) -> Option<i64> {
 }
 
 /// Gate for in-Omni OAuth refresh (shared name across providers).
-/// Default **on**; set `OMNI_OAUTH_REFRESH=0`/`false`/`off`/`no` to disable.
+/// Default **on**. Disable with `OMNI_OAUTH_REFRESH=0`/`false`/`off`/`no`,
+/// `OMNI_NO_OAUTH_REFRESH=1`/`true`/`yes`/`on`, or CLI `--no-oauth-refresh`.
 pub fn oauth_refresh_enabled() -> bool {
+    if env_flag_truthy("OMNI_NO_OAUTH_REFRESH") {
+        return false;
+    }
     match std::env::var("OMNI_OAUTH_REFRESH")
         .ok()
         .map(|v| v.to_ascii_lowercase())
@@ -374,6 +378,16 @@ pub fn oauth_refresh_enabled() -> bool {
         Some("0" | "false" | "off" | "no") => false,
         Some(_) => true,
     }
+}
+
+fn env_flag_truthy(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .ok()
+            .map(|v| v.to_ascii_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 /// Effective Grok token endpoint. Tests may set `OMNI_GROK_OAUTH_TOKEN_URL`.

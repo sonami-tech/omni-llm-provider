@@ -5,8 +5,9 @@
 //! parallel Omni-only setup.
 //!
 //! ChatGPT OAuth tokens in `auth.json` are refreshed in-place by default
-//! (see [`oauth_refresh`]); set `OMNI_OAUTH_REFRESH=0` to disable. Static API
-//! keys are never refreshed.
+//! (see [`oauth_refresh`]); disable with `OMNI_OAUTH_REFRESH=0`,
+//! `OMNI_NO_OAUTH_REFRESH=1`, or `--no-oauth-refresh`. Static API keys are
+//! never refreshed.
 
 mod oauth_refresh;
 

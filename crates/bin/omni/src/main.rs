@@ -41,6 +41,8 @@
 //! - Codex config/auth and Responses wire mapping stay in `provider-codex`.
 //! - Auth and stats are server concerns handled here with `omni-common`.
 //! - Empty key set (via --no-auth or no OMNI_API_KEYS) means "allow all".
+//! - OAuth refresh for Claude/Codex/Grok primary logins is on by default;
+//!   disable with `--no-oauth-refresh` or `OMNI_OAUTH_REFRESH=0`.
 //!
 //! Build: cargo build -p omni
 //! Run (claude only, no keys needed): OMNI_PROVIDERS=claude cargo run -p omni -- --no-auth --port 18321
@@ -100,7 +102,8 @@ const OMNI_ASCII_BANNER: &str = r#"
 
 /// CLI for the light omni aggregator.
 /// Env vars: OMNI_PROVIDERS, OMNI_BIND, OMNI_PUBLIC, OMNI_PORT, OMNI_NO_AUTH,
-/// OMNI_STATS_DB (clap env support). OMNI_API_KEYS configures auth keys.
+/// OMNI_NO_OAUTH_REFRESH, OMNI_STATS_DB (clap env support). OMNI_API_KEYS
+/// configures auth keys. OMNI_OAUTH_REFRESH=0 also disables OAuth refresh.
 #[derive(Parser, Debug)]
 #[command(
     name = "omni",
@@ -127,6 +130,12 @@ struct Cli {
     /// Disable API key auth (if omitted, still allows all unless OMNI_API_KEYS is set).
     #[arg(long, env = "OMNI_NO_AUTH")]
     no_auth: bool,
+
+    /// Disable in-process OAuth credential refresh (Claude/Codex/Grok). Refresh
+    /// is on by default. Equivalent env: OMNI_NO_OAUTH_REFRESH=1, or
+    /// OMNI_OAUTH_REFRESH=0.
+    #[arg(long = "no-oauth-refresh", env = "OMNI_NO_OAUTH_REFRESH")]
+    no_oauth_refresh: bool,
 
     /// Path to the stats redb file. Defaults to a fixed temp file; use a
     /// durable, per-instance path for long-running or concurrent servers.
@@ -195,6 +204,22 @@ struct Cli {
     match_system_exact: bool,
 }
 
+/// Apply CLI flags that providers read via process environment.
+///
+/// Provider crates check `OMNI_OAUTH_REFRESH` (and related) on each load; clap
+/// only populates the `Cli` struct, so disable flags must be written into the
+/// process env before providers initialize.
+fn apply_cli_env_overrides(cli: &Cli) {
+    if cli.no_oauth_refresh {
+        // SAFETY: single-threaded startup before provider init / worker spawn.
+        unsafe {
+            std::env::set_var("OMNI_OAUTH_REFRESH", "0");
+            std::env::set_var("OMNI_NO_OAUTH_REFRESH", "1");
+        }
+        tracing::info!("OAuth credential refresh disabled (--no-oauth-refresh)");
+    }
+}
+
 /// CLI surface for [`omni_core::CatalogMode`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum CatalogModeArg {
@@ -258,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    apply_cli_env_overrides(&cli);
     log_startup_banner();
 
     let (enabled, provider_source) = select_enabled_providers(&cli.providers)?;
@@ -2476,6 +2502,53 @@ mod tests {
             err.to_string().contains(env!("CARGO_PKG_VERSION")),
             "--version output must include package version"
         );
+    }
+
+    #[test]
+    fn test_cli_no_oauth_refresh_flag_parses() {
+        // WHY: operators need a CLI switch matching env disable for OAuth refresh.
+        // Clear env so clap's env = "OMNI_NO_OAUTH_REFRESH" does not bleed in.
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let old_no = std::env::var_os("OMNI_NO_OAUTH_REFRESH");
+        unsafe {
+            std::env::remove_var("OMNI_NO_OAUTH_REFRESH");
+        }
+        let cli = Cli::try_parse_from(["omni", "--no-oauth-refresh", "--no-auth"]).unwrap();
+        assert!(cli.no_oauth_refresh);
+        let cli_default = Cli::try_parse_from(["omni", "--no-auth"]).unwrap();
+        assert!(!cli_default.no_oauth_refresh);
+        unsafe {
+            match old_no {
+                Some(v) => std::env::set_var("OMNI_NO_OAUTH_REFRESH", v),
+                None => std::env::remove_var("OMNI_NO_OAUTH_REFRESH"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_apply_cli_env_overrides_disables_oauth_refresh() {
+        // WHY: providers read process env; CLI flag must land there before init.
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let old_refresh = std::env::var_os("OMNI_OAUTH_REFRESH");
+        let old_no = std::env::var_os("OMNI_NO_OAUTH_REFRESH");
+        unsafe {
+            std::env::remove_var("OMNI_OAUTH_REFRESH");
+            std::env::remove_var("OMNI_NO_OAUTH_REFRESH");
+        }
+        let cli = Cli::try_parse_from(["omni", "--no-oauth-refresh"]).unwrap();
+        apply_cli_env_overrides(&cli);
+        assert_eq!(std::env::var("OMNI_OAUTH_REFRESH").ok().as_deref(), Some("0"));
+        assert_eq!(std::env::var("OMNI_NO_OAUTH_REFRESH").ok().as_deref(), Some("1"));
+        unsafe {
+            match old_refresh {
+                Some(v) => std::env::set_var("OMNI_OAUTH_REFRESH", v),
+                None => std::env::remove_var("OMNI_OAUTH_REFRESH"),
+            }
+            match old_no {
+                Some(v) => std::env::set_var("OMNI_NO_OAUTH_REFRESH", v),
+                None => std::env::remove_var("OMNI_NO_OAUTH_REFRESH"),
+            }
+        }
     }
 
     #[test]
