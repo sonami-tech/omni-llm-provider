@@ -372,6 +372,36 @@ fn unterminated_json_value_end(value_part: &str, value_start: usize) -> usize {
         .unwrap_or(value_start + value_part.len())
 }
 
+/// Relative index of the first unescaped `quote` in `inner` (content after the
+/// opening quote). Treats `\\` and `\"` (or `\'`) so a quote after an odd-length
+/// backslash run is escaped; even-length runs leave the quote as closer.
+/// Returns `None` when no unescaped closer exists.
+fn find_unescaped_quote_end(inner: &str, quote: u8) -> Option<usize> {
+    let bytes = inner.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            // Consume backslash + following byte (if any) as one escape unit.
+            i = i.saturating_add(2);
+            continue;
+        }
+        if bytes[i] == quote {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// True when `after_close` begins with secret-shaped material (alphanumeric /
+/// `_` / `-`). Used to fail-closed on partial redaction like `"REDACTED"suffix`.
+fn residual_after_redacted_close(after_close: &str) -> bool {
+    after_close
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 fn redact_json_secret_fields(input: &str) -> String {
     // Walk every occurrence case-insensitively; advance past already-REDACTED
     // values so later duplicates (e.g. "api_key":"a","API_KEY":"b") are scrubbed.
@@ -400,26 +430,26 @@ fn redact_json_secret_fields(input: &str) -> String {
                 let ws = out[after_colon..].len() - value_part.len();
                 let value_start = after_colon + ws;
                 if value_part.starts_with("\"REDACTED\"") || value_part.starts_with("'REDACTED'") {
-                    // Already scrubbed; advance past this occurrence.
+                    // Already scrubbed; advance past this occurrence. Residual
+                    // alphanumerics glued after the closer are caught by
+                    // still_secret_shaped (fail-closed omit).
                     search_from = value_start + "\"REDACTED\"".len();
                     continue;
                 }
                 if value_part.starts_with('"') {
-                    if let Some(end_rel) = value_part[1..].find('"') {
+                    if let Some(end_rel) = find_unescaped_quote_end(&value_part[1..], b'"') {
                         let value_end = value_start + 1 + end_rel + 1;
                         out.replace_range(value_start..value_end, "\"REDACTED\"");
                         search_from = value_start + "\"REDACTED\"".len();
                     } else {
                         // Unterminated string after a secret key: fail-closed —
                         // redact from opening quote through end (or hard boundary).
-                        // Escaped-quote residuals that slip past simple scan are
-                        // caught by still_secret_shaped (omit error=).
                         let value_end = unterminated_json_value_end(value_part, value_start);
                         out.replace_range(value_start..value_end, "\"REDACTED\"");
                         search_from = value_start + "\"REDACTED\"".len();
                     }
                 } else if value_part.starts_with('\'') {
-                    if let Some(end_rel) = value_part[1..].find('\'') {
+                    if let Some(end_rel) = find_unescaped_quote_end(&value_part[1..], b'\'') {
                         let value_end = value_start + 1 + end_rel + 1;
                         out.replace_range(value_start..value_end, "\"REDACTED\"");
                         search_from = value_start + "\"REDACTED\"".len();
@@ -566,6 +596,7 @@ fn still_secret_shaped(s: &str) -> bool {
     }
     // Residual JSON "key":"value" for secret keys (case-insensitive; non-REDACTED).
     // Scan lowercased copy for key positions; inspect values in the original.
+    // Closing quotes respect escapes so \" cannot truncate a live secret value.
     for key in JSON_SECRET_KEYS {
         for quote in ['"', '\''] {
             let pat = format!("{quote}{key}{quote}");
@@ -581,11 +612,18 @@ fn still_secret_shaped(s: &str) -> bool {
                 let after_colon = after_key + colon_rel + 1;
                 let value_part = s[after_colon..].trim_start();
                 if value_part.starts_with('"') {
-                    if let Some(end_rel) = value_part[1..].find('"') {
+                    if let Some(end_rel) = find_unescaped_quote_end(&value_part[1..], b'"') {
                         let inner = &value_part[1..1 + end_rel];
                         if inner != "REDACTED"
                             && !inner.is_empty()
                             && inner.len() >= RESIDUAL_SECRET_MIN_LEN
+                        {
+                            return true;
+                        }
+                        // Partial scrub: `"REDACTED"secret_suffix…` (naive closer
+                        // left live material glued after the REDACTED closer).
+                        if inner == "REDACTED"
+                            && residual_after_redacted_close(&value_part[1 + end_rel + 1..])
                         {
                             return true;
                         }
@@ -599,11 +637,16 @@ fn still_secret_shaped(s: &str) -> bool {
                         return true;
                     }
                 } else if value_part.starts_with('\'') {
-                    if let Some(end_rel) = value_part[1..].find('\'') {
+                    if let Some(end_rel) = find_unescaped_quote_end(&value_part[1..], b'\'') {
                         let inner = &value_part[1..1 + end_rel];
                         if inner != "REDACTED"
                             && !inner.is_empty()
                             && inner.len() >= RESIDUAL_SECRET_MIN_LEN
+                        {
+                            return true;
+                        }
+                        if inner == "REDACTED"
+                            && residual_after_redacted_close(&value_part[1 + end_rel + 1..])
                         {
                             return true;
                         }
@@ -1323,6 +1366,37 @@ mod tests {
         // Residual detector must catch unterminated secret-key:"value forms.
         assert!(still_secret_shaped(raw));
         assert!(still_secret_shaped(r#"{"API_KEY":"opaque_secret_123456"#));
+    }
+
+    #[test]
+    fn redact_json_escaped_quote_secret_or_fail_closed() {
+        // WHY: naive .find('"') stops at escaped \", truncating redaction and
+        // leaving secret_suffix after "REDACTED"; residual must not treat that
+        // as clean and leak the suffix into error= logs.
+        let raw = r#"body {"api_key":"prefix\"secret_suffix_long_enough"}"#;
+        match redact_error_for_log(raw) {
+            Some(s) => {
+                assert!(!s.contains("secret_suffix"), "{s}");
+                assert!(!s.contains("prefix"), "{s}");
+                assert!(s.contains("REDACTED"), "{s}");
+            }
+            None => {} // fail-closed omit also acceptable
+        }
+        // Direct redactor must consume through the true unescaped closer.
+        let scrubbed = super::redact_json_secret_fields(raw);
+        assert!(!scrubbed.contains("secret_suffix"), "{scrubbed}");
+        assert!(!scrubbed.contains("prefix"), "{scrubbed}");
+        assert!(scrubbed.contains("REDACTED"), "{scrubbed}");
+        // Residual fail-closed on partial scrub: "REDACTED" + glued alphanumerics.
+        assert!(still_secret_shaped(
+            r#"{"api_key":"REDACTED"secret_suffix_long_enough"}"#
+        ));
+        // Clean REDACTED remains non-secret-shaped.
+        assert!(!still_secret_shaped(r#"{"api_key":"REDACTED"}"#));
+        // Even-length backslash run (\\") ends the string; odd (\\\") escapes.
+        let even = super::redact_json_secret_fields(r#"{"api_key":"ab\\"}"#);
+        assert!(!even.contains("ab\\"), "{even}");
+        assert!(even.contains("REDACTED"), "{even}");
     }
 
     #[test]
