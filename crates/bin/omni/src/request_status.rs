@@ -252,7 +252,31 @@ const URL_QUERY_SECRET_KEYS: &[&str] = &[
 
 fn is_query_key_boundary(prev: u8) -> bool {
     // `?` / `&` start query pairs; `#` starts a fragment (same key=value form).
-    prev == b'?' || prev == b'&' || prev == b'#' || prev == b' ' || prev == b'\t'
+    // `\n`/`\r` so multi-line error bodies still match keys before control-char collapse.
+    prev == b'?'
+        || prev == b'&'
+        || prev == b'#'
+        || prev == b' '
+        || prev == b'\t'
+        || prev == b'\n'
+        || prev == b'\r'
+}
+
+/// Sanitize client-controlled model strings for status text: strip controls and
+/// scrub known secret shapes (e.g. pasted sk-/xai- keys as the model field).
+fn sanitize_model_for_status(raw: &str) -> String {
+    let cleaned = sanitize_control_chars(raw);
+    match redact_error_for_log(&cleaned) {
+        Some(s) => s,
+        None => {
+            // Known secret shape residual: do not emit the raw secret as model=.
+            if still_secret_shaped(&cleaned) {
+                "<redacted>".to_string()
+            } else {
+                cleaned
+            }
+        }
+    }
 }
 
 /// True only when `token` is exactly `REDACTED` (not `REDACTEDsuffix` glued on).
@@ -849,8 +873,8 @@ pub fn format_request_complete_fields(params: &RequestCompleteParams) -> String 
         Outcome::Ok => "ok",
         Outcome::Error => "error",
     };
-    // model can be raw client text on bad_request paths; always single-line.
-    let model = sanitize_control_chars(&params.model);
+    // model can be raw client text on bad_request paths; scrub controls + secrets.
+    let model = sanitize_model_for_status(&params.model);
     let mut out = String::new();
     let _ = write!(
         out,
@@ -873,7 +897,7 @@ pub fn format_request_complete_fields(params: &RequestCompleteParams) -> String 
         let _ = write!(out, " ttft_ms={t:.1}");
     }
     if let Some(ref rm) = params.requested_model {
-        let rm = sanitize_control_chars(rm);
+        let rm = sanitize_model_for_status(rm);
         let _ = write!(out, " requested_model={rm}");
     }
     if let Some(ref raw_err) = params.error {
@@ -898,8 +922,8 @@ pub fn log_request_complete(params: &RequestCompleteParams) {
         Outcome::Error => "error",
     };
     let duration = format!("{:.1}", params.duration_ms);
-    // model may be raw client text (bad_request); sanitize before structured field.
-    let model = sanitize_control_chars(&params.model);
+    // model may be raw client text (bad_request); scrub controls + secrets.
+    let model = sanitize_model_for_status(&params.model);
 
     let mut optional = String::new();
     if let Some(n) = params.input_tokens {
@@ -918,7 +942,7 @@ pub fn log_request_complete(params: &RequestCompleteParams) {
         let _ = write!(optional, " ttft_ms={t:.1}");
     }
     if let Some(ref rm) = params.requested_model {
-        let rm = sanitize_control_chars(rm);
+        let rm = sanitize_model_for_status(rm);
         let _ = write!(optional, " requested_model={rm}");
     }
     if let Some(ref raw_err) = params.error {
@@ -1178,6 +1202,35 @@ mod tests {
         assert!(still_secret_shaped("#access_token=opaque_secret_123456"));
         assert!(!still_secret_shaped("?api_key=REDACTED&x=1"));
         assert!(!still_secret_shaped(r#"{"api_key":"REDACTED"}"#));
+    }
+
+    #[test]
+    fn redact_newline_delimited_query_secret_or_fail_closed() {
+        // WHY: multi-line errors place api_key= after \n; boundary must include newline
+        // before control-char collapse turns it into a same-line key=value.
+        let raw = "failed\napi_key=opaque_secret_123456";
+        match redact_error_for_log(raw) {
+            Some(s) => assert!(!s.contains("opaque_secret_123456"), "{s}"),
+            None => {}
+        }
+    }
+
+    #[test]
+    fn model_field_scrubs_known_secret_shapes() {
+        // WHY: bad_request can put a pasted sk- key into model=; scrub it.
+        let params = RequestCompleteParams::error(
+            "sk-abcdefghijklmnopqrstuv",
+            FinishSite {
+                entered_body: false,
+                incomplete: false,
+                no_finish_concept: false,
+                finish_latch: None,
+            },
+            0.0,
+        );
+        let line = format_request_complete_fields(&params);
+        assert!(!line.contains("sk-abcdefghijklmnopqrstuv"), "{line}");
+        assert!(line.contains("model="), "{line}");
     }
 
     #[test]
