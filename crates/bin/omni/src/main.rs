@@ -1278,6 +1278,7 @@ async fn chat_completions_handler(
             session_id.clone(),
             short_request_id.clone(),
             "Chat Completions stream",
+            Some(requested_model.clone()),
         );
         // Echo the resolved canonical provider model, not shorthand aliases.
         let sse = omni_common::sse_from_canonical_stream(stream, stripped_model, chat_id, created);
@@ -1445,6 +1446,7 @@ fn wrap_stream_for_stats(
     session_id: String,
     request_id: String,
     label: &'static str,
+    requested_model: Option<String>,
 ) -> CanonicalStream {
     // Capture the request span so operational logs emitted while polling the
     // provider stream (including provider-side warn!/error! mid-stream) keep the
@@ -1453,6 +1455,10 @@ fn wrap_stream_for_stats(
     let span = tracing::Span::current();
     // Finish labels: "… stream finished" (plan D4).
     let finished_label = format!("{label} finished");
+    // Precompute once: emit requested_model= only when client raw differs.
+    let requested_model_field = requested_model
+        .as_ref()
+        .and_then(|raw| requested_model_if_differs(&model, raw));
     let inner = Box::pin(async_stream::stream! {
         let _active = stats.as_deref().map(ActiveRequestGuard::new);
         let started = Instant::now();
@@ -1501,7 +1507,8 @@ fn wrap_stream_for_stats(
                                 },
                                 dur_ms,
                             )
-                            .with_error(Some(msg));
+                            .with_error(Some(msg))
+                            .with_requested_model(requested_model_field.clone());
                             log_request_complete(&params);
                             if let Some(log) = conversation_log.as_ref() {
                                 log.log(
@@ -1535,7 +1542,8 @@ fn wrap_stream_for_stats(
                             },
                             dur_ms,
                         )
-                        .with_tokens(in_tok, out_tok);
+                        .with_tokens(in_tok, out_tok)
+                        .with_requested_model(requested_model_field.clone());
                         log_request_complete(&params);
                         if let Some(log) = conversation_log.as_ref() {
                             log.log(
@@ -1568,7 +1576,8 @@ fn wrap_stream_for_stats(
                             },
                             dur_ms,
                         )
-                        .with_error(Some(err_msg));
+                        .with_error(Some(err_msg))
+                        .with_requested_model(requested_model_field.clone());
                         log_request_complete(&params);
                         if let Some(log) = conversation_log.as_ref() {
                             log.log(
@@ -1599,7 +1608,8 @@ fn wrap_stream_for_stats(
                     },
                     dur_ms,
                 )
-                .with_error(Some("stream ended without Finish event".into()));
+                .with_error(Some("stream ended without Finish event".into()))
+                .with_requested_model(requested_model_field.clone());
                 log_request_complete(&params);
                 if let Some(log) = conversation_log.as_ref() {
                     log.log(
@@ -1809,6 +1819,7 @@ async fn anthropic_messages_inner(
             session_id,
             short_request_id,
             replacements,
+            Some(prepared.requested_model.clone()),
         ));
     }
 
@@ -2057,12 +2068,17 @@ fn anthropic_sse_response(
     session_id: String,
     request_id: String,
     replacements: Replacements,
+    requested_model: Option<String>,
 ) -> Response {
     let response_request_id = request_id.clone();
     // Keep the request span active across the SSE stream so provider-side logs
     // emitted while relaying Anthropic frames retain request_id/session_id.
     // Entered per-poll via SpannedStream (below), never held across an await.
     let span = tracing::Span::current();
+    // Precompute once: emit requested_model= only when client raw differs.
+    let requested_model_field = requested_model
+        .as_ref()
+        .and_then(|raw| requested_model_if_differs(&model, raw));
     let stream = async_stream::stream! {
         let _active = stats.as_deref().map(ActiveRequestGuard::new);
         let started = Instant::now();
@@ -2147,7 +2163,8 @@ fn anthropic_sse_response(
                                     },
                                     dur_ms,
                                 )
-                                .with_error(Some(message));
+                                .with_error(Some(message))
+                                .with_requested_model(requested_model_field.clone());
                                 log_request_complete(&params);
                                 complete_snapshot = Some(params);
                             }
@@ -2177,7 +2194,8 @@ fn anthropic_sse_response(
                                             },
                                             dur_ms,
                                         )
-                                        .with_error(Some(error.clone()));
+                                        .with_error(Some(error.clone()))
+                                        .with_requested_model(requested_model_field.clone());
                                         log_request_complete(&params);
                                         complete_snapshot = Some(params);
                                     }
@@ -2205,7 +2223,8 @@ fn anthropic_sse_response(
                                 },
                                 dur_ms,
                             )
-                            .with_error(Some(message.clone()));
+                            .with_error(Some(message.clone()))
+                            .with_requested_model(requested_model_field.clone());
                             log_request_complete(&params);
                             complete_snapshot = Some(params);
                         }
@@ -2243,7 +2262,8 @@ fn anthropic_sse_response(
                         },
                         dur_ms,
                     )
-                    .with_error(Some(message.into()));
+                    .with_error(Some(message.into()))
+                    .with_requested_model(requested_model_field.clone());
                     log_request_complete(&params);
                     complete_snapshot = Some(params);
                 }
@@ -2276,7 +2296,8 @@ fn anthropic_sse_response(
                     dur_ms,
                 )
                 .with_tokens(in_tok, out_tok)
-                .with_ttft_ms(ttft_ms);
+                .with_ttft_ms(ttft_ms)
+                .with_requested_model(requested_model_field.clone());
                 log_request_complete(&params);
                 complete_snapshot = Some(params);
             }
@@ -2464,6 +2485,7 @@ async fn responses_handler(
             session_id.clone(),
             short_request_id.clone(),
             "Responses stream",
+            Some(requested_model.clone()),
         );
         // Echo the resolved canonical provider model, not shorthand aliases.
         let sse = omni_common::sse_from_canonical_stream_responses(
@@ -4740,6 +4762,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "sess".into(),
             "req".into(),
             Replacements::empty(),
+            None,
         );
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
@@ -4809,6 +4832,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "sess".into(),
             "req".into(),
             Replacements::empty(),
+            None,
         );
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
@@ -4873,6 +4897,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "sess".into(),
             "req".into(),
             Replacements::empty(),
+            None,
         );
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
@@ -5650,6 +5675,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "sess".into(),
             "req".into(),
             Replacements::empty(),
+            None,
         );
         let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
@@ -5826,6 +5852,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                     format!("s-{id}"),
                     id.into(),
                     "L",
+                    None,
                 )
             });
             while wrapped.next().await.is_some() {}

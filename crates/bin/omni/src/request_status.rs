@@ -248,7 +248,8 @@ const URL_QUERY_SECRET_KEYS: &[&str] = &[
 ];
 
 fn is_query_key_boundary(prev: u8) -> bool {
-    prev == b'?' || prev == b'&' || prev == b' ' || prev == b'\t'
+    // `?` / `&` start query pairs; `#` starts a fragment (same key=value form).
+    prev == b'?' || prev == b'&' || prev == b'#' || prev == b' ' || prev == b'\t'
 }
 
 fn redact_url_query_secrets(input: &str) -> String {
@@ -342,17 +343,20 @@ fn redact_auth_headers(input: &str) -> String {
     out
 }
 
-/// JSON object keys that carry secret material (both snake and camel forms).
+/// JSON object keys that carry secret material (snake, camel, and dashed forms).
 const JSON_SECRET_KEYS: &[&str] = &[
+    "apikey",
     "api_key",
     "apiKey",
+    "x-api-key",
+    "x_api_key",
     "access_token",
     "accessToken",
     "refresh_token",
+    "client_secret",
     "authorization",
     "password",
     "secret",
-    "client_secret",
     "token",
 ];
 
@@ -454,6 +458,9 @@ fn replace_prefixed_token(input: &str, prefix: &str) -> String {
 }
 
 /// Redact bare `sk-…` / `xai-…` keys: start boundary + min total length.
+///
+/// Walks by UTF-8 char boundaries so multi-byte characters (e.g. `…`) are
+/// preserved in the passthrough path; never uses `bytes[i] as char`.
 fn replace_dashed_key_tokens(
     input: &str,
     prefix: &[u8],
@@ -464,7 +471,10 @@ fn replace_dashed_key_tokens(
     let bytes = input.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if i + prefix.len() <= bytes.len() && &bytes[i..i + prefix.len()] == prefix {
+        if i + prefix.len() <= bytes.len()
+            && input.is_char_boundary(i)
+            && &bytes[i..i + prefix.len()] == prefix
+        {
             let boundary_ok = i == 0
                 || (!bytes[i - 1].is_ascii_alphanumeric()
                     && bytes[i - 1] != b'_'
@@ -483,8 +493,10 @@ fn replace_dashed_key_tokens(
                 }
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // Advance one UTF-8 character so multi-byte sequences stay intact.
+        let ch = input[i..].chars().next().expect("i is a char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -993,8 +1005,68 @@ mod tests {
         // First already REDACTED, second still live.
         assert!(still_secret_shaped("?api_key=REDACTED&api_key=stillsecretvalue"));
         assert!(still_secret_shaped(r#"{"api_key":"stillsecretvalue"}"#));
+        assert!(still_secret_shaped(r#"{"apikey":"opaque_secret_123456"}"#));
+        assert!(still_secret_shaped("#access_token=opaque_secret_123456"));
         assert!(!still_secret_shaped("?api_key=REDACTED&x=1"));
         assert!(!still_secret_shaped(r#"{"api_key":"REDACTED"}"#));
+    }
+
+    #[test]
+    fn redact_json_apikey_key_or_fail_closed() {
+        // WHY: bare "apikey" (no underscore) is a common JSON secret field name.
+        let raw = r#"upstream body {"apikey":"opaque_secret_123456"}"#;
+        match redact_error_for_log(raw) {
+            Some(s) => {
+                assert!(!s.contains("opaque_secret_123456"), "{s}");
+                assert!(s.contains("REDACTED"), "{s}");
+            }
+            None => {} // fail-closed omit also acceptable
+        }
+    }
+
+    #[test]
+    fn redact_fragment_access_token_or_fail_closed() {
+        // WHY: fragment-bound keys (#access_token=…) must redact like query pairs.
+        let raw = "redirect https://example.com/cb#access_token=opaque_secret_123456 failed";
+        match redact_error_for_log(raw) {
+            Some(s) => {
+                assert!(!s.contains("opaque_secret_123456"), "{s}");
+                assert!(s.contains("REDACTED"), "{s}");
+            }
+            None => {} // fail-closed omit also acceptable
+        }
+        let scrubbed = super::redact_url_query_secrets(raw);
+        assert!(!scrubbed.contains("opaque_secret_123456"), "{scrubbed}");
+    }
+
+    #[test]
+    fn redact_dashed_key_preserves_utf8() {
+        // WHY: byte-as-char passthrough corrupted multi-byte UTF-8 (e.g. …).
+        let raw = "upstream … failed with sk-abcdefghijklmnopqrstuv";
+        match redact_error_for_log(raw) {
+            Some(s) => {
+                assert!(s.contains('…') || s.contains("…"), "{s}");
+                assert!(!s.contains("abcdefghijklmnopqrstuv"), "{s}");
+                assert!(s.contains("sk-REDACTED") || s.contains("REDACTED"), "{s}");
+            }
+            None => {
+                // Fail-closed is fine for residual secrets, but direct redactor
+                // must keep UTF-8 when rewriting sk- material.
+                let scrubbed = super::replace_dashed_key_tokens(
+                    raw,
+                    b"sk-",
+                    "sk-REDACTED",
+                    12,
+                );
+                assert!(scrubbed.contains('…'), "{scrubbed}");
+                assert!(scrubbed.contains("sk-REDACTED"), "{scrubbed}");
+                assert!(!scrubbed.contains("abcdefghijklmnopqrstuv"), "{scrubbed}");
+            }
+        }
+        let scrubbed =
+            super::replace_dashed_key_tokens(raw, b"sk-", "sk-REDACTED", 12);
+        assert!(scrubbed.contains('…'), "{scrubbed}");
+        assert!(scrubbed.contains("sk-REDACTED"), "{scrubbed}");
     }
 
     #[test]
