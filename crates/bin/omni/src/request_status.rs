@@ -343,17 +343,20 @@ fn redact_auth_headers(input: &str) -> String {
     out
 }
 
-/// JSON object keys that carry secret material (snake, camel, and dashed forms).
+/// JSON object keys that carry secret material (lowercase forms only).
+/// Matching is case-insensitive so API_KEY, Authorization, ApiKey, X-API-Key,
+/// accessToken, etc. all hit the same entries.
 const JSON_SECRET_KEYS: &[&str] = &[
     "apikey",
     "api_key",
-    "apiKey",
     "x-api-key",
     "x_api_key",
     "access_token",
-    "accessToken",
+    "accesstoken",
     "refresh_token",
+    "refreshtoken",
     "client_secret",
+    "clientsecret",
     "authorization",
     "password",
     "secret",
@@ -361,21 +364,23 @@ const JSON_SECRET_KEYS: &[&str] = &[
 ];
 
 fn redact_json_secret_fields(input: &str) -> String {
-    // Walk every occurrence; advance past already-REDACTED values so later
-    // duplicates (e.g. "api_key":"a","api_key":"b") are scrubbed.
+    // Walk every occurrence case-insensitively; advance past already-REDACTED
+    // values so later duplicates (e.g. "api_key":"a","API_KEY":"b") are scrubbed.
+    // Scan a lowercased copy for key positions; redact in the original string
+    // (ASCII keys preserve byte offsets under to_ascii_lowercase).
     let mut out = input.to_string();
     for key in JSON_SECRET_KEYS {
-        // "key":"value" or 'key':'value'
-        let patterns = [format!("\"{key}\""), format!("'{key}'")];
-        for pat in patterns {
+        for quote in ['"', '\''] {
+            let needle = format!("{quote}{key}{quote}");
             let mut search_from = 0;
             let mut guard = 0;
             loop {
-                let Some(rel) = out[search_from..].find(&pat) else {
+                let lower = out.to_ascii_lowercase();
+                let Some(rel) = lower[search_from..].find(&needle) else {
                     break;
                 };
                 let idx = search_from + rel;
-                let after_key = idx + pat.len();
+                let after_key = idx + needle.len();
                 let rest = &out[after_key..];
                 let Some(colon_rel) = rest.find(':') else {
                     search_from = after_key;
@@ -545,12 +550,13 @@ fn still_secret_shaped(s: &str) -> bool {
             search_from = start + needle.len() + token.len().max(1);
         }
     }
-    // Residual JSON "key":"value" for secret keys (non-REDACTED string values).
+    // Residual JSON "key":"value" for secret keys (case-insensitive; non-REDACTED).
+    // Scan lowercased copy for key positions; inspect values in the original.
     for key in JSON_SECRET_KEYS {
         for quote in ['"', '\''] {
             let pat = format!("{quote}{key}{quote}");
             let mut search_from = 0;
-            while let Some(rel) = s[search_from..].find(&pat) {
+            while let Some(rel) = lower[search_from..].find(&pat) {
                 let idx = search_from + rel;
                 let after_key = idx + pat.len();
                 let rest = &s[after_key..];
@@ -682,17 +688,23 @@ fn truncate_chars(s: &str, max: usize) -> String {
 }
 
 /// Format the complete line for tests / conv-log. Never panics.
+///
+/// Client-controlled text (`model`, `requested_model`) is control-char sanitized
+/// so embedded newlines cannot forge extra log lines (unlike `sanitize_message`,
+/// which preserves `\n` for banners).
 pub fn format_request_complete_fields(params: &RequestCompleteParams) -> String {
     let finish_reason = resolve_finish_reason(&params.finish, params.outcome);
     let outcome = match params.outcome {
         Outcome::Ok => "ok",
         Outcome::Error => "error",
     };
+    // model can be raw client text on bad_request paths; always single-line.
+    let model = sanitize_control_chars(&params.model);
     let mut out = String::new();
     let _ = write!(
         out,
         "model={} finish_reason={} duration_ms={:.1} outcome={}",
-        params.model, finish_reason, params.duration_ms, outcome
+        model, finish_reason, params.duration_ms, outcome
     );
     if let Some(n) = params.input_tokens {
         let _ = write!(out, " input_tokens={n}");
@@ -710,6 +722,7 @@ pub fn format_request_complete_fields(params: &RequestCompleteParams) -> String 
         let _ = write!(out, " ttft_ms={t:.1}");
     }
     if let Some(ref rm) = params.requested_model {
+        let rm = sanitize_control_chars(rm);
         let _ = write!(out, " requested_model={rm}");
     }
     if let Some(ref raw_err) = params.error {
@@ -724,7 +737,8 @@ pub fn format_request_complete_fields(params: &RequestCompleteParams) -> String 
 ///
 /// Required fields are structured (so `finish_reason` keeps log-color cues).
 /// Optional token/cache/ttft/error keys are appended to the message only when
-/// present, never as Debug `Some(...)`.
+/// present, never as Debug `Some(...)`. Client text in the message path is
+/// control-char sanitized so `sanitize_message` cannot re-emit forged newlines.
 pub fn log_request_complete(params: &RequestCompleteParams) {
     let finish_reason = resolve_finish_reason(&params.finish, params.outcome);
     let outcome = match params.outcome {
@@ -732,6 +746,8 @@ pub fn log_request_complete(params: &RequestCompleteParams) {
         Outcome::Error => "error",
     };
     let duration = format!("{:.1}", params.duration_ms);
+    // model may be raw client text (bad_request); sanitize before structured field.
+    let model = sanitize_control_chars(&params.model);
 
     let mut optional = String::new();
     if let Some(n) = params.input_tokens {
@@ -750,6 +766,7 @@ pub fn log_request_complete(params: &RequestCompleteParams) {
         let _ = write!(optional, " ttft_ms={t:.1}");
     }
     if let Some(ref rm) = params.requested_model {
+        let rm = sanitize_control_chars(rm);
         let _ = write!(optional, " requested_model={rm}");
     }
     if let Some(ref raw_err) = params.error {
@@ -762,7 +779,7 @@ pub fn log_request_complete(params: &RequestCompleteParams) {
     // structured field named `optional`.
     let message = format!("request_complete{optional}");
     info!(
-        model = %params.model,
+        model = %model,
         finish_reason = %finish_reason,
         duration_ms = %duration,
         outcome = %outcome,
@@ -1025,6 +1042,39 @@ mod tests {
     }
 
     #[test]
+    fn redact_json_secret_keys_case_insensitive() {
+        // WHY: API_KEY / Authorization / X-API-Key / ApiKey must not slip past
+        // exact-case matching and leak into error= (or residual fail-closed).
+        for raw in [
+            r#"upstream body {"API_KEY":"opaque_secret_123456"}"#,
+            r#"upstream body {"Authorization":"secretvaluehere123"}"#,
+            r#"upstream body {"X-API-Key":"opaque_secret_123456"}"#,
+            r#"upstream body {"ApiKey":"opaque_secret_123456"}"#,
+            r#"upstream body {"accessToken":"opaque_secret_123456"}"#,
+        ] {
+            match redact_error_for_log(raw) {
+                Some(s) => {
+                    assert!(!s.contains("opaque_secret_123456"), "{s}");
+                    assert!(!s.contains("secretvaluehere123"), "{s}");
+                    assert!(s.contains("REDACTED"), "{s}");
+                }
+                None => {} // fail-closed omit also acceptable
+            }
+            // Direct redactor must rewrite the value (not only residual omit).
+            let scrubbed = super::redact_json_secret_fields(raw);
+            assert!(!scrubbed.contains("opaque_secret_123456"), "{scrubbed}");
+            assert!(!scrubbed.contains("secretvaluehere123"), "{scrubbed}");
+            assert!(scrubbed.contains("REDACTED"), "{scrubbed}");
+        }
+        // Residual detector must catch unredacted case variants.
+        assert!(still_secret_shaped(r#"{"API_KEY":"opaque_secret_123456"}"#));
+        assert!(still_secret_shaped(
+            r#"{"Authorization":"secretvaluehere123"}"#
+        ));
+        assert!(!still_secret_shaped(r#"{"API_KEY":"REDACTED"}"#));
+    }
+
+    #[test]
     fn redact_fragment_access_token_or_fail_closed() {
         // WHY: fragment-bound keys (#access_token=…) must redact like query pairs.
         let raw = "redirect https://example.com/cb#access_token=opaque_secret_123456 failed";
@@ -1165,6 +1215,46 @@ mod tests {
             Some("sonnet".into())
         );
         assert_eq!(requested_model_if_differs("m", "m"), None);
+    }
+
+    #[test]
+    fn requested_model_and_model_strip_control_chars_single_line() {
+        // WHY: client-controlled model text is appended into the message path;
+        // sanitize_message preserves newlines for banners, so controls must be
+        // stripped here or a model like "x\nEVIL" forges a second log line.
+        let evil_rm = "client-model\nEVIL_FORGED_LINE";
+        let evil_model = "stats-key\nEVIL_MODEL_LINE";
+        let params = RequestCompleteParams::ok(
+            evil_model,
+            FinishSite {
+                entered_body: true,
+                finish_latch: Some("stop".into()),
+                ..Default::default()
+            },
+            1.0,
+        )
+        .with_requested_model(Some(evil_rm.into()));
+        let s = format_request_complete_fields(&params);
+        assert_eq!(s.lines().count(), 1, "multi-line status: {s}");
+        assert!(!s.contains('\n'), "{s}");
+        assert!(!s.contains('\r'), "{s}");
+        assert!(!s.contains("EVIL_FORGED_LINE\n") && !s.starts_with("EVIL"), "{s}");
+        // Content preserved without controls (spaces collapse runs).
+        assert!(s.contains("requested_model=client-model EVIL_FORGED_LINE"), "{s}");
+        assert!(s.contains("model=stats-key EVIL_MODEL_LINE"), "{s}");
+        // Bad-request path: raw requested model used as model key alone.
+        let bad = RequestCompleteParams::error(
+            "raw\nEVIL_ONLY_MODEL",
+            FinishSite {
+                entered_body: false,
+                ..Default::default()
+            },
+            0.0,
+        );
+        let s2 = format_request_complete_fields(&bad);
+        assert_eq!(s2.lines().count(), 1, "{s2}");
+        assert!(!s2.contains('\n'), "{s2}");
+        assert!(s2.contains("model=raw EVIL_ONLY_MODEL"), "{s2}");
     }
 
     #[test]
