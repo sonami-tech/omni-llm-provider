@@ -90,7 +90,12 @@ use provider_codex::CodexProvider;
 use provider_grok::GrokProvider;
 
 mod log_color;
+mod request_status;
 use log_color::{ColorFields, ColorMode};
+use request_status::{
+    FinishSite, RequestCompleteParams, format_conv_log_finish_summary, log_request_complete,
+    log_request_start, map_anthropic_stop_reason, requested_model_if_differs,
+};
 
 const OMNI_ASCII_BANNER: &str = r#"
    ___  __  __ _   _ ___
@@ -747,6 +752,10 @@ async fn request_span_layer(mut req: Request<Body>, next: middleware::Next) -> R
         session_id = tracing::field::Empty,
         provider = tracing::field::Empty,
     );
+    // Thin hang breadcrumb; model is unknown until the handler resolves it.
+    let _enter = span.enter();
+    log_request_start(None);
+    drop(_enter);
     req.extensions_mut().insert(RequestId(request_id));
     next.run(req).instrument(span).await
 }
@@ -1234,10 +1243,21 @@ async fn chat_completions_handler(
         // Streaming: delegate to the provider's native SSE stream and frame it as
         // OpenAI chat.completion.chunk events (terminated by [DONE]) via the shared
         // serializer. Prefix routing has already selected the provider above.
+        let open_started = Instant::now();
         let stream = provider.send_stream(canon).await.map_err(|e| {
+            let err_msg = e.to_string();
             if let Some(stats) = &state.stats {
-                stats.record_error(&stats_key, &e.to_string());
+                stats.record_error(&stats_key, &err_msg);
             }
+            log_terminal_error_complete(
+                &stats_key,
+                open_started.elapsed().as_secs_f64() * 1000.0,
+                false, // pre-body: stream never opened
+                false,
+                None,
+                Some(err_msg),
+                Some(requested_model.as_str()),
+            );
             map_provider_err(e)
         })?;
         log_text(
@@ -1266,15 +1286,31 @@ async fn chat_completions_handler(
     let _active = state.stats.as_deref().map(ActiveRequestGuard::new);
     let started = Instant::now();
     let canon_resp: CanonicalResponse = provider.send(canon).await.map_err(|e| {
+        let err_msg = e.to_string();
         if let Some(stats) = &state.stats {
-            stats.record_error(&stats_key, &e.to_string());
+            stats.record_error(&stats_key, &err_msg);
         }
+        log_terminal_error_complete(
+            &stats_key,
+            started.elapsed().as_secs_f64() * 1000.0,
+            false, // send failed before a response body with finish_reason
+            false,
+            None,
+            Some(err_msg),
+            Some(requested_model.as_str()),
+        );
         map_provider_err(e)
     })?;
 
     if let Some(stats) = &state.stats {
         record_response_stats(stats, &stats_key, &canon_resp, started);
     }
+    log_nonstream_response_complete(
+        &stats_key,
+        &canon_resp,
+        started.elapsed().as_secs_f64() * 1000.0,
+        Some(requested_model.as_str()),
+    );
 
     // Echo the resolved canonical provider model, not shorthand aliases.
     let oai = from_canonical(canon_resp, stripped_model, chat_id, created);
@@ -1306,6 +1342,19 @@ fn record_bad_request(state: &AppState, model: &str, msg: String) -> AppError {
     if let Some(stats) = &state.stats {
         stats.record_error(model, &msg);
     }
+    // Pre-body client error: never entered a finish-capable body path.
+    let params = RequestCompleteParams::error(
+        model,
+        FinishSite {
+            entered_body: false,
+            incomplete: false,
+            no_finish_concept: false,
+            finish_latch: None,
+        },
+        0.0,
+    )
+    .with_error(Some(msg.clone()));
+    log_request_complete(&params);
     AppError::BadRequest(msg)
 }
 
@@ -1323,6 +1372,55 @@ fn record_response_stats(
     };
     let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
     stats.record_response(model, usage, None, dur_ms);
+}
+
+/// Twin complete line for non-stream success next to `record_response_stats`.
+fn log_nonstream_response_complete(
+    model: &str,
+    canon_resp: &CanonicalResponse,
+    duration_ms: f64,
+    requested_model: Option<&str>,
+) {
+    let finish = FinishSite {
+        entered_body: true,
+        incomplete: false,
+        no_finish_concept: false,
+        finish_latch: canon_resp.finish_reason.clone(),
+    };
+    let mut params = RequestCompleteParams::ok(model, finish, duration_ms).with_tokens(
+        Some(canon_resp.usage.input_tokens),
+        Some(canon_resp.usage.output_tokens),
+    );
+    // Cache presence is plain u64 without Option in CanonicalUsage; omit rather
+    // than invent zeros (plan temporary rule).
+    if let Some(raw) = requested_model {
+        params = params.with_requested_model(requested_model_if_differs(model, raw));
+    }
+    log_request_complete(&params);
+}
+
+/// Twin complete line for pre-send / transport errors (finish_reason=none).
+fn log_terminal_error_complete(
+    model: &str,
+    duration_ms: f64,
+    entered_body: bool,
+    incomplete: bool,
+    finish_latch: Option<String>,
+    error: Option<String>,
+    requested_model: Option<&str>,
+) {
+    let finish = FinishSite {
+        entered_body,
+        incomplete,
+        no_finish_concept: false,
+        finish_latch,
+    };
+    let mut params =
+        RequestCompleteParams::error(model, finish, duration_ms).with_error(error);
+    if let Some(raw) = requested_model {
+        params = params.with_requested_model(requested_model_if_differs(model, raw));
+    }
+    log_request_complete(&params);
 }
 
 fn is_error_finish_reason(finish_reason: Option<&str>) -> bool {
@@ -1343,11 +1441,16 @@ fn wrap_stream_for_stats(
     // request_id/session_id fields. The stream outlives the handler, so the span
     // must be entered inside the generator body, not relied upon ambiently.
     let span = tracing::Span::current();
+    // Finish labels: "… stream finished" (plan D4).
+    let finished_label = format!("{label} finished");
     let inner = Box::pin(async_stream::stream! {
         let _active = stats.as_deref().map(ActiveRequestGuard::new);
         let started = Instant::now();
         let mut usage = TokenUsage::default();
+        let mut usage_observed = false;
         let mut finished = false;
+        // Latch last Finish reason synchronously in the Finish arm (before yield).
+        let mut finish_latch: Option<String> = None;
 
         while let Some(item) = futures_util::StreamExt::next(&mut stream).await {
             match item {
@@ -1358,36 +1461,81 @@ fn wrap_stream_for_stats(
                         cache_read_input_tokens: u.cache_read,
                         cache_creation_input_tokens: u.cache_creation,
                     };
+                    usage_observed = true;
                     yield Ok(CanonicalStreamEvent::Usage(u));
                 }
                 Ok(CanonicalStreamEvent::Finish { finish_reason }) => {
                     finished = true;
+                    // Latch before record_*/yield so twin sees the same value.
+                    finish_latch = finish_reason.clone();
                     let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
-                    if is_error_finish_reason(finish_reason.as_deref()) {
+                    let is_err = is_error_finish_reason(finish_reason.as_deref());
+                    if is_err {
+                        let msg = finish_reason
+                            .as_deref()
+                            .unwrap_or("error")
+                            .trim_start_matches("error:")
+                            .trim()
+                            .to_string();
                         if let Some(stats) = stats.as_ref() {
-                            let msg = finish_reason
-                                .as_deref()
-                                .unwrap_or("error")
-                                .trim_start_matches("error:")
-                                .trim();
-                            stats.record_error(&model, msg);
+                            stats.record_error(&model, &msg);
                         }
-                    } else if let Some(stats) = stats.as_ref() {
-                        stats.record_response(
-                            &model,
-                            usage,
-                            None,
+                        let params = RequestCompleteParams::error(
+                            model.clone(),
+                            FinishSite {
+                                entered_body: true,
+                                incomplete: false,
+                                no_finish_concept: false,
+                                finish_latch: finish_latch.clone(),
+                            },
                             dur_ms,
-                        );
-                    }
-                    if let Some(log) = conversation_log.as_ref() {
-                        log.log(
-                            &session_id,
-                            &request_id,
-                            "<<<",
-                            label,
-                            &format!("finish_reason={:?} duration_ms={dur_ms:.1}", finish_reason),
-                        );
+                        )
+                        .with_error(Some(msg));
+                        log_request_complete(&params);
+                        if let Some(log) = conversation_log.as_ref() {
+                            log.log(
+                                &session_id,
+                                &request_id,
+                                "<<<",
+                                &finished_label,
+                                &format_conv_log_finish_summary(&params),
+                            );
+                        }
+                    } else {
+                        if let Some(stats) = stats.as_ref() {
+                            stats.record_response(
+                                &model,
+                                usage,
+                                None,
+                                dur_ms,
+                            );
+                        }
+                        let (in_tok, out_tok) = if usage_observed {
+                            (Some(usage.input_tokens), Some(usage.output_tokens))
+                        } else {
+                            (None, None)
+                        };
+                        let params = RequestCompleteParams::ok(
+                            model.clone(),
+                            FinishSite {
+                                entered_body: true,
+                                incomplete: false,
+                                no_finish_concept: false,
+                                finish_latch: finish_latch.clone(),
+                            },
+                            dur_ms,
+                        )
+                        .with_tokens(in_tok, out_tok);
+                        log_request_complete(&params);
+                        if let Some(log) = conversation_log.as_ref() {
+                            log.log(
+                                &session_id,
+                                &request_id,
+                                "<<<",
+                                &finished_label,
+                                &format_conv_log_finish_summary(&params),
+                            );
+                        }
                     }
                     yield Ok(CanonicalStreamEvent::Finish { finish_reason });
                 }
@@ -1396,11 +1544,31 @@ fn wrap_stream_for_stats(
                 }
                 Err(e) => {
                     finished = true;
+                    let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    let err_msg = e.to_string();
                     if let Some(stats) = stats.as_ref() {
-                        stats.record_error(&model, &e.to_string());
+                        stats.record_error(&model, &err_msg);
                     }
+                    let params = RequestCompleteParams::error(
+                        model.clone(),
+                        FinishSite {
+                            entered_body: true,
+                            incomplete: false,
+                            no_finish_concept: false,
+                            finish_latch: finish_latch.clone(),
+                        },
+                        dur_ms,
+                    )
+                    .with_error(Some(err_msg));
+                    log_request_complete(&params);
                     if let Some(log) = conversation_log.as_ref() {
-                        log.log(&session_id, &request_id, "<<<", label, &format!("error={e}"));
+                        log.log(
+                            &session_id,
+                            &request_id,
+                            "<<<",
+                            &finished_label,
+                            &format_conv_log_finish_summary(&params),
+                        );
                     }
                     yield Err(e);
                 }
@@ -1408,16 +1576,29 @@ fn wrap_stream_for_stats(
         }
 
         if !finished {
+            let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
             if let Some(stats) = stats.as_ref() {
                 stats.record_error(&model, "stream ended without Finish event");
             }
+            let params = RequestCompleteParams::error(
+                model.clone(),
+                FinishSite {
+                    entered_body: true,
+                    incomplete: true,
+                    no_finish_concept: false,
+                    finish_latch: finish_latch.clone(),
+                },
+                dur_ms,
+            )
+            .with_error(Some("stream ended without Finish event".into()));
+            log_request_complete(&params);
             if let Some(log) = conversation_log.as_ref() {
                 log.log(
                     &session_id,
                     &request_id,
                     "<<<",
-                    label,
-                    "stream ended without finish",
+                    &finished_label,
+                    &format_conv_log_finish_summary(&params),
                 );
             }
         }
@@ -1582,13 +1763,24 @@ async fn anthropic_messages_inner(
     );
 
     if prepared.stream {
+        let open_started = Instant::now();
         let stream = claude
             .send_anthropic_messages_stream(prepared.body(), &ctx)
             .await
             .map_err(|error| {
+                let err_msg = error.to_string();
                 if let Some(stats) = &state.stats {
-                    stats.record_error(&stats_key, &error.to_string());
+                    stats.record_error(&stats_key, &err_msg);
                 }
+                log_terminal_error_complete(
+                    &stats_key,
+                    open_started.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    false,
+                    None,
+                    Some(err_msg),
+                    Some(prepared.requested_model.as_str()),
+                );
                 map_provider_err(error)
             })?;
         log_text(
@@ -1616,23 +1808,50 @@ async fn anthropic_messages_inner(
         .send_anthropic_messages_json(prepared.body(), &ctx)
         .await
         .map_err(|error| {
+            let err_msg = error.to_string();
             if let Some(stats) = &state.stats {
-                stats.record_error(&stats_key, &error.to_string());
+                stats.record_error(&stats_key, &err_msg);
             }
+            log_terminal_error_complete(
+                &stats_key,
+                started.elapsed().as_secs_f64() * 1000.0,
+                false,
+                false,
+                None,
+                Some(err_msg),
+                Some(prepared.requested_model.as_str()),
+            );
             map_provider_err(error)
         })?;
     provider_claude::anthropic_passthrough::apply_response_replacements_raw(
         &mut value,
         &replacements,
     );
+    let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let usage = provider_claude::anthropic_passthrough::token_usage_from_response(&value);
     if let Some(stats) = &state.stats {
-        stats.record_response(
-            &stats_key,
-            provider_claude::anthropic_passthrough::token_usage_from_response(&value),
-            None,
-            started.elapsed().as_secs_f64() * 1000.0,
-        );
+        stats.record_response(&stats_key, usage, None, dur_ms);
     }
+    let stop_plain = value
+        .get("stop_reason")
+        .and_then(|v| v.as_str())
+        .map(map_anthropic_stop_reason);
+    let params = RequestCompleteParams::ok(
+        stats_key.clone(),
+        FinishSite {
+            entered_body: true,
+            incomplete: false,
+            no_finish_concept: false,
+            finish_latch: stop_plain,
+        },
+        dur_ms,
+    )
+    .with_tokens(Some(usage.input_tokens), Some(usage.output_tokens))
+    .with_requested_model(requested_model_if_differs(
+        &stats_key,
+        &prepared.requested_model,
+    ));
+    log_request_complete(&params);
     log_json(
         &state,
         &session_id,
@@ -1706,13 +1925,25 @@ async fn anthropic_count_tokens_inner(
         prepared.body(),
     );
 
+    let started = Instant::now();
     let value = claude
         .send_anthropic_count_tokens(prepared.body(), &ctx)
         .await
         .map_err(|error| {
+            let err_msg = error.to_string();
             if let Some(stats) = &state.stats {
-                stats.record_error(&stats_key, &error.to_string());
+                stats.record_error(&stats_key, &err_msg);
             }
+            // count_tokens has no finish concept; errors are pre-body style none.
+            log_terminal_error_complete(
+                &stats_key,
+                started.elapsed().as_secs_f64() * 1000.0,
+                false,
+                false,
+                None,
+                Some(err_msg),
+                Some(prepared.requested_model.as_str()),
+            );
             map_provider_err(error)
         })?;
     Ok((anthropic_request_id_header(&short_request_id), Json(value)).into_response())
@@ -1818,9 +2049,14 @@ fn anthropic_sse_response(
         let _active = stats.as_deref().map(ActiveRequestGuard::new);
         let started = Instant::now();
         let mut usage = TokenUsage::default();
+        let mut usage_observed = false;
         let mut ttft_ms: Option<f64> = None;
         let mut stream_failed = false;
         let mut saw_message_stop = false;
+        // Logging-only latch of last terminal stop_reason from message_delta.
+        let mut stop_reason_latch: Option<String> = None;
+        // Exactly one request_complete even if multiple record_error fire.
+        let mut complete_snapshot: Option<RequestCompleteParams> = None;
         let mut repl_state = provider_claude::anthropic_passthrough::RawSseReplState::new(&replacements);
 
         yield Ok::<Event, Infallible>(Event::default().comment("ok"));
@@ -1828,7 +2064,34 @@ fn anthropic_sse_response(
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(frame) => {
+                    // Presence of usage on message_start / message_delta marks
+                    // token fields as observed for the complete line.
+                    let had_usage_fields = match frame.event.as_str() {
+                        "message_start" => frame
+                            .data
+                            .get("message")
+                            .and_then(|m| m.get("usage"))
+                            .is_some(),
+                        "message_delta" => frame.data.get("usage").is_some(),
+                        _ => false,
+                    };
                     provider_claude::anthropic_passthrough::accumulate_stream_usage(&frame, &mut usage);
+                    if had_usage_fields {
+                        usage_observed = true;
+                    }
+                    // Latch terminal stop_reason from message_delta frames.
+                    if frame.event == "message_delta"
+                        || frame.data.get("type").and_then(|v| v.as_str()) == Some("message_delta")
+                    {
+                        if let Some(sr) = frame
+                            .data
+                            .pointer("/delta/stop_reason")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                        {
+                            stop_reason_latch = Some(map_anthropic_stop_reason(sr));
+                        }
+                    }
                     if ttft_ms.is_none()
                         && provider_claude::anthropic_passthrough::is_upstream_content_delta(&frame)
                     {
@@ -1854,6 +2117,22 @@ fn anthropic_sse_response(
                         if let Some(stats) = stats.as_ref() {
                             stats.record_error(&model, &message);
                         }
+                        if complete_snapshot.is_none() {
+                            let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
+                            let params = RequestCompleteParams::error(
+                                model.clone(),
+                                FinishSite {
+                                    entered_body: true,
+                                    incomplete: false,
+                                    no_finish_concept: false,
+                                    finish_latch: stop_reason_latch.clone(),
+                                },
+                                dur_ms,
+                            )
+                            .with_error(Some(message));
+                            log_request_complete(&params);
+                            complete_snapshot = Some(params);
+                        }
                     }
                     if frame.event == "message_stop"
                         || frame.data.get("type").and_then(|v| v.as_str()) == Some("message_stop")
@@ -1868,6 +2147,22 @@ fn anthropic_sse_response(
                                 if let Some(stats) = stats.as_ref() {
                                     stats.record_error(&model, &error);
                                 }
+                                if complete_snapshot.is_none() {
+                                    let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
+                                    let params = RequestCompleteParams::error(
+                                        model.clone(),
+                                        FinishSite {
+                                            entered_body: true,
+                                            incomplete: false,
+                                            no_finish_concept: false,
+                                            finish_latch: stop_reason_latch.clone(),
+                                        },
+                                        dur_ms,
+                                    )
+                                    .with_error(Some(error.clone()));
+                                    log_request_complete(&params);
+                                    complete_snapshot = Some(params);
+                                }
                                 yield Ok(anthropic_error_event(&error));
                                 break;
                             }
@@ -1879,6 +2174,22 @@ fn anthropic_sse_response(
                     stream_failed = true;
                     if let Some(stats) = stats.as_ref() {
                         stats.record_error(&model, &message);
+                    }
+                    if complete_snapshot.is_none() {
+                        let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
+                        let params = RequestCompleteParams::error(
+                            model.clone(),
+                            FinishSite {
+                                entered_body: true,
+                                incomplete: false,
+                                no_finish_concept: false,
+                                finish_latch: stop_reason_latch.clone(),
+                            },
+                            dur_ms,
+                        )
+                        .with_error(Some(message.clone()));
+                        log_request_complete(&params);
+                        complete_snapshot = Some(params);
                     }
                     for (event, data) in repl_state.flush_all(&replacements) {
                         if let Ok(event) = anthropic_sse_event(&event, &data) {
@@ -1902,25 +2213,63 @@ fn anthropic_sse_response(
             if let Some(stats) = stats.as_ref() {
                 stats.record_error(&model, message);
             }
+            if complete_snapshot.is_none() {
+                let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let params = RequestCompleteParams::error(
+                    model.clone(),
+                    FinishSite {
+                        entered_body: true,
+                        incomplete: true,
+                        no_finish_concept: false,
+                        finish_latch: stop_reason_latch.clone(),
+                    },
+                    dur_ms,
+                )
+                .with_error(Some(message.into()));
+                log_request_complete(&params);
+                complete_snapshot = Some(params);
+            }
             yield Ok(anthropic_error_event(message));
         }
         if !stream_failed {
+            let dur_ms = started.elapsed().as_secs_f64() * 1000.0;
             if let Some(stats) = stats.as_ref() {
                 stats.record_response(
                     &model,
                     usage,
                     ttft_ms,
-                    started.elapsed().as_secs_f64() * 1000.0,
+                    dur_ms,
                 );
             }
+            // Success twin only at AS5 (end-of-pump finalize).
+            let (in_tok, out_tok) = if usage_observed {
+                (Some(usage.input_tokens), Some(usage.output_tokens))
+            } else {
+                (None, None)
+            };
+            let params = RequestCompleteParams::ok(
+                model.clone(),
+                FinishSite {
+                    entered_body: true,
+                    incomplete: false,
+                    no_finish_concept: false,
+                    finish_latch: stop_reason_latch.clone(),
+                },
+                dur_ms,
+            )
+            .with_tokens(in_tok, out_tok)
+            .with_ttft_ms(ttft_ms);
+            log_request_complete(&params);
+            complete_snapshot = Some(params);
         }
-        if let Some(log) = conversation_log.as_ref() {
+        // Conv-log finish only when a terminal twin exists (stats-aligned).
+        if let (Some(log), Some(params)) = (conversation_log.as_ref(), complete_snapshot.as_ref()) {
             log.log(
                 &session_id,
                 &request_id,
                 "<<<",
-                "Anthropic Messages stream",
-                &format!("duration_ms={:.1}", started.elapsed().as_secs_f64() * 1000.0),
+                "Anthropic Messages stream finished",
+                &format_conv_log_finish_summary(params),
             );
         }
     };
@@ -2063,10 +2412,21 @@ async fn responses_handler(
     let created_at = omni_common::unix_now_secs();
 
     if body.stream {
+        let open_started = Instant::now();
         let stream = provider.send_stream(canon).await.map_err(|e| {
+            let err_msg = e.to_string();
             if let Some(stats) = &state.stats {
-                stats.record_error(&stats_key, &e.to_string());
+                stats.record_error(&stats_key, &err_msg);
             }
+            log_terminal_error_complete(
+                &stats_key,
+                open_started.elapsed().as_secs_f64() * 1000.0,
+                false,
+                false,
+                None,
+                Some(err_msg),
+                Some(requested_model.as_str()),
+            );
             map_provider_err(e)
         })?;
         log_text(
@@ -2099,14 +2459,30 @@ async fn responses_handler(
     let _active = state.stats.as_deref().map(ActiveRequestGuard::new);
     let started = Instant::now();
     let canon_resp: CanonicalResponse = provider.send(canon).await.map_err(|e| {
+        let err_msg = e.to_string();
         if let Some(stats) = &state.stats {
-            stats.record_error(&stats_key, &e.to_string());
+            stats.record_error(&stats_key, &err_msg);
         }
+        log_terminal_error_complete(
+            &stats_key,
+            started.elapsed().as_secs_f64() * 1000.0,
+            false,
+            false,
+            None,
+            Some(err_msg),
+            Some(requested_model.as_str()),
+        );
         map_provider_err(e)
     })?;
     if let Some(stats) = &state.stats {
         record_response_stats(stats, &stats_key, &canon_resp, started);
     }
+    log_nonstream_response_complete(
+        &stats_key,
+        &canon_resp,
+        started.elapsed().as_secs_f64() * 1000.0,
+        Some(requested_model.as_str()),
+    );
     let resp =
         omni_common::responses_from_canonical(canon_resp, stripped_model, response_id, created_at);
     log_json(
@@ -4671,6 +5047,616 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         .to_string()
     }
 
+    /// Match the event message, not the test function name (which also contains
+    /// the substring `request_complete` under #[traced_test] spans).
+    fn is_request_complete_line(line: &str) -> bool {
+        line.contains("request_status") && line.contains("request_complete")
+            || line.contains(": request_complete ")
+            || line.contains(": request_complete{")
+            || (line.contains(" INFO ") && line.contains("request_complete model="))
+            || (line.contains(" INFO ")
+                && line.contains("request_complete")
+                && line.contains("finish_reason="))
+    }
+
+    fn count_request_complete_lines(lines: &[&str]) -> usize {
+        lines.iter().filter(|l| is_request_complete_line(l)).count()
+    }
+
+    fn request_complete_lines<'a>(lines: &'a [&str]) -> Vec<&'a str> {
+        lines
+            .iter()
+            .copied()
+            .filter(|l| is_request_complete_line(l))
+            .collect()
+    }
+
+    fn assert_no_some_debug(lines: &[&str]) -> Result<(), String> {
+        for line in request_complete_lines(lines) {
+            if line.contains("Some(") {
+                return Err(format!("Debug Option in complete line: {line}"));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_request_complete_chat_nonstream_success() {
+        // WHY: operators need one info complete line per terminal non-stream
+        // success with plain finish_reason and outcome=ok (not Debug Option).
+        #[derive(Debug)]
+        struct StaticProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for StaticProvider {
+            fn id(&self) -> &'static str {
+                "static"
+            }
+            async fn send(
+                &self,
+                req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalResponse, ProviderError> {
+                Ok(CanonicalResponse {
+                    model: req.model,
+                    content: "ok".into(),
+                    tool_calls: vec![],
+                    finish_reason: Some("stop".into()),
+                    usage: omni_core::CanonicalUsage {
+                        input_tokens: 3,
+                        output_tokens: 5,
+                        ..Default::default()
+                    },
+                    id: None,
+                    refusal: None,
+                    ..Default::default()
+                })
+            }
+        }
+        let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
+        providers.insert(
+            "grok".into(),
+            ProviderEntry {
+                provider: Arc::new(StaticProvider),
+                claude_native: None,
+                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
+                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+            },
+        );
+        let (state, _guard) = state_with_stats(providers);
+        let req = ChatCompletionRequest {
+            model: "grok:grok-4.3".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: false,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            extras: serde_json::Value::Null,
+        };
+        let resp = call_chat_handler(state, req).await.expect("ok");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        logs_assert(|lines: &[&str]| {
+            assert_no_some_debug(lines)?;
+            let completes = request_complete_lines(lines);
+            if completes.len() != 1 {
+                return Err(format!(
+                    "expected exactly one request_complete, got {}: {completes:?}",
+                    completes.len()
+                ));
+            }
+            let line = completes[0];
+            if !line.contains("finish_reason=stop") && !line.contains("finish_reason=\"stop\"") {
+                return Err(format!("missing plain finish_reason=stop: {line}"));
+            }
+            if !line.contains("outcome=ok") && !line.contains("outcome=\"ok\"") {
+                return Err(format!("missing outcome=ok: {line}"));
+            }
+            if !line.contains("input_tokens=3") {
+                return Err(format!("missing observed input_tokens: {line}"));
+            }
+            if !line.contains("output_tokens=5") {
+                return Err(format!("missing observed output_tokens: {line}"));
+            }
+            if line.contains("cache_read") || line.contains("cache_creation") {
+                return Err(format!("cache keys must be omitted when presence unknown: {line}"));
+            }
+            Ok(())
+        });
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_request_complete_chat_stream_once_after_drain() {
+        // WHY: complete must fire once at Finish (not stream open), with plain
+        // finish_reason and outcome=ok after the body is drained.
+        #[derive(Debug)]
+        struct StreamingProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for StreamingProvider {
+            fn id(&self) -> &'static str {
+                "streaming"
+            }
+            async fn send(
+                &self,
+                _req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalResponse, ProviderError> {
+                unreachable!("stream test uses send_stream")
+            }
+            async fn send_stream(
+                &self,
+                _req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalStream, ProviderError> {
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(CanonicalStreamEvent::TextDelta("hi".into())),
+                    Ok(CanonicalStreamEvent::Usage(omni_core::CanonicalUsage {
+                        input_tokens: 11,
+                        output_tokens: 7,
+                        ..Default::default()
+                    })),
+                    Ok(CanonicalStreamEvent::Finish {
+                        finish_reason: Some("stop".into()),
+                    }),
+                ])))
+            }
+        }
+        let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
+        providers.insert(
+            "grok".into(),
+            ProviderEntry {
+                provider: Arc::new(StreamingProvider),
+                claude_native: None,
+                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
+                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+            },
+        );
+        let (state, _guard) = state_with_stats(providers);
+        let req = ChatCompletionRequest {
+            model: "grok:grok-4.3".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: true,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            extras: serde_json::Value::Null,
+        };
+        let resp = call_chat_handler(state, req).await.expect("stream opens");
+        // Before drain there must be no complete (stream open is not terminal).
+        logs_assert(|lines: &[&str]| {
+            if count_request_complete_lines(lines) != 0 {
+                return Err("request_complete must not fire on stream open".into());
+            }
+            Ok(())
+        });
+        let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        logs_assert(|lines: &[&str]| {
+            assert_no_some_debug(lines)?;
+            let completes = request_complete_lines(lines);
+            if completes.len() != 1 {
+                return Err(format!(
+                    "expected exactly one complete after drain, got {}: {completes:?}",
+                    completes.len()
+                ));
+            }
+            let line = completes[0];
+            if !line.contains("finish_reason=stop") && !line.contains("finish_reason=\"stop\"") {
+                return Err(format!("missing plain finish_reason: {line}"));
+            }
+            if !line.contains("outcome=ok") && !line.contains("outcome=\"ok\"") {
+                return Err(format!("missing outcome=ok: {line}"));
+            }
+            if !line.contains("input_tokens=11") || !line.contains("output_tokens=7") {
+                return Err(format!("missing usage tokens after Usage event: {line}"));
+            }
+            Ok(())
+        });
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_request_complete_stream_error_outcome() {
+        // WHY: mid-stream Err must emit one complete with outcome=error and
+        // finish_reason=none (empty latch after body entry).
+        #[derive(Debug)]
+        struct FailingStreamProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for FailingStreamProvider {
+            fn id(&self) -> &'static str {
+                "failing-stream"
+            }
+            async fn send(
+                &self,
+                _req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalResponse, ProviderError> {
+                unreachable!("stream test uses send_stream")
+            }
+            async fn send_stream(
+                &self,
+                _req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalStream, ProviderError> {
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(CanonicalStreamEvent::TextDelta("partial".into())),
+                    Err(ProviderError::upstream("boom")),
+                ])))
+            }
+        }
+        let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
+        providers.insert(
+            "grok".into(),
+            ProviderEntry {
+                provider: Arc::new(FailingStreamProvider),
+                claude_native: None,
+                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
+                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+            },
+        );
+        let (state, _guard) = state_with_stats(providers);
+        let req = ChatCompletionRequest {
+            model: "grok:grok-4.3".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: true,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            extras: serde_json::Value::Null,
+        };
+        let resp = call_chat_handler(state, req).await.expect("stream opens");
+        let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        logs_assert(|lines: &[&str]| {
+            assert_no_some_debug(lines)?;
+            let completes = request_complete_lines(lines);
+            if completes.len() != 1 {
+                return Err(format!(
+                    "expected one complete on stream error, got {}: {completes:?}",
+                    completes.len()
+                ));
+            }
+            let line = completes[0];
+            if !line.contains("outcome=error") && !line.contains("outcome=\"error\"") {
+                return Err(format!("missing outcome=error: {line}"));
+            }
+            if !line.contains("finish_reason=none") && !line.contains("finish_reason=\"none\"") {
+                return Err(format!("expected finish_reason=none on empty latch: {line}"));
+            }
+            if line.contains("input_tokens") || line.contains("output_tokens") {
+                return Err(format!("token keys must be omitted when usage missing: {line}"));
+            }
+            Ok(())
+        });
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_request_complete_stream_incomplete() {
+        // WHY: missing Finish is the incomplete control-flow arm; complete must
+        // say finish_reason=incomplete + outcome=error, not invent from emptiness.
+        #[derive(Debug)]
+        struct MissingFinishStreamProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for MissingFinishStreamProvider {
+            fn id(&self) -> &'static str {
+                "missing-finish-stream"
+            }
+            async fn send(
+                &self,
+                _req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalResponse, ProviderError> {
+                unreachable!("stream test uses send_stream")
+            }
+            async fn send_stream(
+                &self,
+                _req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalStream, ProviderError> {
+                Ok(Box::pin(futures_util::stream::iter(vec![Ok(
+                    CanonicalStreamEvent::TextDelta("partial".into()),
+                )])))
+            }
+        }
+        let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
+        providers.insert(
+            "grok".into(),
+            ProviderEntry {
+                provider: Arc::new(MissingFinishStreamProvider),
+                claude_native: None,
+                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
+                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+            },
+        );
+        let (state, _guard) = state_with_stats(providers);
+        let req = ChatCompletionRequest {
+            model: "grok:grok-4.3".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: true,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            extras: serde_json::Value::Null,
+        };
+        let resp = call_chat_handler(state, req).await.expect("stream opens");
+        let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        logs_assert(|lines: &[&str]| {
+            let completes = request_complete_lines(lines);
+            if completes.len() != 1 {
+                return Err(format!(
+                    "expected one incomplete complete, got {}: {completes:?}",
+                    completes.len()
+                ));
+            }
+            let line = completes[0];
+            if !line.contains("finish_reason=incomplete")
+                && !line.contains("finish_reason=\"incomplete\"")
+            {
+                return Err(format!("expected finish_reason=incomplete: {line}"));
+            }
+            if !line.contains("outcome=error") && !line.contains("outcome=\"error\"") {
+                return Err(format!("missing outcome=error: {line}"));
+            }
+            Ok(())
+        });
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_request_complete_success_empty_latch_is_unknown() {
+        // WHY: finish-capable success without finish_reason must read unknown,
+        // not none (none is for pre-body / transport errors).
+        #[derive(Debug)]
+        struct NoFinishReasonProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for NoFinishReasonProvider {
+            fn id(&self) -> &'static str {
+                "no-finish"
+            }
+            async fn send(
+                &self,
+                req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalResponse, ProviderError> {
+                Ok(CanonicalResponse {
+                    model: req.model,
+                    content: "ok".into(),
+                    tool_calls: vec![],
+                    finish_reason: None,
+                    usage: Default::default(),
+                    id: None,
+                    refusal: None,
+                    ..Default::default()
+                })
+            }
+        }
+        let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
+        providers.insert(
+            "grok".into(),
+            ProviderEntry {
+                provider: Arc::new(NoFinishReasonProvider),
+                claude_native: None,
+                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
+                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+            },
+        );
+        let (state, _guard) = state_with_stats(providers);
+        let req = ChatCompletionRequest {
+            model: "grok:grok-4.3".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: false,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            extras: serde_json::Value::Null,
+        };
+        let _ = call_chat_handler(state, req).await.expect("ok");
+        logs_assert(|lines: &[&str]| {
+            let completes = request_complete_lines(lines);
+            let line = completes
+                .first()
+                .copied()
+                .ok_or_else(|| "missing request_complete".to_string())?;
+            if !line.contains("finish_reason=unknown")
+                && !line.contains("finish_reason=\"unknown\"")
+            {
+                return Err(format!("expected finish_reason=unknown: {line}"));
+            }
+            if !line.contains("outcome=ok") && !line.contains("outcome=\"ok\"") {
+                return Err(format!("missing outcome=ok: {line}"));
+            }
+            Ok(())
+        });
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_request_complete_redacts_secret_shaped_errors() {
+        // WHY: optional error= is fail-closed; secret-shaped transport errors
+        // must never leak raw credentials into the complete line.
+        #[derive(Debug)]
+        struct SecretErrorProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for SecretErrorProvider {
+            fn id(&self) -> &'static str {
+                "secret-err"
+            }
+            async fn send(
+                &self,
+                _req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalResponse, ProviderError> {
+                Err(ProviderError::upstream(
+                    "upstream https://api.example.com/v1?api_key=supersecretTOKEN failed",
+                ))
+            }
+        }
+        let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
+        providers.insert(
+            "grok".into(),
+            ProviderEntry {
+                provider: Arc::new(SecretErrorProvider),
+                claude_native: None,
+                models: provider_model_values("grok", GrokProvider::default_models_list()).unwrap(),
+                catalog: grok_model_catalog(&GrokProvider::new(None).expect("grok provider")),
+            },
+        );
+        let (state, _guard) = state_with_stats(providers);
+        let req = ChatCompletionRequest {
+            model: "grok:grok-4.3".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: false,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            extras: serde_json::Value::Null,
+        };
+        let err = call_chat_handler(state, req).await.expect_err("provider fails");
+        let _ = err;
+        logs_assert(|lines: &[&str]| {
+            let completes = request_complete_lines(lines);
+            for line in &completes {
+                if line.contains("supersecretTOKEN") {
+                    return Err(format!("secret leaked in complete line: {line}"));
+                }
+                if !line.contains("outcome=error") && !line.contains("outcome=\"error\"") {
+                    return Err(format!("missing outcome=error: {line}"));
+                }
+                if !line.contains("finish_reason=none") && !line.contains("finish_reason=\"none\"") {
+                    return Err(format!("pre-body error must be finish_reason=none: {line}"));
+                }
+            }
+            if completes.len() != 1 {
+                return Err(format!(
+                    "expected exactly one complete on non-stream error, got {}",
+                    completes.len()
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_request_complete_anthropic_stream_success() {
+        // WHY: Anthropic SSE success must emit one complete at AS5 with mapped
+        // stop_reason (end_turn → stop), not a multi-fire error twin.
+        let stats_path = temp_stats_path();
+        let _stats_guard = TempStats(stats_path.clone());
+        let stats = Arc::new(Stats::open(&stats_path).unwrap());
+        stats.record_request("claude:claude-sonnet-4-6", None);
+        let upstream = futures_util::stream::iter(vec![
+            Ok(provider_claude::upstream::RawFrame {
+                event: "message_start".into(),
+                data: serde_json::json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_s",
+                        "model": "claude-sonnet-4-6",
+                        "usage": {"input_tokens": 5, "output_tokens": 0}
+                    }
+                }),
+            }),
+            Ok(provider_claude::upstream::RawFrame {
+                event: "content_block_delta".into(),
+                data: serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "hi"}
+                }),
+            }),
+            Ok(provider_claude::upstream::RawFrame {
+                event: "message_delta".into(),
+                data: serde_json::json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": 2}
+                }),
+            }),
+            Ok(provider_claude::upstream::RawFrame {
+                event: "message_stop".into(),
+                data: serde_json::json!({"type": "message_stop"}),
+            }),
+        ]);
+        let resp = anthropic_sse_response(
+            Box::pin(upstream),
+            Some(stats),
+            None,
+            "claude:claude-sonnet-4-6".into(),
+            "sess".into(),
+            "req".into(),
+            Replacements::empty(),
+        );
+        let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        logs_assert(|lines: &[&str]| {
+            let completes = request_complete_lines(lines);
+            if completes.len() != 1 {
+                return Err(format!(
+                    "expected one Anthropic stream complete, got {}: {completes:?}",
+                    completes.len()
+                ));
+            }
+            let line = completes[0];
+            if !line.contains("finish_reason=stop") && !line.contains("finish_reason=\"stop\"") {
+                return Err(format!("expected mapped stop_reason→stop: {line}"));
+            }
+            if !line.contains("outcome=ok") && !line.contains("outcome=\"ok\"") {
+                return Err(format!("missing outcome=ok: {line}"));
+            }
+            if !line.contains("input_tokens=5") || !line.contains("output_tokens=2") {
+                return Err(format!("missing Anthropic usage tokens: {line}"));
+            }
+            Ok(())
+        });
+    }
+
     #[tokio::test]
     #[traced_test]
     async fn test_correlation_fields_on_nonstream_log_line() {
@@ -5704,13 +6690,14 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["model"], "grok-4.3");
+        // Bare alias "grok" resolves to the catalog default (currently grok-4.5).
+        assert_eq!(v["model"], "grok-4.5");
     }
 
     #[tokio::test]
     async fn test_stats_keys_normalize_aliases_and_prefixes_to_canonical() {
         // WHY: aliases are request conveniences. Equivalent traffic must not
-        // split metrics across `grok`, `grok-4.3`, and `grok:grok-4.3`.
+        // split metrics across bare alias, canonical id, and `provider:id`.
         #[derive(Debug)]
         struct StaticProvider;
         #[async_trait::async_trait]
@@ -5747,7 +6734,8 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             },
         );
         let (state, _guard) = state_with_stats(providers);
-        for model in ["grok", "grok-4.3", "grok:grok-4.3"] {
+        // Use the current default-model triple (alias → grok-4.5).
+        for model in ["grok", "grok-4.5", "grok:grok-4.5"] {
             let req = ChatCompletionRequest {
                 model: model.into(),
                 messages: vec![ChatMessage {
@@ -5771,7 +6759,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         }
 
         let snap = state.stats.as_ref().unwrap().snapshot();
-        assert_eq!(snap.models["grok:grok-4.3"].requests, 3);
+        assert_eq!(snap.models["grok:grok-4.5"].requests, 3);
         assert_eq!(snap.models.len(), 1);
     }
 
