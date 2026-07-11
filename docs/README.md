@@ -77,6 +77,9 @@ Useful server flags:
 - `--log-max-bytes <n>` / `OMNI_LOG_MAX_BYTES`
 - `--log-backups <n>` / `OMNI_LOG_BACKUPS`
 - `--no-auth` / `OMNI_NO_AUTH`
+- `--strict-cloud-fidelity` / `OMNI_STRICT_CLOUD_FIDELITY` (default off)
+- `--anthropic-auth-scheme api-key|oauth` / `OMNI_ANTHROPIC_AUTH_SCHEME`
+  (default `api-key`; only enforced when strict cloud fidelity is on)
 
 If `--stats-db` is omitted, Omni writes stats to a fixed temp-file path
 (`omni-stats.redb` under the OS temp directory). Use `--stats-db` for durable
@@ -86,6 +89,11 @@ stats or when running more than one server instance.
 Clients send the key as `Authorization: Bearer <key>`; on the native Anthropic
 paths (`/v1/messages`, `/v1/messages/count_tokens`) the key is also accepted via
 `x-api-key: <key>`, so stock Anthropic SDKs work unchanged.
+Sending both a non-empty `x-api-key` and a non-empty `Authorization: Bearer` on
+those Anthropic paths is always rejected as ambiguous credentials (HTTP 400).
+With `--strict-cloud-fidelity`, Anthropic paths also require the configured
+single-header scheme, and `/v1/chat/completions` enforces OpenAI token-cap field
+shape for known model families (`o1`/`o3`/`o4` vs `gpt-*`).
 On startup, Omni logs its banner and current package version before serving
 requests.
 

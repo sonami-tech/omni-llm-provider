@@ -43,6 +43,11 @@
 //! - Empty key set (via --no-auth or no OMNI_API_KEYS) means "allow all".
 //! - OAuth refresh for Claude/Codex/Grok primary logins is on by default;
 //!   disable with `--no-oauth-refresh` or `OMNI_OAUTH_REFRESH=0`.
+//! - Anthropic paths always reject dual non-empty `x-api-key` + `Authorization: Bearer`
+//!   as ambiguous credentials (HTTP 400).
+//! - Opt-in `--strict-cloud-fidelity` / `OMNI_STRICT_CLOUD_FIDELITY` enforces a single
+//!   Anthropic auth header shape (`--anthropic-auth-scheme` / `OMNI_ANTHROPIC_AUTH_SCHEME`:
+//!   `api-key` or `oauth`) and OpenAI chat token-cap fields for known model families.
 //!
 //! Build: cargo build -p omni
 //! Run (claude only, no keys needed): OMNI_PROVIDERS=claude cargo run -p omni -- --no-auth --port 18321
@@ -89,8 +94,13 @@ use provider_claude::ClaudeProvider;
 use provider_codex::CodexProvider;
 use provider_grok::GrokProvider;
 
+mod cloud_fidelity;
 mod log_color;
 mod request_status;
+use cloud_fidelity::{
+    AnthropicAuthScheme, bearer_token, classify_openai_token_cap_family,
+    dual_anthropic_credentials, strict_anthropic_scheme_ok, validate_strict_token_caps, x_api_key,
+};
 use log_color::{ColorFields, ColorMode};
 use request_status::{
     FinishSite, RequestCompleteParams, format_conv_log_finish_summary, log_request_complete,
@@ -108,8 +118,9 @@ const OMNI_ASCII_BANNER: &str = r#"
 
 /// CLI for the light omni aggregator.
 /// Env vars: OMNI_PROVIDERS, OMNI_BIND, OMNI_PUBLIC, OMNI_PORT, OMNI_NO_AUTH,
-/// OMNI_NO_OAUTH_REFRESH, OMNI_STATS_DB (clap env support). OMNI_API_KEYS
-/// configures auth keys. OMNI_OAUTH_REFRESH=0 also disables OAuth refresh.
+/// OMNI_NO_OAUTH_REFRESH, OMNI_STATS_DB, OMNI_STRICT_CLOUD_FIDELITY,
+/// OMNI_ANTHROPIC_AUTH_SCHEME (clap env support). OMNI_API_KEYS configures auth
+/// keys. OMNI_OAUTH_REFRESH=0 also disables OAuth refresh.
 #[derive(Parser, Debug)]
 #[command(
     name = "omni",
@@ -208,6 +219,21 @@ struct Cli {
     /// installed client; fail loudly at startup if the catalog lacks it.
     #[arg(long, env = "OMNI_MATCH_SYSTEM_EXACT")]
     match_system_exact: bool,
+
+    /// Opt-in cloud-fidelity checks: single Anthropic auth header shape and
+    /// strict OpenAI chat token-cap fields for known model families.
+    #[arg(long, env = "OMNI_STRICT_CLOUD_FIDELITY", default_value_t = false)]
+    strict_cloud_fidelity: bool,
+
+    /// Anthropic auth header scheme enforced when --strict-cloud-fidelity is on.
+    /// `api-key` requires x-api-key only; `oauth` requires Authorization Bearer only.
+    #[arg(
+        long,
+        env = "OMNI_ANTHROPIC_AUTH_SCHEME",
+        value_enum,
+        default_value_t = AnthropicAuthScheme::ApiKey
+    )]
+    anthropic_auth_scheme: AnthropicAuthScheme,
 }
 
 /// Apply CLI flags that providers read via process environment.
@@ -261,6 +287,18 @@ struct AppState {
     providers: HashMap<String, ProviderEntry>,
     stats: Option<Arc<Stats>>,
     conversation_log: Option<Arc<ConversationLog>>,
+    /// Opt-in strict cloud-fidelity profile (auth shape + OpenAI token caps).
+    strict_cloud_fidelity: bool,
+    /// Anthropic header scheme required when `strict_cloud_fidelity` is on.
+    anthropic_auth_scheme: AnthropicAuthScheme,
+}
+
+/// Closed over by the auth middleware (keys + strict profile).
+#[derive(Clone)]
+struct AuthConfig {
+    valid_keys: Arc<HashSet<String>>,
+    strict_cloud_fidelity: bool,
+    anthropic_auth_scheme: AnthropicAuthScheme,
 }
 
 /// Per-request correlation id (full UUID), generated once in `request_span_layer`
@@ -380,6 +418,8 @@ async fn main() -> anyhow::Result<()> {
         providers: providers_map,
         stats,
         conversation_log: build_conversation_log(&cli)?,
+        strict_cloud_fidelity: cli.strict_cloud_fidelity,
+        anthropic_auth_scheme: cli.anthropic_auth_scheme,
     };
     // Auth keys: empty set => allow-all (see omni-common::auth_layer).
     // Support OMNI_API_KEYS= k1,k2,... for a non-empty set when !--no-auth.
@@ -394,7 +434,12 @@ async fn main() -> anyhow::Result<()> {
             .collect();
         Arc::new(keys)
     };
-    info!(no_auth_effective = auth_keys.is_empty(), "auth layer ready");
+    info!(
+        no_auth_effective = auth_keys.is_empty(),
+        strict_cloud_fidelity = state.strict_cloud_fidelity,
+        ?state.anthropic_auth_scheme,
+        "auth layer ready"
+    );
 
     let bind_host = resolve_bind_host(cli.public, cli.bind.as_deref())?;
     let addr: SocketAddr = format!("{}:{}", bind_host, cli.port).parse()?;
@@ -661,6 +706,11 @@ fn resolve_provider_version(
 }
 
 fn build_router(state: Arc<AppState>, auth_keys: Arc<HashSet<String>>) -> Router {
+    let auth = AuthConfig {
+        valid_keys: auth_keys,
+        strict_cloud_fidelity: state.strict_cloud_fidelity,
+        anthropic_auth_scheme: state.anthropic_auth_scheme,
+    };
     Router::new()
         .route("/health", get(health_handler))
         .route("/", get(root_handler))
@@ -675,10 +725,11 @@ fn build_router(state: Arc<AppState>, auth_keys: Arc<HashSet<String>>) -> Router
         .route("/models", get(models_handler))
         .route("/stats", get(stats_handler))
         .with_state(state)
-        // Always layer; the common impl short-circuits when keys are empty.
+        // Always layer; empty keys still run dual-credential / strict checks on
+        // Anthropic paths, then allow-all when no membership set is configured.
         .layer(middleware::from_fn({
-            let keys = auth_keys.clone();
-            move |req, next| omni_auth_layer(keys.clone(), req, next)
+            let auth = auth.clone();
+            move |req, next| omni_auth_layer(auth.clone(), req, next)
         }))
         // Outermost: opens the correlation span before auth runs, so even an
         // auth rejection is logged with a request_id. Layers apply bottom-up,
@@ -687,36 +738,75 @@ fn build_router(state: Arc<AppState>, auth_keys: Arc<HashSet<String>>) -> Router
 }
 
 async fn omni_auth_layer(
-    valid_keys: Arc<HashSet<String>>,
+    auth: AuthConfig,
     mut req: Request<Body>,
     next: middleware::Next,
 ) -> Response {
-    if valid_keys.is_empty() {
+    let is_anthropic =
+        req.uri().path() == "/v1/messages" || req.uri().path() == "/v1/messages/count_tokens";
+
+    // Always-on for Anthropic paths: dual non-empty credentials are ambiguous
+    // (before empty-key passthrough and independent of strict mode).
+    if is_anthropic && dual_anthropic_credentials(req.headers()) {
+        return anthropic_error_response(AppError::BadRequest(
+            "Ambiguous credentials: both non-empty x-api-key and Authorization Bearer headers were provided. Send exactly one."
+                .into(),
+        ));
+    }
+
+    let has_bearer = bearer_token(req.headers()).is_some();
+    let has_x_api_key = x_api_key(req.headers()).is_some();
+
+    if is_anthropic && auth.strict_cloud_fidelity {
+        // When any credential is presented, enforce the configured single-header scheme.
+        if has_bearer || has_x_api_key {
+            if let Err(msg) =
+                strict_anthropic_scheme_ok(auth.anthropic_auth_scheme, has_x_api_key, has_bearer)
+            {
+                return anthropic_error_response(AppError::BadRequest(msg));
+            }
+        }
+        if auth.valid_keys.is_empty() {
+            // Open auth: scheme shape only; missing credentials still allowed.
+            return next.run(req).await;
+        }
+        let key = match auth.anthropic_auth_scheme {
+            AnthropicAuthScheme::ApiKey => x_api_key(req.headers()).map(str::to_string),
+            AnthropicAuthScheme::Oauth => bearer_token(req.headers()).map(str::to_string),
+        };
+        return match key {
+            Some(key) if auth.valid_keys.contains(&key) => {
+                req.extensions_mut().insert(ApiKeyId(auth_key_id(&key)));
+                next.run(req).await
+            }
+            Some(_) => {
+                anthropic_error_response(AppError::Unauthorized("Invalid API key".into()))
+            }
+            None => anthropic_error_response(AppError::Unauthorized(
+                match auth.anthropic_auth_scheme {
+                    AnthropicAuthScheme::ApiKey => {
+                        "Missing API key. Include an 'x-api-key: <key>' header.".into()
+                    }
+                    AnthropicAuthScheme::Oauth => {
+                        "Missing API key. Include an 'Authorization: Bearer <key>' header.".into()
+                    }
+                },
+            )),
+        };
+    }
+
+    if auth.valid_keys.is_empty() {
         return next.run(req).await;
     }
 
-    let is_anthropic =
-        req.uri().path() == "/v1/messages" || req.uri().path() == "/v1/messages/count_tokens";
-    let key = req
-        .headers()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        // Anthropic's official SDKs authenticate with `x-api-key`, not
-        // `Authorization: Bearer`, so on the native Anthropic paths accept the
-        // gateway key from that header too (both may arrive together; the
-        // `Authorization: Bearer` value takes precedence).
-        .or_else(|| {
-            is_anthropic
-                .then(|| req.headers().get("x-api-key"))
-                .flatten()
-                .and_then(|value| value.to_str().ok())
-        })
-        .map(str::trim)
+    // Default mode: single header (Bearer or, on Anthropic paths, x-api-key).
+    // Dual Anthropic credentials already rejected above.
+    let key = bearer_token(req.headers())
+        .or_else(|| is_anthropic.then(|| x_api_key(req.headers())).flatten())
         .map(str::to_string);
 
     match key {
-        Some(key) if valid_keys.contains(&key) => {
+        Some(key) if auth.valid_keys.contains(&key) => {
             req.extensions_mut().insert(ApiKeyId(auth_key_id(&key)));
             next.run(req).await
         }
@@ -1226,6 +1316,14 @@ async fn chat_completions_handler(
         .get(&prov_key)
         .ok_or_else(|| AppError::ServerError("provider disappeared".into()))?;
     let provider = &entry.provider;
+
+    // Strict cloud-fidelity token-cap rules for known OpenAI families only
+    // (after resolve, before to_canonical). Unknown models fail open.
+    if state.strict_cloud_fidelity {
+        let family = classify_openai_token_cap_family(&stripped_model);
+        validate_strict_token_caps(family, body.max_tokens, body.max_completion_tokens)
+            .map_err(|e| record_bad_request(&state, &stats_key, e))?;
+    }
 
     // Build canonical *with the stripped model* so the delegated provider sees the real model name.
     let mut canon = to_canonical(&body).map_err(|e| record_bad_request(&state, &stats_key, e))?;
@@ -2943,6 +3041,52 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_strict_cloud_fidelity_flags_parse() {
+        // WHY: operators need opt-in fidelity flags with stable defaults and env names.
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let old_strict = std::env::var_os("OMNI_STRICT_CLOUD_FIDELITY");
+        let old_scheme = std::env::var_os("OMNI_ANTHROPIC_AUTH_SCHEME");
+        unsafe {
+            std::env::remove_var("OMNI_STRICT_CLOUD_FIDELITY");
+            std::env::remove_var("OMNI_ANTHROPIC_AUTH_SCHEME");
+        }
+        let defaults = Cli::try_parse_from(["omni", "--no-auth"]).unwrap();
+        assert!(!defaults.strict_cloud_fidelity);
+        assert_eq!(defaults.anthropic_auth_scheme, AnthropicAuthScheme::ApiKey);
+
+        let on = Cli::try_parse_from([
+            "omni",
+            "--no-auth",
+            "--strict-cloud-fidelity",
+            "--anthropic-auth-scheme",
+            "oauth",
+        ])
+        .unwrap();
+        assert!(on.strict_cloud_fidelity);
+        assert_eq!(on.anthropic_auth_scheme, AnthropicAuthScheme::Oauth);
+
+        let api_key = Cli::try_parse_from([
+            "omni",
+            "--no-auth",
+            "--anthropic-auth-scheme",
+            "api-key",
+        ])
+        .unwrap();
+        assert_eq!(api_key.anthropic_auth_scheme, AnthropicAuthScheme::ApiKey);
+
+        unsafe {
+            match old_strict {
+                Some(v) => std::env::set_var("OMNI_STRICT_CLOUD_FIDELITY", v),
+                None => std::env::remove_var("OMNI_STRICT_CLOUD_FIDELITY"),
+            }
+            match old_scheme {
+                Some(v) => std::env::set_var("OMNI_ANTHROPIC_AUTH_SCHEME", v),
+                None => std::env::remove_var("OMNI_ANTHROPIC_AUTH_SCHEME"),
+            }
+        }
+    }
+
+    #[test]
     fn test_apply_cli_env_overrides_disables_oauth_refresh() {
         // WHY: providers read process env; CLI flag must land there before init.
         let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -3509,6 +3653,8 @@ requires_openai_auth = false
             providers,
             stats: None,
             conversation_log: None,
+            strict_cloud_fidelity: false,
+            anthropic_auth_scheme: AnthropicAuthScheme::ApiKey,
         })
     }
 
@@ -3520,6 +3666,8 @@ requires_openai_auth = false
                 providers,
                 stats: Some(Arc::new(stats)),
                 conversation_log: None,
+                strict_cloud_fidelity: false,
+                anthropic_auth_scheme: AnthropicAuthScheme::ApiKey,
             }),
             TempStats(path),
         )
@@ -3535,7 +3683,30 @@ requires_openai_auth = false
             conversation_log: Some(Arc::new(
                 ConversationLog::to_dir(dir).expect("open temp conversation log dir"),
             )),
+            strict_cloud_fidelity: false,
+            anthropic_auth_scheme: AnthropicAuthScheme::ApiKey,
         })
+    }
+
+    fn state_with_strict(
+        providers: HashMap<String, ProviderEntry>,
+        scheme: AnthropicAuthScheme,
+    ) -> Arc<AppState> {
+        Arc::new(AppState {
+            providers,
+            stats: None,
+            conversation_log: None,
+            strict_cloud_fidelity: true,
+            anthropic_auth_scheme: scheme,
+        })
+    }
+
+    fn mk_app_strict(
+        providers: HashMap<String, ProviderEntry>,
+        auth_keys: Arc<HashSet<String>>,
+        scheme: AnthropicAuthScheme,
+    ) -> axum::Router {
+        build_router(state_with_strict(providers, scheme), auth_keys)
     }
 
     fn temp_stats_path() -> PathBuf {
@@ -7200,6 +7371,365 @@ rule = [
         assert!(wait_for_200_health(port2, Duration::from_secs(6)));
         let out4 = get(port2, "/health");
         assert_eq!(out4.status, 200);
+    }
+
+    /// Drive `/v1/messages` through the full router (auth + span layers).
+    /// Body is intentionally invalid JSON so successful auth never reaches the
+    /// provider network path; auth rejections still run before body parse.
+    async fn oneshot_messages(
+        app: axum::Router,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, Value) {
+        use tower::ServiceExt;
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json");
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let resp = app
+            .oneshot(builder.body(Body::from("not json")).unwrap())
+            .await
+            .expect("router responds");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            // Axum rejection bodies may be plain text.
+            Value::String(String::from_utf8_lossy(&bytes).into_owned())
+        });
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn test_dual_anthropic_credentials_rejected_open_and_keyed() {
+        // WHY: dual non-empty Anthropic gateway credentials are always ambiguous,
+        // even with open auth (empty key set) and independent of strict mode.
+        let body_msg = "ambiguous";
+        for keys in [
+            Arc::new(HashSet::new()),
+            Arc::new(HashSet::from(["secret123".to_string()])),
+        ] {
+            let app = mk_app_with(
+                HashMap::from([("claude".to_string(), claude_entry())]),
+                keys,
+            );
+            let (status, body) = oneshot_messages(
+                app,
+                &[
+                    ("x-api-key", "secret123"),
+                    ("authorization", "Bearer secret123"),
+                ],
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+            assert_eq!(body["type"], "error");
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            let msg = body["error"]["message"].as_str().unwrap_or("");
+            assert!(
+                msg.to_lowercase().contains(body_msg),
+                "expected dual-cred message, got {msg}"
+            );
+        }
+    }
+
+    fn anthropic_err_message(body: &Value) -> String {
+        body["error"]["message"]
+            .as_str()
+            .or_else(|| body.as_str())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn assert_auth_passed(status: StatusCode, body: &Value) {
+        assert_ne!(status, StatusCode::UNAUTHORIZED, "body={body}");
+        assert_ne!(
+            body["error"]["type"],
+            "authentication_error",
+            "body={body}"
+        );
+        let msg = anthropic_err_message(body).to_lowercase();
+        assert!(
+            !msg.contains("ambiguous") && !msg.contains("strict cloud fidelity"),
+            "auth success must not look like dual/scheme rejection: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_single_anthropic_credential_headers_not_dual_400() {
+        // WHY: stock Anthropic SDKs use x-api-key alone; Bearer alone remains valid
+        // in default mode. Neither path may look like the dual-credential 400.
+        let keys = Arc::new(HashSet::from(["secret123".to_string()]));
+        let app_x = mk_app_with(
+            HashMap::from([("claude".to_string(), claude_entry())]),
+            keys.clone(),
+        );
+        let (status_x, body_x) = oneshot_messages(app_x, &[("x-api-key", "secret123")]).await;
+        assert_auth_passed(status_x, &body_x);
+
+        let app_b = mk_app_with(
+            HashMap::from([("claude".to_string(), claude_entry())]),
+            keys,
+        );
+        let (status_b, body_b) =
+            oneshot_messages(app_b, &[("authorization", "Bearer secret123")]).await;
+        assert_auth_passed(status_b, &body_b);
+    }
+
+    #[tokio::test]
+    async fn test_strict_anthropic_api_key_scheme() {
+        // WHY: strict api-key rejects Bearer-only and accepts x-api-key (with keys).
+        let keys = Arc::new(HashSet::from(["secret123".to_string()]));
+        let providers = HashMap::from([("claude".to_string(), claude_entry())]);
+
+        let (status_bad, body_bad) = oneshot_messages(
+            mk_app_strict(providers.clone(), keys.clone(), AnthropicAuthScheme::ApiKey),
+            &[("authorization", "Bearer secret123")],
+        )
+        .await;
+        assert_eq!(status_bad, StatusCode::BAD_REQUEST, "body={body_bad}");
+        assert_eq!(body_bad["error"]["type"], "invalid_request_error");
+        assert!(
+            body_bad["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("api-key"),
+            "body={body_bad}"
+        );
+
+        let (status_ok, body_ok) = oneshot_messages(
+            mk_app_strict(providers, keys, AnthropicAuthScheme::ApiKey),
+            &[("x-api-key", "secret123")],
+        )
+        .await;
+        assert_auth_passed(status_ok, &body_ok);
+    }
+
+    #[tokio::test]
+    async fn test_strict_anthropic_oauth_scheme() {
+        // WHY: strict oauth rejects x-api-key-only and accepts Bearer (with keys).
+        let keys = Arc::new(HashSet::from(["secret123".to_string()]));
+        let providers = HashMap::from([("claude".to_string(), claude_entry())]);
+
+        let (status_bad, body_bad) = oneshot_messages(
+            mk_app_strict(providers.clone(), keys.clone(), AnthropicAuthScheme::Oauth),
+            &[("x-api-key", "secret123")],
+        )
+        .await;
+        assert_eq!(status_bad, StatusCode::BAD_REQUEST, "body={body_bad}");
+        assert!(
+            body_bad["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("oauth"),
+            "body={body_bad}"
+        );
+
+        let (status_ok, body_ok) = oneshot_messages(
+            mk_app_strict(providers, keys, AnthropicAuthScheme::Oauth),
+            &[("authorization", "Bearer secret123")],
+        )
+        .await;
+        assert_auth_passed(status_ok, &body_ok);
+    }
+
+    #[tokio::test]
+    async fn test_strict_anthropic_open_auth_scheme_shape_only() {
+        // WHY: with empty keys, missing credentials still pass; wrong scheme
+        // header alone is still a 400 under strict mode.
+        let empty = Arc::new(HashSet::new());
+        let providers = HashMap::from([("claude".to_string(), claude_entry())]);
+
+        let (status_none, body_none) = oneshot_messages(
+            mk_app_strict(providers.clone(), empty.clone(), AnthropicAuthScheme::ApiKey),
+            &[],
+        )
+        .await;
+        // Open auth + no headers: auth must allow through (handler may still error later).
+        assert_ne!(status_none, StatusCode::UNAUTHORIZED, "body={body_none}");
+        if status_none == StatusCode::BAD_REQUEST {
+            let msg = body_none["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .to_lowercase();
+            assert!(
+                !msg.contains("ambiguous") && !msg.contains("strict cloud fidelity"),
+                "no-header open auth must not be scheme-rejected: {msg}"
+            );
+        }
+
+        let (status_wrong, body_wrong) = oneshot_messages(
+            mk_app_strict(providers, empty, AnthropicAuthScheme::ApiKey),
+            &[("authorization", "Bearer anything")],
+        )
+        .await;
+        assert_eq!(status_wrong, StatusCode::BAD_REQUEST, "body={body_wrong}");
+        assert!(
+            body_wrong["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("api-key"),
+            "body={body_wrong}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_strict_chat_token_cap_body_rules() {
+        // WHY: strict mode enforces OpenAI token-cap field shape for known families
+        // after model resolve and before to_canonical; unknown families fail open.
+        #[derive(Debug)]
+        struct StaticProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for StaticProvider {
+            fn id(&self) -> &'static str {
+                "static"
+            }
+            async fn send(
+                &self,
+                req: omni_core::CanonicalRequest,
+            ) -> Result<CanonicalResponse, ProviderError> {
+                Ok(CanonicalResponse {
+                    model: req.model,
+                    content: "ok".into(),
+                    tool_calls: vec![],
+                    finish_reason: Some("stop".into()),
+                    usage: omni_core::CanonicalUsage::default(),
+                    id: None,
+                    refusal: None,
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mut catalog = ModelCatalog::default();
+        catalog.insert("o1-mini", "o1-mini");
+        catalog.insert("gpt-4o", "gpt-4o");
+        let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
+        providers.insert(
+            "grok".into(),
+            ProviderEntry {
+                provider: Arc::new(StaticProvider),
+                claude_native: None,
+                models: vec![
+                    serde_json::json!({"id":"o1-mini","owned_by":"grok"}),
+                    serde_json::json!({"id":"gpt-4o","owned_by":"grok"}),
+                ],
+                catalog,
+            },
+        );
+        let state = state_with_strict(providers, AnthropicAuthScheme::ApiKey);
+
+        // Reasoning + max_tokens only -> 400
+        let err = call_chat_handler(
+            state.clone(),
+            ChatCompletionRequest {
+                model: "grok:o1-mini".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: Some("hi".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                stream: false,
+                max_tokens: Some(16),
+                max_completion_tokens: None,
+                temperature: None,
+                top_p: None,
+                tools: None,
+                tool_choice: None,
+                extras: serde_json::Value::Null,
+            },
+        )
+        .await
+        .expect_err("o1-mini + max_tokens must fail strict validation");
+        match err {
+            AppError::BadRequest(msg) => {
+                assert!(msg.contains("max_completion_tokens") || msg.contains("max_tokens"), "{msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        // Reasoning + max_completion_tokens only -> past token-cap validation
+        let ok = call_chat_handler(
+            state.clone(),
+            ChatCompletionRequest {
+                model: "grok:o1-mini".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: Some("hi".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                stream: false,
+                max_tokens: None,
+                max_completion_tokens: Some(16),
+                temperature: None,
+                top_p: None,
+                tools: None,
+                tool_choice: None,
+                extras: serde_json::Value::Null,
+            },
+        )
+        .await
+        .expect("o1-mini + max_completion_tokens should pass strict validation");
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        // Plain + max_completion_tokens only -> 400
+        let err = call_chat_handler(
+            state.clone(),
+            ChatCompletionRequest {
+                model: "grok:gpt-4o".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: Some("hi".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                stream: false,
+                max_tokens: None,
+                max_completion_tokens: Some(16),
+                temperature: None,
+                top_p: None,
+                tools: None,
+                tool_choice: None,
+                extras: serde_json::Value::Null,
+            },
+        )
+        .await
+        .expect_err("gpt-4o + max_completion_tokens must fail strict validation");
+        match err {
+            AppError::BadRequest(msg) => {
+                assert!(msg.contains("max_tokens") || msg.contains("max_completion_tokens"), "{msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        // Plain + max_tokens -> ok past validation
+        let ok = call_chat_handler(
+            state,
+            ChatCompletionRequest {
+                model: "grok:gpt-4o".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: Some("hi".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                stream: false,
+                max_tokens: Some(16),
+                max_completion_tokens: None,
+                temperature: None,
+                top_p: None,
+                tools: None,
+                tool_choice: None,
+                extras: serde_json::Value::Null,
+            },
+        )
+        .await
+        .expect("gpt-4o + max_tokens should pass strict validation");
+        assert_eq!(ok.status(), StatusCode::OK);
     }
 
     #[test]
