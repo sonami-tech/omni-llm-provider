@@ -98,8 +98,8 @@ mod cloud_fidelity;
 mod log_color;
 mod request_status;
 use cloud_fidelity::{
-    AnthropicAuthScheme, bearer_token, classify_openai_token_cap_family,
-    dual_anthropic_credentials, strict_anthropic_scheme_ok, validate_strict_token_caps, x_api_key,
+    AnthropicAuthScheme, anthropic_cred_presence, classify_openai_token_cap_family,
+    strict_anthropic_scheme_ok, validate_strict_token_caps,
 };
 use log_color::{ColorFields, ColorMode};
 use request_status::{
@@ -745,34 +745,35 @@ async fn omni_auth_layer(
     let is_anthropic =
         req.uri().path() == "/v1/messages" || req.uri().path() == "/v1/messages/count_tokens";
 
+    let creds = anthropic_cred_presence(req.headers());
+
     // Always-on for Anthropic paths: dual non-empty credentials are ambiguous
     // (before empty-key passthrough and independent of strict mode).
-    if is_anthropic && dual_anthropic_credentials(req.headers()) {
+    if is_anthropic && creds.dual {
         return anthropic_error_response(AppError::BadRequest(
             "Ambiguous credentials: both non-empty x-api-key and Authorization Bearer headers were provided. Send exactly one."
                 .into(),
         ));
     }
-
-    let has_bearer = bearer_token(req.headers()).is_some();
-    let has_x_api_key = x_api_key(req.headers()).is_some();
+    if is_anthropic && (creds.ambiguous_bearer || creds.ambiguous_x_api_key) {
+        return anthropic_error_response(AppError::BadRequest(
+            "Ambiguous credentials: multiple distinct Authorization Bearer or x-api-key values were provided. Send exactly one."
+                .into(),
+        ));
+    }
 
     if is_anthropic && auth.strict_cloud_fidelity {
-        // When any credential is presented, enforce the configured single-header scheme.
-        if has_bearer || has_x_api_key {
-            if let Err(msg) =
-                strict_anthropic_scheme_ok(auth.anthropic_auth_scheme, has_x_api_key, has_bearer)
-            {
-                return anthropic_error_response(AppError::BadRequest(msg));
-            }
+        // When any credential material is presented, enforce the configured scheme.
+        if let Err(msg) = strict_anthropic_scheme_ok(auth.anthropic_auth_scheme, &creds) {
+            return anthropic_error_response(AppError::BadRequest(msg));
         }
         if auth.valid_keys.is_empty() {
             // Open auth: scheme shape only; missing credentials still allowed.
             return next.run(req).await;
         }
         let key = match auth.anthropic_auth_scheme {
-            AnthropicAuthScheme::ApiKey => x_api_key(req.headers()).map(str::to_string),
-            AnthropicAuthScheme::Oauth => bearer_token(req.headers()).map(str::to_string),
+            AnthropicAuthScheme::ApiKey => creds.x_api_key.clone(),
+            AnthropicAuthScheme::Oauth => creds.bearer_token.clone(),
         };
         return match key {
             Some(key) if auth.valid_keys.contains(&key) => {
@@ -800,10 +801,17 @@ async fn omni_auth_layer(
     }
 
     // Default mode: single header (Bearer or, on Anthropic paths, x-api-key).
-    // Dual Anthropic credentials already rejected above.
-    let key = bearer_token(req.headers())
-        .or_else(|| is_anthropic.then(|| x_api_key(req.headers())).flatten())
-        .map(str::to_string);
+    // Dual Anthropic credentials already rejected above. Bearer scheme is
+    // case-insensitive; scan uses all header values.
+    let key = if is_anthropic {
+        creds
+            .bearer_token
+            .clone()
+            .or_else(|| creds.x_api_key.clone())
+    } else {
+        // Non-Anthropic paths: Authorization Bearer only (OpenAI-style).
+        creds.bearer_token.clone()
+    };
 
     match key {
         Some(key) if auth.valid_keys.contains(&key) => {
@@ -1317,8 +1325,9 @@ async fn chat_completions_handler(
         .ok_or_else(|| AppError::ServerError("provider disappeared".into()))?;
     let provider = &entry.provider;
 
-    // Strict cloud-fidelity token-cap rules for known OpenAI families only
-    // (after resolve, before to_canonical). Unknown models fail open.
+    // Strict cloud-fidelity token-cap rules for known OpenAI-compatible wire
+    // model ids on this chat surface (id shape, not provider backend). Unknown
+    // models fail open. See TokenCapFamily docs.
     if state.strict_cloud_fidelity {
         let family = classify_openai_token_cap_family(&stripped_model);
         validate_strict_token_caps(family, body.max_tokens, body.max_completion_tokens)
@@ -7561,7 +7570,7 @@ rule = [
         }
 
         let (status_wrong, body_wrong) = oneshot_messages(
-            mk_app_strict(providers, empty, AnthropicAuthScheme::ApiKey),
+            mk_app_strict(providers.clone(), empty.clone(), AnthropicAuthScheme::ApiKey),
             &[("authorization", "Bearer anything")],
         )
         .await;
@@ -7572,6 +7581,63 @@ rule = [
                 .unwrap_or("")
                 .contains("api-key"),
             "body={body_wrong}"
+        );
+
+        // Unsupported Authorization scheme alone (open auth + strict) is still shape-invalid.
+        let (status_basic, body_basic) = oneshot_messages(
+            mk_app_strict(providers, empty, AnthropicAuthScheme::ApiKey),
+            &[("authorization", "Basic dXNlcjpwYXNz")],
+        )
+        .await;
+        assert_eq!(status_basic, StatusCode::BAD_REQUEST, "body={body_basic}");
+        let basic_msg = body_basic["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase();
+        assert!(
+            basic_msg.contains("bearer") || basic_msg.contains("strict"),
+            "body={body_basic}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dual_anthropic_credentials_case_insensitive_bearer_and_multi_value() {
+        // WHY: HTTP auth schemes are case-insensitive; HeaderMap::get-only would
+        // miss Bearer when a non-Bearer Authorization value appears first.
+        let keys = Arc::new(HashSet::from(["secret123".to_string()]));
+        let providers = HashMap::from([("claude".to_string(), claude_entry())]);
+
+        let (status_lc, body_lc) = oneshot_messages(
+            mk_app_with(providers.clone(), keys.clone()),
+            &[
+                ("x-api-key", "secret123"),
+                ("authorization", "bearer secret123"),
+            ],
+        )
+        .await;
+        assert_eq!(status_lc, StatusCode::BAD_REQUEST, "body={body_lc}");
+        assert!(
+            anthropic_err_message(&body_lc)
+                .to_lowercase()
+                .contains("ambiguous"),
+            "body={body_lc}"
+        );
+
+        let (status_multi, body_multi) = oneshot_messages(
+            mk_app_with(providers, keys),
+            &[
+                ("authorization", "Basic abc"),
+                ("authorization", "Bearer secret123"),
+                ("x-api-key", "secret123"),
+            ],
+        )
+        .await;
+        assert_eq!(status_multi, StatusCode::BAD_REQUEST, "body={body_multi}");
+        assert!(
+            anthropic_err_message(&body_multi)
+                .to_lowercase()
+                .contains("ambiguous"),
+            "body={body_multi}"
         );
     }
 

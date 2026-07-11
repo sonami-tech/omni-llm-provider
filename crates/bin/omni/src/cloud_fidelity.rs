@@ -19,6 +19,10 @@ pub enum AnthropicAuthScheme {
 }
 
 /// OpenAI chat token-cap family for strict body validation.
+///
+/// Classification keys on **OpenAI-compatible wire model ids** on the chat
+/// completions surface (id shape), not on which backend provider will serve the
+/// request. That matches cloud-contract testing of the OpenAI request form.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TokenCapFamily {
     /// o1 / o3 / o4 family: require `max_completion_tokens`, reject `max_tokens`.
@@ -29,64 +33,177 @@ pub enum TokenCapFamily {
     Unknown,
 }
 
-/// Extract non-empty Bearer token (trimmed), if present.
-pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+/// Parsed Anthropic-path credential presence from request headers.
+///
+/// Scans **all** `authorization` and `x-api-key` values (not just the first).
+/// Bearer scheme matching is case-insensitive per HTTP auth scheme rules.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AnthropicCredPresence {
+    /// First non-empty Bearer token (case-insensitive scheme), if any.
+    pub bearer_token: Option<String>,
+    /// First non-empty `x-api-key` value, if any.
+    pub x_api_key: Option<String>,
+    /// True when both a non-empty Bearer token and non-empty `x-api-key` appear.
+    pub dual: bool,
+    /// True when more than one distinct non-empty Bearer token appears.
+    pub ambiguous_bearer: bool,
+    /// True when more than one distinct non-empty `x-api-key` appears.
+    pub ambiguous_x_api_key: bool,
+    /// True when a non-empty `Authorization` value is present that is not a
+    /// valid Bearer credential (e.g. `Basic …`, bare tokens, empty scheme).
+    pub non_bearer_authorization: bool,
 }
 
-/// Extract non-empty `x-api-key` value (trimmed), if present.
-pub fn x_api_key(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+impl AnthropicCredPresence {
+    pub fn has_bearer(&self) -> bool {
+        self.bearer_token.is_some()
+    }
+
+    pub fn has_x_api_key(&self) -> bool {
+        self.x_api_key.is_some()
+    }
+
+    /// Any credential-shaped material was presented (including malformed Authorization).
+    pub fn any_credential_material(&self) -> bool {
+        self.has_bearer()
+            || self.has_x_api_key()
+            || self.non_bearer_authorization
+            || self.ambiguous_bearer
+            || self.ambiguous_x_api_key
+    }
 }
 
-/// Both non-empty `x-api-key` and non-empty `Authorization: Bearer` present.
+/// Parse a single Authorization header value as a Bearer token.
+/// Scheme match is case-insensitive; token is the remainder after first whitespace.
+pub fn parse_bearer_value(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut parts = value.splitn(2, char::is_whitespace);
+    let scheme = parts.next()?;
+    let rest = parts.next()?.trim();
+    if scheme.eq_ignore_ascii_case("bearer") && !rest.is_empty() {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+/// Collect all Anthropic-relevant credential material from headers.
+pub fn anthropic_cred_presence(headers: &HeaderMap) -> AnthropicCredPresence {
+    let mut presence = AnthropicCredPresence::default();
+    let mut bearer_seen: Vec<String> = Vec::new();
+    let mut xkey_seen: Vec<String> = Vec::new();
+
+    for val in headers.get_all("authorization") {
+        let Ok(raw) = val.to_str() else {
+            presence.non_bearer_authorization = true;
+            continue;
+        };
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        if let Some(tok) = parse_bearer_value(raw) {
+            let tok = tok.to_string();
+            if !bearer_seen.iter().any(|t| t == &tok) {
+                bearer_seen.push(tok);
+            }
+        } else {
+            presence.non_bearer_authorization = true;
+        }
+    }
+
+    for val in headers.get_all("x-api-key") {
+        let Ok(raw) = val.to_str() else {
+            continue;
+        };
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let key = raw.to_string();
+        if !xkey_seen.iter().any(|k| k == &key) {
+            xkey_seen.push(key);
+        }
+    }
+
+    if bearer_seen.len() > 1 {
+        presence.ambiguous_bearer = true;
+    }
+    if xkey_seen.len() > 1 {
+        presence.ambiguous_x_api_key = true;
+    }
+    presence.bearer_token = bearer_seen.into_iter().next();
+    presence.x_api_key = xkey_seen.into_iter().next();
+    presence.dual = presence.bearer_token.is_some() && presence.x_api_key.is_some();
+    presence
+}
+
+/// Both non-empty `x-api-key` and non-empty Bearer present (any values).
 /// Always-on reject for Anthropic paths (independent of strict mode / key set).
 pub fn dual_anthropic_credentials(headers: &HeaderMap) -> bool {
-    x_api_key(headers).is_some() && bearer_token(headers).is_some()
+    anthropic_cred_presence(headers).dual
 }
 
-/// Under strict mode, when any credential is presented, enforce the configured
-/// single-header scheme. Dual credentials are rejected separately before this.
+/// Under strict mode, when any credential material is presented, enforce the
+/// configured single-header scheme. Dual / multi-value ambiguity is handled
+/// separately before this when possible.
 pub fn strict_anthropic_scheme_ok(
     scheme: AnthropicAuthScheme,
-    has_x_api_key: bool,
-    has_bearer: bool,
+    presence: &AnthropicCredPresence,
 ) -> Result<(), String> {
-    if !has_x_api_key && !has_bearer {
-        return Ok(());
+    if presence.ambiguous_bearer || presence.ambiguous_x_api_key {
+        return Err(
+            "Ambiguous credentials: multiple distinct Authorization Bearer or x-api-key values were provided. Send exactly one."
+                .into(),
+        );
     }
-    if has_x_api_key && has_bearer {
+    if presence.dual {
         return Err(
             "Ambiguous credentials: both non-empty x-api-key and Authorization Bearer headers were provided. Send exactly one."
                 .into(),
         );
     }
+    if !presence.any_credential_material() {
+        return Ok(());
+    }
+    if presence.non_bearer_authorization {
+        return Err(
+            "Strict cloud fidelity: Authorization must use the Bearer scheme (case-insensitive) with a non-empty token, or be omitted."
+                .into(),
+        );
+    }
     match scheme {
         AnthropicAuthScheme::ApiKey => {
-            if has_x_api_key {
+            if presence.has_x_api_key() && !presence.has_bearer() {
                 Ok(())
-            } else {
+            } else if presence.has_bearer() {
                 Err(
                     "Strict cloud fidelity (api-key): provide credentials via x-api-key only, not Authorization Bearer."
+                        .into(),
+                )
+            } else {
+                // Credential material without either parsed form should already
+                // have been rejected as non_bearer_authorization.
+                Err(
+                    "Strict cloud fidelity (api-key): provide credentials via x-api-key only."
                         .into(),
                 )
             }
         }
         AnthropicAuthScheme::Oauth => {
-            if has_bearer {
+            if presence.has_bearer() && !presence.has_x_api_key() {
                 Ok(())
-            } else {
+            } else if presence.has_x_api_key() {
                 Err(
                     "Strict cloud fidelity (oauth): provide credentials via Authorization Bearer only, not x-api-key."
+                        .into(),
+                )
+            } else {
+                Err(
+                    "Strict cloud fidelity (oauth): provide credentials via Authorization Bearer only."
                         .into(),
                 )
             }
@@ -157,6 +274,17 @@ pub fn validate_strict_token_caps(
     }
 }
 
+// Backward-compatible thin wrappers used by older call sites / tests.
+/// Extract non-empty Bearer token (trimmed), if present (first Authorization value that parses).
+pub fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    anthropic_cred_presence(headers).bearer_token
+}
+
+/// Extract non-empty `x-api-key` value (trimmed), if present (first non-empty).
+pub fn x_api_key(headers: &HeaderMap) -> Option<String> {
+    anthropic_cred_presence(headers).x_api_key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +311,20 @@ mod tests {
     }
 
     #[test]
+    fn dual_credentials_case_insensitive_bearer() {
+        let h = headers(&[
+            ("x-api-key", "key-a"),
+            ("authorization", "bearer token-b"),
+        ]);
+        assert!(dual_anthropic_credentials(&h));
+        let h2 = headers(&[
+            ("x-api-key", "key-a"),
+            ("authorization", "BEARER token-b"),
+        ]);
+        assert!(dual_anthropic_credentials(&h2));
+    }
+
+    #[test]
     fn dual_credentials_false_for_single_or_empty() {
         assert!(!dual_anthropic_credentials(&headers(&[("x-api-key", "key-a")])));
         assert!(!dual_anthropic_credentials(&headers(&[
@@ -197,7 +339,7 @@ mod tests {
             ("authorization", "Bearer token-b"),
         ])));
         assert!(!dual_anthropic_credentials(&headers(&[])));
-        // Non-Bearer Authorization does not count as Bearer credential.
+        // Non-Bearer Authorization does not count as Bearer credential alone.
         assert!(!dual_anthropic_credentials(&headers(&[
             ("x-api-key", "key-a"),
             ("authorization", "Basic abc"),
@@ -205,26 +347,99 @@ mod tests {
     }
 
     #[test]
+    fn dual_credentials_scans_all_authorization_values() {
+        // First Authorization is Basic; second is Bearer. Must still dual with x-api-key.
+        let h = headers(&[
+            ("authorization", "Basic abc"),
+            ("authorization", "Bearer token-b"),
+            ("x-api-key", "key-a"),
+        ]);
+        assert!(dual_anthropic_credentials(&h));
+        let p = anthropic_cred_presence(&h);
+        assert_eq!(p.bearer_token.as_deref(), Some("token-b"));
+        assert!(p.non_bearer_authorization);
+        assert!(p.dual);
+    }
+
+    #[test]
+    fn dual_credentials_scans_all_x_api_key_values() {
+        let h = headers(&[
+            ("x-api-key", "   "),
+            ("x-api-key", "key-a"),
+            ("authorization", "Bearer token-b"),
+        ]);
+        assert!(dual_anthropic_credentials(&h));
+    }
+
+    #[test]
+    fn parse_bearer_value_case_and_whitespace() {
+        assert_eq!(parse_bearer_value("Bearer tok"), Some("tok"));
+        assert_eq!(parse_bearer_value("bearer tok"), Some("tok"));
+        assert_eq!(parse_bearer_value("  BEARER   tok  "), Some("tok"));
+        assert_eq!(parse_bearer_value("Basic abc"), None);
+        assert_eq!(parse_bearer_value("Bearer "), None);
+        assert_eq!(parse_bearer_value(""), None);
+    }
+
+    #[test]
     fn strict_scheme_api_key_accepts_x_api_key_only() {
-        assert!(strict_anthropic_scheme_ok(AnthropicAuthScheme::ApiKey, true, false).is_ok());
-        let err = strict_anthropic_scheme_ok(AnthropicAuthScheme::ApiKey, false, true).unwrap_err();
+        let ok = AnthropicCredPresence {
+            x_api_key: Some("k".into()),
+            ..Default::default()
+        };
+        assert!(strict_anthropic_scheme_ok(AnthropicAuthScheme::ApiKey, &ok).is_ok());
+        let bearer_only = AnthropicCredPresence {
+            bearer_token: Some("t".into()),
+            ..Default::default()
+        };
+        let err =
+            strict_anthropic_scheme_ok(AnthropicAuthScheme::ApiKey, &bearer_only).unwrap_err();
         assert!(err.contains("api-key"), "{err}");
         assert!(err.contains("x-api-key"), "{err}");
-        assert!(strict_anthropic_scheme_ok(AnthropicAuthScheme::ApiKey, false, false).is_ok());
+        assert!(strict_anthropic_scheme_ok(
+            AnthropicAuthScheme::ApiKey,
+            &AnthropicCredPresence::default()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn strict_scheme_rejects_non_bearer_authorization() {
+        let p = AnthropicCredPresence {
+            non_bearer_authorization: true,
+            ..Default::default()
+        };
+        let err = strict_anthropic_scheme_ok(AnthropicAuthScheme::ApiKey, &p).unwrap_err();
+        assert!(err.to_lowercase().contains("bearer"), "{err}");
+        let err2 = strict_anthropic_scheme_ok(AnthropicAuthScheme::Oauth, &p).unwrap_err();
+        assert!(err2.to_lowercase().contains("bearer"), "{err2}");
     }
 
     #[test]
     fn strict_scheme_oauth_accepts_bearer_only() {
-        assert!(strict_anthropic_scheme_ok(AnthropicAuthScheme::Oauth, false, true).is_ok());
-        let err = strict_anthropic_scheme_ok(AnthropicAuthScheme::Oauth, true, false).unwrap_err();
+        let ok = AnthropicCredPresence {
+            bearer_token: Some("t".into()),
+            ..Default::default()
+        };
+        assert!(strict_anthropic_scheme_ok(AnthropicAuthScheme::Oauth, &ok).is_ok());
+        let x_only = AnthropicCredPresence {
+            x_api_key: Some("k".into()),
+            ..Default::default()
+        };
+        let err = strict_anthropic_scheme_ok(AnthropicAuthScheme::Oauth, &x_only).unwrap_err();
         assert!(err.contains("oauth"), "{err}");
         assert!(err.contains("Bearer"), "{err}");
-        assert!(strict_anthropic_scheme_ok(AnthropicAuthScheme::Oauth, false, false).is_ok());
     }
 
     #[test]
     fn strict_scheme_rejects_dual_if_reached() {
-        let err = strict_anthropic_scheme_ok(AnthropicAuthScheme::ApiKey, true, true).unwrap_err();
+        let dual = AnthropicCredPresence {
+            bearer_token: Some("t".into()),
+            x_api_key: Some("k".into()),
+            dual: true,
+            ..Default::default()
+        };
+        let err = strict_anthropic_scheme_ok(AnthropicAuthScheme::ApiKey, &dual).unwrap_err();
         assert!(err.to_lowercase().contains("ambiguous"), "{err}");
     }
 
@@ -261,9 +476,7 @@ mod tests {
 
     #[test]
     fn validate_token_caps_reasoning() {
-        assert!(
-            validate_strict_token_caps(TokenCapFamily::Reasoning, None, Some(64)).is_ok()
-        );
+        assert!(validate_strict_token_caps(TokenCapFamily::Reasoning, None, Some(64)).is_ok());
         assert!(
             validate_strict_token_caps(TokenCapFamily::Reasoning, Some(64), None)
                 .unwrap_err()
@@ -304,8 +517,6 @@ mod tests {
     #[test]
     fn validate_token_caps_unknown_is_noop() {
         assert!(validate_strict_token_caps(TokenCapFamily::Unknown, None, None).is_ok());
-        assert!(
-            validate_strict_token_caps(TokenCapFamily::Unknown, Some(1), Some(2)).is_ok()
-        );
+        assert!(validate_strict_token_caps(TokenCapFamily::Unknown, Some(1), Some(2)).is_ok());
     }
 }
