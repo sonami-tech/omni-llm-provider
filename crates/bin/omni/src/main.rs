@@ -200,11 +200,6 @@ struct Cli {
     #[arg(long, env = "OMNI_CODEX_VERSION")]
     codex_version: Option<String>,
 
-    /// Grok catalog mode: conservative (only client-advertised models) or extended
-    /// (any verified-working model). Default: extended.
-    #[arg(long, env = "OMNI_GROK_MODE", value_enum, default_value_t = CatalogModeArg::Extended)]
-    grok_mode: CatalogModeArg,
-
     /// Codex catalog mode: conservative or extended. Default: extended.
     #[arg(long, env = "OMNI_CODEX_MODE", value_enum, default_value_t = CatalogModeArg::Extended)]
     codex_mode: CatalogModeArg,
@@ -362,7 +357,7 @@ async fn main() -> anyhow::Result<()> {
                     cli.match_system_exact,
                     "grok",
                 );
-                let p = init_grok_provider(&selector, cli.grok_mode.into())
+                let p = init_grok_provider(&selector)
                     .context("failed to init grok provider")?;
                 // Advertise the catalog the provider actually resolved (mode+version),
                 // not the static default.
@@ -533,17 +528,13 @@ fn init_claude_provider(selector: &VersionSelector) -> anyhow::Result<ClaudeProv
     ClaudeProvider::new_with_profile(profile).map_err(anyhow::Error::from)
 }
 
-fn init_grok_provider(
-    selector: &VersionSelector,
-    mode: omni_core::CatalogMode,
-) -> anyhow::Result<GrokProvider> {
+fn init_grok_provider(selector: &VersionSelector) -> anyhow::Result<GrokProvider> {
     let version = resolve_provider_version("grok", GrokProvider::version_catalog(), selector)?;
     let provider = GrokProvider::new(None)
         .map_err(anyhow::Error::from)?
-        .with_mode(mode)
         .with_version(version.version)
         .map_err(anyhow::Error::from)?;
-    info!(version = version.version, mode = %mode, "grok catalog resolved");
+    info!(version = version.version, "grok catalog resolved");
     if let Some(base_url) = env_nonempty("OMNI_GROK_BASE_URL") {
         info!(
             base_url = %base_url,
@@ -600,8 +591,9 @@ fn init_codex_provider(
 /// Resolve the Claude fingerprint profile for a [`VersionSelector`].
 ///
 /// Claude does not use the conservative/extended catalog split (it already speaks
-/// the exact Anthropic protocol), so only the version selector applies. An exact
-/// or match-system-exact pin that names no known profile is a hard startup error.
+/// the exact Anthropic protocol), so only the version selector applies. Grok also
+/// has a single path (CLI wire). An exact or match-system-exact pin that names no
+/// known profile is a hard startup error.
 fn resolve_claude_profile(
     selector: &VersionSelector,
 ) -> anyhow::Result<&'static provider_claude::FingerprintProfile> {
@@ -2942,7 +2934,6 @@ mod tests {
             "fable=claude-fable-5",
             "grok=grok-4.5",
             "composer=grok-composer-2.5-fast",
-            "build=grok-build",
             "gpt=",
         ] {
             assert!(
@@ -3472,8 +3463,14 @@ mod tests {
     }
 
     fn grok_entry(base_url: &str) -> ProviderEntry {
+        // Custom auth so hermetic tests mock OpenAI-compatible /chat/completions
+        // without requiring the CLI Responses wire.
+        let provider = GrokProvider::new(None)
+            .expect("grok provider")
+            .with_base_url(base_url)
+            .with_custom_auth(Some("k".into()), None, vec![]);
         ProviderEntry {
-            provider: Arc::new(GrokProvider::new_for_test("k", base_url)),
+            provider: Arc::new(provider),
             claude_native: None,
             models: provider_model_values("grok", GrokProvider::default_models_list())
                 .expect("grok model catalog serializes"),
@@ -4273,7 +4270,7 @@ requires_openai_auth = false
             .await;
 
         let provider =
-            init_grok_provider(&VersionSelector::Latest, omni_core::CatalogMode::Extended)
+            init_grok_provider(&VersionSelector::Latest)
                 .expect("custom Grok provider from env");
         let response = provider
             .send(omni_core::CanonicalRequest {
@@ -4335,7 +4332,7 @@ requires_openai_auth = false
             .await;
 
         let provider =
-            init_grok_provider(&VersionSelector::Latest, omni_core::CatalogMode::Extended)
+            init_grok_provider(&VersionSelector::Latest)
                 .expect("OMNI Grok provider from env");
         let response = provider
             .send(omni_core::CanonicalRequest {
@@ -4390,7 +4387,7 @@ requires_openai_auth = false
         }
 
         let provider =
-            init_grok_provider(&VersionSelector::Latest, omni_core::CatalogMode::Extended)
+            init_grok_provider(&VersionSelector::Latest)
                 .expect("custom Grok provider from env");
         let request = || omni_core::CanonicalRequest {
             model: "grok".into(),
@@ -4436,7 +4433,7 @@ requires_openai_auth = false
             .await;
 
         let provider =
-            init_grok_provider(&VersionSelector::Latest, omni_core::CatalogMode::Extended)
+            init_grok_provider(&VersionSelector::Latest)
                 .expect("custom Grok provider from env");
         let response = provider
             .send(omni_core::CanonicalRequest {
@@ -4692,8 +4689,12 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             .filter_map(|m| m["id"].as_str().map(str::to_string))
             .collect();
         assert!(
-            ids.iter().any(|id| id == "grok-4.3"),
+            ids.iter().any(|id| id == "grok-4.5"),
             "grok real catalog entry missing: {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| id == "grok-composer-2.5-fast"),
+            "grok composer catalog entry missing: {ids:?}"
         );
         assert!(
             ids.iter().any(|id| id == "grok-composer-2.5-fast"),

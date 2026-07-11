@@ -7,7 +7,7 @@
 //! with NO `[DONE]` sentinel - that is a Chat Completions convention only).
 //!
 //! It was extracted verbatim from provider-codex so that any provider talking
-//! the same wire at a different host (e.g. Grok "conservative mode") can reuse
+//! the same wire at a different host (e.g. Grok CLI path) can reuse
 //! the exact same parsing, guaranteeing wire parity. To stay decoupled from any
 //! one provider, the three Codex-specific couplings are parameterized:
 //!   1. the canonical metadata `provider` tag -> [`response_to_canonical`] takes

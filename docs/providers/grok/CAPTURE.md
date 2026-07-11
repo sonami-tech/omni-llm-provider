@@ -110,44 +110,38 @@ wrapper around `tools.capture extract jsonl` for sanitized JSONL exports.
 - Any new xAI wire requirement is pinned in a hermetic test.
 - Docs link to source files instead of copying volatile model lists.
 
-## Current Chat Model Findings
+## Current Wire + Model Findings
 
-Re-baselined against grok-shell **0.2.93** and xAI on **2026-07-11**.
+Re-baselined against grok-shell **0.2.93** on **2026-07-11**.
 
-### Conservative (cli-chat-proxy.grok.com `/v1/models`)
+### Default path (cli-chat-proxy.grok.com)
 
-- `grok-4.5` (CLI default; reasoning efforts `low`/`medium`/`high`, default `high`)
-- `grok-composer-2.5-fast`
+Catalog (`/v1/models`):
+
+- `grok-4.5` (default; alias `grok`; reasoning efforts `low`/`medium`/`high`, default `high`)
+- `grok-composer-2.5-fast` (alias `composer`)
 
 Wire notes from live MITM of `grok --single`:
 - Host: `cli-chat-proxy.grok.com`, path `POST /v1/responses`
 - UA / version: `grok-shell/0.2.93 (linux; x86_64)`, `x-grok-client-version: 0.2.93`
-- Fingerprint headers unchanged in shape from 0.2.77: `x-xai-token-auth`,
-  `x-authenticateresponse`, `x-grok-client-identifier`, `x-grok-model-override`,
-  `accept: text/event-stream`
+- Fingerprint headers: `x-xai-token-auth`, `x-authenticateresponse`,
+  `x-grok-client-identifier`, `x-grok-model-override`, `accept: text/event-stream`
 - Main chat body: `model: "grok-4.5"`, `reasoning: { "effort": "high", "summary": "concise" }`,
   `include: ["reasoning.encrypted_content"]`, `store: false`, `stream: true`
 - Session-title side call still uses model `grok-build` (not advertised in `/v1/models`)
 
-### Extended (api.x.ai chat/completions, verified 200)
+`/v1/models` emits only canonical upstream ids. Omni accepts aliases inbound only.
 
-- `grok-4.5` (default; alias `grok`)
-- `grok-4.3`
-- `grok-build-0.1`
-- `grok-4.20-0309-reasoning`
-- `grok-4.20-0309-non-reasoning`
-- work-but-unlisted: `grok-3`, `grok-4`, `grok-build` (alias `build`),
-  `grok-composer-2.5-fast` (alias `composer`)
+### Custom endpoint override
 
-`grok-4.20-multi-agent-0309` is advertised on api.x.ai but is multi-agent-only and
-is not listed by Omni's chat provider. Omni accepts `grok` as shorthand for
-`grok-4.5` and `composer` as shorthand for `grok-composer-2.5-fast`, but
-`/v1/models` emits only canonical upstream ids.
+`OMNI_GROK_BASE_URL` (and legacy `GROK_MODELS_BASE_URL`) switches to an
+OpenAI-compatible `/chat/completions` gateway with custom auth only. That is an
+operator override, not a second catalog mode.
 
 ### Thinking / reasoning_effort
 
-- Chat completions: top-level `"reasoning_effort": "low"|"medium"|"high"`
-- Responses: nested `"reasoning": { "effort": "..." }`
-- On `grok-4.5`, default is `high` and reasoning cannot be disabled (xAI docs +
-  CLI model catalog). Omni maps `CanonicalReasoning.effort` when the client sets it;
-  it does not invent a default when the client omits reasoning.
+- Responses (default): nested `"reasoning": { "effort": "..." }`
+- Custom chat: top-level `"reasoning_effort": "low"|"medium"|"high"`
+- On `grok-4.5`, CLI default is `high` and reasoning cannot be disabled. Omni maps
+  `CanonicalReasoning.effort` when the client sets it; it does not invent a default
+  when the client omits reasoning.

@@ -3,57 +3,23 @@
 //! Grok / xAI provider implementation.
 //!
 //! Uses omni-core canonical types (CanonicalRequest / CanonicalResponse + LlmProvider trait).
-//! Makes real HTTP calls to https://api.x.ai/v1/chat/completions (primary OpenAI-compatible surface).
-//! Auth: default xAI mode resolves a bearer key fresh per request from files,
-//! mirroring the Claude provider. Precedence: `$XAI_CREDENTIALS_PATH`,
-//! a usable `~/.xai/.credentials.json` static key, then `~/.grok/auth.json` (the
-//! Grok CLI's OIDC login, auto-detected). Custom endpoint mode is explicit and uses
-//! only its configured custom auth, so default xAI credentials cannot leak to an
-//! arbitrary base URL. See [`credentials::GrokCredentials`] for the default
-//! source chain and on-disk shapes.
 //!
-//! ## Headers / wire notes (research findings, 2026-06)
-//! - **Standard, no special gates**: `Authorization: Bearer <api key>`, `Content-Type: application/json`.
-//!   No xai-*- headers, no cch checksum, no OAuth subscription gate, no identity preamble, no per-version
-//!   fingerprint profiles (unlike Claude Code provider). xAI accepts standard OpenAI SDK clients pointed at
-//!   base_url="https://api.x.ai/v1".
-//! - API keys are typically prefixed `xai-...` (but the wire does not enforce or inspect the prefix; any valid
-//!   bearer from https://console.x.ai works).
-//! - Primary focus (per requirements): /v1/chat/completions for chat + tools + streaming compat.
-//! - Also exposes /v1/responses (different shape: "input" instead of "messages", "reasoning":{"effort":...},
-//!   output blocks). We deliberately use chat.completions for OpenAI-compat clients and canonical mapping.
-//! - reasoning_effort: for chat.completions surface, top-level string "reasoning_effort": "low"|"medium"|"high"
-//!   (and "none" on older models that allow disabling). On `grok-4.5`, default is "high" and reasoning cannot
-//!   be disabled. In Responses it is nested "reasoning":{"effort":...} (CLI also sends "summary":"concise").
-//!   CanonicalReasoning.effort is mapped to the chat.completions form. Some models reject presence_penalty etc
-//!   when reasoning is active.
-//! - Tools: full function calling (standard OpenAI tool schema). Built-in server-side tools (web_search, x_search,
-//!   code_execution, collections_search, mcp) are also supported by xAI; they can be passed via provider_extras
-//!   or as special tool entries (e.g. {"type":"web_search"}). Custom tools use {"type":"function", "function":{...}}.
-//!   search_parameters (legacy) is deprecated in favor of tools.
-//! - Streaming: SSE on ?stream=true (or "stream":true in body), deltas for content + tool_calls (incremental args).
-//!   Exposed through `LlmProvider::send_stream`.
-//! - Usage: prompt_tokens / completion_tokens + details (cached_tokens/images/audio in prompt,
-//!   reasoning/audio/prediction tokens in completion) map into canonical usage.
-//!   CanonicalResponse extensions if needed.
-//! - Other xAI extensions passed via CanonicalRequest.provider_extras (e.g. service_tier, search_parameters,
-//!   deferred, parallel_tool_calls, response_format for json_schema, etc.). Merged at top level of the wire body.
-//!   Official values for service_tier: "default" | "priority" (affects scheduling/billing per docs.x.ai). No
-//!   other "gate" headers (e.g. no xai-*, no special enterprise tokens on wire for basic use). Built-in tools
-//!   like web_search are passed as top-level tool objects with {"type": "web_search", ...options...} (or via
-//!   provider_extras["tools"] in some flows); /responses surface exists for stateful/agentic use cases but
-//!   chat/completions remains the primary for canonical OpenAI-compat.
-//! - No Replacements or Stats are *required* inside the provider (they are cross-cutting and applied in
-//!   the server layer per omni design). However this crate depends on omni-common and lightly exercises
-//!   Replacements::empty() + apply paths inside the mappers as a hook demonstration. In a fuller integration
-//!   the ctor would accept `Arc<Replacements>` (and/or Stats handle) from omni-common and apply prompt-scope
-//!   rules to message texts/tool surfaces before serialization, and response-scope rules to returned content +
-//!   tool names/arguments after. See omni-common::replacements and omni-common::stats.
+//! Default path matches the installed grok-shell CLI wire:
+//! - host `https://cli-chat-proxy.grok.com`
+//! - `POST /v1/responses` (OpenAI Responses shape)
+//! - CLI fingerprint headers + OIDC bearer (`~/.grok/auth.json` preferred)
+//! - model catalog: `grok-4.5` (alias `grok`) and `grok-composer-2.5-fast` (alias `composer`)
 //!
-//! Production-quality prototype: typed wire structs, robust error mapping to ProviderError, timeouts suitable
-//! for long reasoning traces (5min), tracing, basic id synthesis for tool_calls, support for tools +
-//! reasoning_effort + provider_extras + all core sampling params. Unit tests cover the (de)serialization mappers
-//! with no network.
+//! Custom endpoint mode (`OMNI_GROK_BASE_URL` / `with_custom_auth*`) is a separate operator
+//! override that speaks OpenAI-compatible `/chat/completions` against an arbitrary base URL
+//! with only the configured custom auth (default CLI credentials never leak there).
+//!
+//! Auth (default path): fresh per request via [`credentials::GrokCredentials::load_resolved_cli_async`]
+//! (prefers Grok CLI OIDC for `x-grok-user-id`). Custom endpoints use only their configured auth.
+//!
+//! Reasoning maps to Responses nested `reasoning.effort`. Streaming is SSE via the shared
+//! Responses parser. Custom-endpoint chat path still supports chat-completions mapping for
+//! OpenAI-compat gateways.
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -65,7 +31,7 @@ use omni_common::{env_nonempty, headers_from_env};
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
     CanonicalResponse, CanonicalResponseMetadata, CanonicalStream, CanonicalStreamEvent,
-    CanonicalToolCall, CanonicalToolChoice, CanonicalUsage, CatalogMode, CatalogModel, LlmProvider,
+    CanonicalToolCall, CanonicalToolChoice, CanonicalUsage, CatalogModel, LlmProvider,
     ProviderError, ProviderVersion,
 };
 use reqwest::Client;
@@ -81,68 +47,48 @@ use credentials::GrokCredentials;
 #[cfg(test)]
 static GROK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
+/// Default upstream: the host the installed grok-shell CLI talks to
+/// (`POST /v1/responses`, OpenAI Responses shape).
+const DEFAULT_BASE_URL: &str = "https://cli-chat-proxy.grok.com";
 
-/// Conservative-mode upstream: the host the installed grok-shell CLI talks to
-/// (`POST /v1/responses`, OpenAI Responses shape). Used when conservative mode is
-/// active and the operator has not explicitly overridden `base_url`.
-const CONSERVATIVE_BASE_URL: &str = "https://cli-chat-proxy.grok.com";
-
-/// User-Agent template for conservative-mode requests. `{version}` is filled from
-/// the pinned catalog version (`self.version.version`, e.g. "0.2.93") so the UA
-/// and `x-grok-client-version` cannot drift from the catalog the request claims.
+/// User-Agent template for CLI-parity requests. `{version}` is filled from the
+/// pinned catalog version (`self.version.version`, e.g. "0.2.93") so the UA and
+/// `x-grok-client-version` cannot drift from the catalog the request claims.
 /// Verified live against grok-shell 0.2.93 (2026-07-11; first captured 0.2.60 on
 /// 2026-06-23, UA template unchanged across bumps).
-const CONSERVATIVE_USER_AGENT_TEMPLATE: &str = "grok-shell/{version} (linux; x86_64)";
+const CLI_USER_AGENT_TEMPLATE: &str = "grok-shell/{version} (linux; x86_64)";
 
-// Grok catalogs, re-baselined 2026-07-08 via live capture (docs/providers/grok/CAPTURE.md).
+// Grok catalog, re-baselined 2026-07-11 via live capture (docs/providers/grok/CAPTURE.md).
 //
-// CONSERVATIVE = what the installed grok-shell CLI advertises on its own
-// surface (cli-chat-proxy.grok.com /v1/models): exactly these two. Default model
-// is grok-4.5 (settings also report default_model "grok-4-5"; the wire id is
-// "grok-4.5"). grok-4.5 advertises reasoning_efforts low/medium/high (default
-// high). Session-title side traffic still uses model "grok-build" but that id is
-// not in the advertised catalog.
-//
-// EXTENDED (default) = the api.x.ai /v1/chat/completions surface this provider
-// already speaks - the most optimal working surface for us. The list is the
-// verified union of api.x.ai advertised+chat-OK ids and ids that returned 200 on
-// chat/completions but are not advertised (work-but-unlisted). Aliases are
+// What the installed grok-shell CLI advertises on cli-chat-proxy.grok.com /v1/models:
+// exactly these two. Default model is grok-4.5 (settings also report default_model
+// "grok-4-5"; the wire id is "grok-4.5"). grok-4.5 advertises reasoning_efforts
+// low/medium/high (default high). Session-title side traffic still uses model
+// "grok-build" but that id is not in the advertised catalog. Aliases are
 // inbound-only conveniences (never emitted from /v1/models).
 //
-// Version bumped to 0.2.93 on 2026-07-11. Live capture from grok-shell 0.2.93:
-// fingerprint headers (token-auth, authenticate-response, client version/identifier,
-// UA, model-override, accept text/event-stream) unchanged in shape from 0.2.91;
-// only the version string moved. Main chat body still uses model grok-4.5 with
-// reasoning.effort high + reasoning.summary concise, plus include/store flags we
-// still intentionally omit on Omni's user-driven Responses body. Session headers
+// Live capture from grok-shell 0.2.93: fingerprint headers (token-auth,
+// authenticate-response, client version/identifier, UA, model-override, accept
+// text/event-stream) unchanged in shape from 0.2.91; only the version string moved.
+// Main chat body still uses model grok-4.5 with reasoning.effort high +
+// reasoning.summary concise, plus include/store flags we still intentionally omit
+// on Omni's user-driven Responses body. Session headers
 // (conv/req/session/agent/turn-idx) and x-compaction-at remain intentionally
-// omitted on single-shot Omni requests. Conservative /v1/models still lists
-// grok-4.5 + grok-composer-2.5-fast; extended catalog carried from 0.2.91.
-const GROK_CONSERVATIVE_0_2_93: &[CatalogModel] = &[
+// omitted on single-shot Omni requests.
+const GROK_CATALOG_0_2_93: &[CatalogModel] = &[
     CatalogModel::new("grok-4.5", &["grok"]),
-    CatalogModel::new("grok-composer-2.5-fast", &["composer"]),
-];
-
-const GROK_EXTENDED_0_2_93: &[CatalogModel] = &[
-    CatalogModel::new("grok-4.5", &["grok"]),
-    CatalogModel::new("grok-4.3", &[]),
-    CatalogModel::new("grok-build-0.1", &[]),
-    CatalogModel::new("grok-4.20-0309-reasoning", &[]),
-    CatalogModel::new("grok-4.20-0309-non-reasoning", &[]),
-    // work-but-unlisted on api.x.ai (verified 200 on /v1/chat/completions):
-    CatalogModel::new("grok-3", &[]),
-    CatalogModel::new("grok-4", &[]),
-    CatalogModel::new("grok-build", &["build"]),
     CatalogModel::new("grok-composer-2.5-fast", &["composer"]),
 ];
 
 /// Grok version catalog, newest-first. The version string is the installed
 /// grok-shell CLI version this catalog was verified against.
+///
+/// Both `ProviderVersion` catalog fields point at the same list: omni-core's
+/// shared type still carries two slots (used by Codex); Grok has a single path.
 static GROK_VERSIONS: &[ProviderVersion] = &[ProviderVersion {
     version: "0.2.93",
-    conservative: GROK_CONSERVATIVE_0_2_93,
-    extended: GROK_EXTENDED_0_2_93,
+    conservative: GROK_CATALOG_0_2_93,
+    extended: GROK_CATALOG_0_2_93,
     default_model: "grok-4.5",
 }];
 
@@ -160,25 +106,19 @@ pub struct GrokModelInfo {
 /// Claude provider (see [`credentials::GrokCredentials`] and
 /// docs/grok-gate.md).
 ///
-/// The loader looks for $XAI_CREDENTIALS_PATH, a usable ~/.xai/.credentials.json,
-/// or ~/.grok/auth.json and re-reads on every send (never cached). This picks up
-/// key rotations or refreshes without restarting the process - exactly like
-/// Claude does for ~/.claude/.credentials.json.
+/// Default path: CLI OIDC / credential files re-read on every send (never cached)
+/// so key rotations or CLI re-login are picked up without restarting. Custom
+/// endpoints use only their configured auth.
 #[derive(Debug)]
 pub struct GrokProvider {
     client: Client,
     base_url: String,
     auth: GrokAuthConfig,
-    /// Catalog mode (conservative = advertised-only, extended = optimal working
-    /// surface). Default Extended. Selects which catalog `models_list`,
-    /// `model_aliases`, and inbound model resolution use.
-    mode: CatalogMode,
     /// Pinned version from the provider's own catalog. Default newest.
     version: &'static ProviderVersion,
-    /// Whether conservative mode emits a parity-loss `warn!` when an override
-    /// (custom base_url / custom auth / `XAI_CREDENTIALS_PATH`) is active. True in
-    /// every production constructor; only the conservative test constructor sets it
-    /// false so a mock-pointed test does not log warn noise.
+    /// Whether the CLI path emits a parity-loss `warn!` when an override
+    /// (custom base_url / `XAI_CREDENTIALS_PATH`) is active. True in production
+    /// constructors; test constructors set it false so mock bases do not spam.
     warn_overrides: bool,
 }
 
@@ -189,8 +129,8 @@ enum GrokAuthConfig {
         /// `new(None)` leaves it `None` and the send path resolves from disk.
         fallback_api_key: Option<String>,
         /// Explicit OIDC `user_id` paired with `fallback_api_key`, used for
-        /// `x-grok-user-id` in conservative mode without touching disk (mirrors how
-        /// `fallback_api_key` short-circuits the file chain). `None` in production.
+        /// `x-grok-user-id` without touching disk (mirrors how `fallback_api_key`
+        /// short-circuits the file chain). `None` in production.
         fallback_user_id: Option<String>,
     },
     Custom {
@@ -230,7 +170,6 @@ impl GrokProvider {
                 fallback_api_key: api_key,
                 fallback_user_id: None,
             },
-            mode: CatalogMode::default(),
             version: &GROK_VERSIONS[0],
             warn_overrides: true,
         })
@@ -264,12 +203,6 @@ impl GrokProvider {
         self
     }
 
-    /// Set the catalog mode (conservative vs extended). Chainable. Default Extended.
-    pub fn with_mode(mut self, mode: CatalogMode) -> Self {
-        self.mode = mode;
-        self
-    }
-
     /// Pin a specific version from the provider's catalog. Chainable. Default
     /// newest. Returns `Err` listing available versions if `version` is unknown
     /// (exact-or-fail; no closest match).
@@ -288,38 +221,10 @@ impl GrokProvider {
         Ok(self)
     }
 
-    /// The active catalog for the current mode + pinned version.
+    /// The model catalog for the pinned version.
     fn active_catalog(&self) -> &'static [CatalogModel] {
-        self.version.catalog(self.mode)
-    }
-
-    /// The catalog a chat-completions request should resolve against. Normally the
-    /// active catalog, but on a conservative->extended fallback it must be the
-    /// EXTENDED catalog (the surface actually being hit) so extended-only aliases
-    /// like "grok" resolve instead of being forwarded verbatim.
-    fn fallback_catalog(&self, conservative_fallback: bool) -> &'static [CatalogModel] {
-        if conservative_fallback {
-            self.version.extended
-        } else {
-            self.active_catalog()
-        }
-    }
-
-    /// Whether conservative mode must divert this request to the extended path
-    /// BEFORE attempting the conservative wire. True only for `Custom` auth: the
-    /// conservative wire is xAI-OIDC-specific (Bearer + matching `x-grok-user-id`
-    /// to cli-chat-proxy), so a `Custom` gateway credential is incompatible with
-    /// the grok-shell fingerprint and is honored on the extended path instead. We
-    /// warn accurately here so the log matches what actually happens (no
-    /// conservative request is made for Custom auth).
-    fn conservative_diverts_to_extended(&self) -> bool {
-        if matches!(self.auth, GrokAuthConfig::Custom { .. }) {
-            warn!(
-                "grok conservative mode: custom auth is not compatible with the conservative cli-chat-proxy fingerprint (which needs the xAI OIDC bearer + matching x-grok-user-id); using the extended path (custom endpoint/auth) instead"
-            );
-            return true;
-        }
-        false
+        // Both ProviderVersion slots hold the same Grok catalog.
+        self.version.conservative
     }
 
     /// Configure this provider as a custom OpenAI-compatible endpoint.
@@ -363,34 +268,21 @@ impl GrokProvider {
         self
     }
 
-    /// Test-only constructor (no env, custom client possible in future).
-    /// Not under cfg(test) so bin integration tests and other dependents can construct
-    /// a mock instance for routing tests (while production still uses new()).
+    /// Test-only constructor: points `base_url` at a mock and injects an explicit
+    /// bearer + optional OIDC `user_id` through the real `Default` auth fields so
+    /// the resolver short-circuits the disk chain (same as `new(Some(..))`).
+    /// `warn_overrides` is forced off so the mock base does not spam parity
+    /// warnings. NEVER use real credentials here.
+    ///
+    /// Not under cfg(test) so bin integration tests can construct a mock instance
+    /// (production still uses `new()`).
     pub fn new_for_test(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
-        Self {
-            client: Client::new(),
-            base_url: base_url.into().trim_end_matches('/').to_string(),
-            auth: GrokAuthConfig::Default {
-                fallback_api_key: Some(api_key.into()),
-                fallback_user_id: None,
-            },
-            mode: CatalogMode::default(),
-            version: &GROK_VERSIONS[0],
-            warn_overrides: true,
-        }
+        Self::new_for_test_with_user(api_key, None, base_url)
     }
 
-    /// Test-only constructor for the conservative path: points `base_url` at a
-    /// mock and injects an explicit bearer (a fake JWT) + optional fake user_id
-    /// uuid through the REAL `Default` auth fields, so the resolver short-circuits
-    /// the disk chain exactly the way an operator-supplied `new(Some(..))` key does
-    /// (no test-only field on the production struct). A conservative test thus
-    /// exercises the real request build + HTTP + shared Responses parse without
-    /// touching disk. `warn_overrides` is forced off so the mock base does not spam
-    /// parity warnings (the warn precedence is covered by a unit test on the pure
-    /// helper). NEVER use real credentials here.
-    #[cfg(test)]
-    pub fn new_for_test_conservative(
+    /// Like [`Self::new_for_test`] but also injects a fake `user_id` for
+    /// `x-grok-user-id` header coverage.
+    pub fn new_for_test_with_user(
         api_key: impl Into<String>,
         user_id: Option<String>,
         base_url: impl Into<String>,
@@ -402,7 +294,6 @@ impl GrokProvider {
                 fallback_api_key: Some(api_key.into()),
                 fallback_user_id: user_id,
             },
-            mode: CatalogMode::Conservative,
             version: &GROK_VERSIONS[0],
             warn_overrides: false,
         }
@@ -413,25 +304,25 @@ impl GrokProvider {
         &self.base_url
     }
 
-    /// xAI model catalog for `/v1/models`, for this provider's active mode+version.
+    /// Model catalog for `/v1/models` for this provider's pinned version.
     pub fn models_list(&self) -> Vec<GrokModelInfo> {
         catalog_models_list(self.active_catalog())
     }
 
-    /// Alias map for router-level shorthand support, for the active mode+version.
+    /// Alias map for router-level shorthand support.
     pub fn model_aliases(&self) -> Vec<(&'static str, &'static str)> {
         catalog_model_aliases(self.active_catalog())
     }
 
-    /// Default (newest version, extended mode) `/v1/models` list, for startup
-    /// sites that run before a provider instance exists.
+    /// Default (newest version) `/v1/models` list, for startup sites that run
+    /// before a provider instance exists.
     pub fn default_models_list() -> Vec<GrokModelInfo> {
-        catalog_models_list(GROK_VERSIONS[0].extended)
+        catalog_models_list(GROK_VERSIONS[0].conservative)
     }
 
-    /// Default (newest version, extended mode) alias map, for startup sites.
+    /// Default (newest version) alias map, for startup sites.
     pub fn default_model_aliases() -> Vec<(&'static str, &'static str)> {
-        catalog_model_aliases(GROK_VERSIONS[0].extended)
+        catalog_model_aliases(GROK_VERSIONS[0].conservative)
     }
 
     /// The provider's version catalog (newest-first).
@@ -523,37 +414,29 @@ impl GrokProvider {
         }
     }
 
-    /// The effective conservative upstream base, and whether it is a real override
-    /// (an explicit base_url that is neither the extended default nor the
-    /// conservative host). Precedence: the extended default (`api.x.ai`, untouched
-    /// by the operator) maps to the conservative host with no override; the
-    /// conservative host itself is the intended target (no override); anything else
-    /// is a deliberate redirect (proxy/mock) reported as an override so the caller
-    /// can warn that exact CLI parity no longer holds.
-    fn conservative_base(&self) -> (String, bool) {
+    /// The effective CLI upstream base, and whether it is a real override
+    /// (an explicit base_url that is not the default CLI host). The default host
+    /// is the intended target (no override); anything else is a deliberate
+    /// redirect (proxy/mock) reported as an override so the caller can warn that
+    /// exact CLI parity no longer holds.
+    fn cli_base(&self) -> (String, bool) {
         if self.base_url == DEFAULT_BASE_URL {
-            (CONSERVATIVE_BASE_URL.to_string(), false)
-        } else if self.base_url == CONSERVATIVE_BASE_URL {
             (self.base_url.clone(), false)
         } else {
             (self.base_url.clone(), true)
         }
     }
 
-    /// Resolve credentials for the conservative path (api_key + OIDC user_id).
+    /// Resolve credentials for the CLI path (api_key + OIDC user_id).
     ///
     /// An explicit `fallback_api_key` on the `Default` auth (set by
-    /// `new(Some(..))` / the conservative test constructor) short-circuits the disk
-    /// chain and is used directly, paired with its `fallback_user_id` - the same
-    /// "explicit ctor key wins" rule the chat path uses, so no test-only state
-    /// lives on the production struct. Otherwise the CONSERVATIVE file chain is used
-    /// (which prefers the Grok CLI OIDC login so `x-grok-user-id` is present; see
-    /// [`credentials::GrokCredentials::load_resolved_conservative_async`]), picking
-    /// up a CLI re-login / rotation, with an expired OIDC token warning-but-
-    /// continuing like the chat path. A `Custom` auth config is for a different
-    /// gateway, not the xAI-OIDC conservative wire, so it is rejected with
-    /// `NoSource`; the caller then takes the extended path (which honors Custom).
-    async fn resolve_conservative_credentials(
+    /// `new(Some(..))` / test constructors) short-circuits the disk chain and is
+    /// used directly, paired with its `fallback_user_id`. Otherwise the CLI file
+    /// chain is used (prefers Grok CLI OIDC so `x-grok-user-id` is present; see
+    /// [`credentials::GrokCredentials::load_resolved_cli_async`]), with an expired
+    /// OIDC token warning-but-continuing. A `Custom` auth config is for a different
+    /// gateway and is rejected with `NoSource` (callers use the custom chat path).
+    async fn resolve_cli_credentials(
         &self,
     ) -> Result<GrokCredentials, credentials::GrokCredentialsError> {
         let GrokAuthConfig::Default {
@@ -570,7 +453,7 @@ impl GrokProvider {
                 user_id: fallback_user_id.clone(),
             });
         }
-        let creds = GrokCredentials::load_resolved_conservative_async().await?;
+        let creds = GrokCredentials::load_resolved_cli_async().await?;
         if let Err(e) = creds.check_expired() {
             warn!(
                 error = %e,
@@ -580,7 +463,7 @@ impl GrokProvider {
         Ok(creds)
     }
 
-    /// Build the conservative (grok-shell 0.2.93) request headers for
+    /// Build the grok-shell request headers for
     /// `cli-chat-proxy.grok.com /v1/responses`.
     ///
     /// Header NAMES + VALUES are the fingerprint surface; order does not matter
@@ -597,13 +480,13 @@ impl GrokProvider {
     ///   features are on); not signature-critical.
     /// - `x-grok-user-id`: omitted when the resolved credential has no `user_id`
     ///   (e.g. a static key), mirroring the CLI which omits it when unavailable.
-    fn conservative_headers(
+    fn cli_headers(
         &self,
         creds: &GrokCredentials,
         model: &str,
     ) -> Result<header::HeaderMap, ProviderError> {
         let version = self.version.version;
-        let user_agent = CONSERVATIVE_USER_AGENT_TEMPLATE.replace("{version}", version);
+        let user_agent = CLI_USER_AGENT_TEMPLATE.replace("{version}", version);
 
         let mut headers = header::HeaderMap::new();
 
@@ -628,7 +511,7 @@ impl GrokProvider {
         ];
         for (name, value) in fixed {
             let value = header::HeaderValue::from_str(value).map_err(|_| {
-                ProviderError::Auth(format!("invalid conservative grok header value for {name}"))
+                ProviderError::Auth(format!("invalid grok CLI header value for {name}"))
             })?;
             headers.insert(header::HeaderName::from_static(name), value);
         }
@@ -642,22 +525,22 @@ impl GrokProvider {
         Ok(headers)
     }
 
-    /// Non-stream conservative send: POST a Responses body (stream=false) to
+    /// Non-stream CLI send: POST a Responses body (stream=false) to
     /// cli-chat-proxy and map the JSON via the SHARED Responses mapper.
-    async fn send_conservative(
+    async fn send_cli(
         &self,
         req: CanonicalRequest,
         creds: GrokCredentials,
     ) -> Result<CanonicalResponse, ProviderError> {
-        let (base, overridden) = self.conservative_base();
-        self.warn_conservative_override(overridden);
+        let (base, overridden) = self.cli_base();
+        self.warn_cli_override(overridden);
         let model = resolve_model_alias(&req.model, self.active_catalog())
             .unwrap_or(req.model.as_str())
             .to_string();
         let body = to_grok_responses_request(&req, self.active_catalog(), false)?;
-        let headers = self.conservative_headers(&creds, &model)?;
+        let headers = self.cli_headers(&creds, &model)?;
         let url = format!("{}/v1/responses", base);
-        tracing::trace!(%url, "POST grok conservative responses");
+        tracing::trace!(%url, "POST grok CLI responses");
 
         // Redactor carries the EXACT resolved bearer/key so a non-prefixed operator
         // token cannot leak through an upstream error body (Finding 4).
@@ -671,46 +554,46 @@ impl GrokProvider {
             .await
             .map_err(|e| {
                 ProviderError::upstream(
-                    redactor.redact(&format!("network error calling grok conservative: {e}")),
+                    redactor.redact(&format!("network error calling grok: {e}")),
                 )
             })?;
 
         let status = resp.status();
         let bytes = resp.bytes().await.map_err(|e| {
             ProviderError::upstream(
-                redactor.redact(&format!("grok conservative response read error: {e}")),
+                redactor.redact(&format!("grok response read error: {e}")),
             )
         })?;
         if !status.is_success() {
             return Err(ProviderError::upstream_status(
                 status.as_u16(),
                 redactor.redact(&format!(
-                    "grok conservative {status}: {}",
+                    "grok {status}: {}",
                     String::from_utf8_lossy(&bytes)
                 )),
             ));
         }
 
         let value: Value = serde_json::from_slice(&bytes).map_err(|e| {
-            ProviderError::upstream(format!("failed to decode grok conservative response: {e}"))
+            ProviderError::upstream(format!("failed to decode grok response: {e}"))
         })?;
         responses_upstream::response_to_canonical(&value, &req.model, "grok", &redactor)
     }
 
-    /// Streaming conservative send: POST a Responses body (stream=true) and drive
+    /// Streaming CLI send: POST a Responses body (stream=true) and drive
     /// the SHARED Responses SSE parser, mirroring provider-codex's loop.
-    async fn send_stream_conservative(
+    async fn send_stream_cli(
         &self,
         req: CanonicalRequest,
         creds: GrokCredentials,
     ) -> Result<CanonicalStream, ProviderError> {
-        let (base, overridden) = self.conservative_base();
-        self.warn_conservative_override(overridden);
+        let (base, overridden) = self.cli_base();
+        self.warn_cli_override(overridden);
         let model = resolve_model_alias(&req.model, self.active_catalog())
             .unwrap_or(req.model.as_str())
             .to_string();
         let body = to_grok_responses_request(&req, self.active_catalog(), true)?;
-        let headers = self.conservative_headers(&creds, &model)?;
+        let headers = self.cli_headers(&creds, &model)?;
         let url = format!("{}/v1/responses", base);
         let client = self.client.clone();
         // Redactor carries the EXACT resolved bearer/key so a non-prefixed operator
@@ -724,7 +607,7 @@ impl GrokProvider {
                 Ok(resp) => resp,
                 Err(e) => {
                     yield Err(ProviderError::upstream(redactor.redact(&format!(
-                        "network error calling grok conservative: {e}"
+                        "network error calling grok: {e}"
                     ))));
                     return;
                 }
@@ -738,9 +621,9 @@ impl GrokProvider {
                         .await
                         .unwrap_or_else(|_| "<no body>".to_string()),
                 );
-                error!(%status, body = %err_body, "grok conservative upstream stream error");
+                error!(%status, body = %err_body, "grok upstream stream error");
                 yield Err(ProviderError::upstream_status(status.as_u16(), redactor.redact(&format!(
-                    "grok conservative {status}: {err_body}"
+                    "grok {status}: {err_body}"
                 ))));
                 return;
             }
@@ -754,7 +637,7 @@ impl GrokProvider {
                     .starts_with("text/event-stream")
             {
                 yield Err(ProviderError::upstream(format!(
-                    "grok conservative stream expected text/event-stream, got {content_type}"
+                    "grok stream expected text/event-stream, got {content_type}"
                 )));
                 return;
             }
@@ -770,7 +653,7 @@ impl GrokProvider {
                     Ok(chunk) => chunk,
                     Err(e) => {
                         yield Err(ProviderError::upstream(redactor.redact(&format!(
-                            "grok conservative stream read error: {e}"
+                            "grok stream read error: {e}"
                         ))));
                         return;
                     }
@@ -838,9 +721,9 @@ impl GrokProvider {
 
             if !finished {
                 let message = if saw_event {
-                    "grok conservative stream ended before a terminal response event"
+                    "grok stream ended before a terminal response event"
                 } else {
-                    "grok conservative stream ended without any SSE events"
+                    "grok stream ended without any SSE events"
                 };
                 yield Err(ProviderError::upstream(redactor.redact(message)));
             }
@@ -849,14 +732,11 @@ impl GrokProvider {
         Ok(Box::pin(stream))
     }
 
-    /// Emit a single parity-loss warning when an override is active on the
-    /// conservative wire. Honored-but-not-exact: a custom base_url or an explicit
-    /// `XAI_CREDENTIALS_PATH` is still used, but it breaks byte-exact CLI parity, so
-    /// we surface that once and proceed. Custom AUTH is NOT covered here: it never
-    /// reaches the conservative wire (it is diverted to the extended path with its
-    /// own accurate warning before `send_conservative` runs), so listing it here
-    /// would be misleading.
-    fn warn_conservative_override(&self, base_overridden: bool) {
+    /// Emit a single parity-loss warning when an override is active on the CLI
+    /// wire. A custom base_url or explicit `XAI_CREDENTIALS_PATH` is still used,
+    /// but it breaks byte-exact CLI parity, so we surface that once and proceed.
+    /// Custom auth never reaches this path (it uses the custom chat endpoint).
+    fn warn_cli_override(&self, base_overridden: bool) {
         if !self.warn_overrides {
             return;
         }
@@ -865,17 +745,171 @@ impl GrokProvider {
             warn!(
                 base_overridden,
                 xai_credentials_path = creds_path,
-                "grok conservative mode parity is not exact: an override (custom base_url / XAI_CREDENTIALS_PATH) is active; proceeding with the override on the conservative wire"
+                "grok CLI parity is not exact: an override (custom base_url / XAI_CREDENTIALS_PATH) is active; proceeding with the override"
             );
         }
     }
+
+    /// Custom-endpoint non-stream: OpenAI-compatible `/chat/completions`.
+    async fn send_custom_chat(
+        &self,
+        req: CanonicalRequest,
+    ) -> Result<CanonicalResponse, ProviderError> {
+        let repl = Replacements::empty();
+        let body = to_xai_chat_request(&req, &repl, self.active_catalog())?;
+        let url = format!("{}/chat/completions", self.base_url);
+        tracing::trace!(%url, "POST custom grok chat completions");
+
+        let mut request = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json");
+        for (name, value) in self.auth_headers().await? {
+            request = request.header(name, value);
+        }
+
+        let http_resp =
+            request.json(&body).send().await.map_err(|e| {
+                ProviderError::upstream(format!("network error calling xAI: {}", e))
+            })?;
+
+        let status = http_resp.status();
+        if !status.is_success() {
+            let err_body = redact(
+                &http_resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<no body>".to_string()),
+            );
+            error!(%status, body = %err_body, "xAI upstream error");
+            return Err(ProviderError::upstream_status(
+                status.as_u16(),
+                format!("xAI {}: {}", status, err_body),
+            ));
+        }
+
+        let raw: XaiChatCompletion = http_resp.json().await.map_err(|e| {
+            ProviderError::upstream(format!("failed to decode xAI response: {}", e))
+        })?;
+
+        tracing::trace!(
+            model = %raw.model.as_deref().unwrap_or("unknown"),
+            choices = raw.choices.as_ref().map(|c| c.len()).unwrap_or(0),
+            "xAI response received"
+        );
+
+        Ok(from_xai_chat_response(raw, &repl))
+    }
+
+    /// Custom-endpoint streaming: OpenAI-compatible `/chat/completions` SSE.
+    async fn send_stream_custom_chat(
+        &self,
+        req: CanonicalRequest,
+    ) -> Result<CanonicalStream, ProviderError> {
+        let repl = Replacements::empty();
+        let body = to_xai_chat_stream_request(&req, &repl, self.active_catalog())?;
+        let url = format!("{}/chat/completions", self.base_url);
+
+        let auth_headers = self.auth_headers().await?;
+        let client = self.client.clone();
+
+        let stream = async_stream::stream! {
+            let mut request = client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream");
+            for (name, value) in auth_headers {
+                request = request.header(name, value);
+            }
+            let send_result = request.json(&body).send().await;
+
+            let http_resp = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    yield Err(ProviderError::upstream(format!("network error calling xAI: {}", e)));
+                    return;
+                }
+            };
+
+            let status = http_resp.status();
+            if !status.is_success() {
+                // Read the error body first, same as the non-stream path.
+                let err_body = redact(
+                    &http_resp
+                    .text()
+                    .await
+                        .unwrap_or_else(|_| "<no body>".to_string()),
+                );
+                error!(%status, body = %err_body, "xAI upstream stream error");
+                yield Err(ProviderError::upstream_status(status.as_u16(), format!("xAI {}: {}", status, err_body)));
+                return;
+            }
+
+            // Consume the raw byte stream, reframing into SSE lines (a JSON object may span
+            // multiple byte chunks; SseBuffer holds partial lines across chunk boundaries) and
+            // mapping each `data:` frame to canonical events. The last non-null finish_reason is
+            // remembered and emitted once as the terminal Finish at `data: [DONE]`.
+            let mut bytes = http_resp.bytes_stream();
+            let mut sse = SseBuffer::default();
+            let mut finish_reason: Option<String> = None;
+            let mut done = false;
+
+            while let Some(chunk) = bytes.next().await {
+                let chunk = match chunk {
+                    Ok(b) => b,
+                    Err(e) => {
+                        yield Err(ProviderError::upstream(format!("xAI stream read error: {}", e)));
+                        return;
+                    }
+                };
+                // xAI SSE payloads are UTF-8; tolerate any split multi-byte sequence by lossy decode
+                // (frame boundaries are at `\n`, so SseBuffer only releases complete lines anyway).
+                let text = String::from_utf8_lossy(&chunk);
+                for line in sse.push(&text) {
+                    match classify_sse_line(&line) {
+                        SseLine::Ignore => {}
+                        SseLine::Done => {
+                            done = true;
+                            break;
+                        }
+                        SseLine::Data(payload) => {
+                            if let Some(fr) = finish_reason_from_frame(&payload) {
+                                finish_reason = Some(fr);
+                            }
+                            for ev in parse_grok_sse_frame(&payload) {
+                                let is_err = ev.is_err();
+                                yield ev;
+                                if is_err {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                if done {
+                    break;
+                }
+            }
+
+            if !done {
+                yield Err(ProviderError::upstream("xAI stream ended before [DONE]"));
+                return;
+            }
+
+            // Terminal Finish (exactly one), carrying the remembered finish_reason.
+            yield Ok(CanonicalStreamEvent::Finish { finish_reason });
+        };
+
+        Ok(Box::pin(stream))
+    }
+
 }
 
 fn redact(input: &str) -> String {
     responses_upstream::redact_prefixed_secrets(input, &["sk-", "xai-", "eyJ"])
 }
 
-/// `ErrorRedactor` for the shared Responses machinery (conservative mode).
+/// `ErrorRedactor` for the shared Responses machinery (CLI path).
 ///
 /// Layered redaction: the prefix scrubber [`redact`] (`sk-`/`xai-`/`eyJ`) PLUS the
 /// EXACT resolved secret strings captured in `secrets` (the bearer token and the
@@ -891,7 +925,7 @@ struct GrokErrorRedactor {
 }
 
 impl GrokErrorRedactor {
-    /// Capture the exact secrets for a conservative request from the resolved
+    /// Capture the exact secrets for a CLI request from the resolved
     /// credentials: both the full `Bearer <key>` header value and the bare key, so
     /// either form appearing in an upstream error body is scrubbed regardless of
     /// prefix. Empty/blank values are skipped; longest-first so a longer secret is
@@ -1163,24 +1197,23 @@ fn to_xai_chat_stream_request(
     Ok(body)
 }
 
-// --- Conservative mode (grok-shell CLI parity): OpenAI Responses request body ----------------
+// --- CLI path: OpenAI Responses request body -----------------------------------------------
 //
-// In conservative mode Grok talks the OpenAI *Responses* wire to
-// cli-chat-proxy.grok.com (verified live against grok-shell 0.2.93). The HEADERS
-// are the fingerprint surface (see `conservative_headers`); the BODY only needs a
-// valid Responses shape carrying the USER's request, NOT a byte-replay of the
-// CLI's private content/tools. So this builder is deliberately minimal and
-// user-driven: typed `input` messages (system/developer kept as typed roles, NOT
-// hoisted to `instructions` - that hoist is Codex-only and wrong for Grok), FLAT
-// function `tools`, `tool_choice`, sampling, and `reasoning.effort`. We never emit
-// `instructions`, `include`, or `store`, and never inject the CLI's session_title
-// tool.
+// Grok talks the OpenAI *Responses* wire to cli-chat-proxy.grok.com (verified live
+// against grok-shell 0.2.93). The HEADERS are the fingerprint surface (see
+// `cli_headers`); the BODY only needs a valid Responses shape carrying the USER's
+// request, NOT a byte-replay of the CLI's private content/tools. So this builder is
+// deliberately minimal and user-driven: typed `input` messages (system/developer
+// kept as typed roles, NOT hoisted to `instructions` - that hoist is Codex-only and
+// wrong for Grok), FLAT function `tools`, `tool_choice`, sampling, and
+// `reasoning.effort`. We never emit `instructions`, `include`, or `store`, and never
+// inject the CLI's session_title tool.
 
-/// Build the OpenAI-Responses request body for conservative mode.
+/// Build the OpenAI-Responses request body for the Grok CLI path.
 ///
-/// `stream` sets the `stream` flag. The model id is resolved through the active
-/// (conservative) catalog so aliases map to real ids, falling back to the input
-/// verbatim. Testable in isolation (no network, no provider state).
+/// `stream` sets the `stream` flag. The model id is resolved through the catalog so
+/// aliases map to real ids, falling back to the input verbatim. Testable in
+/// isolation (no network, no provider state).
 fn to_grok_responses_request(
     req: &CanonicalRequest,
     catalog: &[CatalogModel],
@@ -1729,236 +1762,52 @@ impl LlmProvider for GrokProvider {
     }
 
     async fn send(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError> {
-        // Fat start demoted: bin request_start/complete covers operator status.
         tracing::trace!(
             provider = "grok",
             model = %req.model,
-            "sending to xAI"
+            "sending to grok"
         );
 
-        // Conservative mode: mimic the grok-shell CLI wire (Responses /v1/responses
-        // at cli-chat-proxy). Falls back to the extended chat path below if CLI
-        // credentials are absent (NoSource); a present-but-expired token does NOT
-        // fall back (it warns inside resolve_conservative_credentials and proceeds).
-        let mut conservative_fallback = false;
-        if self.mode == CatalogMode::Conservative {
-            if self.conservative_diverts_to_extended() {
-                conservative_fallback = true;
-            } else {
-                match self.resolve_conservative_credentials().await {
-                    Ok(creds) => return self.send_conservative(req, creds).await,
-                    Err(credentials::GrokCredentialsError::NoSource) => {
-                        warn!(
-                            "grok conservative mode: no CLI credentials found; falling back to extended (api.x.ai chat-completions)"
-                        );
-                        conservative_fallback = true;
-                    }
-                    Err(e) => {
-                        return Err(ProviderError::Auth(format!(
-                            "failed to load Grok conservative credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {e}"
-                        )));
-                    }
-                }
-            }
+        // Custom endpoints use OpenAI-compatible chat/completions with custom auth only.
+        if matches!(self.auth, GrokAuthConfig::Custom { .. }) {
+            return self.send_custom_chat(req).await;
         }
 
-        // Hook point (using omni-common): replacements applied at prompt boundary inside the provider.
-        // In real deployment the Replacements would be loaded once in the binary and injected here.
-        let repl = Replacements::empty();
-        // On a conservative->extended fallback the request must resolve against the
-        // EXTENDED catalog (the surface it is actually hitting), NOT active_catalog()
-        // which is the conservative list in this mode and would forward extended
-        // aliases (e.g. "grok") verbatim.
-        let catalog = self.fallback_catalog(conservative_fallback);
-        let body = to_xai_chat_request(&req, &repl, catalog)?;
-
-        let url = format!("{}/chat/completions", self.base_url);
-        tracing::trace!(%url, "POST xAI chat completions");
-
-        let mut request = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/json");
-        for (name, value) in self.auth_headers().await? {
-            request = request.header(name, value);
+        // Default path: grok-shell CLI wire (Responses at cli-chat-proxy).
+        match self.resolve_cli_credentials().await {
+            Ok(creds) => self.send_cli(req, creds).await,
+            Err(e) => Err(ProviderError::Auth(format!(
+                "failed to load Grok credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {e}"
+            ))),
         }
-
-        let http_resp =
-            request.json(&body).send().await.map_err(|e| {
-                ProviderError::upstream(format!("network error calling xAI: {}", e))
-            })?;
-
-        let status = http_resp.status();
-        if !status.is_success() {
-            let err_body = redact(
-                &http_resp
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "<no body>".to_string()),
-            );
-            error!(%status, body = %err_body, "xAI upstream error");
-            return Err(ProviderError::upstream_status(
-                status.as_u16(),
-                format!("xAI {}: {}", status, err_body),
-            ));
-        }
-
-        let raw: XaiChatCompletion = http_resp.json().await.map_err(|e| {
-            ProviderError::upstream(format!("failed to decode xAI response: {}", e))
-        })?;
-
-        tracing::trace!(
-            model = %raw.model.as_deref().unwrap_or("unknown"),
-            choices = raw.choices.as_ref().map(|c| c.len()).unwrap_or(0),
-            "xAI response received"
-        );
-
-        let canon = from_xai_chat_response(raw, &repl);
-
-        // Final inbound hook demonstration (response scope from omni-common).
-        // (content + tool names/args already processed in from_... using the same repl)
-
-        // If the caller supplied provider_extras that requested something we can surface, it would live here.
-        // For now the canonical shape is the contract.
-
-        Ok(canon)
     }
 
-    /// Native SSE streaming against xAI /v1/chat/completions.
+    /// Native SSE streaming.
     ///
-    /// Overrides the trait default (which buffers a whole `send`) so callers get incremental
-    /// deltas as xAI emits them. The HTTP request is issued *inside* the returned stream (via
-    /// `async_stream::stream!`) so the call site gets the stream immediately and any upstream
-    /// failure surfaces as the first `Err` item rather than from the `send_stream` call itself.
+    /// Default path uses the CLI Responses wire; custom endpoints use chat/completions SSE.
+    /// The HTTP request is issued *inside* the returned stream so the call site gets the
+    /// stream immediately and any upstream failure surfaces as the first `Err` item.
     async fn send_stream(&self, req: CanonicalRequest) -> Result<CanonicalStream, ProviderError> {
         tracing::trace!(
             provider = "grok",
             model = %req.model,
-            "streaming to xAI"
+            "streaming to grok"
         );
 
-        // Conservative-mode dispatch + fall-back-to-extended, mirroring the
-        // non-stream send() path (including the EXTENDED-catalog fallback below).
-        let mut conservative_fallback = false;
-        if self.mode == CatalogMode::Conservative {
-            if self.conservative_diverts_to_extended() {
-                conservative_fallback = true;
-            } else {
-                match self.resolve_conservative_credentials().await {
-                    Ok(creds) => return self.send_stream_conservative(req, creds).await,
-                    Err(credentials::GrokCredentialsError::NoSource) => {
-                        warn!(
-                            "grok conservative mode: no CLI credentials found; falling back to extended (api.x.ai chat-completions)"
-                        );
-                        conservative_fallback = true;
-                    }
-                    Err(e) => {
-                        return Err(ProviderError::Auth(format!(
-                            "failed to load Grok conservative credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {e}"
-                        )));
-                    }
-                }
-            }
+        if matches!(self.auth, GrokAuthConfig::Custom { .. }) {
+            return self.send_stream_custom_chat(req).await;
         }
 
-        // Same prompt-scope replacements seam as send() (Replacements::empty() hook).
-        let repl = Replacements::empty();
-        let catalog = self.fallback_catalog(conservative_fallback);
-        let body = to_xai_chat_stream_request(&req, &repl, catalog)?;
-        let url = format!("{}/chat/completions", self.base_url);
-
-        let auth_headers = self.auth_headers().await?;
-        let client = self.client.clone();
-
-        let stream = async_stream::stream! {
-            let mut request = client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .header("Accept", "text/event-stream");
-            for (name, value) in auth_headers {
-                request = request.header(name, value);
+        match self.resolve_cli_credentials().await {
+            Ok(creds) => return self.send_stream_cli(req, creds).await,
+            Err(e) => {
+                return Err(ProviderError::Auth(format!(
+                    "failed to load Grok credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {e}"
+                )));
             }
-            let send_result = request.json(&body).send().await;
-
-            let http_resp = match send_result {
-                Ok(r) => r,
-                Err(e) => {
-                    yield Err(ProviderError::upstream(format!("network error calling xAI: {}", e)));
-                    return;
-                }
-            };
-
-            let status = http_resp.status();
-            if !status.is_success() {
-                // Read the error body first, same as the non-stream path.
-                let err_body = redact(
-                    &http_resp
-                    .text()
-                    .await
-                        .unwrap_or_else(|_| "<no body>".to_string()),
-                );
-                error!(%status, body = %err_body, "xAI upstream stream error");
-                yield Err(ProviderError::upstream_status(status.as_u16(), format!("xAI {}: {}", status, err_body)));
-                return;
-            }
-
-            // Consume the raw byte stream, reframing into SSE lines (a JSON object may span
-            // multiple byte chunks; SseBuffer holds partial lines across chunk boundaries) and
-            // mapping each `data:` frame to canonical events. The last non-null finish_reason is
-            // remembered and emitted once as the terminal Finish at `data: [DONE]`.
-            let mut bytes = http_resp.bytes_stream();
-            let mut sse = SseBuffer::default();
-            let mut finish_reason: Option<String> = None;
-            let mut done = false;
-
-            while let Some(chunk) = bytes.next().await {
-                let chunk = match chunk {
-                    Ok(b) => b,
-                    Err(e) => {
-                        yield Err(ProviderError::upstream(format!("xAI stream read error: {}", e)));
-                        return;
-                    }
-                };
-                // xAI SSE payloads are UTF-8; tolerate any split multi-byte sequence by lossy decode
-                // (frame boundaries are at `\n`, so SseBuffer only releases complete lines anyway).
-                let text = String::from_utf8_lossy(&chunk);
-                for line in sse.push(&text) {
-                    match classify_sse_line(&line) {
-                        SseLine::Ignore => {}
-                        SseLine::Done => {
-                            done = true;
-                            break;
-                        }
-                        SseLine::Data(payload) => {
-                            if let Some(fr) = finish_reason_from_frame(&payload) {
-                                finish_reason = Some(fr);
-                            }
-                            for ev in parse_grok_sse_frame(&payload) {
-                                let is_err = ev.is_err();
-                                yield ev;
-                                if is_err {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-                if done {
-                    break;
-                }
-            }
-
-            if !done {
-                yield Err(ProviderError::upstream("xAI stream ended before [DONE]"));
-                return;
-            }
-
-            // Terminal Finish (exactly one), carrying the remembered finish_reason.
-            yield Ok(CanonicalStreamEvent::Finish { finish_reason });
-        };
-
-        Ok(Box::pin(stream))
+        }
     }
+
 }
 
 // Keep the original free fn for any legacy direct callers (returns the provider id).
@@ -2007,7 +1856,7 @@ mod tests {
             provider_extras: Some(json!({"service_tier": "priority"})),
         };
 
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         assert_eq!(body["model"], "grok-4.3");
         assert_eq!(body["messages"].as_array().unwrap().len(), 2);
         assert_eq!(body["max_completion_tokens"], 128);
@@ -2027,8 +1876,8 @@ mod tests {
             .map(|model| model.id)
             .collect();
         assert!(ids.iter().any(|id| id == "grok-4.5"));
-        assert!(ids.iter().any(|id| id == "grok-4.3"));
         assert!(ids.iter().any(|id| id == "grok-composer-2.5-fast"));
+        assert_eq!(ids.len(), 2, "catalog is only CLI-advertised ids: {ids:?}");
         assert!(
             !ids.iter().any(|id| id == "grok" || id == "composer"),
             "aliases must not be advertised as canonical models: {ids:?}"
@@ -2046,7 +1895,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         assert_eq!(body["model"], "grok-composer-2.5-fast");
     }
 
@@ -2223,7 +2072,7 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/chat/completions"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
-                "model": "grok-4.3",
+                "model": "grok-4.5",
                 "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1}
             })))
@@ -2285,7 +2134,7 @@ mod tests {
                 "Bearer custom-grok-key",
             ))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
-                "model": "grok-4.3",
+                "model": "grok-4.5",
                 "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1}
             })))
@@ -2343,7 +2192,7 @@ mod tests {
             provider_extras: None,
         };
 
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "get_weather");
@@ -2383,7 +2232,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         let messages = body["messages"].as_array().unwrap();
 
         // The assistant message keeps its Text sibling as `content` AND carries
@@ -2438,7 +2287,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         let messages = body["messages"].as_array().unwrap();
         let asst_idx = messages.iter().position(|m| m["role"] == "assistant");
         let tool_idx = messages.iter().position(|m| m["role"] == "tool");
@@ -2466,7 +2315,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         let messages = body["messages"].as_array().unwrap();
         let assistant = messages
             .iter()
@@ -2582,7 +2431,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &repl, GROK_EXTENDED_0_2_93).unwrap();
+        let body = to_xai_chat_request(&req, &repl, GROK_CATALOG_0_2_93).unwrap();
         let msg0 = &body["messages"][0];
         assert_eq!(msg0["content"], "tell REDACTED");
     }
@@ -2612,7 +2461,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "look");
@@ -2646,7 +2495,7 @@ mod tests {
             metadata: Default::default(),
             provider_extras: Some(serde_json::json!({"service_tier": "standard"})),
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         assert_eq!(body["model"], "grok-4.3");
         assert!(body.get("tools").is_some());
         assert_eq!(body["tool_choice"], "auto");
@@ -2789,7 +2638,7 @@ mod tests {
         let err = p.send(req).await.unwrap_err();
         match err {
             ProviderError::Upstream { message: s, .. } => {
-                assert!(s.contains("error calling xAI") || s.contains("connection"))
+                assert!(s.contains("error calling grok") || s.contains("error calling xAI") || s.contains("connection"))
             }
             _ => panic!("expected Upstream error for mocked bad port"),
         }
@@ -2825,7 +2674,7 @@ mod tests {
         };
         let p = GrokProvider::new(Some(key)).expect("ctor with explicit key");
         let req = CanonicalRequest {
-            model: "grok-4.3".into(), // use a generally available lightweight model for the real probe
+            model: "grok-4.5".into(), // CLI-catalog default model for the real probe
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("Reply with the single word: PONG".into()),
@@ -2869,7 +2718,7 @@ mod tests {
         let mut r = base.clone();
         r.temperature = Some(0.2);
         r.max_tokens = Some(64);
-        let b = to_xai_chat_request(&r, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+        let b = to_xai_chat_request(&r, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         let t = b["temperature"].as_f64().unwrap();
         assert!((t - 0.2).abs() < 1e-6, "temp float json: {}", t);
         assert_eq!(b["max_completion_tokens"], 64);
@@ -2877,7 +2726,7 @@ mod tests {
         // top_p only
         let mut r = base.clone();
         r.top_p = Some(0.95);
-        let b = to_xai_chat_request(&r, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+        let b = to_xai_chat_request(&r, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         let tp = b["top_p"].as_f64().unwrap();
         assert!((tp - 0.95).abs() < 1e-6, "top_p float json approx: {}", tp);
 
@@ -2887,7 +2736,7 @@ mod tests {
             effort: Some("low".into()),
             budget_tokens: Some(50),
         });
-        let b = to_xai_chat_request(&r, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+        let b = to_xai_chat_request(&r, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         assert_eq!(b["reasoning_effort"], "low");
 
         // all together
@@ -2900,7 +2749,7 @@ mod tests {
             budget_tokens: None,
         });
         r.provider_extras = Some(json!({"service_tier": "priority"}));
-        let b = to_xai_chat_request(&r, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+        let b = to_xai_chat_request(&r, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         assert_eq!(b["temperature"], 1.0);
         assert_eq!(b["max_completion_tokens"], 10);
         assert_eq!(b["reasoning_effort"], "high");
@@ -2925,7 +2774,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         assert_eq!(body["parallel_tool_calls"], true);
         assert_eq!(body["response_format"]["type"], "json_object");
         assert_eq!(body["seed"], 42);
@@ -2947,7 +2796,7 @@ mod tests {
             provider_extras: Some(json!({"user": "u123"})),
             ..Default::default()
         };
-        let err = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_93)
+        let err = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_93)
             .expect_err("gateway user must reject as provider extra");
         assert!(
             err.to_string().contains("user"),
@@ -2974,7 +2823,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let err = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_93)
+        let err = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_93)
             .expect_err("unsupported Responses extras must reject");
         let msg = err.to_string();
         assert!(
@@ -2997,7 +2846,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         assert!(body.get("input").is_none(), "no responses 'input' shape");
         assert!(body.get("messages").is_some());
         assert_eq!(body["stream"], false);
@@ -3025,7 +2874,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         // extras "tools" wins (last write)
         let tools = &body["tools"];
         assert!(tools.is_array());
@@ -3049,7 +2898,7 @@ mod tests {
             tool_choice: Some(CanonicalToolChoice::Required),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         assert_eq!(body["tool_choice"], "required");
     }
 
@@ -3075,7 +2924,7 @@ mod tests {
             }]),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &repl, GROK_EXTENDED_0_2_93).unwrap();
+        let body = to_xai_chat_request(&req, &repl, GROK_CATALOG_0_2_93).unwrap();
         assert_eq!(body["messages"][0]["content"], "tell REDACTED");
         // desc gets prompt apply (name currently does not per mapper)
         assert_eq!(
@@ -3088,7 +2937,7 @@ mod tests {
     fn test_from_xai_usage_more_details_and_citations_tolerated() {
         // extra fields like citations (from web_search etc) are tolerated (no deny_unknown); details mapped where possible
         let raw_json = json!({
-            "model": "grok-4.3",
+            "model": "grok-4.5",
             "choices": [{"message": {"content": "searched", "citations": ["https://x.ai/1", "https://x.ai/2"] }, "finish_reason": "stop"}],
             "usage": {
                 "prompt_tokens": 20,
@@ -3236,7 +3085,7 @@ mod tests {
         }
         match err {
             ProviderError::Upstream { message: s, .. } => assert!(
-                s.contains("error calling xAI") || s.contains("connection"),
+                s.contains("error calling grok") || s.contains("error calling xAI") || s.contains("connection"),
                 "expected net err after file load: {}",
                 s
             ),
@@ -3306,9 +3155,11 @@ mod tests {
         unsafe {
             ::std::env::set_var("XAI_CREDENTIALS_PATH", tmp.to_str().unwrap());
         }
-        let p = GrokProvider::new_for_test("ignored-ctor-key", "http://127.0.0.1:1");
+        let p = GrokProvider::new(None)
+            .expect("ctor ok")
+            .with_base_url("http://127.0.0.1:1");
         let req = CanonicalRequest {
-            model: "grok-4.3".into(),
+            model: "grok-4.5".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("override send".into()),
@@ -3327,7 +3178,7 @@ mod tests {
         // Key resolved from the file -> reached the (dead) upstream -> network err, not Auth.
         match err {
             ProviderError::Upstream { message: s, .. } => {
-                assert!(s.contains("error calling xAI") || s.contains("connection"))
+                assert!(s.contains("error calling grok") || s.contains("error calling xAI") || s.contains("connection"))
             }
             other => panic!(
                 "expected key resolution then upstream net err, got {:?}",
@@ -3379,7 +3230,7 @@ mod tests {
         // No file source -> ctor key used -> reached the (dead) upstream as a network error.
         match err {
             ProviderError::Upstream { message: s, .. } => {
-                assert!(s.contains("error calling xAI") || s.contains("connection"))
+                assert!(s.contains("error calling grok") || s.contains("error calling xAI") || s.contains("connection"))
             }
             other => panic!(
                 "ctor key must be used when no file source exists; got {:?}",
@@ -3414,7 +3265,7 @@ mod tests {
         }
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/responses"))
             .and(header(
                 "authorization",
                 "Bearer xai-DEFINITELY-INVALID-KEY-FOR-TEST-401-XYZ",
@@ -3429,9 +3280,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let p = GrokProvider::new_for_test("ignored-ctor-key", server.uri());
+        let p = GrokProvider::new(None)
+            .expect("ctor ok")
+            .with_base_url(server.uri());
         let req = CanonicalRequest {
-            model: "grok-4.3".into(),
+            model: "grok-4.5".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("auth test".into()),
@@ -3453,6 +3306,7 @@ mod tests {
                 assert!(
                     s.contains("401")
                         || s.contains("xAI 401")
+                        || s.contains("grok 401")
                         || s.to_lowercase().contains("invalid")
                         || s.to_lowercase().contains("auth"),
                     "bad key 401: {}",
@@ -3530,7 +3384,7 @@ mod tests {
         // We build a request the same way the provider does (Authorization Bearer + Content-Type json).
         let effective_key = "xai-header-test-KEY-987";
         let body = json!({
-            "model": "grok-4.3",
+            "model": "grok-4.5",
             "messages": [{"role":"user","content":"h"}],
             "stream": false
         });
@@ -3575,7 +3429,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         assert_eq!(body["tools"][0]["function"]["name"], "adder");
         assert_eq!(body["tool_choice"]["function"]["name"], "adder");
 
@@ -3617,7 +3471,7 @@ mod tests {
         // SSE parser test). Pin the builder flags here so the non-stream tool path
         // above and the stream path stay distinct.
         let stream_body =
-            to_xai_chat_stream_request(&req, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+            to_xai_chat_stream_request(&req, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         assert_eq!(stream_body["stream"], true);
         assert_eq!(stream_body["stream_options"]["include_usage"], true);
         assert_eq!(body["stream"], false);
@@ -3800,12 +3654,12 @@ mod tests {
             ..Default::default()
         };
         let stream_body =
-            to_xai_chat_stream_request(&req, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+            to_xai_chat_stream_request(&req, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         assert_eq!(stream_body["stream"], true);
         assert_eq!(stream_body["stream_options"]["include_usage"], true);
 
         // The non-stream builder is unchanged: still stream: false, no stream_options.
-        let plain_body = to_xai_chat_request(&req, &empty_repl(), GROK_EXTENDED_0_2_93).unwrap();
+        let plain_body = to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG_0_2_93).unwrap();
         assert_eq!(plain_body["stream"], false);
         assert!(plain_body.get("stream_options").is_none());
     }
@@ -3979,7 +3833,9 @@ mod tests {
         match first {
             Err(ProviderError::Upstream { message: s, .. }) => {
                 assert!(
-                    s.contains("network error calling xAI") || s.contains("connection"),
+                    s.contains("network error calling grok")
+                        || s.contains("network error calling xAI")
+                        || s.contains("connection"),
                     "got: {s}"
                 )
             }
@@ -4126,11 +3982,11 @@ mod tests {
                 "authorization",
                 format!("Bearer {}", DummyXaiCreds::KEY).as_str(),
             ))
-            .and(body_partial_json(json!({"model": "grok-4.3"})))
+            .and(body_partial_json(json!({"model": "grok-4.5"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "chatcmpl-hermetic",
                 "object": "chat.completion",
-                "model": "grok-4.3",
+                "model": "grok-4.5",
                 "choices": [ {
                     "index": 0,
                     "message": { "role": "assistant", "content": "Hello back" },
@@ -4142,9 +3998,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let p = GrokProvider::new_for_test(DummyXaiCreds::WRONG_CTOR_KEY, server.uri());
+        let p = GrokProvider::new(None)
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_custom_auth(Some(DummyXaiCreds::KEY.into()), None, vec![]);
         let req = CanonicalRequest {
-            model: "grok-4.3".into(),
+            model: "grok-4.5".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("hi".into()),
@@ -4182,7 +4041,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "chatcmpl-tool",
                 "object": "chat.completion",
-                "model": "grok-4.3",
+                "model": "grok-4.5",
                 "choices": [ {
                     "index": 0,
                     "message": {
@@ -4202,9 +4061,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let p = GrokProvider::new_for_test(DummyXaiCreds::WRONG_CTOR_KEY, server.uri());
+        let p = GrokProvider::new(None)
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_custom_auth(Some(DummyXaiCreds::KEY.into()), None, vec![]);
         let req = CanonicalRequest {
-            model: "grok-4.3".into(),
+            model: "grok-4.5".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("weather?".into()),
@@ -4271,9 +4133,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let p = GrokProvider::new_for_test(DummyXaiCreds::WRONG_CTOR_KEY, server.uri());
+        let p = GrokProvider::new(None)
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_custom_auth(Some(DummyXaiCreds::KEY.into()), None, vec![]);
         let req = CanonicalRequest {
-            model: "grok-4.3".into(),
+            model: "grok-4.5".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("hi".into()),
@@ -4343,9 +4208,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let p = GrokProvider::new_for_test(DummyXaiCreds::WRONG_CTOR_KEY, server.uri());
+        let p = GrokProvider::new(None)
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_custom_auth(Some(DummyXaiCreds::KEY.into()), None, vec![]);
         let req = CanonicalRequest {
-            model: "grok-4.3".into(),
+            model: "grok-4.5".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("hi".into()),
@@ -4371,56 +4239,42 @@ mod tests {
     /// Requiring `XAI_CREDENTIALS_PATH` to be unset makes it race-immune against the env-mutating
     /// credential tests and keeps the offline suite green.
     #[test]
-    fn conservative_mode_hides_extended_only_models() {
-        // WHY: conservative = what the grok-shell CLI advertises (2 ids). Extended
-        // = the optimal api.x.ai working surface (superset). A regression that
-        // leaked an extended-only id (e.g. grok-4.3) into conservative, or dropped
-        // one from extended, would misrepresent the catalog the user asked for.
-        let cons = GrokProvider::new(None)
-            .unwrap()
-            .with_mode(CatalogMode::Conservative);
-        let ids: Vec<String> = cons.models_list().into_iter().map(|m| m.id).collect();
+    fn model_catalog_is_cli_advertised_ids_only() {
+        // WHY: Grok exposes only what the grok-shell CLI advertises (2 ids). A
+        // regression that leaked retired ids (e.g. grok-4.3) would misrepresent the
+        // surface users can actually hit on cli-chat-proxy.
+        let p = GrokProvider::new(None).unwrap();
+        let ids: Vec<String> = p.models_list().into_iter().map(|m| m.id).collect();
         assert_eq!(
             ids,
             vec![
                 "grok-4.5".to_string(),
                 "grok-composer-2.5-fast".to_string()
             ],
-            "conservative must be exactly the advertised cli-chat-proxy ids"
+            "catalog must be exactly the advertised cli-chat-proxy ids"
         );
         assert!(!ids.iter().any(|id| id == "grok-4.3"));
         assert!(!ids.iter().any(|id| id == "grok-build"));
-
-        let ext = GrokProvider::new(None).unwrap(); // default extended
-        let ext_ids: Vec<String> = ext.models_list().into_iter().map(|m| m.id).collect();
-        assert!(ext_ids.iter().any(|id| id == "grok-4.5"));
-        assert!(ext_ids.iter().any(|id| id == "grok-4.3"));
-        assert!(ext_ids.iter().any(|id| id == "grok-3"));
-        assert!(ext_ids.len() > ids.len(), "extended must be a superset");
     }
 
     #[test]
-    fn conservative_mode_resolves_only_its_own_aliases() {
-        // The wire body model id must come from the active catalog. In conservative
-        // mode, an extended-only alias must NOT resolve to an extended id.
-        let cons = GrokProvider::new(None)
-            .unwrap()
-            .with_mode(CatalogMode::Conservative);
+    fn model_aliases_resolve_only_catalog_entries() {
+        // The wire body model id must come from the catalog. Unknown aliases stay
+        // verbatim; known aliases map to canonical ids.
+        let p = GrokProvider::new(None).unwrap();
         let mut req = CanonicalRequest {
-            model: "build".into(), // alias of grok-build (extended-only)
+            model: "build".into(), // not in catalog
             ..base_req()
         };
-        let body = to_xai_chat_request(&req, &empty_repl(), cons.active_catalog()).unwrap();
-        // "build" is not in conservative -> forwarded verbatim, not mapped to grok-build.
+        let body = to_xai_chat_request(&req, &empty_repl(), p.active_catalog()).unwrap();
         assert_eq!(body["model"], "build");
 
-        // "grok" and "composer" are in conservative and resolve to canonical ids.
         req.model = "grok".into();
-        let body = to_xai_chat_request(&req, &empty_repl(), cons.active_catalog()).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), p.active_catalog()).unwrap();
         assert_eq!(body["model"], "grok-4.5");
 
         req.model = "composer".into();
-        let body = to_xai_chat_request(&req, &empty_repl(), cons.active_catalog()).unwrap();
+        let body = to_xai_chat_request(&req, &empty_repl(), p.active_catalog()).unwrap();
         assert_eq!(body["model"], "grok-composer-2.5-fast");
     }
 
@@ -4445,17 +4299,14 @@ mod tests {
         }
     }
 
-    // ── Conservative mode (grok-shell 0.2.93 CLI parity) ──────────────────────
+    // ── CLI path (grok-shell 0.2.93 parity) ───────────────────────────────────
     //
-    // WHY this block exists: conservative mode is a SECOND transport mimicking the
-    // installed grok-shell CLI wire to cli-chat-proxy.grok.com /v1/responses
-    // (OpenAI Responses shape). The parity guarantees under test are: (1) the body
-    // is valid Responses shape carrying the USER's content - system stays a typed
-    // role (NOT hoisted to `instructions`, which is Codex-only), tools are FLAT,
-    // and we never emit instructions/include/store; (2) the request carries the
-    // EXACT fingerprint header set; (3) responses map through the SHARED Responses
-    // mapper/parser tagged provider=="grok"; and (4) the default extended path is
-    // untouched.
+    // WHY this block exists: Grok talks the installed grok-shell CLI wire to
+    // cli-chat-proxy.grok.com /v1/responses (OpenAI Responses shape). Parity under
+    // test: (1) valid Responses body with user content - system stays a typed role
+    // (NOT hoisted to `instructions`); tools are FLAT; never emit
+    // instructions/include/store; (2) exact fingerprint header set; (3) responses
+    // map through the SHARED Responses mapper/parser tagged provider=="grok".
 
     #[test]
     fn to_grok_responses_request_keeps_system_as_typed_role_not_instructions() {
@@ -4490,7 +4341,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let body = to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_93, false).unwrap();
+        let body = to_grok_responses_request(&req, GROK_CATALOG_0_2_93, false).unwrap();
 
         // No Codex-only / CLI-preference keys.
         assert!(
@@ -4548,7 +4399,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let body = to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_93, true).unwrap();
+        let body = to_grok_responses_request(&req, GROK_CATALOG_0_2_93, true).unwrap();
 
         assert_eq!(body["stream"], true);
         let tools = body["tools"].as_array().expect("tools is an array");
@@ -4574,7 +4425,7 @@ mod tests {
     fn to_grok_responses_request_omits_tool_choice_without_tools() {
         // WHY: the real cli-chat-proxy Responses endpoint returns 400
         // "A tool_choice was set on the request but no tools were specified."
-        // (caught by the live conservative probe). A tool_choice is meaningless
+        // (caught by the live CLI probe). A tool_choice is meaningless
         // without tools, so when the caller supplies a choice but no tools we must
         // emit NEITHER field. Verified live against the real endpoint.
         let req = CanonicalRequest {
@@ -4587,7 +4438,7 @@ mod tests {
             tool_choice: Some(CanonicalToolChoice::Auto),
             ..Default::default()
         };
-        let body = to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_93, false).unwrap();
+        let body = to_grok_responses_request(&req, GROK_CATALOG_0_2_93, false).unwrap();
         assert!(
             body.get("tool_choice").is_none(),
             "tool_choice must be omitted when there are no tools (endpoint rejects it)"
@@ -4603,7 +4454,7 @@ mod tests {
         // WHY: a multi-turn tool conversation must round-trip through the
         // Responses item types: ToolUse -> function_call, ToolResult ->
         // function_call_output, keyed by call_id - mirroring the inbound Responses
-        // converter so a tool loop works end to end on the conservative wire.
+        // converter so a tool loop works end to end on the CLI wire.
         let req = CanonicalRequest {
             model: "grok-build".into(),
             messages: vec![
@@ -4626,7 +4477,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let body = to_grok_responses_request(&req, GROK_CONSERVATIVE_0_2_93, false).unwrap();
+        let body = to_grok_responses_request(&req, GROK_CATALOG_0_2_93, false).unwrap();
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0]["type"], "function_call");
         assert_eq!(input[0]["call_id"], "call_1");
@@ -4637,46 +4488,31 @@ mod tests {
     }
 
     #[test]
-    fn conservative_base_precedence_detects_real_override_only() {
-        // WHY: the override-detection seam decides BOTH the upstream host and
-        // whether to warn. The extended default (untouched api.x.ai) maps to the
-        // conservative host as a non-override; the conservative host itself is the
-        // intended target (non-override); any other base is a deliberate redirect
-        // reported as an override. Getting this wrong either sends conservative to
-        // api.x.ai or warns on every default request.
-        let default_p = GrokProvider::new(None)
-            .unwrap()
-            .with_mode(CatalogMode::Conservative);
+        #[test]
+    fn cli_base_precedence_detects_real_override_only() {
+        // WHY: override detection decides whether to warn. The default CLI host is
+        // the intended target (non-override); any other base is a deliberate
+        // redirect reported as an override.
+        let default_p = GrokProvider::new(None).unwrap();
         assert_eq!(
-            default_p.conservative_base(),
-            (CONSERVATIVE_BASE_URL.to_string(), false),
-            "untouched api.x.ai default -> conservative host, no override"
-        );
-
-        let cons_p = GrokProvider::new(None)
-            .unwrap()
-            .with_mode(CatalogMode::Conservative)
-            .with_base_url(CONSERVATIVE_BASE_URL);
-        assert_eq!(
-            cons_p.conservative_base(),
-            (CONSERVATIVE_BASE_URL.to_string(), false),
-            "explicit conservative host is the intended target, no override"
+            default_p.cli_base(),
+            (DEFAULT_BASE_URL.to_string(), false),
+            "default CLI host is not an override"
         );
 
         let proxy_p = GrokProvider::new(None)
             .unwrap()
-            .with_mode(CatalogMode::Conservative)
             .with_base_url("https://proxy.example.com");
         assert_eq!(
-            proxy_p.conservative_base(),
+            proxy_p.cli_base(),
             ("https://proxy.example.com".to_string(), true),
             "any other base is a real override -> warn"
         );
     }
 
     #[tokio::test]
-    async fn conservative_send_carries_exact_fingerprint_headers() {
-        // WHY: in conservative mode the HEADERS are the parity surface. This pins
+    async fn cli_send_carries_exact_fingerprint_headers() {
+        // WHY: on the CLI path the HEADERS are the parity surface. This pins
         // the EXACT header name+value set the CLI sends (token-auth, client
         // version/identifier, UA derived from the pinned version, model-override,
         // authenticate-response, Bearer, and x-grok-user-id when creds provide it)
@@ -4700,7 +4536,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = GrokProvider::new_for_test_conservative(
+        let provider = GrokProvider::new_for_test_with_user(
             "eyJ-fake-jwt-not-real",
             Some("11111111-2222-3333-4444-555555555555".to_string()),
             server.uri(),
@@ -4716,7 +4552,7 @@ mod tests {
         let resp = provider
             .send(req)
             .await
-            .expect("conservative send must succeed");
+            .expect("CLI send must succeed");
         assert_eq!(resp.content, "ok");
 
         let requests = server.received_requests().await.unwrap();
@@ -4757,7 +4593,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conservative_omits_user_id_header_when_creds_lack_it() {
+    async fn cli_omits_user_id_header_when_creds_lack_it() {
         // WHY: the CLI omits x-grok-user-id when the id is unavailable (e.g. a
         // static key). With injected creds carrying user_id=None the header MUST
         // NOT be sent (an empty/garbage subject would be a fingerprint mismatch).
@@ -4777,7 +4613,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = GrokProvider::new_for_test_conservative("eyJ-fake", None, server.uri());
+        let provider = GrokProvider::new_for_test_with_user("eyJ-fake", None, server.uri());
         let resp = provider.send(base_req_model("grok-build")).await.unwrap();
         assert_eq!(resp.content, "ok");
         let requests = server.received_requests().await.unwrap();
@@ -4798,8 +4634,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conservative_nonstream_maps_via_shared_responses_mapper() {
-        // WHY: the non-stream conservative response must flow through the SHARED
+    async fn cli_nonstream_maps_via_shared_responses_mapper() {
+        // WHY: the non-stream CLI response must flow through the SHARED
         // Responses mapper (response_to_canonical) - the same code Codex uses -
         // surfacing content + tool_calls + usage and tagging provider=="grok". This
         // pins the reuse guarantee (no bespoke Grok Responses parser).
@@ -4823,7 +4659,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = GrokProvider::new_for_test_conservative("eyJ-fake", None, server.uri());
+        let provider = GrokProvider::new_for_test_with_user("eyJ-fake", None, server.uri());
         let resp = provider.send(base_req_model("grok-build")).await.unwrap();
         assert_eq!(resp.content, "hello");
         assert_eq!(resp.tool_calls.len(), 1);
@@ -4840,8 +4676,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conservative_streaming_maps_via_shared_responses_parser() {
-        // WHY: the streaming conservative response must drive the SHARED Responses
+    async fn cli_streaming_maps_via_shared_responses_parser() {
+        // WHY: the streaming CLI response must drive the SHARED Responses
         // SSE parser (the same one Codex uses), turning Responses events into
         // canonical deltas/usage/finish with provider=="grok". Pins ordered
         // TextDelta -> Usage -> single Finish over the real HTTP path, with NO
@@ -4863,11 +4699,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = GrokProvider::new_for_test_conservative("eyJ-fake", None, server.uri());
+        let provider = GrokProvider::new_for_test_with_user("eyJ-fake", None, server.uri());
         let stream = provider
             .send_stream(base_req_model("grok-build"))
             .await
-            .expect("conservative stream opens");
+            .expect("CLI stream opens");
         let events: Vec<CanonicalStreamEvent> =
             stream.map(|r| r.expect("no stream error")).collect().await;
 
@@ -4896,82 +4732,47 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn extended_mode_default_still_hits_chat_completions() {
-        // WHY: the conservative work must not touch the DEFAULT (extended) path.
-        // This proves a default provider still POSTs the chat-completions shape to
-        // /chat/completions (NOT /v1/responses), so the second transport is fully
-        // gated behind CatalogMode::Conservative.
+    async fn default_path_hits_cli_responses() {
+        // WHY: the single default path must POST Responses shape to /v1/responses
+        // (NOT /chat/completions).
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let _creds = DummyXaiCreds::install("extended-unchanged");
-
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/responses"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "chatcmpl-ext",
-                "model": "grok-4.3",
-                "choices": [{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                "id": "resp_cli",
+                "object": "response",
+                "status": "completed",
+                "model": "grok-4.5",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hi"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
             })))
             .expect(1)
             .mount(&server)
             .await;
 
-        // Default mode (Extended), pointed at the mock.
-        let provider = GrokProvider::new_for_test(DummyXaiCreds::WRONG_CTOR_KEY, server.uri());
-        let resp = provider.send(base_req_model("grok-4.3")).await.unwrap();
+        let provider = GrokProvider::new_for_test("eyJ-fake", server.uri());
+        let resp = provider.send(base_req_model("grok-4.5")).await.unwrap();
         assert_eq!(resp.content, "hi");
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         assert!(
-            requests[0].url.path().ends_with("/chat/completions"),
-            "extended default must use chat-completions, not /v1/responses"
-        );
-    }
-
-    #[test]
-    fn fallback_catalog_uses_extended_list_on_conservative_fallback() {
-        // WHY (Finding 2, unit half): the fix routes a conservative->extended
-        // fallback request to the EXTENDED catalog (`version.extended`), NOT
-        // active_catalog() which is the conservative list in this mode. This pins
-        // the catalog SELECTION directly: in conservative mode, fallback_catalog(true)
-        // must return the extended list (so extended-only aliases resolve) while
-        // fallback_catalog(false) stays the active (conservative) list.
-        let cons = GrokProvider::new(None)
-            .unwrap()
-            .with_mode(CatalogMode::Conservative);
-        // Conservative active list lacks the "build" alias; extended has it.
-        assert!(
-            resolve_model_alias("build", cons.active_catalog()).is_none(),
-            "precondition: 'build' is not a conservative alias"
-        );
-        assert_eq!(
-            resolve_model_alias("build", cons.fallback_catalog(true)),
-            Some("grok-build"),
-            "fallback must resolve 'build'->'grok-build' via the EXTENDED catalog"
-        );
-        assert!(
-            resolve_model_alias("build", cons.fallback_catalog(false)).is_none(),
-            "non-fallback keeps the conservative active catalog"
+            requests[0].url.path().ends_with("/v1/responses"),
+            "default path must use /v1/responses, not /chat/completions"
         );
     }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn conservative_no_creds_falls_through_to_extended_path() {
-        // WHY (Finding 2, integration half): a real conservative NoSource (empty
-        // temp HOME, no XAI_CREDENTIALS_PATH, no ctor key) must FALL THROUGH to the
-        // extended chat path rather than erroring on the conservative wire. Since
-        // the shared chain has no key, the extended path then surfaces its OWN auth
-        // error - whose distinctive message ("failed to load Grok credentials",
-        // from resolve_api_key) proves we reached the extended path. The body that
-        // path builds is pinned to the EXTENDED catalog by
-        // `fallback_catalog_uses_extended_list_on_conservative_fallback` above; the
-        // reachable end-to-end body assertion is covered by the Custom-auth divert
-        // test (same fallback_catalog(true) build path).
+    async fn no_creds_fails_loud_on_cli_path() {
+        // WHY: with no credentials, the single path must fail Auth (no silent
+        // fallthrough to a second transport).
         let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = std::env::temp_dir().join(format!("omni-grok-nocreds-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&home).unwrap();
@@ -4982,12 +4783,8 @@ mod tests {
             std::env::set_var("HOME", &home);
             std::env::remove_var("XAI_CREDENTIALS_PATH");
         }
-        // Point at a dead port: if it reached the extended HTTP call it would be a
-        // network error; instead it must fail earlier with the extended AUTH error,
-        // proving the fall-through happened and stopped at extended auth resolution.
         let provider = GrokProvider::new(None)
             .unwrap()
-            .with_mode(CatalogMode::Conservative)
             .with_base_url("http://127.0.0.1:1");
         let err = provider.send(base_req_model("grok")).await.unwrap_err();
         restore_env("HOME", old_home);
@@ -4997,16 +4794,15 @@ mod tests {
         match err {
             ProviderError::Auth(msg) => assert!(
                 msg.contains("failed to load Grok credentials"),
-                "must be the EXTENDED-path auth error (proves fall-through), got: {msg}"
+                "must be the CLI-path auth error, got: {msg}"
             ),
-            other => {
-                panic!("expected the extended-path Auth error after fall-through, got {other:?}")
-            }
+            other => panic!("expected Auth error with no creds, got {other:?}"),
         }
     }
 
+
     #[tokio::test]
-    async fn conservative_nonstream_error_redacts_non_prefixed_bearer() {
+    async fn cli_nonstream_error_redacts_non_prefixed_bearer() {
         // WHY (Finding 4 regression): an operator bearer WITHOUT a known prefix
         // (sk-/xai-/eyJ) must never leak through an upstream error body. The
         // redactor carries the EXACT resolved bearer, so a 401 body echoing the raw
@@ -5027,7 +4823,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = GrokProvider::new_for_test_conservative(SECRET, None, server.uri());
+        let provider = GrokProvider::new_for_test_with_user(SECRET, None, server.uri());
         let err = provider
             .send(base_req_model("grok-build"))
             .await
@@ -5041,9 +4837,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conservative_stream_error_redacts_non_prefixed_bearer() {
+    async fn cli_stream_error_redacts_non_prefixed_bearer() {
         // WHY (Finding 4 regression, stream path): same exact-bearer redaction must
-        // apply to the streaming conservative error path (the 401 branch inside the
+        // apply to the streaming CLI error path (the 401 branch inside the
         // async stream), not only the non-stream send.
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5060,7 +4856,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = GrokProvider::new_for_test_conservative(SECRET, None, server.uri());
+        let provider = GrokProvider::new_for_test_with_user(SECRET, None, server.uri());
         let mut stream = provider
             .send_stream(base_req_model("grok-build"))
             .await
@@ -5083,8 +4879,8 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn conservative_stream_pre_stream_http_error_carries_status() {
-        // WHY (issue #3, Round-2 finding F1): the conservative STREAMING pre-stream
+    async fn cli_stream_pre_stream_http_error_carries_status() {
+        // WHY (issue #3, Round-2 finding F1): the CLI STREAMING pre-stream
         // HTTP error branch must carry the upstream status, like its non-stream
         // sibling. Without it, a 429/503 collapses to 502 and breaks client backoff.
         // This pins status: Some(429) on that branch (it was None before the fix).
@@ -5099,7 +4895,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = GrokProvider::new_for_test_conservative("bearer-token", None, server.uri());
+        let provider = GrokProvider::new_for_test_with_user("bearer-token", None, server.uri());
         let mut stream = provider
             .send_stream(base_req_model("grok-build"))
             .await
@@ -5117,30 +4913,25 @@ mod tests {
                     ..
                 }
             ),
-            "conservative stream HTTP error must carry the upstream status, got {err:?}"
+            "CLI stream HTTP error must carry the upstream status, got {err:?}"
         );
     }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn conservative_custom_auth_diverts_to_extended_path() {
-        // WHY (Finding 1 regression): Custom auth is for a different gateway and is
-        // incompatible with the conservative cli-chat-proxy fingerprint (which needs
-        // the xAI OIDC bearer + matching x-grok-user-id). The documented, intended
-        // behavior is to honor Custom on the EXTENDED path. This proves conservative
-        // + Custom auth POSTs to /chat/completions (NOT /v1/responses) and sends NO
-        // conservative fingerprint headers - matching the accurate warn emitted by
-        // conservative_diverts_to_extended().
+    async fn custom_auth_uses_chat_completions_path() {
+        // WHY: Custom auth is for a different gateway and is incompatible with the
+        // cli-chat-proxy fingerprint. Custom endpoints speak /chat/completions with
+        // only the configured auth (no CLI fingerprint headers).
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _guard = CRED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "chatcmpl-custom",
-                "model": "grok-4.3",
+                "model": "grok-4.5",
                 "choices": [{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
             })))
@@ -5148,11 +4939,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Conservative mode but Custom auth (explicit key, no env). Must divert to
-        // extended and use the custom Bearer, never the conservative wire.
         let provider = GrokProvider::new(None)
             .unwrap()
-            .with_mode(CatalogMode::Conservative)
             .with_base_url(server.uri())
             .with_custom_auth(Some("custom-bearer-key".into()), None, Vec::new());
         let resp = provider.send(base_req_model("grok")).await.unwrap();
@@ -5163,24 +4951,22 @@ mod tests {
         let req = &requests[0];
         assert!(
             req.url.path().ends_with("/chat/completions"),
-            "custom auth in conservative mode must take the extended chat path"
+            "custom auth must take the chat path"
         );
-        // No conservative fingerprint headers leaked onto the extended request.
         assert!(req.headers.get("x-grok-client-identifier").is_none());
         assert!(req.headers.get("x-xai-token-auth").is_none());
         assert!(req.headers.get("x-grok-model-override").is_none());
-        // The custom Bearer is used (extended path honors Custom auth).
         assert_eq!(
             req.headers.get("authorization").unwrap().to_str().unwrap(),
             "Bearer custom-bearer-key"
         );
-        // Extended alias resolution still applies on this path.
         let body: serde_json::Value = req.body_json().unwrap();
         assert_eq!(body["model"], "grok-4.5");
     }
 
-    /// A base request pinned to a specific model id (conservative tests pass a
-    /// real conservative catalog id so model resolution is exercised).
+
+    /// A base request pinned to a specific model id (CLI tests pass a
+    /// real catalog id so model resolution is exercised).
     fn base_req_model(model: &str) -> CanonicalRequest {
         CanonicalRequest {
             model: model.into(),
