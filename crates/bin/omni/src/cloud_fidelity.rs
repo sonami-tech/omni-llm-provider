@@ -43,15 +43,22 @@ pub struct AnthropicCredPresence {
     pub bearer_token: Option<String>,
     /// First non-empty `x-api-key` value, if any.
     pub x_api_key: Option<String>,
-    /// True when both a non-empty Bearer token and non-empty `x-api-key` appear.
+    /// True when both Bearer material and `x-api-key` material appear.
     pub dual: bool,
     /// True when more than one distinct non-empty Bearer token appears.
     pub ambiguous_bearer: bool,
     /// True when more than one distinct non-empty `x-api-key` appears.
     pub ambiguous_x_api_key: bool,
     /// True when a non-empty `Authorization` value is present that is not a
-    /// valid Bearer credential (e.g. `Basic …`, bare tokens, empty scheme).
+    /// valid Bearer credential (e.g. `Basic …`, bare tokens, empty scheme,
+    /// Bearer with internal whitespace).
     pub non_bearer_authorization: bool,
+    /// True when an `x-api-key` header value could not be decoded as UTF-8
+    /// (still credential material for dual / strict shape checks).
+    pub opaque_x_api_key: bool,
+    /// True when an Authorization value used the Bearer scheme but the token
+    /// was empty/malformed (still Bearer-scheme material for dual detection).
+    pub malformed_bearer: bool,
 }
 
 impl AnthropicCredPresence {
@@ -60,7 +67,12 @@ impl AnthropicCredPresence {
     }
 
     pub fn has_x_api_key(&self) -> bool {
-        self.x_api_key.is_some()
+        self.x_api_key.is_some() || self.opaque_x_api_key
+    }
+
+    /// Any Bearer-scheme material (valid token or malformed Bearer).
+    pub fn has_bearer_scheme_material(&self) -> bool {
+        self.bearer_token.is_some() || self.malformed_bearer
     }
 
     /// Any credential-shaped material was presented (including malformed Authorization).
@@ -70,11 +82,16 @@ impl AnthropicCredPresence {
             || self.non_bearer_authorization
             || self.ambiguous_bearer
             || self.ambiguous_x_api_key
+            || self.malformed_bearer
     }
 }
 
 /// Parse a single Authorization header value as a Bearer token.
-/// Scheme match is case-insensitive; token is the remainder after first whitespace.
+///
+/// Scheme match is case-insensitive. The token is the remainder after the first
+/// whitespace and must be non-empty with **no internal whitespace** (RFC 6750
+/// b64token-style single token; rejects `Bearer a b` and comma-stuffed multi-creds
+/// that include spaces).
 pub fn parse_bearer_value(value: &str) -> Option<&str> {
     let value = value.trim();
     if value.is_empty() {
@@ -83,11 +100,24 @@ pub fn parse_bearer_value(value: &str) -> Option<&str> {
     let mut parts = value.splitn(2, char::is_whitespace);
     let scheme = parts.next()?;
     let rest = parts.next()?.trim();
-    if scheme.eq_ignore_ascii_case("bearer") && !rest.is_empty() {
-        Some(rest)
-    } else {
-        None
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
     }
+    if rest.is_empty() || rest.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(rest)
+}
+
+/// True when the value looks like a Bearer scheme (case-insensitive) even if the
+/// token part is missing/malformed. Used to flag shape errors under strict mode.
+pub fn is_bearer_scheme_prefix(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let scheme = value.split(char::is_whitespace).next().unwrap_or("");
+    scheme.eq_ignore_ascii_case("bearer")
 }
 
 /// Collect all Anthropic-relevant credential material from headers.
@@ -111,12 +141,18 @@ pub fn anthropic_cred_presence(headers: &HeaderMap) -> AnthropicCredPresence {
                 bearer_seen.push(tok);
             }
         } else {
+            // Includes Basic, bare tokens, and malformed Bearer (empty / spaced token).
             presence.non_bearer_authorization = true;
+            if is_bearer_scheme_prefix(raw) {
+                presence.malformed_bearer = true;
+            }
         }
     }
 
     for val in headers.get_all("x-api-key") {
         let Ok(raw) = val.to_str() else {
+            // Non-UTF-8 values are still credential material (must not drop dual detection).
+            presence.opaque_x_api_key = true;
             continue;
         };
         let raw = raw.trim();
@@ -137,7 +173,12 @@ pub fn anthropic_cred_presence(headers: &HeaderMap) -> AnthropicCredPresence {
     }
     presence.bearer_token = bearer_seen.into_iter().next();
     presence.x_api_key = xkey_seen.into_iter().next();
-    presence.dual = presence.bearer_token.is_some() && presence.x_api_key.is_some();
+
+    // Dual: any Bearer-scheme material (valid or malformed) + any x-api-key material
+    // (UTF-8 or opaque non-UTF-8). Must not drop dual on decode/shape edge cases.
+    let has_bearer_material = presence.bearer_token.is_some() || presence.malformed_bearer;
+    let has_x_material = presence.x_api_key.is_some() || presence.opaque_x_api_key;
+    presence.dual = has_bearer_material && has_x_material;
     presence
 }
 
@@ -379,6 +420,38 @@ mod tests {
         assert_eq!(parse_bearer_value("Basic abc"), None);
         assert_eq!(parse_bearer_value("Bearer "), None);
         assert_eq!(parse_bearer_value(""), None);
+        // Multi-token remainder is malformed (not a single b64token-style value).
+        assert_eq!(parse_bearer_value("Bearer good evil"), None);
+        assert_eq!(parse_bearer_value("Bearer good, Bearer evil"), None);
+    }
+
+    #[test]
+    fn dual_with_malformed_bearer_and_x_api_key() {
+        let h = headers(&[
+            ("x-api-key", "key-a"),
+            ("authorization", "Bearer good evil"),
+        ]);
+        let p = anthropic_cred_presence(&h);
+        assert!(p.malformed_bearer);
+        assert!(p.dual);
+    }
+
+    #[test]
+    fn dual_with_opaque_x_api_key_and_bearer() {
+        // Non-UTF-8 x-api-key must still count as credential material.
+        let mut map = HeaderMap::new();
+        map.append(
+            axum::http::HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer token-b"),
+        );
+        map.append(
+            axum::http::HeaderName::from_static("x-api-key"),
+            HeaderValue::from_bytes(&[0xff, 0xfe, 0xfd]).unwrap(),
+        );
+        let p = anthropic_cred_presence(&map);
+        assert!(p.opaque_x_api_key);
+        assert!(p.dual);
+        assert!(dual_anthropic_credentials(&map));
     }
 
     #[test]
