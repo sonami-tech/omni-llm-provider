@@ -30,7 +30,7 @@ cargo run -p omni -- --providers claude --no-auth --port 18321
 cargo run -p omni -- --providers claude,grok,codex --no-auth --port 18321
 ```
 
-With both providers enabled, canonical ids such as `claude-sonnet-4-6` and
+With both providers enabled, canonical ids such as `claude-sonnet-5` and
 aliases such as `sonnet` are accepted when unique. Use prefixed model IDs such
 as `claude:sonnet` only when you need to force a provider.
 

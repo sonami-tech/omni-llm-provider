@@ -150,6 +150,41 @@ pub static CATALOG_CC_2_1_175: &[ModelDef] = &[
     },
 ];
 
+/// 2.1.207 catalog captured 2026-07-11 from the installed Claude Code CLI
+/// (shared tools.capture, clean tmpfs HOME). Sonnet renames to `claude-sonnet-5`
+/// and uses the same 64k adaptive/high-effort wire as Opus. Fable stays pinned
+/// (account availability is independent of the wire catalog).
+pub static CATALOG_CC_2_1_207: &[ModelDef] = &[
+    ModelDef {
+        canonical: "claude-fable-5",
+        cli_name: "fable",
+        aliases: &["fable"],
+        context_window: 1_000_000,
+        max_tokens: 64_000,
+    },
+    ModelDef {
+        canonical: "claude-opus-4-8",
+        cli_name: "opus",
+        aliases: &["opus"],
+        context_window: 1_000_000,
+        max_tokens: 64_000,
+    },
+    ModelDef {
+        canonical: "claude-sonnet-5",
+        cli_name: "sonnet",
+        aliases: &["sonnet"],
+        context_window: 1_000_000,
+        max_tokens: 64_000,
+    },
+    ModelDef {
+        canonical: "claude-haiku-4-5-20251001",
+        cli_name: "haiku",
+        aliases: &["haiku"],
+        context_window: 200_000,
+        max_tokens: 64_000,
+    },
+];
+
 /// Resolve an input model string within one Claude Code profile catalog.
 ///
 /// Resolution is exact-only: exact canonical, then exact alias. An unknown
@@ -278,10 +313,10 @@ mod tests {
         );
         assert_eq!(
             profile()
-                .resolve_model("claude-sonnet-4-6")
+                .resolve_model("claude-sonnet-5")
                 .unwrap()
                 .canonical,
-            "claude-sonnet-4-6"
+            "claude-sonnet-5"
         );
         // Only the exact catalog canonical resolves; the non-dated short form
         // `claude-haiku-4-5` is NOT a catalog entry (the canonical is dated) and
@@ -297,7 +332,7 @@ mod tests {
         );
         assert_eq!(
             profile().resolve_model("sonnet").unwrap().canonical,
-            "claude-sonnet-4-6"
+            "claude-sonnet-5"
         );
         assert_eq!(
             profile().resolve_model("haiku").unwrap().canonical,
@@ -384,7 +419,7 @@ mod tests {
         assert_eq!(list.len(), 4);
         assert_eq!(list[0].id, "claude-fable-5");
         assert_eq!(list[1].id, "claude-opus-4-8");
-        assert_eq!(list[2].id, "claude-sonnet-4-6");
+        assert_eq!(list[2].id, "claude-sonnet-5");
         assert_eq!(list[3].id, "claude-haiku-4-5-20251001");
         assert_eq!(list[0].context_window, 1_000_000);
         assert_eq!(list[3].max_tokens, 64_000);
@@ -403,7 +438,7 @@ mod tests {
         );
         assert_eq!(
             profile()
-                .resolve_model("claude-sonnet-4-6")
+                .resolve_model("claude-sonnet-5")
                 .unwrap()
                 .cli_name,
             "sonnet"

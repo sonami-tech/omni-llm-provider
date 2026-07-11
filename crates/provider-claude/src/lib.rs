@@ -631,7 +631,7 @@ mod tests {
         assert_eq!(provider_id(), "claude");
         let p = ClaudeProvider::new().expect("default profile constructs");
         assert_eq!(p.id(), "claude");
-        assert_eq!(p.profile().name, "cc-2.1.197-sdk-cli");
+        assert_eq!(p.profile().name, "cc-2.1.207-sdk-cli");
     }
 
     #[test]
@@ -721,7 +721,7 @@ mod tests {
     fn resolve_via_profile_still_claude_specific() {
         let p = ClaudeProvider::new().unwrap();
         let m = p.profile().resolve_model("sonnet").unwrap();
-        assert_eq!(m.canonical, "claude-sonnet-4-6");
+        assert_eq!(m.canonical, "claude-sonnet-5");
     }
 
     #[test]
@@ -1043,7 +1043,7 @@ mod tests {
         //     cleared the floor (#2) and that the marker is live. Padding is
         //     deterministic (fixed string), so no clock/nonce leaks into the prefix.
         //   - Model choice: Haiku 4.5 (claude-haiku-4-5-20251001), the current
-        //     catalog's canonical Haiku. NOT Sonnet: the active 2.1.197 profile's
+        //     catalog's canonical Haiku. NOT Sonnet: the active 2.1.207 profile's
         //     wire override injects output_config.effort="high" for opus/sonnet/fable,
         //     and the live Anthropic API rejects `effort` on the current Sonnet
         //     (claude-sonnet-4-6) with a 400 ("This model does not support the effort
@@ -1243,13 +1243,13 @@ mod tests {
         let prof = p.profile();
         // canonical -> resolves
         assert_eq!(
-            prof.resolve_model("claude-sonnet-4-6").unwrap().canonical,
-            "claude-sonnet-4-6"
+            prof.resolve_model("claude-sonnet-5").unwrap().canonical,
+            "claude-sonnet-5"
         );
         // alias -> resolves
         assert_eq!(
             prof.resolve_model("sonnet").unwrap().canonical,
-            "claude-sonnet-4-6"
+            "claude-sonnet-5"
         );
         // substring -> NO LONGER resolves (matcher deleted): passes through raw
         assert!(prof.resolve_model("foo-sonnet-bar").is_none());

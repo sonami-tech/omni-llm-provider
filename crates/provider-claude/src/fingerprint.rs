@@ -30,7 +30,8 @@ use uuid::Uuid;
 use crate::credentials::Credentials;
 use crate::models::{
     CATALOG_CC_2_1_142, CATALOG_CC_2_1_150, CATALOG_CC_2_1_154, CATALOG_CC_2_1_158,
-    CATALOG_CC_2_1_175, ModelDef, ModelInfo, models_list_from_catalog, resolve_model_in_catalog,
+    CATALOG_CC_2_1_175, CATALOG_CC_2_1_207, ModelDef, ModelInfo, models_list_from_catalog,
+    resolve_model_in_catalog,
 };
 
 /// Static identity Omni claims on the wire. These values must move together
@@ -606,6 +607,71 @@ const MODEL_BETA_OVERRIDES_CC_2_1_186: &[ModelBetaOverride] = &[
     },
 ];
 
+// 2.1.207 per-model betas captured 2026-07-11. Default/opus/haiku lists match
+// 2.1.186. Sonnet (now `claude-sonnet-5`) gains mid-conversation-system and
+// matches the explicit-opus list (no context-1m). Fable uncaptured; carry 186.
+const MODEL_BETA_OVERRIDES_CC_2_1_207: &[ModelBetaOverride] = &[
+    ModelBetaOverride {
+        model: "claude-fable-5",
+        beta_reply: BETA_CC_2_1_186_FABLE,
+    },
+    ModelBetaOverride {
+        model: "claude-opus-4-8",
+        beta_reply: BETA_CC_2_1_186_OPUS,
+    },
+    ModelBetaOverride {
+        model: "claude-sonnet-5",
+        beta_reply: BETA_CC_2_1_186_OPUS,
+    },
+    ModelBetaOverride {
+        model: "claude-haiku-4-5",
+        beta_reply: BETA_CC_2_1_186_HAIKU,
+    },
+    ModelBetaOverride {
+        model: "claude-haiku-4-5-20251001",
+        beta_reply: BETA_CC_2_1_186_HAIKU,
+    },
+    ModelBetaOverride {
+        model: "haiku",
+        beta_reply: BETA_CC_2_1_186_HAIKU,
+    },
+];
+
+// 2.1.207 wire overrides: opus+sonnet-5 are 64k/no-temp/high-effort; haiku is
+// 32k/no-temp/no-effort. Fable uncaptured; carry 175 xhigh.
+const MODEL_WIRE_OVERRIDES_CC_2_1_207: &[ModelWireOverride] = &[
+    ModelWireOverride {
+        model: "claude-fable-5",
+        max_tokens: 64_000,
+        temperature: None,
+        output_effort: Some("xhigh"),
+    },
+    ModelWireOverride {
+        model: "claude-opus-4-8",
+        max_tokens: 64_000,
+        temperature: None,
+        output_effort: Some("high"),
+    },
+    ModelWireOverride {
+        model: "claude-sonnet-5",
+        max_tokens: 64_000,
+        temperature: None,
+        output_effort: Some("high"),
+    },
+    ModelWireOverride {
+        model: "claude-haiku-4-5",
+        max_tokens: 32_000,
+        temperature: None,
+        output_effort: None,
+    },
+    ModelWireOverride {
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 32_000,
+        temperature: None,
+        output_effort: None,
+    },
+];
+
 const MODEL_WIRE_OVERRIDES_CC_2_1_154: &[ModelWireOverride] = &[
     ModelWireOverride {
         model: "claude-opus-4-8",
@@ -914,7 +980,16 @@ pub const WIRE_DEFAULTS_CC_2_1_186: WireDefaults = WireDefaults {
     output_effort: Some("high"),
 };
 
-pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.197-sdk-cli";
+// 2.1.207 wire defaults - captured 2026-07-11: temperature omitted on all
+// captured models; non-override fallback is 32k/high-effort.
+pub const WIRE_DEFAULTS_CC_2_1_207: WireDefaults = WireDefaults {
+    max_tokens: 32_000,
+    opus_max_tokens: 64_000,
+    temperature: None,
+    output_effort: Some("high"),
+};
+
+pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.207-sdk-cli";
 pub const LATEST_PROFILE_ALIAS: &str = "latest";
 
 pub const PROFILE_CLAUDE_2_1_142_SDK_CLI: FingerprintProfile = FingerprintProfile {
@@ -1118,23 +1193,11 @@ pub const PROFILE_CLAUDE_2_1_186_SDK_CLI: FingerprintProfile = FingerprintProfil
 
 // Captured 2026-07-01 against installed Claude Code 2.1.197 via the shared
 // tools.capture framework (mitmproxy reverse proxy + real claude CLI, clean tmpfs
-// HOME), for default/opus, explicit opus, sonnet, and haiku. This is now the
-// default `latest` profile. ONLY TWO fields drift vs 2.1.186:
-//   1. claude_cli_version 2.1.186 -> 2.1.197 (UA + billing cc_version).
-//   2. stainless_runtime_version v24.3.0 -> v26.3.0 (Node bump; SDK package stays
-//      0.94.0, anthropic-version stays 2023-06-01).
-// The cc_version suffix algorithm is UNCHANGED: the existing Sha256Utf16SampleV1
-// suffix reproduces the captured cc_version=2.1.197.c8e exactly (verified against
-// the live header, and against all eight prior captured suffixes), and the header
-// still carries no cch field. Per-model betas, wire defaults (adaptive thinking +
-// output_config.effort=high on opus/sonnet, enabled+budget on haiku), the catalog,
-// default model (opus -> claude-opus-4-8), and preserve_explicit_model are all
-// byte-identical to 2.1.186, so this profile reuses those 2.1.186/2.1.175 consts.
-// (claude-fable-5 stays in the catalog; upstream returned 404 "use Opus 4.8" for
-// this account on 2026-07-01, but that is account/upstream state, not a wire
-// change, so the pinned catalog is unchanged.)
+// HOME), for default/opus, explicit opus, sonnet, and haiku. Retained as a
+// selectable older profile (no longer `latest`). ONLY TWO fields drifted vs
+// 2.1.186: claude_cli_version and stainless_runtime_version (v26.3.0).
 pub const PROFILE_CLAUDE_2_1_197_SDK_CLI: FingerprintProfile = FingerprintProfile {
-    name: DEFAULT_PROFILE_NAME,
+    name: "cc-2.1.197-sdk-cli",
     aliases: &["2.1.197"],
     claude_cli_version: "2.1.197",
     stainless_package_version: "0.94.0",
@@ -1150,7 +1213,38 @@ pub const PROFILE_CLAUDE_2_1_197_SDK_CLI: FingerprintProfile = FingerprintProfil
     billing: BILLING_SCHEME_V1_NO_CCH,
 };
 
+// Captured 2026-07-11 against installed Claude Code 2.1.207 via the shared
+// tools.capture framework (mitmproxy reverse proxy + real claude CLI, clean tmpfs
+// HOME), for default/opus, explicit opus, sonnet, and haiku. This is now the
+// default `latest` profile. Drift vs 2.1.197:
+//   1. claude_cli_version 2.1.197 -> 2.1.207 (UA + billing cc_version).
+//   2. Sonnet catalog id claude-sonnet-4-6 -> claude-sonnet-5; sonnet wire is
+//      now 64k/no-temp/effort=high (was 32k/temp=1).
+//   3. Opus output_config.effort is high (captured), not the older xhigh pin.
+//   4. Haiku temperature omitted (was temp=1).
+//   5. Sonnet beta list matches explicit opus (gains mid-conversation-system).
+// SDK package stays 0.94.0, runtime stays v26.3.0, anthropic-version stays
+// 2023-06-01. No cch field; cc_version suffix algorithm unchanged
+// (captured cc_version=2.1.207.aa4 for prompt "Say OK").
+pub const PROFILE_CLAUDE_2_1_207_SDK_CLI: FingerprintProfile = FingerprintProfile {
+    name: DEFAULT_PROFILE_NAME,
+    aliases: &["2.1.207"],
+    claude_cli_version: "2.1.207",
+    stainless_package_version: "0.94.0",
+    stainless_runtime_version: "v26.3.0",
+    entrypoint: "sdk-cli",
+    beta_reply: BETA_CC_2_1_186_DEFAULT,
+    model_beta_overrides: MODEL_BETA_OVERRIDES_CC_2_1_207,
+    system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
+    models: CATALOG_CC_2_1_207,
+    preserve_explicit_model: true,
+    wire_defaults: WIRE_DEFAULTS_CC_2_1_207,
+    model_wire_overrides: MODEL_WIRE_OVERRIDES_CC_2_1_207,
+    billing: BILLING_SCHEME_V1_NO_CCH,
+};
+
 pub static FINGERPRINT_PROFILES: &[FingerprintProfile] = &[
+    PROFILE_CLAUDE_2_1_207_SDK_CLI,
     PROFILE_CLAUDE_2_1_197_SDK_CLI,
     PROFILE_CLAUDE_2_1_186_SDK_CLI,
     PROFILE_CLAUDE_2_1_175_SDK_CLI,
@@ -1790,7 +1884,8 @@ mod tests {
         let cases = [
             ("fable", BETA_CC_2_1_186_FABLE, false),
             ("opus", BETA_CC_2_1_186_OPUS, false),
-            ("sonnet", BETA_CC_2_1_186_SONNET, false),
+            // 2.1.207: sonnet-5 beta matches explicit opus (mid-conversation-system).
+            ("sonnet", BETA_CC_2_1_186_OPUS, false),
             ("haiku", BETA_CC_2_1_186_HAIKU, false),
         ];
         for (alias, expected_beta, has_context_1m) in cases {
@@ -1935,13 +2030,13 @@ mod tests {
     #[test]
     fn default_profile_matches_refreshed_claude_code_baseline() {
         let profile = default_profile();
-        assert_eq!(profile.name, "cc-2.1.197-sdk-cli");
-        assert_eq!(profile.claude_cli_version, "2.1.197");
+        assert_eq!(profile.name, "cc-2.1.207-sdk-cli");
+        assert_eq!(profile.claude_cli_version, "2.1.207");
         assert_eq!(profile.stainless_package_version, "0.94.0");
         assert_eq!(profile.stainless_runtime_version, "v26.3.0");
         assert_eq!(
             profile.user_agent(),
-            "claude-cli/2.1.197 (external, sdk-cli)"
+            "claude-cli/2.1.207 (external, sdk-cli)"
         );
         assert_eq!(
             profile.resolve_model("fable").unwrap().canonical,
@@ -1953,7 +2048,7 @@ mod tests {
         );
         assert_eq!(
             profile.resolve_model("sonnet").unwrap().canonical,
-            "claude-sonnet-4-6"
+            "claude-sonnet-5"
         );
         assert_eq!(
             profile.resolve_model("haiku").unwrap().canonical,
@@ -1965,7 +2060,13 @@ mod tests {
     fn profile_registry_resolves_known_selectors() {
         assert_eq!(
             resolve_profile("latest").unwrap().name,
-            "cc-2.1.197-sdk-cli"
+            "cc-2.1.207-sdk-cli"
+        );
+        assert_eq!(
+            resolve_profile("cc-2.1.197-sdk-cli")
+                .unwrap()
+                .claude_cli_version,
+            "2.1.197"
         );
         assert_eq!(
             resolve_profile("cc-2.1.186-sdk-cli")
@@ -2099,11 +2200,15 @@ mod tests {
         // and prompt "Say OK" on 2026-07-01 (live shared-capture mitmproxy run:
         // the real billing header read `cc_version=2.1.197.c8e`).
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.197"), "c8e");
-        // 2.1.197 (the default) emits NO cch field - the header ends at the
+        // Captured from Claude Code 2.1.207 with CLAUDE_CODE_ENTRYPOINT=sdk-cli
+        // and prompt "Say OK" on 2026-07-11 (live shared-capture mitmproxy run:
+        // the real billing header read `cc_version=2.1.207.aa4`).
+        assert_eq!(claude_code_version_suffix("Say OK", "2.1.207"), "aa4");
+        // 2.1.207 (the default) emits NO cch field - the header ends at the
         // entrypoint. Verified byte-for-byte from the live capture.
         assert_eq!(
             default_profile().billing_header_text("Say OK"),
-            "x-anthropic-billing-header: cc_version=2.1.197.c8e; cc_entrypoint=sdk-cli;"
+            "x-anthropic-billing-header: cc_version=2.1.207.aa4; cc_entrypoint=sdk-cli;"
         );
         // The 2.1.175 profile still emits the cch placeholder form.
         assert_eq!(

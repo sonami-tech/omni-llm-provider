@@ -26,6 +26,9 @@ upstream.
 - `tools/providers/claude/fingerprint/CCH_ALGORITHM.md`
 - `tools/providers/claude/fingerprint/vectors/`
 
+Live extraction requires the `mitmproxy` Python package in the same interpreter
+as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture`).
+
 ## Procedure
 
 1. Detect drift:
@@ -40,16 +43,16 @@ upstream.
 2. Capture live traffic on tmpfs (requires `OMNI_CAPTURE_LIVE=1` or `--live-capture`):
 
    ```sh
-   python3 -m tools.capture capture run \
+   uv run --with mitmproxy python -m tools.capture capture run \
      --provider claude --mode general --live-capture \
-     --models claude-fable-5 claude-haiku-4-5 claude-sonnet-4-6 claude-opus-4-8
+     --models opus sonnet haiku
    ```
 
    The legacy wrapper remains for compatibility:
 
    ```sh
    tools/providers/claude/fingerprint/capture_baseline.sh \
-     claude-fable-5 claude-haiku-4-5 claude-sonnet-4-6 claude-opus-4-8
+     claude-fable-5 claude-haiku-4-5 claude-sonnet-5 claude-opus-4-8
    ```
 
    Both helpers start mitmdump as a reverse proxy to `https://api.anthropic.com`,
@@ -65,7 +68,7 @@ upstream.
    Refresh capture command:
 
    ```sh
-   python3 -m tools.capture capture run \
+   uv run --with mitmproxy python -m tools.capture capture run \
      --provider claude --mode refresh --live-capture --refresh-capture
    ```
 
@@ -126,22 +129,29 @@ upstream.
 - Recovered vectors are local to this repo and covered by Rust tests.
 - Default workspace tests pass without credentials or network.
 
-## Current 2.1.197 Status
+## Current 2.1.207 Status
 
-On 2026-07-01, Claude Code 2.1.197 was captured and model behavior was verified
+On 2026-07-11, Claude Code 2.1.207 was captured and model behavior was verified
 for default, `opus`, `sonnet`, and `haiku` flows. Headers still use SDK package
-`0.94.0` and Anthropic version `2023-06-01`, but the Node runtime moved to
-`v26.3.0` (was `v24.3.0`), and the UA is `claude-cli/2.1.197 (external, sdk-cli)`.
+`0.94.0`, runtime `v26.3.0`, Anthropic version `2023-06-01`, and
+`claude-cli/2.1.207 (external, sdk-cli)`.
 
-2.1.197 is the current `latest` profile. Only two fields drift versus 2.1.186:
-the CLI version string and the stainless runtime version. Like 2.1.186 it emits
-the billing header with no `cch=` field, ending at `cc_entrypoint=sdk-cli;`. The
-`cc_version` suffix algorithm is unchanged: the existing Sha256Utf16SampleV1
-suffix reproduces the captured `cc_version=2.1.197.c8e` exactly, and the live
-drift checker agrees against the installed CLI. Because there is no checksum to
-recompute, this no-cch profile ships no clean-room cch vectors (matching 2.1.186).
+2.1.207 is the current `latest` profile. Drift versus 2.1.197:
 
-`claude-fable-5` remains pinned in the catalog. On 2026-07-01 upstream returned
-`404 not_found` ("Claude Fable 5 is not available. Please use Opus 4.8.") for
-this account, but that is account/upstream state, not a wire change, so the
-catalog is unchanged and the capture used `opus`, `sonnet`, and `haiku`.
+- CLI version string only for UA / billing `cc_version`.
+- Sonnet catalog id is now `claude-sonnet-5` (was `claude-sonnet-4-6`).
+- Sonnet wire is 64k / no temperature / `output_config.effort=high` (was 32k / temp=1).
+- Opus `output_config.effort` is `high` on the captured wire.
+- Haiku omits temperature (was temp=1).
+- Sonnet beta list matches explicit Opus (includes `mid-conversation-system`).
+
+Like 2.1.186/197 it emits the billing header with no `cch=` field, ending at
+`cc_entrypoint=sdk-cli;`. The `cc_version` suffix algorithm is unchanged: the
+existing Sha256Utf16SampleV1 suffix reproduces the captured
+`cc_version=2.1.207.aa4` exactly, and the live drift checker agrees against the
+installed CLI. Because there is no checksum to recompute, this no-cch profile
+ships no clean-room cch vectors.
+
+`claude-fable-5` remains pinned in the catalog (not re-exercised this capture;
+account availability is independent of wire shape). Capture used `opus`,
+`sonnet`, and `haiku`.

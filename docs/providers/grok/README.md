@@ -20,7 +20,7 @@ billing cch, or injected identity preambles. The maintained contract is:
 - correct xAI/OpenAI-compatible request body,
 - expected auth and content headers,
 - correct non-stream and stream decoding,
-- model catalog kept current (latest pin: grok-shell 0.2.91, default `grok-4.5`).
+- model catalog kept current (latest pin: grok-shell 0.2.93, default `grok-4.5`).
 
 Default Grok mode resolves credentials from `$XAI_CREDENTIALS_PATH`, then a
 usable `~/.xai/.credentials.json`, then `~/.grok/auth.json`. Custom endpoint mode is

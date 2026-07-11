@@ -1,7 +1,7 @@
 # Claude CLI Baseline Wire Fingerprint
 
-Active baseline: Claude Code 2.1.197, captured 2026-07-01. `latest` resolves to
-`cc-2.1.197-sdk-cli`.
+Active baseline: Claude Code 2.1.207, captured 2026-07-11. `latest` resolves to
+`cc-2.1.207-sdk-cli`.
 
 Raw mitmproxy `.flow` files are not committed because they contain live bearer
 tokens and account identifiers. Keep raw captures on tmpfs and inspect them with
@@ -11,6 +11,7 @@ tokens and account identifiers. Keep raw captures on tmpfs and inspect them with
 
 | Profile | Claude Code | SDK package | Runtime | Entrypoint | Source |
 |---|---|---|---|---|---|
+| `cc-2.1.207-sdk-cli` | `2.1.207` | `0.94.0` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/default, 2026-07-11 |
 | `cc-2.1.197-sdk-cli` | `2.1.197` | `0.94.0` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/default, 2026-07-01 |
 | `cc-2.1.186-sdk-cli` | `2.1.186` | `0.94.0` | `v24.3.0` | `sdk-cli` | live shared-capture mitmproxy, default/Opus/Sonnet/Haiku, 2026-06-22 |
 | `cc-2.1.175-sdk-cli` | `2.1.175` | `0.94.0` | `v24.3.0` | `sdk-cli` | fake-server and live capture, Fable/Opus/Sonnet/Haiku/default, 2026-06-12 |

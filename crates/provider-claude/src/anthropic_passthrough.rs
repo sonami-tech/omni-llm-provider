@@ -716,7 +716,7 @@ mod tests {
             // exact canonical -> canonical
             ("claude-opus-4-8", "claude-opus-4-8"),
             // short alias -> canonical
-            ("sonnet", "claude-sonnet-4-6"),
+            ("sonnet", "claude-sonnet-5"),
             // family long-form: NOT a catalog alias -> forwards raw
             ("claude-sonnet", "claude-sonnet"),
             // non-Claude id: no reject -> forwards raw (Anthropic will 400 it)
@@ -791,7 +791,8 @@ mod tests {
         )
         .expect("reconcile ok");
         assert!(req.max_tokens > 0);
-        assert_eq!(req.temperature, Some(1.0));
+        // 2.1.207 haiku wire omits temperature when the client did not set one.
+        assert_eq!(req.temperature, None);
 
         let body = serde_json::json!({
             "model": "claude-haiku-4-5",

@@ -1444,28 +1444,28 @@ mod tests {
         );
         let cases: &[WireCase] = &[
             ("fable", "claude-fable-5", 64_000, None, Some("xhigh")),
-            ("opus", "claude-opus-4-8", 64_000, None, Some("xhigh")),
+            ("opus", "claude-opus-4-8", 64_000, None, Some("high")),
             (
                 "sonnet",
-                "claude-sonnet-4-6",
-                32_000,
-                Some(1.0),
+                "claude-sonnet-5",
+                64_000,
+                None,
                 Some("high"),
             ),
-            // The "haiku" alias resolves to the dated canonical; its wire override
-            // carries the same 32k / 1.0 / no-effort values as the undated entry.
+            // The "haiku" alias resolves to the dated canonical; 2.1.207 omits
+            // temperature on the wire (no temp=1) and has no output_config.
             (
                 "haiku",
                 "claude-haiku-4-5-20251001",
                 32_000,
-                Some(1.0),
+                None,
                 None,
             ),
             (
                 "claude-haiku-4-5",
                 "claude-haiku-4-5",
                 32_000,
-                Some(1.0),
+                None,
                 None,
             ),
         ];
