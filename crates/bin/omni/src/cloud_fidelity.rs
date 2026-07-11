@@ -120,6 +120,26 @@ pub fn is_bearer_scheme_prefix(value: &str) -> bool {
     scheme.eq_ignore_ascii_case("bearer")
 }
 
+/// Best-effort Bearer detection on raw header bytes when UTF-8 decode fails.
+/// Matches optional leading spaces, case-insensitive `Bearer`, then whitespace
+/// or end (so `Bearer` / `Bearer <opaque>` both count as Bearer-scheme material).
+fn authorization_bytes_look_like_bearer(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    const BEARER: &[u8] = b"bearer";
+    if bytes.len().saturating_sub(i) < BEARER.len() {
+        return false;
+    }
+    let scheme = &bytes[i..i + BEARER.len()];
+    if !scheme.eq_ignore_ascii_case(BEARER) {
+        return false;
+    }
+    let after = i + BEARER.len();
+    after == bytes.len() || bytes[after].is_ascii_whitespace()
+}
+
 /// Collect all Anthropic-relevant credential material from headers.
 pub fn anthropic_cred_presence(headers: &HeaderMap) -> AnthropicCredPresence {
     let mut presence = AnthropicCredPresence::default();
@@ -128,7 +148,12 @@ pub fn anthropic_cred_presence(headers: &HeaderMap) -> AnthropicCredPresence {
 
     for val in headers.get_all("authorization") {
         let Ok(raw) = val.to_str() else {
+            // Non-UTF-8 Authorization: still inspect ASCII Bearer prefix so dual
+            // with x-api-key cannot be bypassed by opaque bytes after "Bearer ".
             presence.non_bearer_authorization = true;
+            if authorization_bytes_look_like_bearer(val.as_bytes()) {
+                presence.malformed_bearer = true;
+            }
             continue;
         };
         let raw = raw.trim();
@@ -452,6 +477,26 @@ mod tests {
         );
         let p = anthropic_cred_presence(&map);
         assert!(p.opaque_x_api_key);
+        assert!(p.dual);
+        assert!(dual_anthropic_credentials(&map));
+    }
+
+    #[test]
+    fn dual_with_opaque_bearer_bytes_and_x_api_key() {
+        // Non-UTF-8 Authorization that still has ASCII Bearer prefix + x-api-key.
+        let mut raw = b"Bearer ".to_vec();
+        raw.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+        let mut map = HeaderMap::new();
+        map.append(
+            axum::http::HeaderName::from_static("authorization"),
+            HeaderValue::from_bytes(&raw).unwrap(),
+        );
+        map.append(
+            axum::http::HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static("key-a"),
+        );
+        let p = anthropic_cred_presence(&map);
+        assert!(p.malformed_bearer);
         assert!(p.dual);
         assert!(dual_anthropic_credentials(&map));
     }
