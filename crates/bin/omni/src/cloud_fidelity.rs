@@ -371,16 +371,18 @@ mod tests {
         assert!(!dual_anthropic_credentials(&headers(&[
             ("authorization", "Bearer token-b")
         ])));
-        assert!(!dual_anthropic_credentials(&headers(&[
+        // Empty Bearer token is still Bearer-scheme material: dual with x-api-key.
+        assert!(dual_anthropic_credentials(&headers(&[
             ("x-api-key", "key-a"),
             ("authorization", "Bearer "),
         ])));
+        // Whitespace-only x-api-key is not material; Bearer alone is not dual.
         assert!(!dual_anthropic_credentials(&headers(&[
             ("x-api-key", "   "),
             ("authorization", "Bearer token-b"),
         ])));
         assert!(!dual_anthropic_credentials(&headers(&[])));
-        // Non-Bearer Authorization does not count as Bearer credential alone.
+        // Non-Bearer Authorization is not Bearer-scheme material (not dual).
         assert!(!dual_anthropic_credentials(&headers(&[
             ("x-api-key", "key-a"),
             ("authorization", "Basic abc"),
