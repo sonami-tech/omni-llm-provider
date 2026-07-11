@@ -70,11 +70,6 @@ impl AnthropicCredPresence {
         self.x_api_key.is_some() || self.opaque_x_api_key
     }
 
-    /// Any Bearer-scheme material (valid token or malformed Bearer).
-    pub fn has_bearer_scheme_material(&self) -> bool {
-        self.bearer_token.is_some() || self.malformed_bearer
-    }
-
     /// Any credential-shaped material was presented (including malformed Authorization).
     pub fn any_credential_material(&self) -> bool {
         self.has_bearer()
@@ -215,12 +210,6 @@ pub fn anthropic_cred_presence(headers: &HeaderMap) -> AnthropicCredPresence {
     presence
 }
 
-/// Both non-empty `x-api-key` and non-empty Bearer present (any values).
-/// Always-on reject for Anthropic paths (independent of strict mode / key set).
-pub fn dual_anthropic_credentials(headers: &HeaderMap) -> bool {
-    anthropic_cred_presence(headers).dual
-}
-
 /// Under strict mode, when any credential material is presented, enforce the
 /// configured single-header scheme. Dual / multi-value ambiguity is handled
 /// separately before this when possible.
@@ -348,17 +337,6 @@ pub fn validate_strict_token_caps(
     }
 }
 
-// Backward-compatible thin wrappers used by older call sites / tests.
-/// Extract non-empty Bearer token (trimmed), if present (first Authorization value that parses).
-pub fn bearer_token(headers: &HeaderMap) -> Option<String> {
-    anthropic_cred_presence(headers).bearer_token
-}
-
-/// Extract non-empty `x-api-key` value (trimmed), if present (first non-empty).
-pub fn x_api_key(headers: &HeaderMap) -> Option<String> {
-    anthropic_cred_presence(headers).x_api_key
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,7 +359,7 @@ mod tests {
             ("x-api-key", "key-a"),
             ("authorization", "Bearer token-b"),
         ]);
-        assert!(dual_anthropic_credentials(&h));
+        assert!(anthropic_cred_presence(&h).dual);
     }
 
     #[test]
@@ -390,36 +368,37 @@ mod tests {
             ("x-api-key", "key-a"),
             ("authorization", "bearer token-b"),
         ]);
-        assert!(dual_anthropic_credentials(&h));
+        assert!(anthropic_cred_presence(&h).dual);
         let h2 = headers(&[
             ("x-api-key", "key-a"),
             ("authorization", "BEARER token-b"),
         ]);
-        assert!(dual_anthropic_credentials(&h2));
+        assert!(anthropic_cred_presence(&h2).dual);
     }
 
     #[test]
     fn dual_credentials_false_for_single_or_empty() {
-        assert!(!dual_anthropic_credentials(&headers(&[("x-api-key", "key-a")])));
-        assert!(!dual_anthropic_credentials(&headers(&[
-            ("authorization", "Bearer token-b")
-        ])));
+        assert!(!anthropic_cred_presence(&headers(&[("x-api-key", "key-a")])).dual);
+        assert!(!anthropic_cred_presence(&headers(&[("authorization", "Bearer token-b")])).dual);
         // Empty Bearer token is still Bearer-scheme material: dual with x-api-key.
-        assert!(dual_anthropic_credentials(&headers(&[
+        assert!(anthropic_cred_presence(&headers(&[
             ("x-api-key", "key-a"),
             ("authorization", "Bearer "),
-        ])));
+        ]))
+        .dual);
         // Whitespace-only x-api-key is not material; Bearer alone is not dual.
-        assert!(!dual_anthropic_credentials(&headers(&[
+        assert!(!anthropic_cred_presence(&headers(&[
             ("x-api-key", "   "),
             ("authorization", "Bearer token-b"),
-        ])));
-        assert!(!dual_anthropic_credentials(&headers(&[])));
+        ]))
+        .dual);
+        assert!(!anthropic_cred_presence(&headers(&[])).dual);
         // Non-Bearer Authorization is not Bearer-scheme material (not dual).
-        assert!(!dual_anthropic_credentials(&headers(&[
+        assert!(!anthropic_cred_presence(&headers(&[
             ("x-api-key", "key-a"),
             ("authorization", "Basic abc"),
-        ])));
+        ]))
+        .dual);
     }
 
     #[test]
@@ -430,7 +409,6 @@ mod tests {
             ("authorization", "Bearer token-b"),
             ("x-api-key", "key-a"),
         ]);
-        assert!(dual_anthropic_credentials(&h));
         let p = anthropic_cred_presence(&h);
         assert_eq!(p.bearer_token.as_deref(), Some("token-b"));
         assert!(p.non_bearer_authorization);
@@ -444,7 +422,7 @@ mod tests {
             ("x-api-key", "key-a"),
             ("authorization", "Bearer token-b"),
         ]);
-        assert!(dual_anthropic_credentials(&h));
+        assert!(anthropic_cred_presence(&h).dual);
     }
 
     #[test]
@@ -486,7 +464,6 @@ mod tests {
         let p = anthropic_cred_presence(&map);
         assert!(p.opaque_x_api_key);
         assert!(p.dual);
-        assert!(dual_anthropic_credentials(&map));
     }
 
     #[test]
@@ -525,7 +502,6 @@ mod tests {
         let p = anthropic_cred_presence(&map);
         assert!(p.malformed_bearer);
         assert!(p.dual);
-        assert!(dual_anthropic_credentials(&map));
     }
 
     #[test]
