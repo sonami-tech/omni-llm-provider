@@ -204,6 +204,14 @@ pub fn anthropic_cred_presence(headers: &HeaderMap) -> AnthropicCredPresence {
     let has_bearer_material = presence.bearer_token.is_some() || presence.malformed_bearer;
     let has_x_material = presence.x_api_key.is_some() || presence.opaque_x_api_key;
     presence.dual = has_bearer_material && has_x_material;
+
+    // Mixed opaque + UTF-8 (or valid + malformed Bearer) is multi-value ambiguity.
+    if presence.opaque_x_api_key && presence.x_api_key.is_some() {
+        presence.ambiguous_x_api_key = true;
+    }
+    if presence.malformed_bearer && presence.bearer_token.is_some() {
+        presence.ambiguous_bearer = true;
+    }
     presence
 }
 
@@ -479,6 +487,25 @@ mod tests {
         assert!(p.opaque_x_api_key);
         assert!(p.dual);
         assert!(dual_anthropic_credentials(&map));
+    }
+
+    #[test]
+    fn mixed_opaque_and_utf8_x_api_key_is_ambiguous() {
+        let mut map = HeaderMap::new();
+        map.append(
+            axum::http::HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static("key-a"),
+        );
+        map.append(
+            axum::http::HeaderName::from_static("x-api-key"),
+            HeaderValue::from_bytes(&[0xff, 0xfe, 0xfd]).unwrap(),
+        );
+        let p = anthropic_cred_presence(&map);
+        assert!(p.opaque_x_api_key);
+        assert_eq!(p.x_api_key.as_deref(), Some("key-a"));
+        assert!(p.ambiguous_x_api_key);
+        let err = strict_anthropic_scheme_ok(AnthropicAuthScheme::ApiKey, &p).unwrap_err();
+        assert!(err.to_lowercase().contains("ambiguous"), "{err}");
     }
 
     #[test]
