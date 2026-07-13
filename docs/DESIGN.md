@@ -35,24 +35,32 @@ Provider implementations remain separate crates:
 
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
-- `POST /v1/messages` for Claude-native Anthropic Messages inbound
-- `POST /v1/messages/count_tokens` for Claude-native Anthropic token counting
+- `POST /v1/messages` dual-mode Anthropic Messages inbound (Claude native, or
+  Grok/Codex via canonical translation)
+- `POST /v1/messages/count_tokens` Claude-native only (non-Claude → 400)
 - `GET /v1/models`, `GET /models`
 - `GET /stats`
 - `GET /health`, `GET /`
 
 OpenAI-compatible inbound surfaces route through `LlmProvider` and can target
-any enabled provider. Anthropic inbound is different: it is provider-native and
-routes only to Claude. The Claude provider owns the closed Anthropic allowlist,
-model resolution, identity injection, cch finalization, raw JSON response path,
-raw SSE forwarding, and `count_tokens` body shaping.
+any enabled provider.
+
+Anthropic inbound is **dual-mode** (same shared model resolver as chat):
+
+| Resolved provider | Path |
+|---|---|
+| **claude** | Native passthrough: fingerprint, cch, raw JSON/SSE. Original body is not run through Anthropic→canonical. |
+| **grok** / **codex** | Translated: Anthropic → Canonical → `LlmProvider` → Anthropic JSON/SSE (`omni-common::anthropic`). Best-effort protocol fidelity; lossy fields documented in `docs/anthropic-compat.md`. |
+
+Claude native path stays in `provider-claude`. Mappers live in `omni-common`;
+dispatch in `bin/omni`. Providers remain canonical-only on the trait.
 
 Codex supports OpenAI inbound non-streaming and streaming paths by posting to
 the Codex Responses API and translating native Responses SSE events into
 canonical stream events.
 
-`LlmProvider` remains canonical-only. Native Anthropic methods are not on the
-shared trait because Grok and Codex cannot preserve Anthropic wire fidelity.
+`LlmProvider` remains canonical-only. Native Anthropic methods stay Claude-only
+on the Claude provider (not on the shared trait).
 
 ## Build
 
@@ -67,7 +75,11 @@ cargo run -p omni -- --port 18321
 - Do not merge provider internals into `omni`.
 - Do not route unknown or ambiguous bare model names heuristically when more
   than one provider is enabled.
-- Do not emulate Anthropic inbound for non-Claude providers.
+- Do not claim perfect Anthropic wire fidelity on Grok/Codex translated path
+  (see `docs/anthropic-compat.md`).
+- Do not emit thinking blocks on the translated Anthropic path (v1).
+- Do not add a separate `openai` provider id; OpenAI-compat backends use Codex
+  (and existing custom endpoints).
 - Do not add provider-specific server binaries unless there is a concrete
   compatibility requirement.
 
@@ -78,8 +90,8 @@ The Codex backend is implemented in `provider-codex` and implements
 configuration from `$CODEX_HOME` or `~/.codex`, including provider overrides
 such as `base_url`, `wire_api`, `env_key`, `http_headers`,
 `env_http_headers`, query parameters, and command-backed auth. Secret auth
-material is resolved per request and is not logged. Anthropic inbound remains
-Claude-only.
+material is resolved per request and is not logged. Anthropic inbound may also
+target Codex via the dual-mode translated path (best-effort).
 
 ## Custom Upstream Auth
 

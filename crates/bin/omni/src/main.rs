@@ -82,7 +82,9 @@ use uuid::Uuid;
 
 use omni_common::{
     ActiveRequestGuard, ApiKeyId, AppError, ChatCompletionRequest, ConversationLog, Replacements,
-    Stats, TokenUsage, env_nonempty, from_canonical, to_canonical,
+    Stats, TokenUsage, anthropic_to_canonical, canonical_to_anthropic, env_nonempty, from_canonical,
+    parse_anthropic_object_no_dup_keys, peek_model_string, sse_from_canonical_stream_anthropic,
+    to_canonical,
 };
 use omni_core::{
     CanonicalResponse, CanonicalStream, CanonicalStreamEvent, LlmProvider, ProviderError,
@@ -1823,36 +1825,118 @@ async fn anthropic_messages_inner(
 ) -> Result<Response, AppError> {
     let request_id = request_id_from(&request);
     let short_request_id = request_id.chars().take(8).collect::<String>();
-    let raw_body = read_anthropic_body(request).await?;
-    let requested_model = raw_body
-        .get("model")
-        .and_then(|value| value.as_str())
-        .unwrap_or("<missing>")
-        .to_string();
+    // Retain original bytes for Claude native path (cch/fingerprint isolation).
+    let raw_bytes = read_anthropic_body_bytes(request).await?;
+    let requested_model = peek_model_string(&raw_bytes).unwrap_or_else(|| "<missing>".into());
+
+    // Peek-only parse for session/logging (Claude arm still prepares from original bytes).
+    let peek_body: serde_json::Value =
+        serde_json::from_slice(&raw_bytes).unwrap_or(serde_json::json!({}));
     let session_id = anthropic_session_id(
         &headers,
-        raw_body
+        peek_body
             .get("metadata")
             .and_then(|metadata| metadata.get("user_id"))
             .and_then(|value| value.as_str()),
         api_key.as_ref().map(|key| key.0.0.as_str()),
         &short_request_id,
     );
-    // The native Anthropic route only ever delegates to claude.
+
+    // Shared model resolver (same as chat) — identity only.
+    let catalogs = provider_catalogs(&state.providers);
+    let (prov_key, stripped_model) =
+        resolve_provider_and_model(&requested_model, &catalogs).map_err(AppError::BadRequest)?;
+
     let span = tracing::Span::current();
     span.record("session_id", session_id.as_str());
-    span.record("provider", "claude");
+    span.record("provider", prov_key.as_str());
     log_json(
         &state,
         &session_id,
         &short_request_id,
         ">>>",
         "Inbound Anthropic Messages body",
-        &raw_body,
+        &peek_body,
     );
 
-    let claude = claude_native_for_anthropic(&state, &requested_model)?;
-    let raw_body = strip_claude_model_prefix(raw_body)?;
+    match prov_key.as_str() {
+        "claude" => {
+            anthropic_messages_claude_native(
+                state,
+                api_key,
+                raw_bytes,
+                requested_model,
+                stripped_model,
+                session_id,
+                short_request_id,
+            )
+            .await
+        }
+        "grok" | "codex" => {
+            anthropic_messages_translated(
+                state,
+                api_key,
+                &raw_bytes,
+                &prov_key,
+                requested_model,
+                stripped_model,
+                session_id,
+                short_request_id,
+            )
+            .await
+        }
+        other => Err(AppError::BadRequest(format!(
+            "Anthropic /v1/messages does not support provider '{other}'"
+        ))),
+    }
+}
+
+/// Claude-native Anthropic path: original body bytes → prepare/fingerprint/cch.
+/// Never runs `anthropic_to_canonical`.
+async fn anthropic_messages_claude_native(
+    state: Arc<AppState>,
+    api_key: Option<Extension<ApiKeyId>>,
+    raw_bytes: Vec<u8>,
+    requested_model: String,
+    stripped_model: String,
+    session_id: String,
+    short_request_id: String,
+) -> Result<Response, AppError> {
+    let Some(entry) = state.providers.get("claude") else {
+        return Err(AppError::BadRequest(
+            "Anthropic /v1/messages is supported only when the claude provider is enabled".into(),
+        ));
+    };
+    let Some(claude) = entry.claude_native.as_ref() else {
+        return Err(AppError::ServerError(
+            "claude provider does not expose native Anthropic support".into(),
+        ));
+    };
+
+    // Parse once for prepare; strip `claude:` prefix only when present.
+    let mut raw_body: serde_json::Value = serde_json::from_slice(&raw_bytes)
+        .map_err(|e| AppError::BadRequest(format!("invalid JSON: {e}")))?;
+    if let Some(model) = raw_body.get("model").and_then(|v| v.as_str()) {
+        if let Some((prefix, rest)) = model.split_once(':') {
+            if prefix.eq_ignore_ascii_case("claude") {
+                if rest.trim().is_empty() {
+                    return Err(AppError::BadRequest(
+                        "empty model after claude provider prefix".into(),
+                    ));
+                }
+                raw_body["model"] = serde_json::Value::String(rest.trim().to_string());
+            }
+        }
+    }
+    // Prefer catalog-stripped model when no prefix strip happened (aliases).
+    if raw_body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .is_some_and(|m| m == requested_model && m != stripped_model && !m.contains(':'))
+    {
+        raw_body["model"] = serde_json::Value::String(stripped_model.clone());
+    }
+
     let replacements = Replacements::empty();
     let prepared = claude
         .prepare_anthropic_messages(raw_body, &replacements, true)
@@ -1955,7 +2039,6 @@ async fn anthropic_messages_inner(
             .get("stop_reason")
             .and_then(|v| v.as_str())
             .map(map_anthropic_stop_reason);
-        // Plain u64 usage may default missing fields to 0; omit all-zero.
         let (in_tok, out_tok) = tokens_from_plain_usage(
             usage.input_tokens,
             usage.output_tokens,
@@ -1990,6 +2073,138 @@ async fn anthropic_messages_inner(
     Ok((anthropic_request_id_header(&short_request_id), Json(value)).into_response())
 }
 
+/// Translated Anthropic path for Grok/Codex: Anthropic → Canonical → provider → Anthropic.
+#[allow(clippy::too_many_arguments)]
+async fn anthropic_messages_translated(
+    state: Arc<AppState>,
+    api_key: Option<Extension<ApiKeyId>>,
+    raw_bytes: &[u8],
+    prov_key: &str,
+    requested_model: String,
+    stripped_model: String,
+    session_id: String,
+    short_request_id: String,
+) -> Result<Response, AppError> {
+    let body = parse_anthropic_object_no_dup_keys(raw_bytes)
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+
+    let mut canon =
+        anthropic_to_canonical(&body, prov_key).map_err(|e| AppError::BadRequest(e.to_string()))?;
+    // Provider sees stripped model (no client prefix).
+    canon.model = stripped_model.clone();
+    validate_provider_extras(prov_key, canon.provider_extras.as_ref())
+        .map_err(AppError::BadRequest)?;
+
+    let stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let entry = state
+        .providers
+        .get(prov_key)
+        .ok_or_else(|| AppError::ServerError("provider disappeared".into()))?;
+    let provider = &entry.provider;
+
+    let stats_key = stats_model_key(prov_key, &stripped_model);
+    if let Some(stats) = &state.stats {
+        stats.record_request(&stats_key, api_key.as_ref().map(|key| key.0.0.as_str()));
+    }
+
+    let message_id = format!("msg_{short_request_id}");
+
+    if stream {
+        // Open upstream BEFORE HTTP 200 + message_start (plan §4.3 stream open order).
+        let open_started = Instant::now();
+        let upstream = provider.send_stream(canon).await.map_err(|error| {
+            let err_msg = error.to_string();
+            if let Some(stats) = &state.stats {
+                stats.record_error(&stats_key, &err_msg);
+                log_terminal_error_complete(
+                    &stats_key,
+                    open_started.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    false,
+                    None,
+                    Some(err_msg),
+                    Some(requested_model.as_str()),
+                );
+            }
+            map_anthropic_translated_provider_err(error)
+        })?;
+        log_text(
+            &state,
+            &session_id,
+            &short_request_id,
+            "<<<",
+            "Anthropic Messages (translated) stream opened",
+            &format!("model={requested_model} provider={prov_key}"),
+        );
+        // Wrap for stats then frame as Anthropic SSE.
+        let stream = wrap_stream_for_stats(
+            upstream,
+            state.stats.clone(),
+            stats_key.clone(),
+            state.conversation_log.clone(),
+            session_id.clone(),
+            short_request_id.clone(),
+            "Anthropic Messages translated stream",
+            Some(requested_model.clone()),
+        );
+        let sse =
+            sse_from_canonical_stream_anthropic(stream, stripped_model, message_id);
+        let mut response = sse.into_response();
+        response.headers_mut().insert(
+            header::HeaderName::from_static("x-request-id"),
+            request_id_header(&short_request_id),
+        );
+        return Ok(response);
+    }
+
+    let _active = state.stats.as_deref().map(ActiveRequestGuard::new);
+    let started = Instant::now();
+    let canon_resp = provider.send(canon).await.map_err(|error| {
+        let err_msg = error.to_string();
+        if let Some(stats) = &state.stats {
+            stats.record_error(&stats_key, &err_msg);
+            log_terminal_error_complete(
+                &stats_key,
+                started.elapsed().as_secs_f64() * 1000.0,
+                false,
+                false,
+                None,
+                Some(err_msg),
+                Some(requested_model.as_str()),
+            );
+        }
+        map_anthropic_translated_provider_err(error)
+    })?;
+
+    if let Some(stats) = &state.stats {
+        record_response_stats(stats, &stats_key, &canon_resp, started);
+        log_nonstream_response_complete(
+            &stats_key,
+            &canon_resp,
+            started.elapsed().as_secs_f64() * 1000.0,
+            Some(requested_model.as_str()),
+        );
+    }
+
+    let value = canonical_to_anthropic(&canon_resp, &stripped_model).map_err(|e| {
+        // Protocol/shape error after successful upstream → 502
+        AppError::http(502, e.to_string())
+    })?;
+    log_json(
+        &state,
+        &session_id,
+        &short_request_id,
+        "<<<",
+        "Anthropic Messages (translated) response",
+        &value,
+    );
+    Ok((anthropic_request_id_header(&short_request_id), Json(value)).into_response())
+}
+
 async fn anthropic_count_tokens_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2010,28 +2225,68 @@ async fn anthropic_count_tokens_inner(
 ) -> Result<Response, AppError> {
     let request_id = request_id_from(&request);
     let short_request_id = request_id.chars().take(8).collect::<String>();
-    let raw_body = read_anthropic_body(request).await?;
-    let requested_model = raw_body
-        .get("model")
-        .and_then(|value| value.as_str())
-        .unwrap_or("<missing>")
-        .to_string();
+    let raw_bytes = read_anthropic_body_bytes(request).await?;
+    let requested_model = peek_model_string(&raw_bytes).unwrap_or_else(|| "<missing>".into());
+    let peek_body: serde_json::Value =
+        serde_json::from_slice(&raw_bytes).unwrap_or(serde_json::json!({}));
     let session_id = anthropic_session_id(
         &headers,
-        raw_body
+        peek_body
             .get("metadata")
             .and_then(|metadata| metadata.get("user_id"))
             .and_then(|value| value.as_str()),
         api_key.as_ref().map(|key| key.0.0.as_str()),
         &short_request_id,
     );
-    // The native Anthropic count_tokens route only ever delegates to claude.
+
+    let catalogs = provider_catalogs(&state.providers);
+    let (prov_key, stripped_model) = resolve_provider_and_model(&requested_model, &catalogs)
+        .map_err(AppError::BadRequest)?;
+
     let span = tracing::Span::current();
     span.record("session_id", session_id.as_str());
-    span.record("provider", "claude");
+    span.record("provider", prov_key.as_str());
 
-    let claude = claude_native_for_anthropic(&state, &requested_model)?;
-    let raw_body = strip_claude_model_prefix(raw_body)?;
+    // Non-Claude: 400 token counting unsupported (plan §7).
+    if prov_key != "claude" {
+        return Err(AppError::BadRequest(format!(
+            "token counting is not supported for provider '{prov_key}' on Anthropic /v1/messages/count_tokens"
+        )));
+    }
+
+    let Some(entry) = state.providers.get("claude") else {
+        return Err(AppError::BadRequest(
+            "Anthropic count_tokens requires the claude provider".into(),
+        ));
+    };
+    let Some(claude) = entry.claude_native.as_ref() else {
+        return Err(AppError::ServerError(
+            "claude provider does not expose native Anthropic support".into(),
+        ));
+    };
+
+    let mut raw_body: serde_json::Value = serde_json::from_slice(&raw_bytes)
+        .map_err(|e| AppError::BadRequest(format!("invalid JSON: {e}")))?;
+    if let Some(model) = raw_body.get("model").and_then(|v| v.as_str()) {
+        if let Some((prefix, rest)) = model.split_once(':') {
+            if prefix.eq_ignore_ascii_case("claude") {
+                if rest.trim().is_empty() {
+                    return Err(AppError::BadRequest(
+                        "empty model after claude provider prefix".into(),
+                    ));
+                }
+                raw_body["model"] = serde_json::Value::String(rest.trim().to_string());
+            }
+        }
+    }
+    if raw_body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .is_some_and(|m| m == requested_model && m != stripped_model && !m.contains(':'))
+    {
+        raw_body["model"] = serde_json::Value::String(stripped_model);
+    }
+
     let replacements = Replacements::empty();
     let prepared = claude
         .prepare_anthropic_count_tokens(raw_body, &replacements)
@@ -2058,10 +2313,8 @@ async fn anthropic_count_tokens_inner(
         .await
         .map_err(|error| {
             let err_msg = error.to_string();
-            // count_tokens error twin only when record_error ran (stats Some).
             if let Some(stats) = &state.stats {
                 stats.record_error(&stats_key, &err_msg);
-                // count_tokens has no finish concept; errors are pre-body style none.
                 log_terminal_error_complete(
                     &stats_key,
                     started.elapsed().as_secs_f64() * 1000.0,
@@ -2077,57 +2330,31 @@ async fn anthropic_count_tokens_inner(
     Ok((anthropic_request_id_header(&short_request_id), Json(value)).into_response())
 }
 
-async fn read_anthropic_body(request: Request<Body>) -> Result<serde_json::Value, AppError> {
+async fn read_anthropic_body_bytes(request: Request<Body>) -> Result<Vec<u8>, AppError> {
     let body = axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024)
         .await
         .map_err(|error| AppError::BadRequest(format!("failed to read body: {error}")))?;
-    serde_json::from_slice(&body)
-        .map_err(|error| AppError::BadRequest(format!("invalid JSON: {error}")))
+    Ok(body.to_vec())
 }
 
-fn claude_native_for_anthropic(
-    state: &AppState,
-    requested_model: &str,
-) -> Result<Arc<ClaudeProvider>, AppError> {
-    let Some(entry) = state.providers.get("claude") else {
-        return Err(AppError::BadRequest(
-            "Anthropic /v1/messages is supported only when the claude provider is enabled".into(),
-        ));
-    };
-    let Some(claude) = entry.claude_native.as_ref() else {
-        return Err(AppError::ServerError(
-            "claude provider does not expose native Anthropic support".into(),
-        ));
-    };
-    if let Some((prefix, _)) = requested_model.split_once(':')
-        && prefix != "claude"
-    {
-        return Err(AppError::BadRequest(
-            "Anthropic /v1/messages supports only claude models".into(),
-        ));
+/// Status mapping for translated Anthropic path only (plan §4.3).
+/// Never returns gateway 401 for upstream/provider credential failures.
+fn map_anthropic_translated_provider_err(e: ProviderError) -> AppError {
+    match e {
+        ProviderError::Auth(msg) => AppError::http(502, format!("provider credentials: {msg}")),
+        ProviderError::BadRequest(msg) => AppError::BadRequest(msg),
+        ProviderError::Upstream { status, message } => {
+            let msg = format!("upstream: {message}");
+            match status {
+                Some(429) => AppError::rate_limited(msg),
+                Some(401 | 403) => AppError::http(502, msg),
+                Some(s) if (400..500).contains(&s) => AppError::BadRequest(msg),
+                Some(s) if (500..600).contains(&s) => AppError::http(502, msg),
+                _ => AppError::http(502, msg),
+            }
+        }
+        ProviderError::Other(a) => AppError::http(502, a.to_string()),
     }
-    Ok(claude.clone())
-}
-
-fn strip_claude_model_prefix(mut body: serde_json::Value) -> Result<serde_json::Value, AppError> {
-    let Some(model) = body.get("model").and_then(|value| value.as_str()) else {
-        return Ok(body);
-    };
-    let Some((prefix, stripped)) = model.split_once(':') else {
-        return Ok(body);
-    };
-    if prefix != "claude" {
-        return Err(AppError::BadRequest(
-            "Anthropic /v1/messages supports only claude models".into(),
-        ));
-    }
-    if stripped.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "empty model after claude provider prefix".into(),
-        ));
-    }
-    body["model"] = serde_json::Value::String(stripped.trim().to_string());
-    Ok(body)
 }
 
 fn map_anthropic_prepare_err(error: ProviderError) -> AppError {
@@ -4716,7 +4943,10 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
     }
 
     #[tokio::test]
-    async fn test_anthropic_messages_rejects_when_claude_disabled() {
+    async fn test_anthropic_messages_translated_routes_when_claude_disabled() {
+        // Dual-mode: Grok-only server accepts Anthropic /v1/messages for grok models.
+        // Upstream will fail (bad port / no creds) but must not be the old
+        // "claude provider required" reject.
         let mut providers = HashMap::new();
         providers.insert("grok".into(), grok_entry("http://127.0.0.1:9"));
         let resp = call_anthropic_messages_handler(
@@ -4724,23 +4954,31 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             r#"{"model":"grok-4.3","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let status = resp.status();
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["type"], "error");
-        assert_eq!(v["error"]["type"], "invalid_request_error");
+        let msg = v["error"]["message"].as_str().unwrap_or("");
         assert!(
-            v["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("claude provider")
+            !msg.contains("claude provider") && !msg.contains("only claude models"),
+            "translated path must not require claude: status={status} msg={msg}"
         );
+        // Missing credentials / upstream failure → 502 api_error (never 401).
+        assert!(
+            status == StatusCode::BAD_GATEWAY
+                || status == StatusCode::BAD_REQUEST
+                || status == StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected status {status}: {msg}"
+        );
+        if status == StatusCode::BAD_GATEWAY {
+            assert_eq!(v["error"]["type"], "api_error");
+        }
     }
 
     #[tokio::test]
-    async fn test_anthropic_messages_rejects_non_claude_prefix() {
+    async fn test_anthropic_messages_accepts_grok_prefix() {
+        // Dual-mode: grok: prefix must resolve to translated path, not reject.
         let mut providers = HashMap::new();
         providers.insert("claude".into(), claude_entry());
         providers.insert("grok".into(), grok_entry("http://127.0.0.1:9"));
@@ -4749,6 +4987,29 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             r#"{"model":"grok:grok-4.3","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
         )
         .await;
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            !msg.contains("only claude models"),
+            "grok: prefix must be accepted on dual-mode Anthropic: {msg}"
+        );
+        assert_ne!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_count_tokens_rejects_non_claude() {
+        let mut providers = HashMap::new();
+        providers.insert("claude".into(), claude_entry());
+        providers.insert("grok".into(), grok_entry("http://127.0.0.1:9"));
+        let resp = call_anthropic_count_tokens_handler(
+            state_with(providers),
+            r#"{"model":"grok:grok-4.3","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
@@ -4758,9 +5019,56 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         assert!(
             v["error"]["message"]
                 .as_str()
-                .unwrap()
-                .contains("only claude models")
+                .unwrap_or("")
+                .contains("token counting")
+                || v["error"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("not supported"),
+            "{}",
+            v["error"]["message"]
         );
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_messages_translated_nonstream_mock_grok() {
+        // Hermetic: Anthropic request → Grok mock (custom auth) → Anthropic response.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl_test",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "pong"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}
+            })))
+            .mount(&server)
+            .await;
+
+        let mut providers = HashMap::new();
+        // grok_entry uses with_custom_auth — no XAI_CREDENTIALS_PATH needed.
+        providers.insert("grok".into(), grok_entry(server.uri().as_str()));
+        let resp = call_anthropic_messages_handler(
+            state_with(providers),
+            r#"{"model":"grok:grok-4.3","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status, StatusCode::OK, "translated nonstream: {v}");
+        assert_eq!(v["type"], "message");
+        assert_eq!(v["role"], "assistant");
+        assert_eq!(v["stop_reason"], "end_turn");
+        assert_eq!(v["content"][0]["type"], "text");
+        assert_eq!(v["content"][0]["text"], "pong");
+        assert!(v["stop_sequence"].is_null());
     }
 
     #[tokio::test]

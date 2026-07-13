@@ -1,6 +1,6 @@
 # Compatibility Matrix
 
-Last updated: 2026-06-16.
+Last updated: 2026-07-12.
 
 Normal tests are hermetic and quota-free. Live provider checks remain opt-in via
 `OMNI_LIVE_TESTS=1`.
@@ -18,6 +18,21 @@ Normal tests are hermetic and quota-free. Live provider checks remain opt-in via
 | File input | No | No | No | No | No |
 
 Unsupported typed media parts fail loudly with a request error.
+
+## Anthropic inbound (`POST /v1/messages`)
+
+| Feature | Claude (native) | Grok (translated) | Codex (translated) |
+|---|---:|---:|---:|
+| Text + multi-block | Yes | Yes | Yes |
+| Function tools + tool loops | Yes | Yes | Yes |
+| Images (url/base64) | Yes | Yes | Yes |
+| Streaming SSE | Yes (raw) | Yes (framed) | Yes (framed) |
+| Thinking wire emit | Yes | No | No |
+| Hosted/computer tools | Passthrough | No (400) | No (400) |
+| `count_tokens` | Yes | No (400) | No (400) |
+| Fingerprint / cch | Yes | No | No |
+
+Details and lossy fields: `docs/anthropic-compat.md`.
 
 ## Responses Fields
 
@@ -53,4 +68,6 @@ provider-specific reasoning events from those deltas.
 - Core request and response contract: `crates/omni-core/src/canonical.rs`
 - Chat conversion and framing: `crates/omni-common/src/http.rs`
 - Responses conversion and framing: `crates/omni-common/src/responses.rs`
+- Anthropic dual-mode mappers/framer: `crates/omni-common/src/anthropic.rs`
+- Anthropic translated-path notes: `docs/anthropic-compat.md`
 - Provider allowlists: `docs/providers/README.md`

@@ -1519,7 +1519,7 @@ fn append_message_items(message: &CanonicalMessage, input: &mut Vec<Value>) {
                     CanonicalBlock::ToolResult {
                         tool_use_id,
                         content,
-                        ..
+                        is_error,
                     } => {
                         flush_codex_message(
                             input,
@@ -1528,10 +1528,11 @@ fn append_message_items(message: &CanonicalMessage, input: &mut Vec<Value>) {
                             &mut content_parts,
                             &mut has_image,
                         );
+                        let wire = omni_common::encode_tool_result_content(content, *is_error);
                         input.push(json!({
                             "type": "function_call_output",
                             "call_id": tool_use_id,
-                            "output": content,
+                            "output": wire,
                         }));
                     }
                 }

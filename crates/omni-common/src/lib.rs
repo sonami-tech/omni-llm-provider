@@ -2,6 +2,7 @@
 //! Shared, provider- and frontend-agnostic infrastructure.
 //! Extracted/adapted from the original claude-code-provider common pieces.
 
+pub mod anthropic;
 pub mod auth;
 pub mod canonical_mapping;
 pub mod conversation_log;
@@ -17,6 +18,11 @@ pub mod stats;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
+pub use anthropic::{
+    AnthropicMapError, AnthropicProtocolError, anthropic_to_canonical, canonical_to_anthropic,
+    encode_tool_result_content, parse_anthropic_object_no_dup_keys, peek_model_string,
+    sse_from_canonical_stream_anthropic,
+};
 pub use auth::{ApiKeyId, auth_layer};
 pub use conversation_log::{ConversationLog, DEFAULT_LOG_BACKUPS, DEFAULT_LOG_MAX_BYTES};
 pub use env::{env_nonempty, headers_from_env, parse_custom_headers};

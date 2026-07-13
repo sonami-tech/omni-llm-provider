@@ -20,9 +20,10 @@
 - With exactly one provider enabled, bare model names are accepted.
 - With multiple providers enabled, bare model names are accepted only when the
   model id or alias uniquely matches one provider catalog.
-- Anthropic inbound (`/v1/messages` and `/v1/messages/count_tokens`) is
-  Claude-only. Non-Claude prefixes or models return an Anthropic-shaped request
-  error instead of falling back to another provider.
+- Anthropic inbound (`/v1/messages`) is **dual-mode**: same model resolver as
+  chat. Claude → native passthrough; Grok/Codex → Anthropic↔canonical
+  translation in `omni-common`. See `docs/anthropic-compat.md`.
+- Anthropic `count_tokens` remains Claude-only; non-Claude models return 400.
 
 ## Provider Boundaries
 
@@ -41,8 +42,8 @@
 
 - OpenAI Chat Completions: `/v1/chat/completions`
 - OpenAI Responses subset: `/v1/responses`
-- Anthropic Messages, Claude only: `/v1/messages`
-- Anthropic token count, Claude only: `/v1/messages/count_tokens`
+- Anthropic Messages, dual-mode (Claude native / Grok+Codex translated): `/v1/messages`
+- Anthropic token count, Claude only (else 400): `/v1/messages/count_tokens`
 - Models: `/v1/models`, `/models`
 - Stats: `/stats`
 - Health/root: `/health`, `/`

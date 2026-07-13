@@ -1008,12 +1008,13 @@ fn to_xai_chat_request(
                         CanonicalBlock::ToolResult {
                             tool_use_id,
                             content,
-                            ..
+                            is_error,
                         } => {
+                            let wire = omni_common::encode_tool_result_content(content, *is_error);
                             tool_result_msgs.push(json!({
                                 "role": "tool",
                                 "tool_call_id": tool_use_id,
-                                "content": repl.apply_prompt(content)
+                                "content": repl.apply_prompt(&wire)
                             }));
                         }
                     }
@@ -1342,7 +1343,7 @@ fn append_grok_responses_items(message: &CanonicalMessage, input: &mut Vec<Value
                     CanonicalBlock::ToolResult {
                         tool_use_id,
                         content,
-                        ..
+                        is_error,
                     } => {
                         flush_grok_responses_message(
                             input,
@@ -1351,10 +1352,11 @@ fn append_grok_responses_items(message: &CanonicalMessage, input: &mut Vec<Value
                             &mut content_parts,
                             &mut has_image,
                         );
+                        let wire = omni_common::encode_tool_result_content(content, *is_error);
                         input.push(json!({
                             "type": "function_call_output",
                             "call_id": tool_use_id,
-                            "output": content,
+                            "output": wire,
                         }));
                     }
                 }
