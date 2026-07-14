@@ -34,14 +34,15 @@
 //! OIDC access token via `POST https://auth.x.ai/oauth2/token` (form-urlencoded,
 //! public client) and **atomically write back** the rotated `refresh_token` to the
 //! same path. RTs rotate with a short grace window then revoke — never leave the old
-//! RT on disk after a successful grant. Disable with `OMNI_OAUTH_REFRESH=0`
-//! (or `false`/`off`/`no`), `OMNI_NO_OAUTH_REFRESH=1`, or `--no-oauth-refresh`.
+//! RT on disk after a successful grant. Disable/enable globally or per provider
+//! via `OMNI_OAUTH_REFRESH`, `OMNI_NO_OAUTH_REFRESH`, `OMNI_GROK_OAUTH_REFRESH`,
+//! or matching omni CLI flags (see `omni_common::oauth_refresh`).
 
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::Value;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Captured Grok OIDC token endpoint (grok-shell 0.2.93).
 pub const GROK_OAUTH_TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
@@ -149,6 +150,42 @@ impl GrokCredentials {
     /// exactly as it reads `~/.claude/.credentials.json` for Claude.
     pub fn grok_cli_path() -> Option<PathBuf> {
         dirs::home_dir().map(|home| home.join(".grok").join("auth.json"))
+    }
+
+    /// Operator-facing auth source for the default CLI path (no secrets).
+    ///
+    /// Mirrors [`load_resolved_cli_async`] precedence: `$XAI_CREDENTIALS_PATH`,
+    /// then `~/.grok/auth.json`, then `~/.xai/.credentials.json`.
+    pub fn describe_cli_auth_source() -> String {
+        if let Some(p) = std::env::var_os("XAI_CREDENTIALS_PATH") {
+            let path = PathBuf::from(p);
+            return format!(
+                "auth={} via XAI_CREDENTIALS_PATH ({}, {})",
+                display_path(&path),
+                peek_cred_shape(&path),
+                file_presence(&path)
+            );
+        }
+        if let Some(cli_path) = Self::grok_cli_path()
+            && cli_path.is_file()
+        {
+            return format!(
+                "auth={} ({}, present)",
+                display_path(&cli_path),
+                peek_cred_shape(&cli_path)
+            );
+        }
+        if let Some(home) = dirs::home_dir() {
+            let static_path = home.join(".xai").join(".credentials.json");
+            if static_path.is_file() {
+                return format!(
+                    "auth={} ({}, present)",
+                    display_path(&static_path),
+                    peek_cred_shape(&static_path)
+                );
+            }
+        }
+        "auth=none (no credentials file)".into()
     }
 
     /// Resolve credentials fresh from disk (never cached). The operator provides creds in one of
@@ -360,32 +397,57 @@ fn parse_iso8601_to_ms(s: &str) -> Option<i64> {
         .map(|dt| dt.timestamp_millis())
 }
 
-/// Gate for in-Omni OAuth refresh (shared name across providers).
-/// Default **on**. Disable with `OMNI_OAUTH_REFRESH=0`/`false`/`off`/`no`,
-/// `OMNI_NO_OAUTH_REFRESH=1`/`true`/`yes`/`on`, or CLI `--no-oauth-refresh`.
-pub fn oauth_refresh_enabled() -> bool {
-    if env_flag_truthy("OMNI_NO_OAUTH_REFRESH") {
-        return false;
-    }
-    match std::env::var("OMNI_OAUTH_REFRESH")
-        .ok()
-        .map(|v| v.to_ascii_lowercase())
-        .as_deref()
-    {
-        None => true,
-        Some("0" | "false" | "off" | "no") => false,
-        Some(_) => true,
+fn display_path(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
+fn file_presence(path: &Path) -> &'static str {
+    if path.is_file() {
+        "present"
+    } else {
+        "missing"
     }
 }
 
-fn env_flag_truthy(name: &str) -> bool {
-    matches!(
-        std::env::var(name)
-            .ok()
-            .map(|v| v.to_ascii_lowercase())
-            .as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
+/// Cheap shape probe for startup logs (no secret values).
+fn peek_cred_shape(path: &Path) -> &'static str {
+    let Ok(bytes) = std::fs::read(path) else {
+        return "unreadable";
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return "invalid-json";
+    };
+    if value
+        .as_object()
+        .map(|obj| {
+            obj.values().any(|entry| {
+                entry
+                    .get("auth_mode")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|m| m.eq_ignore_ascii_case("oidc"))
+            })
+        })
+        .unwrap_or(false)
+    {
+        return "oidc";
+    }
+    if value.get("apiKey").and_then(|v| v.as_str()).is_some()
+        || value.get("xaiApiKey").and_then(|v| v.as_str()).is_some()
+    {
+        return "static-key";
+    }
+    "unknown-shape"
+}
+
+/// Gate for in-Omni Grok OAuth refresh.
+///
+/// Default **on**. See [`omni_common::oauth_refresh_enabled_for`] for global and
+/// per-provider env / CLI controls.
+pub fn oauth_refresh_enabled() -> bool {
+    omni_common::oauth_refresh_enabled_for(omni_common::OAuthRefreshProvider::Grok)
 }
 
 /// Effective Grok token endpoint. Tests may set `OMNI_GROK_OAUTH_TOKEN_URL`.
@@ -564,6 +626,7 @@ pub async fn refresh_oauth_inplace(
     path: &Path,
     token_url: &str,
 ) -> Result<(), GrokCredentialsError> {
+    info!(path = %path.display(), "grok OAuth refresh starting");
     let bytes = tokio::fs::read(path).await?;
     let material = extract_oidc_refresh_material(&bytes)?;
     let form = build_refresh_form_body(&material);
@@ -640,6 +703,7 @@ pub async fn refresh_oauth_inplace(
     let out = serde_json::to_vec_pretty(&latest)
         .map_err(|e| GrokCredentialsError::Refresh(format!("serialize auth.json: {e}")))?;
     atomic_write(path, &out)?;
+    info!(path = %path.display(), "grok OAuth refresh ok");
     Ok(())
 }
 
@@ -660,6 +724,33 @@ mod tests {
         let mut f = std::fs::File::create(path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f.flush().unwrap();
+    }
+
+    #[test]
+    fn describe_cli_auth_source_names_winning_file() {
+        // WHY: startup must say which path wins, not the whole search list.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let p = temp_credentials_path();
+        write_temp_creds(
+            &p,
+            r#"{"https://auth.x.ai::client":{"auth_mode":"oidc","key":"k","refresh_token":"rt","user_id":"u"}}"#,
+        );
+        let old = std::env::var_os("XAI_CREDENTIALS_PATH");
+        unsafe {
+            std::env::set_var("XAI_CREDENTIALS_PATH", &p);
+        }
+        let desc = GrokCredentials::describe_cli_auth_source();
+        assert!(
+            desc.contains("XAI_CREDENTIALS_PATH") && desc.contains("oidc") && desc.contains("present"),
+            "{desc}"
+        );
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("XAI_CREDENTIALS_PATH", v),
+                None => std::env::remove_var("XAI_CREDENTIALS_PATH"),
+            }
+        }
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

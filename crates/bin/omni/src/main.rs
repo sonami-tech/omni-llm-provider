@@ -42,7 +42,8 @@
 //! - Auth and stats are server concerns handled here with `omni-common`.
 //! - Empty key set (via --no-auth or no OMNI_API_KEYS) means "allow all".
 //! - OAuth refresh for Claude/Codex/Grok primary logins is on by default;
-//!   disable with `--no-oauth-refresh` or `OMNI_OAUTH_REFRESH=0`.
+//!   control globally or per provider via `--[no-]oauth-refresh[-{claude,codex,grok}]`
+//!   or `OMNI_[CLAUDE_|CODEX_|GROK_]OAUTH_REFRESH` / `OMNI_NO_OAUTH_REFRESH`.
 //! - Anthropic paths always reject dual non-empty `x-api-key` + `Authorization: Bearer`
 //!   as ambiguous credentials (HTTP 400).
 //! - Opt-in `--strict-cloud-fidelity` / `OMNI_STRICT_CLOUD_FIDELITY` enforces a single
@@ -150,11 +151,47 @@ struct Cli {
     #[arg(long, env = "OMNI_NO_AUTH")]
     no_auth: bool,
 
-    /// Disable in-process OAuth credential refresh (Claude/Codex/Grok). Refresh
-    /// is on by default. Equivalent env: OMNI_NO_OAUTH_REFRESH=1, or
-    /// OMNI_OAUTH_REFRESH=0.
+    /// Force-enable in-process OAuth credential refresh for all providers.
+    /// Default is already on; use this with per-provider offs, or after a
+    /// global off via env. Equivalent env: OMNI_OAUTH_REFRESH=1.
+    #[arg(long = "oauth-refresh", conflicts_with = "no_oauth_refresh")]
+    oauth_refresh: bool,
+
+    /// Disable in-process OAuth credential refresh for all providers.
+    /// Refresh is on by default. Equivalent env: OMNI_NO_OAUTH_REFRESH=1, or
+    /// OMNI_OAUTH_REFRESH=0. Per-provider `--oauth-refresh-*` can re-enable one.
     #[arg(long = "no-oauth-refresh", env = "OMNI_NO_OAUTH_REFRESH")]
     no_oauth_refresh: bool,
+
+    /// Force-enable Claude OAuth refresh (beats global off). Env:
+    /// OMNI_CLAUDE_OAUTH_REFRESH=1.
+    #[arg(long = "oauth-refresh-claude", conflicts_with = "no_oauth_refresh_claude")]
+    oauth_refresh_claude: bool,
+
+    /// Disable Claude OAuth refresh (beats global on). Env:
+    /// OMNI_CLAUDE_OAUTH_REFRESH=0.
+    #[arg(long = "no-oauth-refresh-claude", conflicts_with = "oauth_refresh_claude")]
+    no_oauth_refresh_claude: bool,
+
+    /// Force-enable Codex OAuth refresh (beats global off). Env:
+    /// OMNI_CODEX_OAUTH_REFRESH=1.
+    #[arg(long = "oauth-refresh-codex", conflicts_with = "no_oauth_refresh_codex")]
+    oauth_refresh_codex: bool,
+
+    /// Disable Codex OAuth refresh (beats global on). Env:
+    /// OMNI_CODEX_OAUTH_REFRESH=0.
+    #[arg(long = "no-oauth-refresh-codex", conflicts_with = "oauth_refresh_codex")]
+    no_oauth_refresh_codex: bool,
+
+    /// Force-enable Grok OAuth refresh (beats global off). Env:
+    /// OMNI_GROK_OAUTH_REFRESH=1.
+    #[arg(long = "oauth-refresh-grok", conflicts_with = "no_oauth_refresh_grok")]
+    oauth_refresh_grok: bool,
+
+    /// Disable Grok OAuth refresh (beats global on). Env:
+    /// OMNI_GROK_OAUTH_REFRESH=0.
+    #[arg(long = "no-oauth-refresh-grok", conflicts_with = "oauth_refresh_grok")]
+    no_oauth_refresh_grok: bool,
 
     /// Path to the stats redb file. Defaults to a fixed temp file; use a
     /// durable, per-instance path for long-running or concurrent servers.
@@ -202,10 +239,6 @@ struct Cli {
     #[arg(long, env = "OMNI_CODEX_VERSION")]
     codex_version: Option<String>,
 
-    /// Codex catalog mode: conservative or extended. Default: extended.
-    #[arg(long, env = "OMNI_CODEX_MODE", value_enum, default_value_t = CatalogModeArg::Extended)]
-    codex_mode: CatalogModeArg,
-
     /// Match every provider to the client version installed on this system,
     /// choosing the CLOSEST catalog version when there is no exact match. A
     /// per-provider --{provider}-version overrides this for that provider.
@@ -235,33 +268,62 @@ struct Cli {
 
 /// Apply CLI flags that providers read via process environment.
 ///
-/// Provider crates check `OMNI_OAUTH_REFRESH` (and related) on each load; clap
-/// only populates the `Cli` struct, so disable flags must be written into the
-/// process env before providers initialize.
+/// Provider crates evaluate `OMNI_OAUTH_REFRESH` / per-provider
+/// `OMNI_*_OAUTH_REFRESH` on each load; clap only populates the `Cli` struct, so
+/// switches must be written into the process env before providers initialize.
+/// Env-only operators skip this path and set those keys directly.
 fn apply_cli_env_overrides(cli: &Cli) {
+    // SAFETY: single-threaded startup before provider init / worker spawn.
     if cli.no_oauth_refresh {
-        // SAFETY: single-threaded startup before provider init / worker spawn.
         unsafe {
             std::env::set_var("OMNI_OAUTH_REFRESH", "0");
             std::env::set_var("OMNI_NO_OAUTH_REFRESH", "1");
         }
-        tracing::info!("OAuth credential refresh disabled (--no-oauth-refresh)");
-    }
-}
-
-/// CLI surface for [`omni_core::CatalogMode`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum CatalogModeArg {
-    Conservative,
-    Extended,
-}
-
-impl From<CatalogModeArg> for omni_core::CatalogMode {
-    fn from(value: CatalogModeArg) -> Self {
-        match value {
-            CatalogModeArg::Conservative => omni_core::CatalogMode::Conservative,
-            CatalogModeArg::Extended => omni_core::CatalogMode::Extended,
+        tracing::info!("OAuth credential refresh disabled globally (--no-oauth-refresh)");
+    } else if cli.oauth_refresh {
+        unsafe {
+            std::env::set_var("OMNI_OAUTH_REFRESH", "1");
+            std::env::remove_var("OMNI_NO_OAUTH_REFRESH");
         }
+        tracing::info!("OAuth credential refresh enabled globally (--oauth-refresh)");
+    }
+
+    set_provider_oauth_refresh_env(
+        "claude",
+        "OMNI_CLAUDE_OAUTH_REFRESH",
+        cli.oauth_refresh_claude,
+        cli.no_oauth_refresh_claude,
+    );
+    set_provider_oauth_refresh_env(
+        "codex",
+        "OMNI_CODEX_OAUTH_REFRESH",
+        cli.oauth_refresh_codex,
+        cli.no_oauth_refresh_codex,
+    );
+    set_provider_oauth_refresh_env(
+        "grok",
+        "OMNI_GROK_OAUTH_REFRESH",
+        cli.oauth_refresh_grok,
+        cli.no_oauth_refresh_grok,
+    );
+}
+
+/// Write one provider's on/off CLI switch into process env.
+///
+/// Must only run during single-threaded startup. Clap `conflicts_with` ensures
+/// `enable` and `disable` are never both true.
+fn set_provider_oauth_refresh_env(provider: &str, env_key: &str, enable: bool, disable: bool) {
+    // SAFETY: only called from apply_cli_env_overrides at single-threaded startup.
+    if disable {
+        unsafe {
+            std::env::set_var(env_key, "0");
+        }
+        tracing::info!(provider, "OAuth credential refresh disabled for provider");
+    } else if enable {
+        unsafe {
+            std::env::set_var(env_key, "1");
+        }
+        tracing::info!(provider, "OAuth credential refresh enabled for provider");
     }
 }
 
@@ -328,7 +390,13 @@ async fn main() -> anyhow::Result<()> {
     log_startup_banner();
 
     let (enabled, provider_source) = select_enabled_providers(&cli.providers)?;
-    info!(?enabled, source = provider_source, "omni enabled providers");
+    let detection_detail = format_provider_detection_detail(&enabled, provider_source);
+    info!(
+        ?enabled,
+        source = provider_source,
+        detail = %detection_detail,
+        "omni enabled providers"
+    );
 
     let mut providers_map: HashMap<String, ProviderEntry> = HashMap::new();
     for name in &enabled {
@@ -373,14 +441,13 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             "codex" => {
-                info!("initializing codex provider (config read from CODEX_HOME or ~/.codex)");
                 let selector = version_selector_for(
                     &cli.codex_version,
                     cli.match_system,
                     cli.match_system_exact,
                     "codex",
                 );
-                let p = init_codex_provider(&selector, cli.codex_mode.into())
+                let p = init_codex_provider(&selector)
                     .context("failed to init codex provider")?;
                 let models = provider_model_values("codex", p.models_list())?;
                 let catalog = codex_model_catalog(&p);
@@ -420,19 +487,28 @@ async fn main() -> anyhow::Result<()> {
     };
     // Auth keys: empty set => allow-all (see omni-common::auth_layer).
     // Support OMNI_API_KEYS= k1,k2,... for a non-empty set when !--no-auth.
-    let auth_keys: Arc<HashSet<String>> = if cli.no_auth {
-        Arc::new(HashSet::new())
-    } else {
-        let keys: HashSet<String> = std::env::var("OMNI_API_KEYS")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        Arc::new(keys)
-    };
+    let (auth_keys, auth_cause, auth_key_count): (Arc<HashSet<String>>, &'static str, usize) =
+        if cli.no_auth {
+            (Arc::new(HashSet::new()), "--no-auth", 0)
+        } else {
+            let keys: HashSet<String> = std::env::var("OMNI_API_KEYS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let count = keys.len();
+            let cause = if count == 0 {
+                "OMNI_API_KEYS empty/unset"
+            } else {
+                "OMNI_API_KEYS"
+            };
+            (Arc::new(keys), cause, count)
+        };
     info!(
         no_auth_effective = auth_keys.is_empty(),
+        cause = auth_cause,
+        key_count = auth_key_count,
         strict_cloud_fidelity = state.strict_cloud_fidelity,
         ?state.anthropic_auth_scheme,
         "auth layer ready"
@@ -464,6 +540,7 @@ fn log_startup_banner() {
 
 fn init_claude_provider(selector: &VersionSelector) -> anyhow::Result<ClaudeProvider> {
     let profile = resolve_claude_profile(selector)?;
+    let selector_desc = describe_version_selector(selector, profile.claude_cli_version);
     if let Some(base_url) = env_nonempty("OMNI_CLAUDE_BASE_URL") {
         let authorization_bearer = env_nonempty("OMNI_CLAUDE_AUTH_TOKEN")
             .is_some()
@@ -474,16 +551,17 @@ fn init_claude_provider(selector: &VersionSelector) -> anyhow::Result<ClaudeProv
         let custom_headers = std::env::var_os("OMNI_CLAUDE_CUSTOM_HEADERS")
             .is_some()
             .then(|| "OMNI_CLAUDE_CUSTOM_HEADERS".to_string());
+        let auth = describe_env_auth_winner(&[
+            ("OMNI_CLAUDE_AUTH_TOKEN", "bearer"),
+            ("OMNI_CLAUDE_API_KEY", "x-api-key"),
+            ("OMNI_CLAUDE_CUSTOM_HEADERS", "custom-headers"),
+        ]);
         info!(
+            profile = profile.claude_cli_version,
+            selector = %selector_desc,
             base_url = %base_url,
-            auth = if authorization_bearer.is_some() {
-                "bearer"
-            } else if api_key.is_some() {
-                "x-api-key"
-            } else {
-                "custom-headers-or-no-auth"
-            },
-            "initializing claude provider with OMNI_CLAUDE_BASE_URL custom gateway"
+            auth = %auth,
+            "initializing claude provider (custom gateway via OMNI_CLAUDE_BASE_URL)"
         );
         return ClaudeProvider::new_for_custom_gateway_env(
             profile,
@@ -505,16 +583,17 @@ fn init_claude_provider(selector: &VersionSelector) -> anyhow::Result<ClaudeProv
         let custom_headers = std::env::var_os("ANTHROPIC_CUSTOM_HEADERS")
             .is_some()
             .then(|| "ANTHROPIC_CUSTOM_HEADERS".to_string());
+        let auth = describe_env_auth_winner(&[
+            ("ANTHROPIC_AUTH_TOKEN", "bearer"),
+            ("ANTHROPIC_API_KEY", "x-api-key"),
+            ("ANTHROPIC_CUSTOM_HEADERS", "custom-headers"),
+        ]);
         info!(
+            profile = profile.claude_cli_version,
+            selector = %selector_desc,
             base_url = %base_url,
-            auth = if authorization_bearer.is_some() {
-                "bearer"
-            } else if api_key.is_some() {
-                "x-api-key"
-            } else {
-                "custom-headers-or-no-auth"
-            },
-            "initializing claude provider with ANTHROPIC_BASE_URL custom gateway"
+            auth = %auth,
+            "initializing claude provider (custom gateway via ANTHROPIC_BASE_URL)"
         );
         return ClaudeProvider::new_for_custom_gateway_env(
             profile,
@@ -526,28 +605,49 @@ fn init_claude_provider(selector: &VersionSelector) -> anyhow::Result<ClaudeProv
         .map_err(anyhow::Error::from);
     }
 
-    info!("initializing claude provider");
+    let creds_path = provider_claude::credentials::Credentials::default_path();
+    let via = if std::env::var_os("CLAUDE_CREDENTIALS_PATH").is_some() {
+        " via CLAUDE_CREDENTIALS_PATH"
+    } else {
+        ""
+    };
+    let path_disp = display_path_for_log(&creds_path);
+    if !creds_path.is_file() {
+        anyhow::bail!(
+            "claude: credentials file missing at {path_disp}{via}; cannot start with claude enabled"
+        );
+    }
+    provider_claude::credentials::Credentials::load_fresh(&creds_path).with_context(|| {
+        format!("claude: credentials at {path_disp}{via} are unreadable or invalid")
+    })?;
+    info!(
+        profile = profile.claude_cli_version,
+        selector = %selector_desc,
+        auth = %format!("auth={path_disp}{via} (present)"),
+        "initializing claude provider"
+    );
     ClaudeProvider::new_with_profile(profile).map_err(anyhow::Error::from)
 }
 
 fn init_grok_provider(selector: &VersionSelector) -> anyhow::Result<GrokProvider> {
     let version = resolve_provider_version("grok", GrokProvider::version_catalog(), selector)?;
+    let selector_desc = describe_version_selector(selector, version.version);
     let provider = GrokProvider::new(None)
         .map_err(anyhow::Error::from)?
         .with_version(version.version)
         .map_err(anyhow::Error::from)?;
-    info!(version = version.version, "grok catalog resolved");
     if let Some(base_url) = env_nonempty("OMNI_GROK_BASE_URL") {
+        let auth = describe_env_auth_winner(&[
+            ("OMNI_GROK_AUTH_TOKEN", "bearer-token"),
+            ("OMNI_GROK_API_KEY", "api-key"),
+            ("OMNI_GROK_CUSTOM_HEADERS", "custom-headers"),
+        ]);
         info!(
+            version = version.version,
+            selector = %selector_desc,
             base_url = %base_url,
-            auth = if env_nonempty("OMNI_GROK_AUTH_TOKEN").is_some() {
-                "bearer-token"
-            } else if env_nonempty("OMNI_GROK_API_KEY").is_some() {
-                "api-key"
-            } else {
-                "custom-headers-or-no-auth"
-            },
-            "initializing grok provider with OMNI_GROK_BASE_URL custom endpoint"
+            auth = %auth,
+            "initializing grok provider (custom endpoint via OMNI_GROK_BASE_URL)"
         );
         return Ok(provider.with_custom_auth_env(
             base_url,
@@ -558,10 +658,17 @@ fn init_grok_provider(selector: &VersionSelector) -> anyhow::Result<GrokProvider
     }
 
     if let Some(base_url) = env_nonempty("GROK_MODELS_BASE_URL") {
+        let auth = if env_nonempty("XAI_API_KEY").is_some() {
+            "auth=env:XAI_API_KEY (set)"
+        } else {
+            "auth=none (XAI_API_KEY unset)"
+        };
         info!(
+            version = version.version,
+            selector = %selector_desc,
             base_url = %base_url,
-            auth = if env_nonempty("XAI_API_KEY").is_some() { "bearer" } else { "no-auth" },
-            "initializing grok provider with GROK_MODELS_BASE_URL custom endpoint"
+            auth,
+            "initializing grok provider (custom endpoint via GROK_MODELS_BASE_URL)"
         );
         return Ok(provider.with_base_url(base_url).with_custom_auth(
             None,
@@ -570,24 +677,135 @@ fn init_grok_provider(selector: &VersionSelector) -> anyhow::Result<GrokProvider
         ));
     }
 
+    // Fail hard when the default CLI path has no usable credentials file.
+    validate_grok_cli_credentials_at_startup()?;
+    let auth = provider_grok::credentials::GrokCredentials::describe_cli_auth_source();
     info!(
-        "initializing grok provider (key read per request from XAI_CREDENTIALS_PATH, ~/.xai/.credentials.json, or ~/.grok/auth.json)"
+        version = version.version,
+        selector = %selector_desc,
+        base_url = "https://cli-chat-proxy.grok.com",
+        auth = %auth,
+        "initializing grok provider (CLI path; credentials re-read per request)"
     );
     Ok(provider)
 }
 
-fn init_codex_provider(
-    selector: &VersionSelector,
-    mode: omni_core::CatalogMode,
-) -> anyhow::Result<CodexProvider> {
+fn init_codex_provider(selector: &VersionSelector) -> anyhow::Result<CodexProvider> {
     let version = resolve_provider_version("codex", CodexProvider::version_catalog(), selector)?;
+    let selector_desc = describe_version_selector(selector, version.version);
     let provider = CodexProvider::new()
         .map_err(anyhow::Error::from)?
-        .with_mode(mode)
         .with_version(version.version)
         .map_err(anyhow::Error::from)?;
-    info!(version = version.version, mode = %mode, "codex catalog resolved");
+    // Transport (ChatGPT WS vs REST) is inferred per-request from CODEX_HOME
+    // config/auth, matching Claude/Grok (no operator mode flag).
+    // Hard-fail at launch when settings cannot be loaded (invalid CODEX_HOME, etc.).
+    let source = CodexProvider::startup_source_summary().map_err(|e| {
+        anyhow::anyhow!("codex: cannot load settings for enabled provider: {e}")
+    })?;
+    info!(
+        version = version.version,
+        selector = %selector_desc,
+        source = %source,
+        "initializing codex provider"
+    );
     Ok(provider)
+}
+
+/// Human-readable version selector for startup logs.
+fn describe_version_selector(selector: &VersionSelector, chose: &str) -> String {
+    match selector {
+        VersionSelector::Latest => format!("latest → chose={chose}"),
+        VersionSelector::Exact(v) => format!("exact={v} → chose={chose}"),
+        VersionSelector::MatchSystem(v) => {
+            format!("match-system detected={v} → chose={chose}")
+        }
+        VersionSelector::MatchSystemExact(v) => {
+            format!("match-system-exact detected={v} → chose={chose}")
+        }
+    }
+}
+
+/// Ensure Grok's default credential chain can load at least one file at launch.
+///
+/// Mirrors CLI-path precedence (XAI override → ~/.grok/auth.json → ~/.xai static).
+/// Custom endpoints skip this (they do not use the ambient file chain).
+fn validate_grok_cli_credentials_at_startup() -> anyhow::Result<()> {
+    use provider_grok::credentials::{GrokCredentials, GrokCredentialsError};
+
+    if let Some(p) = std::env::var_os("XAI_CREDENTIALS_PATH") {
+        let path = std::path::PathBuf::from(p);
+        if !path.is_file() {
+            anyhow::bail!(
+                "grok: XAI_CREDENTIALS_PATH={} is missing or not a file; cannot start with grok enabled",
+                path.display()
+            );
+        }
+        GrokCredentials::load_fresh(&path).with_context(|| {
+            format!(
+                "grok: credentials at {} (XAI_CREDENTIALS_PATH) are unreadable or invalid",
+                path.display()
+            )
+        })?;
+        return Ok(());
+    }
+
+    if let Some(cli_path) = GrokCredentials::grok_cli_path()
+        && cli_path.is_file()
+    {
+        match GrokCredentials::load_fresh(&cli_path) {
+            Ok(_) => return Ok(()),
+            Err(GrokCredentialsError::MissingToken) => {
+                // Fall through to static key, same as runtime CLI resolve.
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "grok: credentials at {} are unreadable or invalid: {e}",
+                    cli_path.display()
+                );
+            }
+        }
+    }
+
+    // default_path without XAI_CREDENTIALS_PATH is ~/.xai/.credentials.json.
+    let static_path = GrokCredentials::default_path();
+    if static_path.is_file() {
+        GrokCredentials::load_fresh(&static_path).with_context(|| {
+            format!(
+                "grok: credentials at {} are unreadable or invalid",
+                static_path.display()
+            )
+        })?;
+        return Ok(());
+    }
+
+    let auth = GrokCredentials::describe_cli_auth_source();
+    anyhow::bail!(
+        "grok: no credentials file found for CLI path ({auth}); cannot start with grok enabled"
+    );
+}
+
+/// First matching env wins. `kind` is a short role (bearer / api-key / …).
+/// Header envs count as set when the variable is present (even empty).
+fn describe_env_auth_winner(candidates: &[(&str, &str)]) -> String {
+    for (env_key, kind) in candidates {
+        let present = if env_key.contains("HEADERS") {
+            std::env::var_os(env_key).is_some()
+        } else {
+            env_nonempty(env_key).is_some()
+        };
+        if present {
+            return format!("auth=env:{env_key} ({kind}, set)");
+        }
+    }
+    "auth=none (no gateway auth env set)".into()
+}
+
+fn display_path_for_log(path: &std::path::Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
 }
 
 /// Resolve the Claude fingerprint profile for a [`VersionSelector`].
@@ -612,10 +830,13 @@ fn resolve_claude_profile(
         VersionSelector::MatchSystem(v) => {
             // Closest match: try exact, else fall back to the default (newest).
             Ok(provider_claude::resolve_profile(v).unwrap_or_else(|| {
+                let newest = provider_claude::default_profile();
                 warn!(
-                    "claude: no exact profile for installed {v:?}; using newest (default) profile"
+                    installed = %v,
+                    chose = newest.claude_cli_version,
+                    "claude: no exact profile for installed version; using newest (default) profile"
                 );
-                provider_claude::default_profile()
+                newest
             }))
         }
     }
@@ -641,19 +862,23 @@ fn version_selector_for(
     }
     if match_system_exact {
         match detect_installed_cli_version(bin) {
-            Some(v) => return VersionSelector::MatchSystemExact(v),
-            None => {
+            Ok(v) => return VersionSelector::MatchSystemExact(v),
+            Err(reason) => {
                 warn!(
-                    "{bin}: --match-system-exact set but no installed {bin} version detected; using newest catalog version"
+                    bin,
+                    reason,
+                    "{bin}: --match-system-exact set but no installed version detected; using newest catalog version"
                 );
             }
         }
     } else if match_system {
         match detect_installed_cli_version(bin) {
-            Some(v) => return VersionSelector::MatchSystem(v),
-            None => {
+            Ok(v) => return VersionSelector::MatchSystem(v),
+            Err(reason) => {
                 warn!(
-                    "{bin}: --match-system set but no installed {bin} version detected; using newest catalog version"
+                    bin,
+                    reason,
+                    "{bin}: --match-system set but no installed version detected; using newest catalog version"
                 );
             }
         }
@@ -662,18 +887,22 @@ fn version_selector_for(
 }
 
 /// Detect the version string of an installed provider CLI by running
-/// `<bin> --version` and extracting the first dotted-number token. Returns `None`
-/// if the binary is absent or prints nothing parseable.
-fn detect_installed_cli_version(bin: &str) -> Option<String> {
-    let out = std::process::Command::new(bin)
-        .arg("--version")
-        .output()
-        .ok()?;
+/// `<bin> --version` and extracting the first dotted-number token.
+///
+/// On failure returns a short operator-facing reason (`not on PATH`, etc.).
+fn detect_installed_cli_version(bin: &str) -> Result<String, &'static str> {
+    let out = match std::process::Command::new(bin).arg("--version").output() {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err("not on PATH");
+        }
+        Err(_) => return Err("failed to spawn --version"),
+    };
     if !out.status.success() {
-        return None;
+        return Err("nonzero --version exit");
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    extract_version_token(&text)
+    extract_version_token(&text).ok_or("unparseable --version output")
 }
 
 /// Extract the first whitespace-delimited token that looks like a dotted version
@@ -982,20 +1211,93 @@ impl ModelCatalog {
 }
 
 fn format_aliases_for_log(providers: &HashMap<String, ProviderEntry>) -> Option<String> {
+    // Prefer documented shorthands first, then every other advertised alias for
+    // enabled providers (cap length so the launch screen stays readable).
+    const MAX_ALIAS_PAIRS: usize = 24;
     let catalogs = provider_catalogs(providers);
-    let mut pairs = Vec::new();
-    for alias in [
+    let preferred = [
         "sonnet", "opus", "haiku", "fable", "grok", "composer", "build", "gpt",
-    ] {
+    ];
+    let mut pairs = Vec::new();
+    let mut seen = HashSet::new();
+    for alias in preferred {
         let matches = model_matches(alias, &catalogs);
         if matches.len() == 1 {
             pairs.push(format!("{}={}", alias, matches[0].1));
+            seen.insert(alias.to_string());
         }
     }
+    let mut extras: Vec<(String, String)> = Vec::new();
+    for entry in providers.values() {
+        for (alias, canonical) in &entry.catalog.aliases {
+            if alias == canonical || seen.contains(alias) {
+                continue;
+            }
+            // Only unique bare aliases (same rule as routing).
+            if model_matches(alias, &catalogs).len() == 1 {
+                extras.push((alias.clone(), canonical.clone()));
+                seen.insert(alias.clone());
+            }
+        }
+    }
+    extras.sort_by(|a, b| a.0.cmp(&b.0));
+    for (alias, canonical) in extras {
+        pairs.push(format!("{alias}={canonical}"));
+    }
     if pairs.is_empty() {
-        None
+        return None;
+    }
+    if pairs.len() > MAX_ALIAS_PAIRS {
+        let more = pairs.len() - MAX_ALIAS_PAIRS;
+        pairs.truncate(MAX_ALIAS_PAIRS);
+        Some(format!("{}, +{more} more", pairs.join(", ")))
     } else {
         Some(pairs.join(", "))
+    }
+}
+
+fn format_completions_example(providers: &HashMap<String, ProviderEntry>) -> String {
+    // Prefer short aliases when unique; otherwise a real model id from each
+    // enabled provider so the example only names what will actually route.
+    let catalogs = provider_catalogs(providers);
+    let mut examples = Vec::new();
+    for preferred in ["grok", "gpt", "sonnet", "composer", "opus", "haiku"] {
+        if model_matches(preferred, &catalogs).len() == 1 {
+            examples.push(preferred.to_string());
+        }
+    }
+    if examples.is_empty() {
+        let mut provider_keys: Vec<_> = providers.keys().cloned().collect();
+        provider_keys.sort();
+        for key in provider_keys {
+            if let Some(entry) = providers.get(&key) {
+                if let Some(id) = entry
+                    .models
+                    .iter()
+                    .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
+                    .next()
+                {
+                    examples.push(id.to_string());
+                }
+            }
+        }
+    }
+    if examples.is_empty() {
+        "completions example: (no models enabled)".into()
+    } else if examples.len() == 1 {
+        format!("completions example: model={}", examples[0])
+    } else if examples.len() == 2 {
+        format!(
+            "completions example: model={} or {}",
+            examples[0], examples[1]
+        )
+    } else {
+        let last = examples.pop().unwrap();
+        format!(
+            "completions example: model={}, or {}",
+            examples.join(", "),
+            last
+        )
     }
 }
 
@@ -1038,11 +1340,15 @@ fn startup_summary_lines(
         format!("providers: {}", enabled.join(",")),
         format!("models: {model_text}"),
         format!("aliases: {alias_text}"),
+        format!(
+            "oauth refresh: {}",
+            omni_common::oauth_refresh_policy_summary()
+        ),
         "endpoints: OpenAI Responses POST /v1/responses; OpenAI Chat Completions POST /v1/chat/completions; Anthropic Messages POST /v1/messages".to_string(),
         format!("try: curl http://{addr}/health"),
         format!("models endpoint: curl http://{addr}/v1/models"),
         format!("stats endpoint: curl http://{addr}/stats"),
-        "completions example: model=grok, gpt, or claude-sonnet-5".to_string(),
+        format_completions_example(providers),
     ]
 }
 
@@ -1072,6 +1378,40 @@ fn select_enabled_providers(raw: &[String]) -> anyhow::Result<(Vec<String>, &'st
         );
     }
     Ok((detected, "auto-detected"))
+}
+
+/// Concrete why-each-provider detail for the enabled-providers startup line.
+fn format_provider_detection_detail(enabled: &[String], source: &str) -> String {
+    let mut parts = Vec::new();
+    for name in enabled {
+        let reason = match name.as_str() {
+            "claude" => ClaudeProvider::detection_source()
+                .unwrap_or_else(|| {
+                    if source == "configured" {
+                        "configured".into()
+                    } else {
+                        "unknown".into()
+                    }
+                }),
+            "grok" => GrokProvider::detection_source().unwrap_or_else(|| {
+                if source == "configured" {
+                    "configured".into()
+                } else {
+                    "unknown".into()
+                }
+            }),
+            "codex" => CodexProvider::detection_source().unwrap_or_else(|| {
+                if source == "configured" {
+                    "configured".into()
+                } else {
+                    "unknown".into()
+                }
+            }),
+            other => other.to_string(),
+        };
+        parts.push(format!("{name}={reason}"));
+    }
+    parts.join("; ")
 }
 
 /// Normalize/validate a providers CLI/env list.
@@ -3196,6 +3536,22 @@ mod tests {
     }
 
     #[test]
+    fn test_completions_example_uses_enabled_provider_aliases() {
+        // WHY: the launch completions tip must not advertise disabled providers.
+        let mut providers: HashMap<String, ProviderEntry> = HashMap::new();
+        providers.insert("codex".into(), codex_entry());
+        let text = format_completions_example(&providers);
+        assert!(
+            text.contains("gpt") || text.contains("model="),
+            "codex-only example should name a codex route: {text}"
+        );
+        assert!(
+            !text.contains("grok") && !text.contains("sonnet") && !text.contains("claude-sonnet"),
+            "codex-only example must not advertise claude/grok: {text}"
+        );
+    }
+
+    #[test]
     fn test_startup_summary_lists_models_aliases_and_endpoints_left_aligned() {
         // WHY: the launch screen is operator-facing. Active provider models
         // must appear before aliases, the HTTP entrypoints should be visible in
@@ -3215,14 +3571,29 @@ mod tests {
             .iter()
             .position(|line| line.starts_with("aliases: "))
             .expect("aliases line present");
+        let oauth_pos = lines
+            .iter()
+            .position(|line| line.starts_with("oauth refresh: "))
+            .expect("oauth refresh line present");
         let endpoints_pos = lines
             .iter()
             .position(|line| line.starts_with("endpoints: "))
             .expect("endpoints line present");
         assert!(models_pos < aliases_pos, "models line must precede aliases");
         assert!(
-            aliases_pos < endpoints_pos,
-            "endpoints line must follow aliases"
+            aliases_pos < oauth_pos,
+            "oauth refresh line must follow aliases"
+        );
+        assert!(
+            oauth_pos < endpoints_pos,
+            "endpoints line must follow oauth refresh"
+        );
+        assert!(
+            lines[oauth_pos].contains("claude=")
+                && lines[oauth_pos].contains("codex=")
+                && lines[oauth_pos].contains("grok="),
+            "oauth refresh line must list effective per-provider state: {}",
+            lines[oauth_pos]
         );
         let endpoints = &lines[endpoints_pos];
         assert!(endpoints.contains("OpenAI Responses POST /v1/responses"));
@@ -3259,6 +3630,61 @@ mod tests {
         assert!(cli.no_oauth_refresh);
         let cli_default = Cli::try_parse_from(["omni", "--no-auth"]).unwrap();
         assert!(!cli_default.no_oauth_refresh);
+        assert!(!cli_default.oauth_refresh);
+        assert!(!cli_default.oauth_refresh_codex);
+        assert!(!cli_default.no_oauth_refresh_codex);
+        unsafe {
+            match old_no {
+                Some(v) => std::env::set_var("OMNI_NO_OAUTH_REFRESH", v),
+                None => std::env::remove_var("OMNI_NO_OAUTH_REFRESH"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_cli_oauth_refresh_provider_flags_parse_and_conflict() {
+        // WHY: full CLI duals (on/off global + per provider) must parse; same-scope
+        // opposites must fail so operators cannot set ambiguous refresh policy.
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let old_no = std::env::var_os("OMNI_NO_OAUTH_REFRESH");
+        unsafe {
+            std::env::remove_var("OMNI_NO_OAUTH_REFRESH");
+        }
+
+        let only_codex = Cli::try_parse_from([
+            "omni",
+            "--no-auth",
+            "--no-oauth-refresh",
+            "--oauth-refresh-codex",
+        ])
+        .unwrap();
+        assert!(only_codex.no_oauth_refresh);
+        assert!(only_codex.oauth_refresh_codex);
+        assert!(!only_codex.oauth_refresh_claude);
+
+        let disable_one = Cli::try_parse_from([
+            "omni",
+            "--no-auth",
+            "--no-oauth-refresh-claude",
+            "--no-oauth-refresh-grok",
+        ])
+        .unwrap();
+        assert!(disable_one.no_oauth_refresh_claude);
+        assert!(disable_one.no_oauth_refresh_grok);
+        assert!(!disable_one.no_oauth_refresh_codex);
+
+        let conflict = Cli::try_parse_from([
+            "omni",
+            "--no-auth",
+            "--oauth-refresh-codex",
+            "--no-oauth-refresh-codex",
+        ]);
+        assert!(conflict.is_err());
+
+        let global_conflict =
+            Cli::try_parse_from(["omni", "--no-auth", "--oauth-refresh", "--no-oauth-refresh"]);
+        assert!(global_conflict.is_err());
+
         unsafe {
             match old_no {
                 Some(v) => std::env::set_var("OMNI_NO_OAUTH_REFRESH", v),
@@ -3319,14 +3745,65 @@ mod tests {
         let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let old_refresh = std::env::var_os("OMNI_OAUTH_REFRESH");
         let old_no = std::env::var_os("OMNI_NO_OAUTH_REFRESH");
+        let old_codex = std::env::var_os("OMNI_CODEX_OAUTH_REFRESH");
+        let old_claude = std::env::var_os("OMNI_CLAUDE_OAUTH_REFRESH");
+        let old_grok = std::env::var_os("OMNI_GROK_OAUTH_REFRESH");
         unsafe {
             std::env::remove_var("OMNI_OAUTH_REFRESH");
             std::env::remove_var("OMNI_NO_OAUTH_REFRESH");
+            std::env::remove_var("OMNI_CODEX_OAUTH_REFRESH");
+            std::env::remove_var("OMNI_CLAUDE_OAUTH_REFRESH");
+            std::env::remove_var("OMNI_GROK_OAUTH_REFRESH");
         }
         let cli = Cli::try_parse_from(["omni", "--no-oauth-refresh"]).unwrap();
         apply_cli_env_overrides(&cli);
         assert_eq!(std::env::var("OMNI_OAUTH_REFRESH").ok().as_deref(), Some("0"));
         assert_eq!(std::env::var("OMNI_NO_OAUTH_REFRESH").ok().as_deref(), Some("1"));
+        assert!(!omni_common::oauth_refresh_enabled_for(
+            omni_common::OAuthRefreshProvider::Codex
+        ));
+
+        // Global off + codex on → only codex refreshes (CLI dual of env).
+        let cli = Cli::try_parse_from([
+            "omni",
+            "--no-oauth-refresh",
+            "--oauth-refresh-codex",
+        ])
+        .unwrap();
+        apply_cli_env_overrides(&cli);
+        assert_eq!(
+            std::env::var("OMNI_CODEX_OAUTH_REFRESH").ok().as_deref(),
+            Some("1")
+        );
+        assert!(omni_common::oauth_refresh_enabled_for(
+            omni_common::OAuthRefreshProvider::Codex
+        ));
+        assert!(!omni_common::oauth_refresh_enabled_for(
+            omni_common::OAuthRefreshProvider::Claude
+        ));
+        assert!(!omni_common::oauth_refresh_enabled_for(
+            omni_common::OAuthRefreshProvider::Grok
+        ));
+
+        // Per-provider off without global off.
+        unsafe {
+            std::env::remove_var("OMNI_OAUTH_REFRESH");
+            std::env::remove_var("OMNI_NO_OAUTH_REFRESH");
+            std::env::remove_var("OMNI_CODEX_OAUTH_REFRESH");
+        }
+        let cli = Cli::try_parse_from(["omni", "--no-oauth-refresh-codex"]).unwrap();
+        apply_cli_env_overrides(&cli);
+        assert_eq!(
+            std::env::var("OMNI_CODEX_OAUTH_REFRESH").ok().as_deref(),
+            Some("0")
+        );
+        assert!(!omni_common::oauth_refresh_enabled_for(
+            omni_common::OAuthRefreshProvider::Codex
+        ));
+        assert!(omni_common::oauth_refresh_enabled_for(
+            omni_common::OAuthRefreshProvider::Claude
+        ));
+
         unsafe {
             match old_refresh {
                 Some(v) => std::env::set_var("OMNI_OAUTH_REFRESH", v),
@@ -3335,6 +3812,18 @@ mod tests {
             match old_no {
                 Some(v) => std::env::set_var("OMNI_NO_OAUTH_REFRESH", v),
                 None => std::env::remove_var("OMNI_NO_OAUTH_REFRESH"),
+            }
+            match old_codex {
+                Some(v) => std::env::set_var("OMNI_CODEX_OAUTH_REFRESH", v),
+                None => std::env::remove_var("OMNI_CODEX_OAUTH_REFRESH"),
+            }
+            match old_claude {
+                Some(v) => std::env::set_var("OMNI_CLAUDE_OAUTH_REFRESH", v),
+                None => std::env::remove_var("OMNI_CLAUDE_OAUTH_REFRESH"),
+            }
+            match old_grok {
+                Some(v) => std::env::set_var("OMNI_GROK_OAUTH_REFRESH", v),
+                None => std::env::remove_var("OMNI_GROK_OAUTH_REFRESH"),
             }
         }
     }

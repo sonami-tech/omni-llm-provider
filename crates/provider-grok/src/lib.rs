@@ -176,25 +176,53 @@ impl GrokProvider {
     }
 
     pub fn detected() -> bool {
-        if env_nonempty("OMNI_GROK_BASE_URL").is_some()
-            || env_nonempty("GROK_MODELS_BASE_URL").is_some()
-        {
-            return true;
+        Self::detection_source().is_some()
+    }
+
+    /// Short reason grok is auto-detectable (file/env), for startup logs.
+    pub fn detection_source() -> Option<String> {
+        if env_nonempty("OMNI_GROK_BASE_URL").is_some() {
+            return Some("OMNI_GROK_BASE_URL set".into());
+        }
+        if env_nonempty("GROK_MODELS_BASE_URL").is_some() {
+            return Some("GROK_MODELS_BASE_URL set".into());
         }
         if let Some(path) = std::env::var_os("XAI_CREDENTIALS_PATH") {
-            return std::path::PathBuf::from(path).is_file();
+            let p = std::path::PathBuf::from(path);
+            if p.is_file() {
+                let disp = std::fs::canonicalize(&p)
+                    .unwrap_or(p)
+                    .display()
+                    .to_string();
+                return Some(format!("XAI_CREDENTIALS_PATH={disp}"));
+            }
+            return None;
         }
         let static_path = GrokCredentials::default_path();
         if static_path.is_file() {
             match GrokCredentials::load_fresh(&static_path) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    let disp = std::fs::canonicalize(&static_path)
+                        .unwrap_or(static_path)
+                        .display()
+                        .to_string();
+                    return Some(format!("creds={disp}"));
+                }
                 Err(credentials::GrokCredentialsError::MissingToken) => {}
-                Err(_) => return false,
+                Err(_) => return None,
             }
         }
-        GrokCredentials::grok_cli_path()
-            .as_deref()
-            .is_some_and(|path| path.is_file() && GrokCredentials::load_fresh(path).is_ok())
+        if let Some(cli_path) = GrokCredentials::grok_cli_path()
+            && cli_path.is_file()
+            && GrokCredentials::load_fresh(&cli_path).is_ok()
+        {
+            let disp = std::fs::canonicalize(&cli_path)
+                .unwrap_or(cli_path)
+                .display()
+                .to_string();
+            return Some(format!("cli-login={disp}"));
+        }
+        None
     }
 
     /// Override the base URL (useful for tests or proxies). Chainable.
@@ -351,8 +379,10 @@ impl GrokProvider {
         match GrokCredentials::load_resolved_async().await {
             Ok(creds) => {
                 if let Err(e) = creds.check_expired() {
+                    let source = GrokCredentials::describe_cli_auth_source();
                     warn!(
                         error = %e,
+                        source = %source,
                         "grok OIDC token past expiry (continuing; re-run the Grok CLI login if requests 401)"
                     );
                 }
@@ -363,9 +393,9 @@ impl GrokProvider {
                     debug!(error = %e, "no grok creds file (or load failed); using explicit ctor key");
                     Ok(k.clone())
                 } else {
+                    let source = GrokCredentials::describe_cli_auth_source();
                     Err(ProviderError::Auth(format!(
-                        "failed to load Grok credentials (set $XAI_CREDENTIALS_PATH, or provide ~/.xai/.credentials.json, or log in with the Grok CLI): {}",
-                        e
+                        "failed to load Grok credentials ({source}): {e}"
                     )))
                 }
             }
@@ -455,8 +485,10 @@ impl GrokProvider {
         }
         let creds = GrokCredentials::load_resolved_cli_async().await?;
         if let Err(e) = creds.check_expired() {
+            let source = GrokCredentials::describe_cli_auth_source();
             warn!(
                 error = %e,
+                source = %source,
                 "grok OIDC token past expiry (continuing; re-run the Grok CLI login if requests 401)"
             );
         }
@@ -740,11 +772,18 @@ impl GrokProvider {
         if !self.warn_overrides {
             return;
         }
-        let creds_path = std::env::var_os("XAI_CREDENTIALS_PATH").is_some();
-        if base_overridden || creds_path {
+        let xai_path = std::env::var_os("XAI_CREDENTIALS_PATH").map(|p| {
+            let path = std::path::PathBuf::from(p);
+            std::fs::canonicalize(&path)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        });
+        if base_overridden || xai_path.is_some() {
             warn!(
+                base_url = %self.base_url,
                 base_overridden,
-                xai_credentials_path = creds_path,
+                xai_credentials_path = xai_path.as_deref().unwrap_or("unset"),
                 "grok CLI parity is not exact: an override (custom base_url / XAI_CREDENTIALS_PATH) is active; proceeding with the override"
             );
         }

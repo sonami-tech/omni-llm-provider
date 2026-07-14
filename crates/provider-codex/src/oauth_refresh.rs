@@ -2,10 +2,11 @@
 //!
 //! OAuth refresh is **on by default**: Omni may refresh a near-expired
 //! `tokens.access_token` (JWT `exp`) via the captured OpenAI auth endpoint and
-//! atomically write back `tokens.*` + `last_refresh`. Disable with
-//! `OMNI_OAUTH_REFRESH=0` (or `false`/`off`/`no`), `OMNI_NO_OAUTH_REFRESH=1`, or
-//! the omni CLI flag `--no-oauth-refresh`. Static `OPENAI_API_KEY` entries are
-//! never refreshed.
+//! atomically write back `tokens.*` + `last_refresh`. Disable/enable globally or
+//! per provider via `OMNI_OAUTH_REFRESH`, `OMNI_NO_OAUTH_REFRESH`,
+//! `OMNI_CODEX_OAUTH_REFRESH`, or matching omni CLI flags (see
+//! `omni_common::oauth_refresh`). Static `OPENAI_API_KEY` entries are never
+//! refreshed.
 //!
 //! Wire contract: live capture codex 0.144.1 — see
 //! `/home/username/oauth-credential-renewal-handoff.md`.
@@ -15,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Captured ChatGPT OAuth token endpoint.
 pub const CODEX_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -39,32 +40,12 @@ pub struct CodexTokenGrant {
     pub expires_in: Option<i64>,
 }
 
-/// Gate for in-Omni OAuth refresh (shared name across providers).
-/// Default **on**. Disable with `OMNI_OAUTH_REFRESH=0`/`false`/`off`/`no`,
-/// `OMNI_NO_OAUTH_REFRESH=1`/`true`/`yes`/`on`, or CLI `--no-oauth-refresh`.
+/// Gate for in-Omni Codex OAuth refresh.
+///
+/// Default **on**. See [`omni_common::oauth_refresh_enabled_for`] for global and
+/// per-provider env / CLI controls.
 pub fn oauth_refresh_enabled() -> bool {
-    if env_flag_truthy("OMNI_NO_OAUTH_REFRESH") {
-        return false;
-    }
-    match std::env::var("OMNI_OAUTH_REFRESH")
-        .ok()
-        .map(|v| v.to_ascii_lowercase())
-        .as_deref()
-    {
-        None => true,
-        Some("0" | "false" | "off" | "no") => false,
-        Some(_) => true,
-    }
-}
-
-fn env_flag_truthy(name: &str) -> bool {
-    matches!(
-        std::env::var(name)
-            .ok()
-            .map(|v| v.to_ascii_lowercase())
-            .as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
+    omni_common::oauth_refresh_enabled_for(omni_common::OAuthRefreshProvider::Codex)
 }
 
 /// Effective token endpoint. Tests may set `OMNI_CODEX_OAUTH_TOKEN_URL`.
@@ -271,6 +252,7 @@ pub async fn maybe_refresh_auth_json(
 
 /// POST the JSON grant and atomically write back to `path`.
 pub async fn refresh_oauth_inplace(path: &Path, token_url: &str) -> Result<(), String> {
+    info!(path = %path.display(), "codex OAuth refresh starting");
     let bytes = tokio::fs::read(path)
         .await
         .map_err(|e| e.to_string())?;
@@ -339,6 +321,7 @@ pub async fn refresh_oauth_inplace(path: &Path, token_url: &str) -> Result<(), S
     apply_grant_to_auth_json(&mut latest, &grant, &now)?;
     let out = serde_json::to_vec_pretty(&latest).map_err(|e| e.to_string())?;
     atomic_write(path, &out)?;
+    info!(path = %path.display(), "codex OAuth refresh ok");
     Ok(())
 }
 

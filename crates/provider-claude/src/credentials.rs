@@ -6,8 +6,9 @@
 //! OAuth refresh is **on by default**: Omni may proactively refresh a near-expired
 //! or expired OAuth access token via the Claude token endpoint and **atomically
 //! write back** the rotated tokens to the same credentials path.
-//! Disable with `OMNI_OAUTH_REFRESH=0` (or `false`/`off`/`no`),
-//! `OMNI_NO_OAUTH_REFRESH=1`, or the omni CLI flag `--no-oauth-refresh`.
+//! Disable/enable globally or per provider via `OMNI_OAUTH_REFRESH`,
+//! `OMNI_NO_OAUTH_REFRESH`, `OMNI_CLAUDE_OAUTH_REFRESH`, or matching omni CLI
+//! flags (see `omni_common::oauth_refresh`).
 //!
 //! Ported from reference-src-claude/upstream/credentials.rs .
 //! All credential handling for the OAuth gate stays isolated here.
@@ -16,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::upstream::errors::UpstreamError;
 
@@ -185,32 +186,12 @@ enum RefreshTrigger {
     Force,
 }
 
-/// Gate for in-Omni OAuth refresh (shared name across providers).
-/// Default **on**. Disable with `OMNI_OAUTH_REFRESH=0`/`false`/`off`/`no`,
-/// `OMNI_NO_OAUTH_REFRESH=1`/`true`/`yes`/`on`, or CLI `--no-oauth-refresh`.
+/// Gate for in-Omni Claude OAuth refresh.
+///
+/// Default **on**. See [`omni_common::oauth_refresh_enabled_for`] for global and
+/// per-provider env / CLI controls.
 pub fn oauth_refresh_enabled() -> bool {
-    if env_flag_truthy("OMNI_NO_OAUTH_REFRESH") {
-        return false;
-    }
-    match std::env::var("OMNI_OAUTH_REFRESH")
-        .ok()
-        .map(|v| v.to_ascii_lowercase())
-        .as_deref()
-    {
-        None => true,
-        Some("0" | "false" | "off" | "no") => false,
-        Some(_) => true,
-    }
-}
-
-fn env_flag_truthy(name: &str) -> bool {
-    matches!(
-        std::env::var(name)
-            .ok()
-            .map(|v| v.to_ascii_lowercase())
-            .as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
+    omni_common::oauth_refresh_enabled_for(omni_common::OAuthRefreshProvider::Claude)
 }
 
 /// Effective Claude token endpoint. Production uses the captured host; tests may
@@ -331,6 +312,7 @@ pub async fn refresh_oauth_inplace(
     path: &Path,
     token_url: &str,
 ) -> Result<(), UpstreamError> {
+    info!(path = %path.display(), "claude OAuth refresh starting");
     let bytes = tokio::fs::read(path)
         .await
         .map_err(UpstreamError::CredentialsRead)?;
@@ -406,6 +388,7 @@ pub async fn refresh_oauth_inplace(
         UpstreamError::Decode(format!("serialize refreshed credentials: {e}"))
     })?;
     atomic_write(path, &out)?;
+    info!(path = %path.display(), "claude OAuth refresh ok");
     Ok(())
 }
 

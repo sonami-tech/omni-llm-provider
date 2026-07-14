@@ -233,9 +233,31 @@ impl ClaudeProvider {
     }
 
     pub fn detected() -> bool {
-        env_nonempty("OMNI_CLAUDE_BASE_URL").is_some()
-            || env_nonempty("ANTHROPIC_BASE_URL").is_some()
-            || credentials::Credentials::default_path().is_file()
+        Self::detection_source().is_some()
+    }
+
+    /// Short reason claude is auto-detectable (file/env), for startup logs.
+    pub fn detection_source() -> Option<String> {
+        if env_nonempty("OMNI_CLAUDE_BASE_URL").is_some() {
+            return Some("OMNI_CLAUDE_BASE_URL set".into());
+        }
+        if env_nonempty("ANTHROPIC_BASE_URL").is_some() {
+            return Some("ANTHROPIC_BASE_URL set".into());
+        }
+        let path = credentials::Credentials::default_path();
+        if path.is_file() {
+            let via = if std::env::var_os("CLAUDE_CREDENTIALS_PATH").is_some() {
+                " via CLAUDE_CREDENTIALS_PATH"
+            } else {
+                ""
+            };
+            let disp = std::fs::canonicalize(&path)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            return Some(format!("creds={disp}{via}"));
+        }
+        None
     }
 
     pub fn new_with_profile(profile: &'static FingerprintProfile) -> Result<Self, ProviderError> {

@@ -4,10 +4,14 @@
 //! own `CODEX_HOME` / `~/.codex` config and auth state instead of inventing a
 //! parallel Omni-only setup.
 //!
+//! Transport is inferred from that state (no operator mode flag): ChatGPT OAuth
+//! on the default OpenAI-shaped config uses the CLI-parity ChatGPT WebSocket
+//! path; API keys and custom gateways use the configured REST Responses path.
+//!
 //! ChatGPT OAuth tokens in `auth.json` are refreshed in-place by default
-//! (see [`oauth_refresh`]); disable with `OMNI_OAUTH_REFRESH=0`,
-//! `OMNI_NO_OAUTH_REFRESH=1`, or `--no-oauth-refresh`. Static API keys are
-//! never refreshed.
+//! (see [`oauth_refresh`]); control with global/per-provider env or CLI
+//! (`OMNI_OAUTH_REFRESH`, `OMNI_CODEX_OAUTH_REFRESH`, `--no-oauth-refresh-codex`,
+//! etc.). Static API keys are never refreshed.
 
 mod oauth_refresh;
 
@@ -20,7 +24,7 @@ use omni_common::{env_nonempty, headers_from_env};
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
     CanonicalResponse, CanonicalStream, CanonicalStreamEvent, CanonicalToolCall,
-    CanonicalToolChoice, CatalogMode, CatalogModel, LlmProvider, ProviderError, ProviderVersion,
+    CanonicalToolChoice, CatalogModel, LlmProvider, ProviderError, ProviderVersion,
 };
 use reqwest::header::HeaderMap;
 use reqwest::{Client, Url, header};
@@ -37,8 +41,6 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tracing::warn;
-
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const CONSERVATIVE_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const CONSERVATIVE_OPENAI_BETA: &str = "responses_websockets=2026-02-06";
@@ -91,11 +93,6 @@ pub struct CodexModelInfo {
 #[derive(Debug, Clone)]
 pub struct CodexProvider {
     client: Client,
-    /// Catalog mode (conservative vs extended). Default Extended. On the captured
-    /// free plan the two catalogs are identical, but the field is carried so the
-    /// selector is uniform across providers and a future plan-dependent split is a
-    /// data-only change.
-    mode: CatalogMode,
     /// Pinned version from the provider's own catalog. Default newest.
     version: &'static ProviderVersion,
 }
@@ -109,15 +106,8 @@ impl CodexProvider {
             .map_err(|e| ProviderError::Other(anyhow::anyhow!("http client: {e}")))?;
         Ok(Self {
             client,
-            mode: CatalogMode::default(),
             version: &CODEX_VERSIONS[0],
         })
-    }
-
-    /// Set the catalog mode (conservative vs extended). Chainable. Default Extended.
-    pub fn with_mode(mut self, mode: CatalogMode) -> Self {
-        self.mode = mode;
-        self
     }
 
     /// Pin a specific version from the provider's catalog. Chainable. Default
@@ -138,9 +128,13 @@ impl CodexProvider {
         Ok(self)
     }
 
-    /// The active catalog for the current mode + pinned version.
+    /// The active catalog for the pinned version.
+    ///
+    /// Both `ProviderVersion` catalog slots hold the same Codex list today (like
+    /// Grok). Path selection (ChatGPT WebSocket vs REST) is inferred from
+    /// `CODEX_HOME` config/auth, not from a catalog mode flag.
     fn active_catalog(&self) -> &'static [CatalogModel] {
-        self.version.catalog(self.mode)
+        self.version.conservative
     }
 
     /// The model id used for an actual request. This stays config-driven (the
@@ -152,6 +146,65 @@ impl CodexProvider {
 
     pub fn detected() -> bool {
         CodexRequestConfig::detected()
+    }
+
+    /// Operator-facing one-liner: resolved home, auth winner, transport, model.
+    ///
+    /// Discovery only (no secrets). Used at omni startup so logs name the real
+    /// `CODEX_HOME` / files rather than "CODEX_HOME or ~/.codex".
+    ///
+    /// Returns `Err` when config/home cannot be loaded (startup should fail hard).
+    pub fn startup_source_summary() -> Result<String, ProviderError> {
+        let config = CodexRequestConfig::load()?;
+        let home = display_path(&config.home);
+        let config_path = config.home.join("config.toml");
+        let auth_path = config.home.join("auth.json");
+        let config_state = if config_path.is_file() {
+            "present"
+        } else {
+            "missing"
+        };
+        let auth = describe_codex_auth_source(&config, &auth_path);
+        let path = if config.should_use_chatgpt_ws() {
+            "chatgpt-ws"
+        } else if omni_codex_override_present() {
+            "omni-override-rest"
+        } else {
+            "rest"
+        };
+        Ok(format!(
+            "home={home} config={config_state} {auth} path={path} model={} base_url={}",
+            config.model, config.base_url
+        ))
+    }
+
+    /// Short reason codex is auto-detectable (file/env), for startup logs.
+    ///
+    /// Prefers concrete home files over ambient env keys when both are present,
+    /// so operators see the home that will actually be used.
+    pub fn detection_source() -> Option<String> {
+        if omni_codex_override_present() {
+            return Some("OMNI_CODEX_BASE_URL set".into());
+        }
+        let home = codex_home();
+        // Explicit invalid CODEX_HOME is still a detection signal for diagnostics.
+        if std::env::var_os("CODEX_HOME").is_some() && !home.is_dir() {
+            return Some(format!("CODEX_HOME={} (missing)", home.display()));
+        }
+        let config = home.join("config.toml");
+        let auth = home.join("auth.json");
+        if config.is_file() {
+            return Some(format!("home={} config=present", display_path(&home)));
+        }
+        if auth.is_file() {
+            return Some(format!("home={} auth=present", display_path(&home)));
+        }
+        for key in ["CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"] {
+            if env_nonempty(key).is_some() {
+                return Some(format!("env:{key} set"));
+            }
+        }
+        None
     }
 
     /// `/v1/models` advertises the active version catalog plus the actually
@@ -379,11 +432,10 @@ impl LlmProvider for CodexProvider {
 
     async fn send(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError> {
         let config = CodexRequestConfig::load()?;
-        if self.mode == CatalogMode::Conservative {
-            if config.conservative_ws_eligible() {
-                return self.send_conservative_ws(req, config).await;
-            }
-            warn_codex_conservative_fallback(&config);
+        // ChatGPT login + default Codex OpenAI-shaped config → CLI-parity WS path.
+        // Custom gateway / API-key-only / override env → configured REST path.
+        if config.should_use_chatgpt_ws() {
+            return self.send_conservative_ws(req, config).await;
         }
         if config.wire_api != WireApi::Responses {
             return Err(ProviderError::upstream(format!(
@@ -435,11 +487,8 @@ impl LlmProvider for CodexProvider {
 
     async fn send_stream(&self, req: CanonicalRequest) -> Result<CanonicalStream, ProviderError> {
         let config = CodexRequestConfig::load()?;
-        if self.mode == CatalogMode::Conservative {
-            if config.conservative_ws_eligible() {
-                return self.send_stream_conservative_ws(req, config).await;
-            }
-            warn_codex_conservative_fallback(&config);
+        if config.should_use_chatgpt_ws() {
+            return self.send_stream_conservative_ws(req, config).await;
         }
         if config.wire_api != WireApi::Responses {
             return Err(ProviderError::upstream(format!(
@@ -713,13 +762,44 @@ impl CodexRequestConfig {
     }
 
     fn load_from_home(home: &Path) -> Result<Self, ProviderError> {
+        // Explicit CODEX_HOME must resolve to a real directory (invalid paths
+        // used to fall through to empty defaults and start a broken provider).
+        let codex_home_explicit = std::env::var_os("CODEX_HOME").is_some();
+        if codex_home_explicit {
+            if !home.exists() {
+                return Err(ProviderError::Auth(format!(
+                    "CODEX_HOME={} does not exist",
+                    home.display()
+                )));
+            }
+            if !home.is_dir() {
+                return Err(ProviderError::Auth(format!(
+                    "CODEX_HOME={} is not a directory",
+                    home.display()
+                )));
+            }
+        }
+
         let config_path = home.join("config.toml");
-        let raw = std::fs::read_to_string(&config_path).unwrap_or_default();
+        let raw = match std::fs::read_to_string(&config_path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(ProviderError::Auth(format!(
+                    "Codex config.toml at {}: {e}",
+                    config_path.display()
+                )));
+            }
+        };
         let value: toml::Value = if raw.trim().is_empty() {
             toml::Value::Table(Default::default())
         } else {
-            raw.parse::<toml::Value>()
-                .map_err(|e| ProviderError::Auth(format!("Codex config parse failed: {e}")))?
+            raw.parse::<toml::Value>().map_err(|e| {
+                ProviderError::Auth(format!(
+                    "Codex config parse failed at {}: {e}",
+                    config_path.display()
+                ))
+            })?
         };
 
         let model = toml_str(&value, &["model"])
@@ -841,6 +921,9 @@ impl CodexRequestConfig {
         Ok(url)
     }
 
+    /// Config shape matches the real Codex CLI's default OpenAI provider (no
+    /// custom base_url, headers, or auth hooks). ChatGPT WS still requires OAuth
+    /// tokens; see [`Self::should_use_chatgpt_ws`].
     fn conservative_ws_eligible(&self) -> bool {
         !omni_codex_override_present()
             && self.wire_api == WireApi::Responses
@@ -854,6 +937,38 @@ impl CodexRequestConfig {
             && self.experimental_bearer_token.is_none()
             && self.env_key.is_none()
             && self.requires_openai_auth
+    }
+
+    /// Whether this request should use the ChatGPT backend WebSocket path.
+    ///
+    /// Mirrors Claude/Grok: infer from credentials + config, no operator mode
+    /// flag. Default OpenAI-shaped Codex config with ChatGPT OAuth tokens → WS;
+    /// API-key-only or custom gateway → REST.
+    fn should_use_chatgpt_ws(&self) -> bool {
+        self.conservative_ws_eligible() && self.has_chatgpt_oauth_tokens()
+    }
+
+    /// True when `auth.json` has a non-empty ChatGPT `access_token` + `account_id`.
+    fn has_chatgpt_oauth_tokens(&self) -> bool {
+        let auth_path = self.home.join("auth.json");
+        let Ok(bytes) = std::fs::read(&auth_path) else {
+            return false;
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+            return false;
+        };
+        let Some(tokens) = value.get("tokens").and_then(|v| v.as_object()) else {
+            return false;
+        };
+        let access = tokens
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+        let account = tokens
+            .get("account_id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+        access && account
     }
 
     fn conservative_models_url(&self, version: &str) -> Result<Url, ProviderError> {
@@ -1086,22 +1201,6 @@ fn conservative_chatgpt_ws_base_url() -> String {
     conservative_chatgpt_base_url()
 }
 
-fn warn_codex_conservative_fallback(config: &CodexRequestConfig) {
-    let reason = if omni_codex_override_present() {
-        "OMNI_CODEX_BASE_URL override is active"
-    } else if !is_default_openai_base(&config.base_url) {
-        "Codex config uses a custom/non-default base_url"
-    } else if !config.requires_openai_auth {
-        "Codex config does not require OpenAI/ChatGPT auth"
-    } else {
-        "Codex config has custom auth, headers, or query parameters"
-    };
-    warn!(
-        reason,
-        "codex conservative mode parity is not exact; using the configured REST Responses path instead"
-    );
-}
-
 impl AuthCommand {
     async fn run(&self, home: &Path) -> Result<String, ProviderError> {
         let mut child = Command::new(&self.command)
@@ -1145,6 +1244,96 @@ fn codex_home() -> PathBuf {
     dirs::home_dir()
         .map(|home| home.join(".codex"))
         .unwrap_or_else(|| PathBuf::from(".codex"))
+}
+
+fn display_path(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
+/// Auth source that the current config will prefer (no secret values).
+fn describe_codex_auth_source(config: &CodexRequestConfig, auth_path: &Path) -> String {
+    if let Some(env_key) = &config.env_key {
+        let state = if env_nonempty(env_key).is_some() {
+            "set"
+        } else {
+            "unset"
+        };
+        return format!("auth=env:{env_key} ({state})");
+    }
+    if config.experimental_bearer_token.is_some() {
+        return "auth=experimental_bearer_token (set)".into();
+    }
+    if config.auth_command.is_some() {
+        return "auth=auth_command".into();
+    }
+
+    // ChatGPT WS path uses tokens.* only (not env sk- keys).
+    if config.should_use_chatgpt_ws() {
+        return describe_codex_auth_json(auth_path, true);
+    }
+
+    // Built-in OpenAI REST: env keys beat auth.json (mirrors openai_auth_token).
+    if config.requires_openai_auth {
+        for env_key in ["CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"] {
+            if env_nonempty(env_key).is_some() {
+                return format!("auth=env:{env_key} (set)");
+            }
+        }
+        return describe_codex_auth_json(auth_path, false);
+    }
+
+    // Custom gateway fallback: auth.json then env (mirrors openai_auth_token_fallback).
+    let from_file = describe_codex_auth_json(auth_path, false);
+    if !from_file.contains("missing") && !from_file.contains("no usable token") {
+        return from_file;
+    }
+    for env_key in ["CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"] {
+        if env_nonempty(env_key).is_some() {
+            return format!("auth=env:{env_key} (set)");
+        }
+    }
+    from_file
+}
+
+fn describe_codex_auth_json(auth_path: &Path, prefer_oauth: bool) -> String {
+    if !auth_path.is_file() {
+        return format!("auth={} (missing)", display_path(auth_path));
+    }
+    let path = display_path(auth_path);
+    match std::fs::read(auth_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+    {
+        Some(value) => {
+            let has_oauth = value
+                .get("tokens")
+                .and_then(|t| t.get("access_token"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty())
+                && value
+                    .get("tokens")
+                    .and_then(|t| t.get("account_id"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.trim().is_empty());
+            let has_api_key = value
+                .get("OPENAI_API_KEY")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty());
+            if prefer_oauth && has_oauth {
+                format!("auth={path} (chatgpt-oauth, present)")
+            } else if has_api_key {
+                format!("auth={path} (OPENAI_API_KEY, present)")
+            } else if has_oauth {
+                format!("auth={path} (chatgpt-oauth, present)")
+            } else {
+                format!("auth={path} (present, no usable token)")
+            }
+        }
+        None => format!("auth={path} (present, unreadable)"),
+    }
 }
 
 fn toml_str<'a>(value: &'a toml::Value, path: &[&str]) -> Option<&'a str> {
@@ -1983,6 +2172,49 @@ model = "gpt-native"
     }
 
     #[test]
+    fn load_fails_when_codex_home_does_not_exist() {
+        // WHY: an invalid/missing CODEX_HOME must not start as empty defaults;
+        // operators need a hard config error at launch.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let missing = std::env::temp_dir().join(format!(
+            "omni-codex-missing-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Ensure absent.
+        let _ = std::fs::remove_dir_all(&missing);
+        let old_home = std::env::var_os("CODEX_HOME");
+        let old_override = std::env::var_os("OMNI_CODEX_BASE_URL");
+        unsafe {
+            std::env::set_var("CODEX_HOME", &missing);
+            std::env::remove_var("OMNI_CODEX_BASE_URL");
+        }
+        let err = CodexRequestConfig::load().expect_err("missing CODEX_HOME must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not exist"),
+            "expected missing-home error, got: {msg}"
+        );
+        assert!(
+            CodexProvider::startup_source_summary().is_err(),
+            "startup summary must fail when CODEX_HOME is invalid"
+        );
+        unsafe {
+            match old_home {
+                Some(v) => std::env::set_var("CODEX_HOME", v),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+            match old_override {
+                Some(v) => std::env::set_var("OMNI_CODEX_BASE_URL", v),
+                None => std::env::remove_var("OMNI_CODEX_BASE_URL"),
+            }
+        }
+    }
+
+    #[test]
     fn detected_accepts_openai_api_key() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _home = TempCodexHome::new("", None);
@@ -2588,9 +2820,9 @@ model = "gpt-5.5"
             std::env::set_var("OMNI_CODEX_CONSERVATIVE_WS_BASE_URL_FOR_TEST", &ws_base_url);
         }
 
-        let provider = CodexProvider::new()
-            .unwrap()
-            .with_mode(CatalogMode::Conservative);
+        // No mode flag: ChatGPT OAuth tokens + default OpenAI-shaped config
+        // auto-select the CLI-parity WebSocket path.
+        let provider = CodexProvider::new().unwrap();
         let resp = provider
             .send(CanonicalRequest {
                 model: "gpt-5.5".into(),
@@ -2620,6 +2852,63 @@ model = "gpt-5.5"
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"], "hi");
         assert!(body.get("stream").is_none());
+    }
+
+    #[test]
+    fn should_use_chatgpt_ws_when_oauth_tokens_and_default_config() {
+        // WHY: ChatGPT login must not require an operator mode flag; path follows
+        // credentials + config like Claude/Grok.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _home = TempCodexHome::new(
+            r#"model = "gpt-5.5""#,
+            Some(
+                r#"{"tokens":{"access_token":"eyJ-oauth","account_id":"acct-1"}}"#,
+            ),
+        );
+        let cfg = CodexRequestConfig::load().unwrap();
+        assert!(cfg.should_use_chatgpt_ws());
+        let summary = CodexProvider::startup_source_summary().unwrap();
+        assert!(
+            summary.contains("path=chatgpt-ws") && summary.contains("chatgpt-oauth"),
+            "startup summary must name the resolved chatgpt path: {summary}"
+        );
+        assert!(
+            summary.contains("home=") && summary.contains("model=gpt-5.5"),
+            "startup summary must include home and model: {summary}"
+        );
+    }
+
+    #[test]
+    fn should_not_use_chatgpt_ws_for_api_key_only_auth() {
+        // WHY: platform sk- auth must stay on REST api.openai.com, not ChatGPT WS.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _home = TempCodexHome::new(
+            r#"model = "gpt-5.5""#,
+            Some(r#"{"OPENAI_API_KEY":"sk-rest-only"}"#),
+        );
+        let cfg = CodexRequestConfig::load().unwrap();
+        assert!(cfg.conservative_ws_eligible());
+        assert!(!cfg.should_use_chatgpt_ws());
+    }
+
+    #[test]
+    fn should_not_use_chatgpt_ws_for_custom_gateway() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _home = TempCodexHome::new(
+            r#"
+model = "gpt-custom"
+model_provider = "proxy"
+[model_providers.proxy]
+base_url = "https://proxy.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = false
+"#,
+            Some(
+                r#"{"tokens":{"access_token":"eyJ-oauth","account_id":"acct-1"}}"#,
+            ),
+        );
+        let cfg = CodexRequestConfig::load().unwrap();
+        assert!(!cfg.should_use_chatgpt_ws());
     }
 
     #[test]

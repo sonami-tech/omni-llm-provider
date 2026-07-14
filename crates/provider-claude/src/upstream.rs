@@ -907,7 +907,13 @@ impl UpstreamClient {
                         match Credentials::load_fresh_async_force_refresh(&path).await {
                             Ok(fresh) => {
                                 warn!(
-                                    "upstream 401, re-reading credentials.json (oauth refresh if enabled) and retrying"
+
+                                    path = %path.display(),
+
+                                    oauth_refresh = crate::credentials::oauth_refresh_enabled(),
+
+                                    "upstream 401, re-read credentials and retrying"
+
                                 );
                                 creds_owned = fresh;
                                 ctx_owned.next_attempt();
@@ -988,7 +994,13 @@ impl UpstreamClient {
                         match Credentials::load_fresh_async_force_refresh(&path).await {
                             Ok(fresh) => {
                                 warn!(
-                                    "count_tokens 401, re-reading credentials.json (oauth refresh if enabled) and retrying"
+
+                                    path = %path.display(),
+
+                                    oauth_refresh = crate::credentials::oauth_refresh_enabled(),
+
+                                    "count_tokens 401, re-read credentials and retrying"
+
                                 );
                                 creds_owned = fresh;
                                 ctx_owned.next_attempt();
@@ -1096,7 +1108,13 @@ impl UpstreamClient {
                             Credentials::load_fresh_async_force_refresh(&path).await
                         {
                             warn!(
-                                "upstream 401 on stream open, re-reading credentials.json (oauth refresh if enabled)"
+
+                                path = %path.display(),
+
+                                oauth_refresh = crate::credentials::oauth_refresh_enabled(),
+
+                                "upstream 401 on stream open, re-read credentials"
+
                             );
                             creds_owned = fresh;
                             ctx_owned.next_attempt();
@@ -1171,7 +1189,13 @@ impl UpstreamClient {
                             Credentials::load_fresh_async_force_refresh(&path).await
                         {
                             warn!(
-                                "upstream 401 on raw stream open, re-reading credentials.json (oauth refresh if enabled)"
+
+                                path = %path.display(),
+
+                                oauth_refresh = crate::credentials::oauth_refresh_enabled(),
+
+                                "upstream 401 on raw stream open, re-read credentials"
+
                             );
                             creds_owned = fresh;
                             ctx_owned.next_attempt();

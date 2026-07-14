@@ -9,6 +9,7 @@ pub mod conversation_log;
 pub mod env;
 pub mod error;
 pub mod http;
+pub mod oauth_refresh;
 pub mod replacements;
 pub mod responses;
 pub mod responses_upstream;
@@ -26,6 +27,10 @@ pub use anthropic::{
 pub use auth::{ApiKeyId, auth_layer};
 pub use conversation_log::{ConversationLog, DEFAULT_LOG_BACKUPS, DEFAULT_LOG_MAX_BYTES};
 pub use env::{env_nonempty, headers_from_env, parse_custom_headers};
+pub use oauth_refresh::{
+    OAuthRefreshProvider, global_oauth_refresh_enabled, oauth_refresh_enabled_for,
+    oauth_refresh_policy_summary, parse_bool_env,
+};
 pub use error::{AppError, classify_upstream};
 pub use http::{
     ChatCompletionRequest, ChatCompletionResponse, ChatContentPart, ChatImageUrl, ChatMessage,
