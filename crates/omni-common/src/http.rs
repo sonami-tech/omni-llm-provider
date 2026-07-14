@@ -220,7 +220,13 @@ pub struct ChatUsage {
     pub completion_tokens_details: Option<Value>,
 }
 
-const GATEWAY_ONLY_EXTRAS: &[&str] = &["user"];
+/// Top-level chat fields Omni consumes (or ignores) as gateway/transport
+/// metadata rather than forwarding as provider extras.
+///
+/// - `user`: session attribution for the gateway, not an upstream model field.
+/// - `stream_options`: OpenAI chat streaming transport (`include_usage`); the
+///   Responses/Codex/Claude paths do not accept this key.
+const GATEWAY_ONLY_EXTRAS: &[&str] = &["user", "stream_options"];
 
 /// Top-level request fields that Omni consumes as gateway metadata rather than
 /// forwarding as provider extras.
@@ -783,6 +789,28 @@ mod tests {
             .expect("provider extras should be preserved");
         assert_eq!(extras["response_format"]["type"], "json_object");
         assert!(extras.get("user").is_none());
+    }
+
+    #[test]
+    fn to_canonical_strips_stream_options_as_gateway_only() {
+        // WHY: chat clients send stream_options (include_usage) as transport
+        // metadata. Codex/Responses reject it as an unsupported provider extra;
+        // strip at the chat→canonical boundary instead of failing the request.
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "stream":true,"stream_options":{"include_usage":true},
+                "response_format":{"type":"json_object"}}"#,
+        )
+        .unwrap();
+        let canon = to_canonical(&req).expect("chat request should convert");
+        let extras = canon
+            .provider_extras
+            .expect("non-gateway extras should remain");
+        assert_eq!(extras["response_format"]["type"], "json_object");
+        assert!(
+            extras.get("stream_options").is_none(),
+            "stream_options must not become a provider extra: {extras}"
+        );
     }
 
     #[test]

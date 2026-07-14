@@ -264,6 +264,30 @@ struct Cli {
         default_value_t = AnthropicAuthScheme::ApiKey
     )]
     anthropic_auth_scheme: AnthropicAuthScheme,
+
+    /// Increase log verbosity. Default is warn. `-v` = info, `-vv` = debug,
+    /// `-vvv` = trace. `RUST_LOG` overrides this when set.
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
+    verbose: u8,
+}
+
+/// Default log filter for a `-v` count when `RUST_LOG` is unset.
+///
+/// 0 → warn, 1 → info, 2 → debug, 3+ → trace.
+fn default_log_filter(verbose: u8) -> &'static str {
+    match verbose {
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
+    }
+}
+
+/// Build the tracing filter: `RUST_LOG` wins when set, otherwise `-v` count.
+fn build_env_filter(verbose: u8) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(default_log_filter(verbose))
+    })
 }
 
 /// Apply CLI flags that providers read via process environment.
@@ -372,20 +396,20 @@ struct RequestId(String);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Parse first so `-v` can set the filter before the subscriber is installed.
+    let cli = Cli::parse();
+
     // Resolve color policy once (env + stderr TTY), then install a field
     // formatter that gives request_id/session_id stable per-value hues and each
     // provider a fixed color. with_ansi gates the level/timestamp escape codes to
     // the same decision so a redirected or piped stream stays plain.
     let color_mode = ColorMode::from_env();
     tracing_subscriber::fmt()
-        .with_env_filter(
-            "info,omni=debug,provider_claude=debug,provider_grok=debug,provider_codex=debug",
-        )
+        .with_env_filter(build_env_filter(cli.verbose))
         .with_ansi(matches!(color_mode, ColorMode::On))
         .fmt_fields(ColorFields::new(color_mode))
         .init();
 
-    let cli = Cli::parse();
     apply_cli_env_overrides(&cli);
     log_startup_banner();
 
@@ -3603,6 +3627,27 @@ mod tests {
             lines.iter().all(|line| !line.starts_with(' ')),
             "startup summary lines must be left-aligned: {lines:?}"
         );
+    }
+
+    #[test]
+    fn test_verbose_flag_maps_to_log_levels() {
+        // WHY: default must stay quiet (warn); each -v steps through info/debug/trace.
+        assert_eq!(default_log_filter(0), "warn");
+        assert_eq!(default_log_filter(1), "info");
+        assert_eq!(default_log_filter(2), "debug");
+        assert_eq!(default_log_filter(3), "trace");
+        assert_eq!(default_log_filter(9), "trace");
+
+        let none = Cli::try_parse_from(["omni", "--no-auth"]).unwrap();
+        assert_eq!(none.verbose, 0);
+        let v = Cli::try_parse_from(["omni", "-v", "--no-auth"]).unwrap();
+        assert_eq!(v.verbose, 1);
+        let vv = Cli::try_parse_from(["omni", "-vv", "--no-auth"]).unwrap();
+        assert_eq!(vv.verbose, 2);
+        let vvv = Cli::try_parse_from(["omni", "-vvv", "--no-auth"]).unwrap();
+        assert_eq!(vvv.verbose, 3);
+        let long = Cli::try_parse_from(["omni", "--verbose", "--verbose", "--no-auth"]).unwrap();
+        assert_eq!(long.verbose, 2);
     }
 
     #[test]

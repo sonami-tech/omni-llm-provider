@@ -1486,7 +1486,14 @@ fn http_header_value(name: &str, value: &str) -> Result<http::HeaderValue, Provi
 fn codex_response_create_body(req: &CanonicalRequest) -> Result<Value, ProviderError> {
     let mut body = codex_responses_body(req, true)?;
     body["type"] = Value::String("response.create".into());
-    body.as_object_mut().map(|obj| obj.remove("stream"));
+    if let Some(obj) = body.as_object_mut() {
+        // WebSocket frames are the stream; REST `stream: true` is not used.
+        obj.remove("stream");
+        // ChatGPT's codex backend rejects max_output_tokens (HTTP 400). The
+        // public OpenAI Responses REST path still accepts it via
+        // `codex_responses_body`; only the WS response.create shape strips it.
+        obj.remove("max_output_tokens");
+    }
     Ok(body)
 }
 
@@ -2618,6 +2625,7 @@ query_params = { api-version = "2026-01-01" }
                     content: CanonicalContent::Text("hi".into()),
                 },
             ],
+            max_tokens: Some(256),
             reasoning: Some(CanonicalReasoning {
                 effort: Some("high".into()),
                 budget_tokens: None,
@@ -2636,6 +2644,13 @@ query_params = { api-version = "2026-01-01" }
             body.get("stream").is_none(),
             "WebSocket response.create frames are text messages, not REST stream:true bodies"
         );
+        assert!(
+            body.get("max_output_tokens").is_none(),
+            "ChatGPT codex WS rejects max_output_tokens; must not appear on response.create: {body}"
+        );
+        // REST body still carries the cap for OpenAI api.openai.com Responses.
+        let rest = codex_responses_body(&req, false).unwrap();
+        assert_eq!(rest["max_output_tokens"], 256);
     }
 
     #[tokio::test]
