@@ -2876,9 +2876,7 @@ model = "gpt-5.5"
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _home = TempCodexHome::new(
             r#"model = "gpt-5.5""#,
-            Some(
-                r#"{"tokens":{"access_token":"eyJ-oauth","account_id":"acct-1"}}"#,
-            ),
+            Some(r#"{"tokens":{"access_token":"eyJ-oauth","account_id":"acct-1"}}"#),
         );
         let cfg = CodexRequestConfig::load().unwrap();
         assert!(cfg.should_use_chatgpt_ws());
@@ -2918,9 +2916,7 @@ base_url = "https://proxy.example.com/v1"
 wire_api = "responses"
 requires_openai_auth = false
 "#,
-            Some(
-                r#"{"tokens":{"access_token":"eyJ-oauth","account_id":"acct-1"}}"#,
-            ),
+            Some(r#"{"tokens":{"access_token":"eyJ-oauth","account_id":"acct-1"}}"#),
         );
         let cfg = CodexRequestConfig::load().unwrap();
         assert!(!cfg.should_use_chatgpt_ws());

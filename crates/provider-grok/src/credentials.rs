@@ -283,9 +283,7 @@ impl GrokCredentials {
     }
 
     /// Force OAuth refresh (if enabled) then re-read — for 401-once paths.
-    pub async fn load_fresh_async_force_refresh(
-        path: &Path,
-    ) -> Result<Self, GrokCredentialsError> {
+    pub async fn load_fresh_async_force_refresh(path: &Path) -> Result<Self, GrokCredentialsError> {
         Self::load_fresh_async_with_refresh(path, true).await
     }
 
@@ -405,11 +403,7 @@ fn display_path(path: &Path) -> String {
 }
 
 fn file_presence(path: &Path) -> &'static str {
-    if path.is_file() {
-        "present"
-    } else {
-        "missing"
-    }
+    if path.is_file() { "present" } else { "missing" }
 }
 
 /// Cheap shape probe for startup logs (no secret values).
@@ -601,9 +595,7 @@ pub fn extract_oidc_refresh_material(
                     .map(|s| s.to_string())
                     .filter(|s| !s.is_empty())
             })
-            .ok_or_else(|| {
-                GrokCredentialsError::Refresh("OIDC entry missing client_id".into())
-            })?;
+            .ok_or_else(|| GrokCredentialsError::Refresh("OIDC entry missing client_id".into()))?;
         let principal_id = entry
             .principal_id
             .filter(|s| !s.trim().is_empty())
@@ -661,9 +653,8 @@ pub async fn refresh_oauth_inplace(
         )));
     }
 
-    let grant: GrokTokenGrant = serde_json::from_slice(&resp_bytes).map_err(|e| {
-        GrokCredentialsError::Refresh(format!("token response parse: {e}"))
-    })?;
+    let grant: GrokTokenGrant = serde_json::from_slice(&resp_bytes)
+        .map_err(|e| GrokCredentialsError::Refresh(format!("token response parse: {e}")))?;
     if grant.access_token.is_empty() {
         return Err(GrokCredentialsError::Refresh(
             "token response missing access_token".into(),
@@ -741,7 +732,9 @@ mod tests {
         }
         let desc = GrokCredentials::describe_cli_auth_source();
         assert!(
-            desc.contains("XAI_CREDENTIALS_PATH") && desc.contains("oidc") && desc.contains("present"),
+            desc.contains("XAI_CREDENTIALS_PATH")
+                && desc.contains("oidc")
+                && desc.contains("present"),
             "{desc}"
         );
         unsafe {
@@ -1285,8 +1278,8 @@ mod tests {
     #[test]
     fn apply_grant_rotates_refresh_token_on_disk_shape() {
         // WHY: rotation-then-revoke — old RT must not remain after success.
-        let mut file: Value = serde_json::from_str(&grok_cli_json("old-jwt", "2000-01-01T00:00:00Z"))
-            .unwrap();
+        let mut file: Value =
+            serde_json::from_str(&grok_cli_json("old-jwt", "2000-01-01T00:00:00Z")).unwrap();
         let entry_key = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828";
         let grant = GrokTokenGrant {
             access_token: "new-jwt".into(),
@@ -1307,10 +1300,7 @@ mod tests {
                 .starts_with("2026-07-09T18:00:00")
         );
         assert_eq!(entry["auth_mode"], "oidc");
-        assert_eq!(
-            entry["user_id"],
-            "11111111-2222-3333-4444-555555555555"
-        );
+        assert_eq!(entry["user_id"], "11111111-2222-3333-4444-555555555555");
     }
 
     #[test]
@@ -1333,10 +1323,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(url_path("/oauth2/token"))
-            .and(header(
-                "content-type",
-                "application/x-www-form-urlencoded",
-            ))
+            .and(header("content-type", "application/x-www-form-urlencoded"))
             .and(header("user-agent", GROK_OAUTH_USER_AGENT))
             .and(wiremock::matchers::body_string_contains(
                 "grant_type=refresh_token",

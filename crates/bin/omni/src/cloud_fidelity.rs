@@ -355,24 +355,15 @@ mod tests {
 
     #[test]
     fn dual_credentials_both_nonempty() {
-        let h = headers(&[
-            ("x-api-key", "key-a"),
-            ("authorization", "Bearer token-b"),
-        ]);
+        let h = headers(&[("x-api-key", "key-a"), ("authorization", "Bearer token-b")]);
         assert!(anthropic_cred_presence(&h).dual);
     }
 
     #[test]
     fn dual_credentials_case_insensitive_bearer() {
-        let h = headers(&[
-            ("x-api-key", "key-a"),
-            ("authorization", "bearer token-b"),
-        ]);
+        let h = headers(&[("x-api-key", "key-a"), ("authorization", "bearer token-b")]);
         assert!(anthropic_cred_presence(&h).dual);
-        let h2 = headers(&[
-            ("x-api-key", "key-a"),
-            ("authorization", "BEARER token-b"),
-        ]);
+        let h2 = headers(&[("x-api-key", "key-a"), ("authorization", "BEARER token-b")]);
         assert!(anthropic_cred_presence(&h2).dual);
     }
 
@@ -381,24 +372,30 @@ mod tests {
         assert!(!anthropic_cred_presence(&headers(&[("x-api-key", "key-a")])).dual);
         assert!(!anthropic_cred_presence(&headers(&[("authorization", "Bearer token-b")])).dual);
         // Empty Bearer token is still Bearer-scheme material: dual with x-api-key.
-        assert!(anthropic_cred_presence(&headers(&[
-            ("x-api-key", "key-a"),
-            ("authorization", "Bearer "),
-        ]))
-        .dual);
+        assert!(
+            anthropic_cred_presence(&headers(&[
+                ("x-api-key", "key-a"),
+                ("authorization", "Bearer "),
+            ]))
+            .dual
+        );
         // Whitespace-only x-api-key is not material; Bearer alone is not dual.
-        assert!(!anthropic_cred_presence(&headers(&[
-            ("x-api-key", "   "),
-            ("authorization", "Bearer token-b"),
-        ]))
-        .dual);
+        assert!(
+            !anthropic_cred_presence(&headers(&[
+                ("x-api-key", "   "),
+                ("authorization", "Bearer token-b"),
+            ]))
+            .dual
+        );
         assert!(!anthropic_cred_presence(&headers(&[])).dual);
         // Non-Bearer Authorization is not Bearer-scheme material (not dual).
-        assert!(!anthropic_cred_presence(&headers(&[
-            ("x-api-key", "key-a"),
-            ("authorization", "Basic abc"),
-        ]))
-        .dual);
+        assert!(
+            !anthropic_cred_presence(&headers(&[
+                ("x-api-key", "key-a"),
+                ("authorization", "Basic abc"),
+            ]))
+            .dual
+        );
     }
 
     #[test]
@@ -519,11 +516,13 @@ mod tests {
             strict_anthropic_scheme_ok(AnthropicAuthScheme::ApiKey, &bearer_only).unwrap_err();
         assert!(err.contains("api-key"), "{err}");
         assert!(err.contains("x-api-key"), "{err}");
-        assert!(strict_anthropic_scheme_ok(
-            AnthropicAuthScheme::ApiKey,
-            &AnthropicCredPresence::default()
-        )
-        .is_ok());
+        assert!(
+            strict_anthropic_scheme_ok(
+                AnthropicAuthScheme::ApiKey,
+                &AnthropicCredPresence::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -568,7 +567,15 @@ mod tests {
 
     #[test]
     fn classify_reasoning_and_plain() {
-        for id in ["o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4", "o4-mini"] {
+        for id in [
+            "o1",
+            "o1-mini",
+            "o1-preview",
+            "o3",
+            "o3-mini",
+            "o4",
+            "o4-mini",
+        ] {
             assert_eq!(
                 classify_openai_token_cap_family(id),
                 TokenCapFamily::Reasoning,
@@ -588,7 +595,13 @@ mod tests {
             TokenCapFamily::Reasoning
         );
         // Fail-open unknowns.
-        for id in ["claude-sonnet-4-6", "grok-4.3", "sonnet", "o10-mini", "xo1-mini"] {
+        for id in [
+            "claude-sonnet-4-6",
+            "grok-4.3",
+            "sonnet",
+            "o10-mini",
+            "xo1-mini",
+        ] {
             assert_eq!(
                 classify_openai_token_cap_family(id),
                 TokenCapFamily::Unknown,

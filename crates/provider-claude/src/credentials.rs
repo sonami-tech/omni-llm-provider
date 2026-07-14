@@ -197,7 +197,8 @@ pub fn oauth_refresh_enabled() -> bool {
 /// Effective Claude token endpoint. Production uses the captured host; tests may
 /// set `OMNI_CLAUDE_OAUTH_TOKEN_URL` to a wiremock URL.
 pub fn oauth_token_url() -> String {
-    std::env::var("OMNI_CLAUDE_OAUTH_TOKEN_URL").unwrap_or_else(|_| CLAUDE_OAUTH_TOKEN_URL.to_string())
+    std::env::var("OMNI_CLAUDE_OAUTH_TOKEN_URL")
+        .unwrap_or_else(|_| CLAUDE_OAUTH_TOKEN_URL.to_string())
 }
 
 /// True when access-token expiry is missing-as-ok, or within the near-expiry skew.
@@ -238,7 +239,10 @@ pub fn apply_grant_to_credentials_json(
             UpstreamError::Decode("credentials.json missing claudeAiOauth object".into())
         })?;
 
-    oauth.insert("accessToken".into(), Value::String(grant.access_token.clone()));
+    oauth.insert(
+        "accessToken".into(),
+        Value::String(grant.access_token.clone()),
+    );
 
     if let Some(rt) = grant.refresh_token.as_ref().filter(|s| !s.is_empty()) {
         oauth.insert("refreshToken".into(), Value::String(rt.clone()));
@@ -308,10 +312,7 @@ fn refresh_token_from_bytes(bytes: &[u8]) -> Result<String, UpstreamError> {
 /// POST the refresh grant and atomically write back to `path`.
 ///
 /// `token_url` is injectable so hermetic tests can point at wiremock.
-pub async fn refresh_oauth_inplace(
-    path: &Path,
-    token_url: &str,
-) -> Result<(), UpstreamError> {
+pub async fn refresh_oauth_inplace(path: &Path, token_url: &str) -> Result<(), UpstreamError> {
     info!(path = %path.display(), "claude OAuth refresh starting");
     let bytes = tokio::fs::read(path)
         .await
@@ -343,9 +344,8 @@ pub async fn refresh_oauth_inplace(
         )));
     }
 
-    let grant: ClaudeTokenGrant = serde_json::from_slice(&resp_bytes).map_err(|e| {
-        UpstreamError::Decode(format!("Claude OAuth token response parse: {e}"))
-    })?;
+    let grant: ClaudeTokenGrant = serde_json::from_slice(&resp_bytes)
+        .map_err(|e| UpstreamError::Decode(format!("Claude OAuth token response parse: {e}")))?;
     if grant.access_token.is_empty() {
         return Err(UpstreamError::Decode(
             "Claude OAuth token response missing access_token".into(),
@@ -384,9 +384,8 @@ pub async fn refresh_oauth_inplace(
 
     let now_ms = chrono::Utc::now().timestamp_millis();
     apply_grant_to_credentials_json(&mut latest, &grant, now_ms)?;
-    let out = serde_json::to_vec_pretty(&latest).map_err(|e| {
-        UpstreamError::Decode(format!("serialize refreshed credentials: {e}"))
-    })?;
+    let out = serde_json::to_vec_pretty(&latest)
+        .map_err(|e| UpstreamError::Decode(format!("serialize refreshed credentials: {e}")))?;
     atomic_write(path, &out)?;
     info!(path = %path.display(), "claude OAuth refresh ok");
     Ok(())

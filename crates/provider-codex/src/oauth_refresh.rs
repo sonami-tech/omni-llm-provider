@@ -159,7 +159,10 @@ pub fn apply_grant_to_auth_json(
     }
     file.as_object_mut()
         .ok_or_else(|| "auth.json root must be object".to_string())?
-        .insert("last_refresh".into(), Value::String(now_rfc3339.to_string()));
+        .insert(
+            "last_refresh".into(),
+            Value::String(now_rfc3339.to_string()),
+        );
     Ok(())
 }
 
@@ -226,9 +229,7 @@ pub async fn maybe_refresh_auth_json(
     if !oauth_refresh_enabled() {
         return Ok(());
     }
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
     let file: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     if skip_if_static_api_key
         && file
@@ -253,9 +254,7 @@ pub async fn maybe_refresh_auth_json(
 /// POST the JSON grant and atomically write back to `path`.
 pub async fn refresh_oauth_inplace(path: &Path, token_url: &str) -> Result<(), String> {
     info!(path = %path.display(), "codex OAuth refresh starting");
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
     let file: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     let refresh_token = refresh_token_from_auth(&file)
         .ok_or_else(|| "auth.json has no tokens.refresh_token".to_string())?;
@@ -294,16 +293,14 @@ pub async fn refresh_oauth_inplace(path: &Path, token_url: &str) -> Result<(), S
         .as_ref()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            "token response missing refresh_token; refusing write-back that would strand RT".to_string()
+            "token response missing refresh_token; refusing write-back that would strand RT"
+                .to_string()
         })?;
 
     // CAS: if another writer rotated the RT while we were on the network, do not
     // clobber their write with our snapshot of the pre-refresh file.
-    let latest_bytes = tokio::fs::read(path)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut latest: Value =
-        serde_json::from_slice(&latest_bytes).map_err(|e| e.to_string())?;
+    let latest_bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
+    let mut latest: Value = serde_json::from_slice(&latest_bytes).map_err(|e| e.to_string())?;
     match refresh_token_from_auth(&latest).as_deref() {
         Some(disk_rt) if disk_rt == refresh_token || disk_rt == new_rt => {
             // Our RT still current, or peer already wrote the same grant.
@@ -373,8 +370,7 @@ mod tests {
     }
 
     fn b64url_encode(data: &[u8]) -> String {
-        const CHARS: &[u8] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::new();
         for chunk in data.chunks(3) {
             let b0 = chunk[0] as u32;

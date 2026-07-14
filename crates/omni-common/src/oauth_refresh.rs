@@ -228,10 +228,7 @@ mod tests {
         // WHY: startup must show resolved on/off, not only which flags were passed.
         let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let env = EnvGuard::capture(ALL_KEYS);
-        assert_eq!(
-            oauth_refresh_policy_summary(),
-            "claude=on codex=on grok=on"
-        );
+        assert_eq!(oauth_refresh_policy_summary(), "claude=on codex=on grok=on");
         env.set("OMNI_OAUTH_REFRESH", "0");
         env.set("OMNI_CODEX_OAUTH_REFRESH", "1");
         assert_eq!(

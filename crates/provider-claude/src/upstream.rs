@@ -1104,8 +1104,7 @@ impl UpstreamClient {
                     if status == Some(401) && !refreshed_credentials && !self.auth.is_custom() {
                         refreshed_credentials = true;
                         let path = Credentials::default_path();
-                        if let Ok(fresh) =
-                            Credentials::load_fresh_async_force_refresh(&path).await
+                        if let Ok(fresh) = Credentials::load_fresh_async_force_refresh(&path).await
                         {
                             warn!(
 
@@ -1185,8 +1184,7 @@ impl UpstreamClient {
                     if status == Some(401) && !refreshed_credentials && !self.auth.is_custom() {
                         refreshed_credentials = true;
                         let path = Credentials::default_path();
-                        if let Ok(fresh) =
-                            Credentials::load_fresh_async_force_refresh(&path).await
+                        if let Ok(fresh) = Credentials::load_fresh_async_force_refresh(&path).await
                         {
                             warn!(
 

@@ -190,10 +190,7 @@ impl GrokProvider {
         if let Some(path) = std::env::var_os("XAI_CREDENTIALS_PATH") {
             let p = std::path::PathBuf::from(path);
             if p.is_file() {
-                let disp = std::fs::canonicalize(&p)
-                    .unwrap_or(p)
-                    .display()
-                    .to_string();
+                let disp = std::fs::canonicalize(&p).unwrap_or(p).display().to_string();
                 return Some(format!("XAI_CREDENTIALS_PATH={disp}"));
             }
             return None;
@@ -592,9 +589,7 @@ impl GrokProvider {
 
         let status = resp.status();
         let bytes = resp.bytes().await.map_err(|e| {
-            ProviderError::upstream(
-                redactor.redact(&format!("grok response read error: {e}")),
-            )
+            ProviderError::upstream(redactor.redact(&format!("grok response read error: {e}")))
         })?;
         if !status.is_success() {
             return Err(ProviderError::upstream_status(
@@ -606,9 +601,8 @@ impl GrokProvider {
             ));
         }
 
-        let value: Value = serde_json::from_slice(&bytes).map_err(|e| {
-            ProviderError::upstream(format!("failed to decode grok response: {e}"))
-        })?;
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|e| ProviderError::upstream(format!("failed to decode grok response: {e}")))?;
         responses_upstream::response_to_canonical(&value, &req.model, "grok", &redactor)
     }
 
@@ -941,7 +935,6 @@ impl GrokProvider {
 
         Ok(Box::pin(stream))
     }
-
 }
 
 fn redact(input: &str) -> String {
@@ -1848,7 +1841,6 @@ impl LlmProvider for GrokProvider {
             }
         }
     }
-
 }
 
 // Keep the original free fn for any legacy direct callers (returns the provider id).
@@ -2679,7 +2671,11 @@ mod tests {
         let err = p.send(req).await.unwrap_err();
         match err {
             ProviderError::Upstream { message: s, .. } => {
-                assert!(s.contains("error calling grok") || s.contains("error calling xAI") || s.contains("connection"))
+                assert!(
+                    s.contains("error calling grok")
+                        || s.contains("error calling xAI")
+                        || s.contains("connection")
+                )
             }
             _ => panic!("expected Upstream error for mocked bad port"),
         }
@@ -3126,7 +3122,9 @@ mod tests {
         }
         match err {
             ProviderError::Upstream { message: s, .. } => assert!(
-                s.contains("error calling grok") || s.contains("error calling xAI") || s.contains("connection"),
+                s.contains("error calling grok")
+                    || s.contains("error calling xAI")
+                    || s.contains("connection"),
                 "expected net err after file load: {}",
                 s
             ),
@@ -3219,7 +3217,11 @@ mod tests {
         // Key resolved from the file -> reached the (dead) upstream -> network err, not Auth.
         match err {
             ProviderError::Upstream { message: s, .. } => {
-                assert!(s.contains("error calling grok") || s.contains("error calling xAI") || s.contains("connection"))
+                assert!(
+                    s.contains("error calling grok")
+                        || s.contains("error calling xAI")
+                        || s.contains("connection")
+                )
             }
             other => panic!(
                 "expected key resolution then upstream net err, got {:?}",
@@ -3271,7 +3273,11 @@ mod tests {
         // No file source -> ctor key used -> reached the (dead) upstream as a network error.
         match err {
             ProviderError::Upstream { message: s, .. } => {
-                assert!(s.contains("error calling grok") || s.contains("error calling xAI") || s.contains("connection"))
+                assert!(
+                    s.contains("error calling grok")
+                        || s.contains("error calling xAI")
+                        || s.contains("connection")
+                )
             }
             other => panic!(
                 "ctor key must be used when no file source exists; got {:?}",
@@ -4288,10 +4294,7 @@ mod tests {
         let ids: Vec<String> = p.models_list().into_iter().map(|m| m.id).collect();
         assert_eq!(
             ids,
-            vec![
-                "grok-4.5".to_string(),
-                "grok-composer-2.5-fast".to_string()
-            ],
+            vec!["grok-4.5".to_string(), "grok-composer-2.5-fast".to_string()],
             "catalog must be exactly the advertised cli-chat-proxy ids"
         );
         assert!(!ids.iter().any(|id| id == "grok-4.3"));
@@ -4529,7 +4532,7 @@ mod tests {
     }
 
     #[test]
-        #[test]
+    #[test]
     fn cli_base_precedence_detects_real_override_only() {
         // WHY: override detection decides whether to warn. The default CLI host is
         // the intended target (non-override); any other base is a deliberate
@@ -4590,10 +4593,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let resp = provider
-            .send(req)
-            .await
-            .expect("CLI send must succeed");
+        let resp = provider.send(req).await.expect("CLI send must succeed");
         assert_eq!(resp.content, "ok");
 
         let requests = server.received_requests().await.unwrap();
@@ -4841,7 +4841,6 @@ mod tests {
         }
     }
 
-
     #[tokio::test]
     async fn cli_nonstream_error_redacts_non_prefixed_bearer() {
         // WHY (Finding 4 regression): an operator bearer WITHOUT a known prefix
@@ -5004,7 +5003,6 @@ mod tests {
         let body: serde_json::Value = req.body_json().unwrap();
         assert_eq!(body["model"], "grok-4.5");
     }
-
 
     /// A base request pinned to a specific model id (CLI tests pass a
     /// real catalog id so model resolution is exercised).

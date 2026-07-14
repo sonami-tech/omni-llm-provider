@@ -356,12 +356,7 @@ fn redact_auth_headers(input: &str) -> String {
     // ApiKey, raw token), redact the full credential material in one shot from
     // the first non-ws after the colon through end of the credential run
     // (quote/comma/newline). Do not leave trailing scheme or token fragments.
-    let markers = [
-        "authorization:",
-        "x-api-key:",
-        "api-key:",
-        "x-auth-token:",
-    ];
+    let markers = ["authorization:", "x-api-key:", "api-key:", "x-auth-token:"];
     let mut out = input.to_string();
     for marker in markers {
         let mut guard = 0;
@@ -700,7 +695,8 @@ fn still_secret_shaped(s: &str) -> bool {
                         {
                             return true;
                         }
-                        search_from = after_colon + (s[after_colon..].len() - value_part.len())
+                        search_from = after_colon
+                            + (s[after_colon..].len() - value_part.len())
                             + 1
                             + end_rel
                             + 1;
@@ -723,7 +719,8 @@ fn still_secret_shaped(s: &str) -> bool {
                         {
                             return true;
                         }
-                        search_from = after_colon + (s[after_colon..].len() - value_part.len())
+                        search_from = after_colon
+                            + (s[after_colon..].len() - value_part.len())
                             + 1
                             + end_rel
                             + 1;
@@ -1011,10 +1008,7 @@ mod tests {
             no_finish_concept: false,
             finish_latch: None,
         };
-        assert_eq!(
-            resolve_finish_reason(&finish, Outcome::Error),
-            "incomplete"
-        );
+        assert_eq!(resolve_finish_reason(&finish, Outcome::Error), "incomplete");
     }
 
     #[test]
@@ -1038,10 +1032,7 @@ mod tests {
             no_finish_concept: false,
             finish_latch: Some("tool_calls".into()),
         };
-        assert_eq!(
-            resolve_finish_reason(&finish, Outcome::Ok),
-            "tool_calls"
-        );
+        assert_eq!(resolve_finish_reason(&finish, Outcome::Ok), "tool_calls");
     }
 
     #[test]
@@ -1213,7 +1204,9 @@ mod tests {
         assert!(still_secret_shaped("refresh_token=longrefreshtokenval"));
         assert!(still_secret_shaped("id_token=longidtokenvaluehere"));
         // First already REDACTED, second still live.
-        assert!(still_secret_shaped("?api_key=REDACTED&api_key=stillsecretvalue"));
+        assert!(still_secret_shaped(
+            "?api_key=REDACTED&api_key=stillsecretvalue"
+        ));
         assert!(still_secret_shaped(r#"{"api_key":"stillsecretvalue"}"#));
         assert!(still_secret_shaped(r#"{"apikey":"opaque_secret_123456"}"#));
         assert!(still_secret_shaped("#access_token=opaque_secret_123456"));
@@ -1278,7 +1271,10 @@ mod tests {
         // WHY: skipping any token that merely starts_with("REDACTED") fail-opens
         // on api_key=REDACTEDactualsecret… — only the exact placeholder is clean.
         let glued = "api_key=REDACTEDactualsecretvalue12345";
-        assert!(still_secret_shaped(glued), "residual must flag glued secret");
+        assert!(
+            still_secret_shaped(glued),
+            "residual must flag glued secret"
+        );
         match redact_error_for_log(glued) {
             Some(s) => assert!(
                 !s.contains("actualsecretvalue12345"),
@@ -1286,7 +1282,9 @@ mod tests {
             ),
             None => {} // fail-closed also OK
         }
-        assert!(still_secret_shaped("authorization: REDACTEDactualsecretvalue12345"));
+        assert!(still_secret_shaped(
+            "authorization: REDACTEDactualsecretvalue12345"
+        ));
     }
 
     #[test]
@@ -1363,19 +1361,13 @@ mod tests {
             None => {
                 // Fail-closed is fine for residual secrets, but direct redactor
                 // must keep UTF-8 when rewriting sk- material.
-                let scrubbed = super::replace_dashed_key_tokens(
-                    raw,
-                    b"sk-",
-                    "sk-REDACTED",
-                    12,
-                );
+                let scrubbed = super::replace_dashed_key_tokens(raw, b"sk-", "sk-REDACTED", 12);
                 assert!(scrubbed.contains('…'), "{scrubbed}");
                 assert!(scrubbed.contains("sk-REDACTED"), "{scrubbed}");
                 assert!(!scrubbed.contains("abcdefghijklmnopqrstuv"), "{scrubbed}");
             }
         }
-        let scrubbed =
-            super::replace_dashed_key_tokens(raw, b"sk-", "sk-REDACTED", 12);
+        let scrubbed = super::replace_dashed_key_tokens(raw, b"sk-", "sk-REDACTED", 12);
         assert!(scrubbed.contains('…'), "{scrubbed}");
         assert!(scrubbed.contains("sk-REDACTED"), "{scrubbed}");
     }
@@ -1499,9 +1491,15 @@ mod tests {
         assert_eq!(s.lines().count(), 1, "multi-line status: {s}");
         assert!(!s.contains('\n'), "{s}");
         assert!(!s.contains('\r'), "{s}");
-        assert!(!s.contains("EVIL_FORGED_LINE\n") && !s.starts_with("EVIL"), "{s}");
+        assert!(
+            !s.contains("EVIL_FORGED_LINE\n") && !s.starts_with("EVIL"),
+            "{s}"
+        );
         // Content preserved without controls (spaces collapse runs).
-        assert!(s.contains("requested_model=client-model EVIL_FORGED_LINE"), "{s}");
+        assert!(
+            s.contains("requested_model=client-model EVIL_FORGED_LINE"),
+            "{s}"
+        );
         assert!(s.contains("model=stats-key EVIL_MODEL_LINE"), "{s}");
         // Bad-request path: raw requested model used as model key alone.
         let bad = RequestCompleteParams::error(
@@ -1619,8 +1617,7 @@ mod tests {
         assert!(!s.contains(secret), "{s}");
         // Either redacted in place or collapsed to the bounded token `error`.
         assert!(
-            s.contains("finish_reason=error")
-                || s.contains("REDACTED"),
+            s.contains("finish_reason=error") || s.contains("REDACTED"),
             "expected redacted or collapsed finish_reason: {s}"
         );
         let conv = format_conv_log_finish_summary(&params);

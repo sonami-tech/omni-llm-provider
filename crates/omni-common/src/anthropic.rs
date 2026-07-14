@@ -153,8 +153,8 @@ pub fn anthropic_to_canonical(
         .get("max_tokens")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| AnthropicMapError::new("max_tokens is required"))?;
-    let max_tokens = u32::try_from(max_tokens)
-        .map_err(|_| AnthropicMapError::new("max_tokens out of range"))?;
+    let max_tokens =
+        u32::try_from(max_tokens).map_err(|_| AnthropicMapError::new("max_tokens out of range"))?;
 
     let messages_val = body
         .get("messages")
@@ -222,12 +222,8 @@ pub fn anthropic_to_canonical(
     // Drop thinking / redacted_thinking; strip empty; fail on same-role adjacency after drop.
     let mut normalized: Vec<RawMsg> = Vec::new();
     for mut msg in raw_msgs {
-        msg.blocks.retain(|b| {
-            !matches!(
-                b,
-                RawBlock::Thinking | RawBlock::RedactedThinking
-            )
-        });
+        msg.blocks
+            .retain(|b| !matches!(b, RawBlock::Thinking | RawBlock::RedactedThinking));
         if msg.blocks.is_empty() {
             continue;
         }
@@ -309,7 +305,9 @@ struct RawMsg {
 
 enum RawBlock {
     Text(String),
-    Image { source: CanonicalImageSource },
+    Image {
+        source: CanonicalImageSource,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -330,10 +328,7 @@ fn system_to_text(system: &Value) -> Result<Option<String>, AnthropicMapError> {
         Value::Array(blocks) => {
             let mut parts = Vec::new();
             for (i, b) in blocks.iter().enumerate() {
-                let ty = b
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("");
+                let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match ty {
                     "text" => {
                         parts.push(
@@ -344,7 +339,12 @@ fn system_to_text(system: &Value) -> Result<Option<String>, AnthropicMapError> {
                         );
                     }
                     "" if b.get("text").is_some() => {
-                        parts.push(b.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string());
+                        parts.push(
+                            b.get("text")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        );
                     }
                     other => {
                         return Err(AnthropicMapError::new(format!(
@@ -372,14 +372,11 @@ fn parse_message_blocks(
         Value::Array(arr) => {
             let mut blocks = Vec::with_capacity(arr.len());
             for (bi, b) in arr.iter().enumerate() {
-                let ty = b
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .ok_or_else(|| {
-                        AnthropicMapError::new(format!(
-                            "messages[{msg_idx}].content[{bi}]: type is required"
-                        ))
-                    })?;
+                let ty = b.get("type").and_then(|t| t.as_str()).ok_or_else(|| {
+                    AnthropicMapError::new(format!(
+                        "messages[{msg_idx}].content[{bi}]: type is required"
+                    ))
+                })?;
                 match ty {
                     "text" => {
                         let text = b
@@ -405,10 +402,8 @@ fn parse_message_blocks(
                                 "messages[{msg_idx}].content[{bi}]: image missing source"
                             ))
                         })?;
-                        let src_ty = source
-                            .get("type")
-                            .and_then(|t| t.as_str())
-                            .ok_or_else(|| {
+                        let src_ty =
+                            source.get("type").and_then(|t| t.as_str()).ok_or_else(|| {
                                 AnthropicMapError::new(format!(
                                     "messages[{msg_idx}].content[{bi}]: image source.type required"
                                 ))
@@ -486,7 +481,10 @@ fn parse_message_blocks(
                                 ))
                             })?
                             .to_string();
-                        let input = b.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
+                        let input = b
+                            .get("input")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
                         if !input.is_object() {
                             return Err(AnthropicMapError::new(format!(
                                 "messages[{msg_idx}].content[{bi}]: tool_use.input must be an object"
@@ -520,10 +518,7 @@ fn parse_message_blocks(
                             })?
                             .to_string();
                         let content_str = tool_result_content(b.get("content"), msg_idx, bi)?;
-                        let is_error = b
-                            .get("is_error")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
+                        let is_error = b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
                         blocks.push(RawBlock::ToolResult {
                             tool_use_id,
                             content: content_str,
@@ -628,9 +623,7 @@ fn rewrite_tool_history(msgs: Vec<RawMsg>) -> Result<Vec<CanonicalMessage>, Anth
                         tool_uses.push((id.clone(), name.clone(), arguments.clone()));
                     }
                     RawBlock::Image { .. } => {
-                        return Err(AnthropicMapError::new(
-                            "assistant images are not supported",
-                        ));
+                        return Err(AnthropicMapError::new("assistant images are not supported"));
                     }
                     RawBlock::ToolResult { .. } => {
                         return Err(AnthropicMapError::new(
@@ -679,7 +672,8 @@ fn rewrite_tool_history(msgs: Vec<RawMsg>) -> Result<Vec<CanonicalMessage>, Anth
                         "assistant tool_use must be immediately followed by a user message resolving tool results",
                     ));
                 }
-                let mut outstanding: HashSet<String> = tool_uses.iter().map(|(id, _, _)| id.clone()).collect();
+                let mut outstanding: HashSet<String> =
+                    tool_uses.iter().map(|(id, _, _)| id.clone()).collect();
                 let mut seen_results: HashSet<String> = HashSet::new();
                 let mut result_msgs = Vec::new();
                 let mut trailing: Vec<CanonicalBlock> = Vec::new();
@@ -704,11 +698,13 @@ fn rewrite_tool_history(msgs: Vec<RawMsg>) -> Result<Vec<CanonicalMessage>, Anth
                             outstanding.remove(tool_use_id);
                             result_msgs.push(CanonicalMessage {
                                 role: "tool".into(),
-                                content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
-                                    tool_use_id: tool_use_id.clone(),
-                                    content: content.clone(),
-                                    is_error: *is_error,
-                                }]),
+                                content: CanonicalContent::Blocks(vec![
+                                    CanonicalBlock::ToolResult {
+                                        tool_use_id: tool_use_id.clone(),
+                                        content: content.clone(),
+                                        is_error: *is_error,
+                                    },
+                                ]),
                             });
                         }
                         RawBlock::Text(t) => {
@@ -1004,12 +1000,7 @@ pub fn classify_anthropic_finish(
     // Priority 1: error class
     if matches!(
         fr_l.as_str(),
-        "content_filter"
-            | "refusal"
-            | "error"
-            | "cancel"
-            | "cancelled"
-            | "incomplete"
+        "content_filter" | "refusal" | "error" | "cancel" | "cancelled" | "incomplete"
     ) {
         return AnthropicFinishClass::Error {
             message: format!("upstream finish_reason={fr}"),
@@ -1107,16 +1098,10 @@ pub fn canonical_to_anthropic(
         }
     }
 
-    let class = classify_anthropic_finish(
-        canon.finish_reason.as_deref(),
-        tool_count,
-        text_empty,
-    );
+    let class = classify_anthropic_finish(canon.finish_reason.as_deref(), tool_count, text_empty);
 
     match class {
-        AnthropicFinishClass::Error { message } => {
-            Err(AnthropicProtocolError::new(message))
-        }
+        AnthropicFinishClass::Error { message } => Err(AnthropicProtocolError::new(message)),
         AnthropicFinishClass::Success { stop_reason } => {
             if content.is_empty() {
                 // Empty success → one empty text block
@@ -1128,12 +1113,7 @@ pub fn canonical_to_anthropic(
             let id = canon
                 .id
                 .clone()
-                .or_else(|| {
-                    canon
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.id.clone())
-                })
+                .or_else(|| canon.metadata.as_ref().and_then(|m| m.id.clone()))
                 .unwrap_or_else(|| format!("msg_{}", uuid_simple()));
 
             let mut usage = serde_json::json!({
@@ -1638,7 +1618,10 @@ mod tests {
             ]
         });
         let err = anthropic_to_canonical(&body, "grok").unwrap_err();
-        assert!(err.0.contains("adjacent") || err.0.contains("same-role"), "{err}");
+        assert!(
+            err.0.contains("adjacent") || err.0.contains("same-role"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1674,7 +1657,10 @@ mod tests {
         });
         // missing input_schema
         let err = anthropic_to_canonical(&body, "grok").unwrap_err();
-        assert!(err.0.contains("input_schema") || err.0.contains("function"), "{err}");
+        assert!(
+            err.0.contains("input_schema") || err.0.contains("function"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1769,7 +1755,10 @@ mod tests {
             ]
         });
         let err = anthropic_to_canonical(&body, "grok").unwrap_err();
-        assert!(err.0.contains("missing tool_result") || err.0.contains("t1"), "{err}");
+        assert!(
+            err.0.contains("missing tool_result") || err.0.contains("t1"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2002,7 +1991,10 @@ mod tests {
             ..Default::default()
         };
         let err = canonical_to_anthropic(&canon, "m").unwrap_err();
-        assert!(err.0.contains("JSON") || err.0.contains("arguments"), "{err}");
+        assert!(
+            err.0.contains("JSON") || err.0.contains("arguments"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2071,7 +2063,10 @@ mod tests {
             frames.push(format!("{ev:?}"));
         }
         let joined = frames.join("\n");
-        assert!(joined.contains("message_start") || frames.len() >= 3, "{joined}");
+        assert!(
+            joined.contains("message_start") || frames.len() >= 3,
+            "{joined}"
+        );
         assert!(
             joined.contains("message_stop") || joined.contains("message_delta"),
             "{joined}"
@@ -2083,9 +2078,8 @@ mod tests {
         use futures_util::stream;
         use omni_core::ProviderError;
 
-        let events: Vec<Result<CanonicalStreamEvent, ProviderError>> = vec![Ok(
-            CanonicalStreamEvent::TextDelta("hi".into()),
-        )];
+        let events: Vec<Result<CanonicalStreamEvent, ProviderError>> =
+            vec![Ok(CanonicalStreamEvent::TextDelta("hi".into()))];
         let stream: CanonicalStream = Box::pin(stream::iter(events));
         let mut s = std::pin::pin!(anthropic_sse_body(stream, "m".into(), "msg_y".into()));
         let mut saw_error = false;

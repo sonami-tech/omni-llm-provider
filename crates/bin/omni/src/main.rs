@@ -83,9 +83,9 @@ use uuid::Uuid;
 
 use omni_common::{
     ActiveRequestGuard, ApiKeyId, AppError, ChatCompletionRequest, ConversationLog, Replacements,
-    Stats, TokenUsage, anthropic_to_canonical, canonical_to_anthropic, env_nonempty, from_canonical,
-    parse_anthropic_object_no_dup_keys, peek_model_string, sse_from_canonical_stream_anthropic,
-    to_canonical,
+    Stats, TokenUsage, anthropic_to_canonical, canonical_to_anthropic, env_nonempty,
+    from_canonical, parse_anthropic_object_no_dup_keys, peek_model_string,
+    sse_from_canonical_stream_anthropic, to_canonical,
 };
 use omni_core::{
     CanonicalResponse, CanonicalStream, CanonicalStreamEvent, LlmProvider, ProviderError,
@@ -165,22 +165,34 @@ struct Cli {
 
     /// Force-enable Claude OAuth refresh (beats global off). Env:
     /// OMNI_CLAUDE_OAUTH_REFRESH=1.
-    #[arg(long = "oauth-refresh-claude", conflicts_with = "no_oauth_refresh_claude")]
+    #[arg(
+        long = "oauth-refresh-claude",
+        conflicts_with = "no_oauth_refresh_claude"
+    )]
     oauth_refresh_claude: bool,
 
     /// Disable Claude OAuth refresh (beats global on). Env:
     /// OMNI_CLAUDE_OAUTH_REFRESH=0.
-    #[arg(long = "no-oauth-refresh-claude", conflicts_with = "oauth_refresh_claude")]
+    #[arg(
+        long = "no-oauth-refresh-claude",
+        conflicts_with = "oauth_refresh_claude"
+    )]
     no_oauth_refresh_claude: bool,
 
     /// Force-enable Codex OAuth refresh (beats global off). Env:
     /// OMNI_CODEX_OAUTH_REFRESH=1.
-    #[arg(long = "oauth-refresh-codex", conflicts_with = "no_oauth_refresh_codex")]
+    #[arg(
+        long = "oauth-refresh-codex",
+        conflicts_with = "no_oauth_refresh_codex"
+    )]
     oauth_refresh_codex: bool,
 
     /// Disable Codex OAuth refresh (beats global on). Env:
     /// OMNI_CODEX_OAUTH_REFRESH=0.
-    #[arg(long = "no-oauth-refresh-codex", conflicts_with = "oauth_refresh_codex")]
+    #[arg(
+        long = "no-oauth-refresh-codex",
+        conflicts_with = "oauth_refresh_codex"
+    )]
     no_oauth_refresh_codex: bool,
 
     /// Force-enable Grok OAuth refresh (beats global off). Env:
@@ -285,9 +297,8 @@ fn default_log_filter(verbose: u8) -> &'static str {
 
 /// Build the tracing filter: `RUST_LOG` wins when set, otherwise `-v` count.
 fn build_env_filter(verbose: u8) -> tracing_subscriber::EnvFilter {
-    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new(default_log_filter(verbose))
-    })
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_log_filter(verbose)))
 }
 
 /// Apply CLI flags that providers read via process environment.
@@ -451,8 +462,7 @@ async fn main() -> anyhow::Result<()> {
                     cli.match_system_exact,
                     "grok",
                 );
-                let p = init_grok_provider(&selector)
-                    .context("failed to init grok provider")?;
+                let p = init_grok_provider(&selector).context("failed to init grok provider")?;
                 // Advertise the catalog the provider actually resolved (mode+version),
                 // not the static default.
                 let models = provider_model_values("grok", p.models_list())?;
@@ -471,8 +481,7 @@ async fn main() -> anyhow::Result<()> {
                     cli.match_system_exact,
                     "codex",
                 );
-                let p = init_codex_provider(&selector)
-                    .context("failed to init codex provider")?;
+                let p = init_codex_provider(&selector).context("failed to init codex provider")?;
                 let models = provider_model_values("codex", p.models_list())?;
                 let catalog = codex_model_catalog(&p);
                 ProviderEntry {
@@ -724,9 +733,8 @@ fn init_codex_provider(selector: &VersionSelector) -> anyhow::Result<CodexProvid
     // Transport (ChatGPT WS vs REST) is inferred per-request from CODEX_HOME
     // config/auth, matching Claude/Grok (no operator mode flag).
     // Hard-fail at launch when settings cannot be loaded (invalid CODEX_HOME, etc.).
-    let source = CodexProvider::startup_source_summary().map_err(|e| {
-        anyhow::anyhow!("codex: cannot load settings for enabled provider: {e}")
-    })?;
+    let source = CodexProvider::startup_source_summary()
+        .map_err(|e| anyhow::anyhow!("codex: cannot load settings for enabled provider: {e}"))?;
     info!(
         version = version.version,
         selector = %selector_desc,
@@ -1027,19 +1035,17 @@ async fn omni_auth_layer(
                 req.extensions_mut().insert(ApiKeyId(auth_key_id(&key)));
                 next.run(req).await
             }
-            Some(_) => {
-                anthropic_error_response(AppError::Unauthorized("Invalid API key".into()))
-            }
-            None => anthropic_error_response(AppError::Unauthorized(
-                match auth.anthropic_auth_scheme {
+            Some(_) => anthropic_error_response(AppError::Unauthorized("Invalid API key".into())),
+            None => {
+                anthropic_error_response(AppError::Unauthorized(match auth.anthropic_auth_scheme {
                     AnthropicAuthScheme::ApiKey => {
                         "Missing API key. Include an 'x-api-key: <key>' header.".into()
                     }
                     AnthropicAuthScheme::Oauth => {
                         "Missing API key. Include an 'Authorization: Bearer <key>' header.".into()
                     }
-                },
-            )),
+                }))
+            }
         };
     }
 
@@ -1409,14 +1415,13 @@ fn format_provider_detection_detail(enabled: &[String], source: &str) -> String 
     let mut parts = Vec::new();
     for name in enabled {
         let reason = match name.as_str() {
-            "claude" => ClaudeProvider::detection_source()
-                .unwrap_or_else(|| {
-                    if source == "configured" {
-                        "configured".into()
-                    } else {
-                        "unknown".into()
-                    }
-                }),
+            "claude" => ClaudeProvider::detection_source().unwrap_or_else(|| {
+                if source == "configured" {
+                    "configured".into()
+                } else {
+                    "unknown".into()
+                }
+            }),
             "grok" => GrokProvider::detection_source().unwrap_or_else(|| {
                 if source == "configured" {
                     "configured".into()
@@ -1891,8 +1896,7 @@ fn log_terminal_error_complete(
         no_finish_concept: false,
         finish_latch,
     };
-    let mut params =
-        RequestCompleteParams::error(model, finish, duration_ms).with_error(error);
+    let mut params = RequestCompleteParams::error(model, finish, duration_ms).with_error(error);
     if let Some(raw) = requested_model {
         params = params.with_requested_model(requested_model_if_differs(model, raw));
     }
@@ -2515,8 +2519,7 @@ async fn anthropic_messages_translated(
             "Anthropic Messages translated stream",
             Some(requested_model.clone()),
         );
-        let sse =
-            sse_from_canonical_stream_anthropic(stream, stripped_model, message_id);
+        let sse = sse_from_canonical_stream_anthropic(stream, stripped_model, message_id);
         let mut response = sse.into_response();
         response.headers_mut().insert(
             header::HeaderName::from_static("x-request-id"),
@@ -2604,8 +2607,8 @@ async fn anthropic_count_tokens_inner(
     );
 
     let catalogs = provider_catalogs(&state.providers);
-    let (prov_key, stripped_model) = resolve_provider_and_model(&requested_model, &catalogs)
-        .map_err(AppError::BadRequest)?;
+    let (prov_key, stripped_model) =
+        resolve_provider_and_model(&requested_model, &catalogs).map_err(AppError::BadRequest)?;
 
     let span = tracing::Span::current();
     span.record("session_id", session_id.as_str());
@@ -3763,13 +3766,9 @@ mod tests {
         assert!(on.strict_cloud_fidelity);
         assert_eq!(on.anthropic_auth_scheme, AnthropicAuthScheme::Oauth);
 
-        let api_key = Cli::try_parse_from([
-            "omni",
-            "--no-auth",
-            "--anthropic-auth-scheme",
-            "api-key",
-        ])
-        .unwrap();
+        let api_key =
+            Cli::try_parse_from(["omni", "--no-auth", "--anthropic-auth-scheme", "api-key"])
+                .unwrap();
         assert_eq!(api_key.anthropic_auth_scheme, AnthropicAuthScheme::ApiKey);
 
         unsafe {
@@ -3802,19 +3801,21 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["omni", "--no-oauth-refresh"]).unwrap();
         apply_cli_env_overrides(&cli);
-        assert_eq!(std::env::var("OMNI_OAUTH_REFRESH").ok().as_deref(), Some("0"));
-        assert_eq!(std::env::var("OMNI_NO_OAUTH_REFRESH").ok().as_deref(), Some("1"));
+        assert_eq!(
+            std::env::var("OMNI_OAUTH_REFRESH").ok().as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            std::env::var("OMNI_NO_OAUTH_REFRESH").ok().as_deref(),
+            Some("1")
+        );
         assert!(!omni_common::oauth_refresh_enabled_for(
             omni_common::OAuthRefreshProvider::Codex
         ));
 
         // Global off + codex on → only codex refreshes (CLI dual of env).
-        let cli = Cli::try_parse_from([
-            "omni",
-            "--no-oauth-refresh",
-            "--oauth-refresh-codex",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["omni", "--no-oauth-refresh", "--oauth-refresh-codex"]).unwrap();
         apply_cli_env_overrides(&cli);
         assert_eq!(
             std::env::var("OMNI_CODEX_OAUTH_REFRESH").ok().as_deref(),
@@ -5031,8 +5032,7 @@ requires_openai_auth = false
             .await;
 
         let provider =
-            init_grok_provider(&VersionSelector::Latest)
-                .expect("custom Grok provider from env");
+            init_grok_provider(&VersionSelector::Latest).expect("custom Grok provider from env");
         let response = provider
             .send(omni_core::CanonicalRequest {
                 model: "grok".into(),
@@ -5093,8 +5093,7 @@ requires_openai_auth = false
             .await;
 
         let provider =
-            init_grok_provider(&VersionSelector::Latest)
-                .expect("OMNI Grok provider from env");
+            init_grok_provider(&VersionSelector::Latest).expect("OMNI Grok provider from env");
         let response = provider
             .send(omni_core::CanonicalRequest {
                 model: "grok".into(),
@@ -5148,8 +5147,7 @@ requires_openai_auth = false
         }
 
         let provider =
-            init_grok_provider(&VersionSelector::Latest)
-                .expect("custom Grok provider from env");
+            init_grok_provider(&VersionSelector::Latest).expect("custom Grok provider from env");
         let request = || omni_core::CanonicalRequest {
             model: "grok".into(),
             messages: vec![omni_core::CanonicalMessage {
@@ -5194,8 +5192,7 @@ requires_openai_auth = false
             .await;
 
         let provider =
-            init_grok_provider(&VersionSelector::Latest)
-                .expect("custom Grok provider from env");
+            init_grok_provider(&VersionSelector::Latest).expect("custom Grok provider from env");
         let response = provider
             .send(omni_core::CanonicalRequest {
                 model: "grok".into(),
@@ -6233,7 +6230,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                 return Err(format!("missing observed output_tokens: {line}"));
             }
             if line.contains("cache_read") || line.contains("cache_creation") {
-                return Err(format!("cache keys must be omitted when presence unknown: {line}"));
+                return Err(format!(
+                    "cache keys must be omitted when presence unknown: {line}"
+                ));
             }
             Ok(())
         });
@@ -6410,10 +6409,14 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                 return Err(format!("missing outcome=error: {line}"));
             }
             if !line.contains("finish_reason=none") && !line.contains("finish_reason=\"none\"") {
-                return Err(format!("expected finish_reason=none on empty latch: {line}"));
+                return Err(format!(
+                    "expected finish_reason=none on empty latch: {line}"
+                ));
             }
             if line.contains("input_tokens") || line.contains("output_tokens") {
-                return Err(format!("token keys must be omitted when usage missing: {line}"));
+                return Err(format!(
+                    "token keys must be omitted when usage missing: {line}"
+                ));
             }
             Ok(())
         });
@@ -6623,7 +6626,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             tool_choice: None,
             extras: serde_json::Value::Null,
         };
-        let err = call_chat_handler(state, req).await.expect_err("provider fails");
+        let err = call_chat_handler(state, req)
+            .await
+            .expect_err("provider fails");
         let _ = err;
         logs_assert(|lines: &[&str]| {
             let completes = request_complete_lines(lines);
@@ -6634,7 +6639,8 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                 if !line.contains("outcome=error") && !line.contains("outcome=\"error\"") {
                     return Err(format!("missing outcome=error: {line}"));
                 }
-                if !line.contains("finish_reason=none") && !line.contains("finish_reason=\"none\"") {
+                if !line.contains("finish_reason=none") && !line.contains("finish_reason=\"none\"")
+                {
                     return Err(format!("pre-body error must be finish_reason=none: {line}"));
                 }
             }
@@ -8228,10 +8234,7 @@ rule = [
     /// Drive `/v1/messages` through the full router (auth + span layers).
     /// Body is intentionally invalid JSON so successful auth never reaches the
     /// provider network path; auth rejections still run before body parse.
-    async fn oneshot_messages(
-        app: axum::Router,
-        headers: &[(&str, &str)],
-    ) -> (StatusCode, Value) {
+    async fn oneshot_messages(app: axum::Router, headers: &[(&str, &str)]) -> (StatusCode, Value) {
         use tower::ServiceExt;
         let mut builder = Request::builder()
             .method("POST")
@@ -8297,11 +8300,7 @@ rule = [
 
     fn assert_auth_passed(status: StatusCode, body: &Value) {
         assert_ne!(status, StatusCode::UNAUTHORIZED, "body={body}");
-        assert_ne!(
-            body["error"]["type"],
-            "authentication_error",
-            "body={body}"
-        );
+        assert_ne!(body["error"]["type"], "authentication_error", "body={body}");
         let msg = anthropic_err_message(body).to_lowercase();
         assert!(
             !msg.contains("ambiguous") && !msg.contains("strict cloud fidelity"),
@@ -8395,7 +8394,11 @@ rule = [
         let providers = HashMap::from([("claude".to_string(), claude_entry())]);
 
         let (status_none, body_none) = oneshot_messages(
-            mk_app_strict(providers.clone(), empty.clone(), AnthropicAuthScheme::ApiKey),
+            mk_app_strict(
+                providers.clone(),
+                empty.clone(),
+                AnthropicAuthScheme::ApiKey,
+            ),
             &[],
         )
         .await;
@@ -8413,7 +8416,11 @@ rule = [
         }
 
         let (status_wrong, body_wrong) = oneshot_messages(
-            mk_app_strict(providers.clone(), empty.clone(), AnthropicAuthScheme::ApiKey),
+            mk_app_strict(
+                providers.clone(),
+                empty.clone(),
+                AnthropicAuthScheme::ApiKey,
+            ),
             &[("authorization", "Bearer anything")],
         )
         .await;
@@ -8555,7 +8562,10 @@ rule = [
         .expect_err("o1-mini + max_tokens must fail strict validation");
         match err {
             AppError::BadRequest(msg) => {
-                assert!(msg.contains("max_completion_tokens") || msg.contains("max_tokens"), "{msg}");
+                assert!(
+                    msg.contains("max_completion_tokens") || msg.contains("max_tokens"),
+                    "{msg}"
+                );
             }
             other => panic!("expected BadRequest, got {other:?}"),
         }
@@ -8610,7 +8620,10 @@ rule = [
         .expect_err("gpt-4o + max_completion_tokens must fail strict validation");
         match err {
             AppError::BadRequest(msg) => {
-                assert!(msg.contains("max_tokens") || msg.contains("max_completion_tokens"), "{msg}");
+                assert!(
+                    msg.contains("max_tokens") || msg.contains("max_completion_tokens"),
+                    "{msg}"
+                );
             }
             other => panic!("expected BadRequest, got {other:?}"),
         }

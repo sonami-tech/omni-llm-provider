@@ -437,10 +437,7 @@ mod tests {
             "opus"
         );
         assert_eq!(
-            profile()
-                .resolve_model("claude-sonnet-5")
-                .unwrap()
-                .cli_name,
+            profile().resolve_model("claude-sonnet-5").unwrap().cli_name,
             "sonnet"
         );
     }

@@ -27,14 +27,14 @@ pub use anthropic::{
 pub use auth::{ApiKeyId, auth_layer};
 pub use conversation_log::{ConversationLog, DEFAULT_LOG_BACKUPS, DEFAULT_LOG_MAX_BYTES};
 pub use env::{env_nonempty, headers_from_env, parse_custom_headers};
-pub use oauth_refresh::{
-    OAuthRefreshProvider, global_oauth_refresh_enabled, oauth_refresh_enabled_for,
-    oauth_refresh_policy_summary, parse_bool_env,
-};
 pub use error::{AppError, classify_upstream};
 pub use http::{
     ChatCompletionRequest, ChatCompletionResponse, ChatContentPart, ChatImageUrl, ChatMessage,
     ChatMessageContent, from_canonical, sse_from_canonical_stream, to_canonical, unix_now_secs,
+};
+pub use oauth_refresh::{
+    OAuthRefreshProvider, global_oauth_refresh_enabled, oauth_refresh_enabled_for,
+    oauth_refresh_policy_summary, parse_bool_env,
 };
 pub use replacements::{Replacements, ReplacementsError};
 pub use responses::{
