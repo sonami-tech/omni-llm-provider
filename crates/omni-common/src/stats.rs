@@ -503,7 +503,7 @@ impl StatsSnapshot {
         if total_tok > 0 {
             let ratio =
                 (self.total_cache_read_input_tokens as f64 / total_tok as f64) * 100.0;
-            out.push_str(&format!("    Cache ratio: {ratio:.1}%\n"));
+            out.push_str(&format!("    Cache ratio:   {ratio:.1}%\n"));
         }
         out.push_str(&format!(
             "    Total:         {}\n\n",
