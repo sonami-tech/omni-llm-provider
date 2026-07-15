@@ -81,9 +81,9 @@ Useful server flags:
 - `--anthropic-auth-scheme api-key|oauth` / `OMNI_ANTHROPIC_AUTH_SCHEME`
   (default `api-key`; only enforced when strict cloud fidelity is on)
 
-If `--stats-db` is omitted, Omni writes stats to a fixed temp-file path
-(`omni-stats.redb` under the OS temp directory). Use `--stats-db` for durable
-stats or when running more than one server instance.
+If `--stats-db` is omitted, Omni writes stats to `omni-stats.redb` in the
+process current working directory. Use `--stats-db` when running more than one
+server instance (each needs its own file).
 
 `OMNI_API_KEYS` enables gateway auth when set to a comma-separated key list.
 Clients send the key as `Authorization: Bearer <key>`; on the native Anthropic

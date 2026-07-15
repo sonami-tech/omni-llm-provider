@@ -122,9 +122,9 @@ configuration owns auth for that provider and default credentials must not leak:
 
 ## Runtime State
 
-Stats default to `omni-stats.redb` under the OS temp directory. Production or
-multi-instance runs should set `--stats-db` / `OMNI_STATS_DB` to a durable,
-instance-specific path.
+Stats default to `omni-stats.redb` in the process current working directory.
+Multi-instance runs should set `--stats-db` / `OMNI_STATS_DB` to a distinct
+path per instance.
 
 Conversation logging is disabled by default. It can write to stderr, a rotating
 single file, or per-session files via `--log-conversations`, `--log-file`, or

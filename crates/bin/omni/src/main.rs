@@ -207,8 +207,9 @@ struct Cli {
     #[arg(long = "no-oauth-refresh-grok", conflicts_with = "oauth_refresh_grok")]
     no_oauth_refresh_grok: bool,
 
-    /// Path to the stats redb file. Defaults to a fixed temp file; use a
-    /// durable, per-instance path for long-running or concurrent servers.
+    /// Path to the stats redb file. Defaults to `omni-stats.redb` in the
+    /// process current working directory. Use a distinct path per concurrent
+    /// instance.
     #[arg(long, env = "OMNI_STATS_DB")]
     stats_db: Option<PathBuf>,
 
@@ -1150,7 +1151,7 @@ fn auth_key_id(key: &str) -> String {
 }
 
 fn default_stats_db_path() -> PathBuf {
-    std::env::temp_dir().join("omni-stats.redb")
+    PathBuf::from("omni-stats.redb")
 }
 
 fn build_conversation_log(cli: &Cli) -> anyhow::Result<Option<Arc<ConversationLog>>> {
