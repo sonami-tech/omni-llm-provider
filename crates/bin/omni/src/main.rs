@@ -20,7 +20,7 @@
 //! - POST /v1/chat/completions  (text + sampling; non-stream JSON and stream SSE)
 //! - POST /v1/responses          (supported OpenAI Responses subset)
 //! - GET  /v1/models , /models
-//! - GET  /stats               (plain text by default; ?format=json for JSON)
+//! - GET  /stats               (plain text by default, auto-refresh every 5s in browsers; ?format=json for JSON)
 //! - GET  /stats/json          (JSON alias)
 //! - GET  /health
 //! - GET  /
@@ -1693,9 +1693,15 @@ fn stats_human_response(state: &AppState) -> Response {
         Some(stats) => stats.format_human(Some(env!("CARGO_PKG_VERSION"))),
         None => stats_disabled_human(),
     };
+    // Refresh keeps a browser tab current without JS; Cache-Control avoids stale
+    // intermediate caches. curl and JSON clients ignore Refresh.
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::HeaderName::from_static("refresh"), "5"),
+        ],
         body,
     )
         .into_response()
@@ -6158,6 +6164,60 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         assert_eq!(v["models"]["grok:grok-4.3"]["requests"], 1);
         assert_eq!(v["models"]["grok:grok-4.3"]["input_tokens"], 3);
         assert_eq!(v["models"]["grok:grok-4.3"]["output_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_stats_human_response_sends_browser_refresh_headers() {
+        // WHY: human /stats is a browser dashboard. Refresh reloads without JS;
+        // Cache-Control: no-store prevents a frozen intermediate cache. JSON
+        // must not get Refresh (clients are not browsers watching a page).
+        let (state, _guard) = state_with_stats(HashMap::new());
+
+        let human = stats_handler(
+            State(state.clone()),
+            Query(StatsQuery { format: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(human.status(), StatusCode::OK);
+        assert_eq!(
+            human
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain; charset=utf-8")
+        );
+        assert_eq!(
+            human
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(
+            human
+                .headers()
+                .get("refresh")
+                .and_then(|v| v.to_str().ok()),
+            Some("5")
+        );
+
+        let json = stats_handler(
+            State(state),
+            Query(StatsQuery {
+                format: Some("json".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert!(
+            json.headers().get("refresh").is_none(),
+            "JSON /stats must not send Refresh"
+        );
+        assert!(
+            json.headers().get(header::CACHE_CONTROL).is_none(),
+            "JSON /stats must not send Cache-Control: no-store"
+        );
     }
 
     /// A provider stub that emits a `warn!` from deep inside the request path:

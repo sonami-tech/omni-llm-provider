@@ -41,7 +41,8 @@ fingerprint logic remains isolated in provider crates.
   models only.
 - `GET /v1/models`, `GET /models` - provider-owned canonical model catalogs.
   Shorthand aliases are accepted on requests but are not emitted as model ids.
-- `GET /stats` - persistent request, token, and error counters.
+- `GET /stats` - persistent request, token, and error counters (human text
+  auto-refreshes every 5s in browsers via the `Refresh` header).
 - `GET /health`, `GET /`.
 
 Current client compatibility gaps and priority notes are tracked in

@@ -39,7 +39,7 @@ Provider implementations remain separate crates:
   Grok/Codex via canonical translation)
 - `POST /v1/messages/count_tokens` Claude-native only (non-Claude → 400)
 - `GET /v1/models`, `GET /models`
-- `GET /stats` (plain text by default; `?format=json` or `/stats/json` for JSON)
+- `GET /stats` (plain text by default with `Refresh: 5` for browsers; `?format=json` or `/stats/json` for JSON)
 - `GET /health`, `GET /`
 
 OpenAI-compatible inbound surfaces route through `LlmProvider` and can target
