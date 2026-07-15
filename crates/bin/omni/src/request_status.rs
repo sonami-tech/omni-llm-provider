@@ -46,6 +46,10 @@ pub struct RequestCompleteParams {
     pub requested_model: Option<String>,
     /// Raw error text; redacted fail-closed before emission.
     pub error: Option<String>,
+    /// Cumulative requests since process launch (only when stats is enabled).
+    pub requests_since_launch: Option<u64>,
+    /// Cumulative tokens since process launch (only when stats is enabled).
+    pub tokens_since_launch: Option<u64>,
 }
 
 impl RequestCompleteParams {
@@ -62,6 +66,8 @@ impl RequestCompleteParams {
             ttft_ms: None,
             requested_model: None,
             error: None,
+            requests_since_launch: None,
+            tokens_since_launch: None,
         }
     }
 
@@ -78,6 +84,8 @@ impl RequestCompleteParams {
             ttft_ms: None,
             requested_model: None,
             error: None,
+            requests_since_launch: None,
+            tokens_since_launch: None,
         }
     }
 
@@ -106,6 +114,13 @@ impl RequestCompleteParams {
 
     pub fn with_error(mut self, error: Option<String>) -> Self {
         self.error = error;
+        self
+    }
+
+    /// Attach process-scoped cumulative totals from stats (omit when stats is off).
+    pub fn with_since_launch(mut self, requests: u64, tokens: u64) -> Self {
+        self.requests_since_launch = Some(requests);
+        self.tokens_since_launch = Some(tokens);
         self
     }
 }
@@ -919,6 +934,12 @@ pub fn format_request_complete_fields(params: &RequestCompleteParams) -> String 
             let _ = write!(out, " error={redacted}");
         }
     }
+    if let Some(n) = params.requests_since_launch {
+        let _ = write!(out, " requests_since_launch={n}");
+    }
+    if let Some(n) = params.tokens_since_launch {
+        let _ = write!(out, " tokens_since_launch={n}");
+    }
     out
 }
 
@@ -963,6 +984,12 @@ pub fn log_request_complete(params: &RequestCompleteParams) {
         if let Some(redacted) = redact_error_for_log(raw_err) {
             let _ = write!(optional, " error={redacted}");
         }
+    }
+    if let Some(n) = params.requests_since_launch {
+        let _ = write!(optional, " requests_since_launch={n}");
+    }
+    if let Some(n) = params.tokens_since_launch {
+        let _ = write!(optional, " tokens_since_launch={n}");
     }
 
     // Build the message string so optional keys do not become a separate
@@ -1099,7 +1126,29 @@ mod tests {
         assert!(!s.contains("input_tokens"));
         assert!(!s.contains("output_tokens"));
         assert!(!s.contains("cache_read"));
+        assert!(!s.contains("requests_since_launch"));
+        assert!(!s.contains("tokens_since_launch"));
         assert!(!s.contains("Some("));
+    }
+
+    #[test]
+    fn format_emits_since_launch_totals_when_present() {
+        // WHY: operators need cumulative load since process start on each complete line.
+        let params = RequestCompleteParams::ok(
+            "m",
+            FinishSite {
+                entered_body: true,
+                finish_latch: Some("stop".into()),
+                ..Default::default()
+            },
+            1.0,
+        )
+        .with_tokens(Some(3), Some(2))
+        .with_since_launch(7, 42);
+        let s = format_request_complete_fields(&params);
+        assert!(s.contains("requests_since_launch=7"), "{s}");
+        assert!(s.contains("tokens_since_launch=42"), "{s}");
+        assert!(s.contains("input_tokens=3"), "{s}");
     }
 
     #[test]

@@ -69,6 +69,10 @@ pub struct StatsSnapshot {
     pub total_output_tokens: u64,
     pub total_cache_read_input_tokens: u64,
     pub total_cache_creation_input_tokens: u64,
+    /// Process-scoped request count since this process launched (not durable).
+    pub requests_since_launch: u64,
+    /// Process-scoped token sum (input+output+cache_*) since this process launched.
+    pub tokens_since_launch: u64,
     pub last_request_at: Option<String>,
     pub models: HashMap<String, ModelStats>,
     pub api_keys: HashMap<String, u64>,
@@ -122,6 +126,9 @@ pub struct Stats {
     volatile: Mutex<Volatile>,
     active: AtomicU64,
     start: Instant,
+    /// Process-scoped counters (reset on restart). Cheap for status lines.
+    requests_since_launch: AtomicU64,
+    tokens_since_launch: AtomicU64,
 }
 
 impl Stats {
@@ -145,13 +152,25 @@ impl Stats {
             volatile: Mutex::new(Volatile::default()),
             active: AtomicU64::new(0),
             start: Instant::now(),
+            requests_since_launch: AtomicU64::new(0),
+            tokens_since_launch: AtomicU64::new(0),
         })
+    }
+
+    /// Process-scoped totals since this process launched (not durable, not clearable).
+    /// There is no stats-clear API; when one exists, a since-clear window can be added.
+    pub fn since_launch_totals(&self) -> (u64, u64) {
+        (
+            self.requests_since_launch.load(Ordering::Relaxed),
+            self.tokens_since_launch.load(Ordering::Relaxed),
+        )
     }
 
     /// Record an inbound request: bumps the global counter, the per-model and
     /// per-key counters, and stamps the last-request time. Per-key attribution
     /// is what lets the dashboard show which API key drives load.
     pub fn record_request(&self, model: &str, key: Option<&str>) {
+        self.requests_since_launch.fetch_add(1, Ordering::Relaxed);
         if let Err(e) = self.record_request_inner(model, key) {
             tracing::warn!("stats: record_request failed: {e}");
         }
@@ -176,6 +195,13 @@ impl Stats {
     /// Record a completed response: accumulates token usage for the model and
     /// feeds the rolling latency window (ttft + total duration).
     pub fn record_response(&self, model: &str, usage: TokenUsage, ttft: Option<f64>, dur: f64) {
+        let tok = usage
+            .input_tokens
+            .saturating_add(usage.output_tokens)
+            .saturating_add(usage.cache_read_input_tokens)
+            .saturating_add(usage.cache_creation_input_tokens);
+        self.tokens_since_launch
+            .fetch_add(tok, Ordering::Relaxed);
         if let Err(e) = self.record_response_inner(model, usage) {
             tracing::warn!("stats: record_response failed: {e}");
         }
@@ -334,6 +360,7 @@ impl Stats {
             );
         }
 
+        let (requests_since_launch, tokens_since_launch) = self.since_launch_totals();
         Ok(StatsSnapshot {
             uptime_seconds: self.start.elapsed().as_secs(),
             total_requests,
@@ -343,6 +370,8 @@ impl Stats {
             total_output_tokens: total_output,
             total_cache_read_input_tokens: total_cache_read,
             total_cache_creation_input_tokens: total_cache_creation,
+            requests_since_launch,
+            tokens_since_launch,
             last_request_at,
             models,
             api_keys,
@@ -351,6 +380,7 @@ impl Stats {
     }
 
     fn empty_snapshot(&self) -> StatsSnapshot {
+        let (requests_since_launch, tokens_since_launch) = self.since_launch_totals();
         StatsSnapshot {
             uptime_seconds: self.start.elapsed().as_secs(),
             total_requests: 0,
@@ -360,12 +390,231 @@ impl Stats {
             total_output_tokens: 0,
             total_cache_read_input_tokens: 0,
             total_cache_creation_input_tokens: 0,
+            requests_since_launch,
+            tokens_since_launch,
             last_request_at: None,
             models: HashMap::new(),
             api_keys: HashMap::new(),
             recent_errors: Vec::new(),
         }
     }
+
+    /// Human-readable plain text (ckb-mcp style). Optional version banner.
+    pub fn format_human(&self, version: Option<&str>) -> String {
+        self.snapshot().format_human(version)
+    }
+
+    /// Pretty-printed JSON of the full snapshot.
+    pub fn format_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(&self.snapshot())
+    }
+}
+
+impl StatsSnapshot {
+    /// Render a curl-friendly plain-text summary (default GET /stats body).
+    ///
+    /// Layout (top → bottom): live process state → this-process window →
+    /// durable lifetime totals (traffic, then tokens with cache ratio under
+    /// cache counts) → per-model / per-key breakdowns → recent errors.
+    pub fn format_human(&self, version: Option<&str>) -> String {
+        let mut out = String::new();
+        match version {
+            Some(v) => {
+                let header = format!("Omni LLM Provider Stats (v{v})");
+                out.push_str(&header);
+                out.push('\n');
+                out.push_str(&"=".repeat(header.len()));
+                out.push_str("\n\n");
+            }
+            None => {
+                out.push_str("Omni LLM Provider Stats\n");
+                out.push_str("======================\n\n");
+            }
+        }
+
+        // 1. Live process state (is the server up and busy right now?)
+        out.push_str("Process\n");
+        out.push_str("-------\n");
+        out.push_str(&format!(
+            "  Uptime:          {}\n",
+            format_uptime(self.uptime_seconds)
+        ));
+        out.push_str(&format!(
+            "  Active now:      {}\n",
+            format_commas(self.active_requests)
+        ));
+        out.push_str(&format!(
+            "  Last request:    {}\n\n",
+            self.last_request_at.as_deref().unwrap_or("never")
+        ));
+
+        // 2. This process only (resets on restart; short window operators watch)
+        out.push_str("Since launch (this process)\n");
+        out.push_str("---------------------------\n");
+        out.push_str(&format!(
+            "  Requests:        {}\n",
+            format_commas(self.requests_since_launch)
+        ));
+        out.push_str(&format!(
+            "  Tokens:          {}\n\n",
+            format_commas(self.tokens_since_launch)
+        ));
+
+        // 3. Durable lifetime totals (survive restarts)
+        let total_tok = self
+            .total_input_tokens
+            .saturating_add(self.total_output_tokens)
+            .saturating_add(self.total_cache_read_input_tokens)
+            .saturating_add(self.total_cache_creation_input_tokens);
+
+        out.push_str("All time (durable)\n");
+        out.push_str("------------------\n");
+        out.push_str("  Traffic\n");
+        out.push_str(&format!(
+            "    Requests:      {}\n",
+            format_commas(self.total_requests)
+        ));
+        out.push_str(&format!(
+            "    Errors:        {}\n",
+            format_commas(self.errors)
+        ));
+        if self.total_requests > 0 {
+            let rate = (self.errors as f64 / self.total_requests as f64) * 100.0;
+            out.push_str(&format!("    Error rate:    {rate:.1}%\n"));
+        }
+        out.push_str("  Tokens\n");
+        out.push_str(&format!(
+            "    Input:         {}\n",
+            format_commas(self.total_input_tokens)
+        ));
+        out.push_str(&format!(
+            "    Output:        {}\n",
+            format_commas(self.total_output_tokens)
+        ));
+        out.push_str(&format!(
+            "    Cache read:    {}\n",
+            format_commas(self.total_cache_read_input_tokens)
+        ));
+        out.push_str(&format!(
+            "    Cache create:  {}\n",
+            format_commas(self.total_cache_creation_input_tokens)
+        ));
+        // Ratio sits under the cache counts it is derived from.
+        if total_tok > 0 {
+            let ratio =
+                (self.total_cache_read_input_tokens as f64 / total_tok as f64) * 100.0;
+            out.push_str(&format!("    Cache read ratio: {ratio:.1}%\n"));
+        }
+        out.push_str(&format!(
+            "    Total:         {}\n\n",
+            format_commas(total_tok)
+        ));
+
+        // 4. Where load goes — models busiest first
+        if !self.models.is_empty() {
+            out.push_str("Per-model\n");
+            out.push_str("---------\n");
+            let mut names: Vec<&String> = self.models.keys().collect();
+            names.sort_by(|a, b| {
+                let ra = self.models[*a].requests;
+                let rb = self.models[*b].requests;
+                rb.cmp(&ra).then_with(|| a.cmp(b))
+            });
+            for name in names {
+                let m = &self.models[name];
+                out.push_str(&format!("  {name}\n"));
+                out.push_str(&format!(
+                    "    Requests:     {}\n",
+                    format_commas(m.requests)
+                ));
+                out.push_str(&format!(
+                    "    Latency:      avg_ttft_ms={:.1}  avg_duration_ms={:.1}\n",
+                    m.avg_ttft_ms, m.avg_duration_ms
+                ));
+                out.push_str(&format!(
+                    "    Tokens:       in={}  out={}\n",
+                    format_commas(m.input_tokens),
+                    format_commas(m.output_tokens)
+                ));
+                out.push_str(&format!(
+                    "    Cache:        read={}  create={}\n",
+                    format_commas(m.cache_read_input_tokens),
+                    format_commas(m.cache_creation_input_tokens)
+                ));
+            }
+            out.push('\n');
+        }
+
+        // 5. Who is calling
+        if !self.api_keys.is_empty() {
+            out.push_str("API keys\n");
+            out.push_str("--------\n");
+            let mut keys: Vec<(&String, u64)> =
+                self.api_keys.iter().map(|(k, v)| (k, *v)).collect();
+            keys.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            for (key, count) in keys {
+                out.push_str(&format!(
+                    "  {} - {} requests\n",
+                    key,
+                    format_commas(count)
+                ));
+            }
+            out.push('\n');
+        }
+
+        // 6. Diagnostics last
+        if !self.recent_errors.is_empty() {
+            out.push_str("Recent errors\n");
+            out.push_str("-------------\n");
+            for (i, err) in self.recent_errors.iter().take(20).enumerate() {
+                out.push_str(&format!(
+                    "  {}. [{}] {} - {}\n",
+                    i + 1,
+                    err.timestamp,
+                    err.model,
+                    err.message
+                ));
+            }
+        }
+
+        out
+    }
+}
+
+fn format_uptime(secs: u64) -> String {
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    if days > 0 {
+        format!("{days}d {hours}h {minutes}m {seconds}s")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// Group thousands with commas for human-readable counters (e.g. 1234567 -> "1,234,567").
+fn format_commas(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    let first = bytes.len() % 3;
+    if first > 0 {
+        out.push_str(&s[..first]);
+    }
+    let mut i = first;
+    while i < bytes.len() {
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out.push_str(&s[i..i + 3]);
+        i += 3;
+    }
+    out
 }
 
 fn db_err(e: impl std::fmt::Display) -> AppError {
@@ -498,6 +747,10 @@ mod tests {
         assert_eq!(snap.total_output_tokens, 3);
         assert_eq!(snap.total_cache_read_input_tokens, 1);
         assert_eq!(snap.total_cache_creation_input_tokens, 2);
+        // Process-scoped since-launch: 2 requests, all token kinds summed once.
+        assert_eq!(snap.requests_since_launch, 2);
+        assert_eq!(snap.tokens_since_launch, 7 + 3 + 1 + 2);
+        assert_eq!(stats.since_launch_totals(), (2, 13));
 
         // Error counter and recent-errors ring both reflect the one error.
         assert_eq!(snap.errors, 1);
@@ -605,10 +858,139 @@ mod tests {
         assert_eq!(snap.models["m"].avg_ttft_ms, 200.0);
         assert_eq!(snap.models["m"].avg_duration_ms, 300.0);
 
-        // Snapshot is the wire shape for GET /stats; it must serialize.
+        // Snapshot is the wire shape for GET /stats?format=json; it must serialize.
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("uptime_seconds"));
         assert!(json.contains("avg_ttft_ms"));
+    }
+
+    // Human text is the default /stats body: readable summary with since-launch window.
+    #[test]
+    fn format_human_includes_totals_and_since_launch() {
+        let path = temp_db_path();
+        let _cleanup = TempDb(path.clone());
+        let stats = Stats::open(&path).expect("open");
+        stats.record_request("m", Some("k1"));
+        stats.record_response(
+            "m",
+            TokenUsage {
+                input_tokens: 10,
+                output_tokens: 4,
+                cache_read_input_tokens: 1,
+                cache_creation_input_tokens: 0,
+            },
+            Some(50.0),
+            100.0,
+        );
+        let text = stats.format_human(Some("9.9.9"));
+        assert!(text.contains("Omni LLM Provider Stats (v9.9.9)"), "{text}");
+        assert!(text.contains("Process"), "{text}");
+        assert!(text.contains("Since launch"), "{text}");
+        assert!(text.contains("All time (durable)"), "{text}");
+        // Section order: Process → Since launch → All time → Per-model
+        let process_i = text.find("Process\n").expect("Process section");
+        let launch_i = text.find("Since launch").expect("Since launch section");
+        let all_i = text.find("All time (durable)").expect("All time section");
+        let model_i = text.find("Per-model").expect("Per-model section");
+        assert!(process_i < launch_i && launch_i < all_i && all_i < model_i, "{text}");
+        // Cache ratio sits after cache counts, before total.
+        let cache_read = text.find("Cache read:").expect("cache read");
+        let cache_create = text.find("Cache create:").expect("cache create");
+        let cache_ratio = text.find("Cache read ratio:").expect("cache ratio");
+        let total_line = text.find("    Total:").expect("token total");
+        assert!(
+            cache_read < cache_create && cache_create < cache_ratio && cache_ratio < total_line,
+            "token block order wrong: {text}"
+        );
+        assert!(text.contains("Tokens:          15"), "{text}");
+        assert!(text.contains("  m\n"), "{text}");
+        let pretty = stats.format_json().expect("json");
+        assert!(pretty.contains("\"total_requests\": 1"), "{pretty}");
+        assert!(pretty.contains("requests_since_launch"), "{pretty}");
+    }
+
+    #[test]
+    fn format_commas_groups_thousands() {
+        assert_eq!(format_commas(0), "0");
+        assert_eq!(format_commas(12), "12");
+        assert_eq!(format_commas(999), "999");
+        assert_eq!(format_commas(1_000), "1,000");
+        assert_eq!(format_commas(12_345), "12,345");
+        assert_eq!(format_commas(1_234_567), "1,234,567");
+        assert_eq!(format_commas(1_000_000_000), "1,000,000,000");
+    }
+
+    // Large cumulative counters in human text use comma grouping (JSON stays raw).
+    #[test]
+    fn format_human_comma_formats_large_counts() {
+        let path = temp_db_path();
+        let _cleanup = TempDb(path.clone());
+        let stats = Stats::open(&path).expect("open");
+        // Bump process-scoped token total into thousands via one response.
+        stats.record_request("m", None);
+        stats.record_response(
+            "m",
+            TokenUsage {
+                input_tokens: 1_234_567,
+                output_tokens: 8_901,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+            None,
+            1.0,
+        );
+        let text = stats.format_human(None);
+        assert!(
+            text.contains("1,234,567"),
+            "input tokens should be comma-grouped: {text}"
+        );
+        assert!(
+            text.contains("8,901"),
+            "output tokens should be comma-grouped: {text}"
+        );
+        // 1_234_567 + 8_901 = 1_243_468
+        assert!(
+            text.contains("1,243,468"),
+            "since-launch / sum tokens should be comma-grouped: {text}"
+        );
+        // JSON remains unformatted integers for machines.
+        let pretty = stats.format_json().expect("json");
+        assert!(pretty.contains("1234567"), "{pretty}");
+        assert!(!pretty.contains("1,234,567"), "{pretty}");
+    }
+
+    // Since-launch counters are process-scoped: they advance with record_* but
+    // do not survive reopen (unlike durable redb totals).
+    #[test]
+    fn since_launch_counters_reset_on_reopen() {
+        let path = temp_db_path();
+        let _cleanup = TempDb(path.clone());
+        {
+            let stats = Stats::open(&path).expect("open");
+            stats.record_request("m", None);
+            stats.record_response(
+                "m",
+                TokenUsage {
+                    input_tokens: 4,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+                None,
+                10.0,
+            );
+            assert_eq!(stats.since_launch_totals(), (1, 5));
+        }
+        let reopened = Stats::open(&path).expect("reopen");
+        let snap = reopened.snapshot();
+        assert_eq!(snap.total_requests, 1, "durable request count survived");
+        assert_eq!(snap.total_input_tokens, 4, "durable tokens survived");
+        assert_eq!(
+            reopened.since_launch_totals(),
+            (0, 0),
+            "process-scoped counters start at zero after relaunch"
+        );
+        assert_eq!(snap.requests_since_launch, 0);
+        assert_eq!(snap.tokens_since_launch, 0);
     }
 
     // ActiveRequestGuard tracks in-flight requests: increment on construction,

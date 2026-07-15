@@ -20,7 +20,8 @@
 //! - POST /v1/chat/completions  (text + sampling; non-stream JSON and stream SSE)
 //! - POST /v1/responses          (supported OpenAI Responses subset)
 //! - GET  /v1/models , /models
-//! - GET  /stats
+//! - GET  /stats               (plain text by default; ?format=json for JSON)
+//! - GET  /stats/json          (JSON alias)
 //! - GET  /health
 //! - GET  /
 //!
@@ -67,7 +68,7 @@ use anyhow::Context;
 use axum::{
     Router,
     body::Body,
-    extract::{Extension, Json, State},
+    extract::{Extension, Json, Query, State},
     http::{HeaderMap, Request, StatusCode, header},
     middleware,
     response::{
@@ -76,6 +77,7 @@ use axum::{
     },
     routing::{get, post},
 };
+use serde::Deserialize;
 use clap::Parser;
 use futures_util::StreamExt;
 use tracing::{Instrument, info, warn};
@@ -979,6 +981,7 @@ fn build_router(state: Arc<AppState>, auth_keys: Arc<HashSet<String>>) -> Router
         .route("/v1/models", get(models_handler))
         .route("/models", get(models_handler))
         .route("/stats", get(stats_handler))
+        .route("/stats/json", get(stats_json_handler))
         .with_state(state)
         // Always layer; empty keys still run dual-credential / strict checks on
         // Anthropic paths, then allow-all when no membership set is configured.
@@ -1377,7 +1380,7 @@ fn startup_summary_lines(
         "endpoints: OpenAI Responses POST /v1/responses; OpenAI Chat Completions POST /v1/chat/completions; Anthropic Messages POST /v1/messages".to_string(),
         format!("try: curl http://{addr}/health"),
         format!("models endpoint: curl http://{addr}/v1/models"),
-        format!("stats endpoint: curl http://{addr}/stats"),
+        format!("stats endpoint: curl http://{addr}/stats  (add ?format=json for JSON)"),
         format_completions_example(providers),
     ]
 }
@@ -1644,15 +1647,82 @@ async fn models_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
     Json(serde_json::json!({ "object": "list", "data": data }))
 }
 
-/// Handler: GET /stats
-async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match &state.stats {
-        Some(stats) => Json(serde_json::json!(stats.snapshot())),
-        None => Json(serde_json::json!({
-            "stats_enabled": false,
-            "note": "stats db unavailable; counters not being recorded",
-        })),
+/// Query for GET /stats — mirrors ckb-mcp: human text default, json optional.
+#[derive(Debug, Deserialize, Default)]
+struct StatsQuery {
+    /// Output format: `human` (default) or `json`.
+    #[serde(default)]
+    format: Option<String>,
+}
+
+fn stats_disabled_human() -> String {
+    "Omni LLM Provider Stats\n\
+     ======================\n\n\
+     Stats not enabled\n\
+     stats db unavailable; counters not being recorded\n"
+        .to_string()
+}
+
+fn stats_disabled_json() -> serde_json::Value {
+    serde_json::json!({
+        "stats_enabled": false,
+        "note": "stats db unavailable; counters not being recorded",
+    })
+}
+
+/// Handler: GET /stats — plain text by default; `?format=json` for JSON.
+async fn stats_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<StatsQuery>,
+) -> Response {
+    let format = query.format.as_deref().unwrap_or("human");
+    match format {
+        "json" => stats_json_response(&state),
+        _ => stats_human_response(&state),
     }
+}
+
+/// Handler: GET /stats/json — always JSON (alias for `?format=json`).
+async fn stats_json_handler(State(state): State<Arc<AppState>>) -> Response {
+    stats_json_response(&state)
+}
+
+fn stats_human_response(state: &AppState) -> Response {
+    let body = match &state.stats {
+        Some(stats) => stats.format_human(Some(env!("CARGO_PKG_VERSION"))),
+        None => stats_disabled_human(),
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        body,
+    )
+        .into_response()
+}
+
+fn stats_json_response(state: &AppState) -> Response {
+    let body = match &state.stats {
+        Some(stats) => match stats.format_json() {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    format!("failed to serialize stats: {e}"),
+                )
+                    .into_response();
+            }
+        },
+        None => serde_json::to_string_pretty(&stats_disabled_json()).unwrap_or_else(|_| {
+            r#"{"stats_enabled":false,"note":"stats db unavailable"}"#.into()
+        }),
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
 }
 
 /// Handler: POST /v1/chat/completions
@@ -1728,6 +1798,7 @@ async fn chat_completions_handler(
                     None,
                     Some(err_msg),
                     Some(requested_model.as_str()),
+                    Some(stats.as_ref()),
                 );
             }
             map_provider_err(e)
@@ -1770,6 +1841,7 @@ async fn chat_completions_handler(
                 None,
                 Some(err_msg),
                 Some(requested_model.as_str()),
+                Some(stats.as_ref()),
             );
         }
         map_provider_err(e)
@@ -1782,6 +1854,7 @@ async fn chat_completions_handler(
             &canon_resp,
             started.elapsed().as_secs_f64() * 1000.0,
             Some(requested_model.as_str()),
+            Some(stats.as_ref()),
         );
     }
 
@@ -1811,22 +1884,38 @@ fn map_provider_err(e: ProviderError) -> AppError {
     }
 }
 
+/// Attach process-scoped cumulative totals when stats is enabled. Call after
+/// the adjacent `record_*` so the line includes the current request/tokens.
+/// No stats-clear API exists; only since-launch is emitted.
+fn with_since_launch(params: RequestCompleteParams, stats: Option<&Stats>) -> RequestCompleteParams {
+    match stats {
+        Some(s) => {
+            let (req, tok) = s.since_launch_totals();
+            params.with_since_launch(req, tok)
+        }
+        None => params,
+    }
+}
+
 fn record_bad_request(state: &AppState, model: &str, msg: String) -> AppError {
     // Complete twin only when record_error actually ran (same gate as other sites).
     if let Some(stats) = &state.stats {
         stats.record_error(model, &msg);
         // Pre-body client error: never entered a finish-capable body path.
-        let params = RequestCompleteParams::error(
-            model,
-            FinishSite {
-                entered_body: false,
-                incomplete: false,
-                no_finish_concept: false,
-                finish_latch: None,
-            },
-            0.0,
-        )
-        .with_error(Some(msg.clone()));
+        let params = with_since_launch(
+            RequestCompleteParams::error(
+                model,
+                FinishSite {
+                    entered_body: false,
+                    incomplete: false,
+                    no_finish_concept: false,
+                    finish_latch: None,
+                },
+                0.0,
+            )
+            .with_error(Some(msg.clone())),
+            Some(stats.as_ref()),
+        );
         log_request_complete(&params);
     }
     AppError::BadRequest(msg)
@@ -1855,6 +1944,7 @@ fn log_nonstream_response_complete(
     canon_resp: &CanonicalResponse,
     duration_ms: f64,
     requested_model: Option<&str>,
+    stats: Option<&Stats>,
 ) {
     let finish = FinishSite {
         entered_body: true,
@@ -1877,7 +1967,7 @@ fn log_nonstream_response_complete(
     if let Some(raw) = requested_model {
         params = params.with_requested_model(requested_model_if_differs(model, raw));
     }
-    log_request_complete(&params);
+    log_request_complete(&with_since_launch(params, stats));
 }
 
 /// Twin complete line for pre-send / transport errors (finish_reason=none).
@@ -1889,6 +1979,7 @@ fn log_terminal_error_complete(
     finish_latch: Option<String>,
     error: Option<String>,
     requested_model: Option<&str>,
+    stats: Option<&Stats>,
 ) {
     let finish = FinishSite {
         entered_body,
@@ -1900,7 +1991,7 @@ fn log_terminal_error_complete(
     if let Some(raw) = requested_model {
         params = params.with_requested_model(requested_model_if_differs(model, raw));
     }
-    log_request_complete(&params);
+    log_request_complete(&with_since_launch(params, stats));
 }
 
 fn is_error_finish_reason(finish_reason: Option<&str>) -> bool {
@@ -1978,6 +2069,7 @@ fn wrap_stream_for_stats(
                             )
                             .with_error(Some(msg))
                             .with_requested_model(requested_model_field.clone());
+                            let params = with_since_launch(params, Some(stats.as_ref()));
                             log_request_complete(&params);
                             if let Some(log) = conversation_log.as_ref() {
                                 log.log(
@@ -2013,6 +2105,7 @@ fn wrap_stream_for_stats(
                         )
                         .with_tokens(in_tok, out_tok)
                         .with_requested_model(requested_model_field.clone());
+                        let params = with_since_launch(params, Some(stats.as_ref()));
                         log_request_complete(&params);
                         if let Some(log) = conversation_log.as_ref() {
                             log.log(
@@ -2047,6 +2140,7 @@ fn wrap_stream_for_stats(
                         )
                         .with_error(Some(err_msg))
                         .with_requested_model(requested_model_field.clone());
+                        let params = with_since_launch(params, Some(stats.as_ref()));
                         log_request_complete(&params);
                         if let Some(log) = conversation_log.as_ref() {
                             log.log(
@@ -2079,6 +2173,7 @@ fn wrap_stream_for_stats(
                 )
                 .with_error(Some("stream ended without Finish event".into()))
                 .with_requested_model(requested_model_field.clone());
+                let params = with_since_launch(params, Some(stats.as_ref()));
                 log_request_complete(&params);
                 if let Some(log) = conversation_log.as_ref() {
                     log.log(
@@ -2350,6 +2445,7 @@ async fn anthropic_messages_claude_native(
                         None,
                         Some(err_msg),
                         Some(prepared.requested_model.as_str()),
+                        Some(stats.as_ref()),
                     );
                 }
                 map_provider_err(error)
@@ -2391,6 +2487,7 @@ async fn anthropic_messages_claude_native(
                     None,
                     Some(err_msg),
                     Some(prepared.requested_model.as_str()),
+                    Some(stats.as_ref()),
                 );
             }
             map_provider_err(error)
@@ -2428,6 +2525,7 @@ async fn anthropic_messages_claude_native(
             &stats_key,
             &prepared.requested_model,
         ));
+        let params = with_since_launch(params, Some(stats.as_ref()));
         log_request_complete(&params);
     }
     log_json(
@@ -2496,6 +2594,7 @@ async fn anthropic_messages_translated(
                     None,
                     Some(err_msg),
                     Some(requested_model.as_str()),
+                    Some(stats.as_ref()),
                 );
             }
             map_anthropic_translated_provider_err(error)
@@ -2542,6 +2641,7 @@ async fn anthropic_messages_translated(
                 None,
                 Some(err_msg),
                 Some(requested_model.as_str()),
+                Some(stats.as_ref()),
             );
         }
         map_anthropic_translated_provider_err(error)
@@ -2554,6 +2654,7 @@ async fn anthropic_messages_translated(
             &canon_resp,
             started.elapsed().as_secs_f64() * 1000.0,
             Some(requested_model.as_str()),
+            Some(stats.as_ref()),
         );
     }
 
@@ -2690,6 +2791,7 @@ async fn anthropic_count_tokens_inner(
                     None,
                     Some(err_msg),
                     Some(prepared.requested_model.as_str()),
+                    Some(stats.as_ref()),
                 );
             }
             map_provider_err(error)
@@ -2858,6 +2960,7 @@ fn anthropic_sse_response(
                                 )
                                 .with_error(Some(message))
                                 .with_requested_model(requested_model_field.clone());
+                                let params = with_since_launch(params, Some(stats.as_ref()));
                                 log_request_complete(&params);
                                 complete_snapshot = Some(params);
                             }
@@ -2889,6 +2992,7 @@ fn anthropic_sse_response(
                                         )
                                         .with_error(Some(error.clone()))
                                         .with_requested_model(requested_model_field.clone());
+                                        let params = with_since_launch(params, Some(stats.as_ref()));
                                         log_request_complete(&params);
                                         complete_snapshot = Some(params);
                                     }
@@ -2918,6 +3022,7 @@ fn anthropic_sse_response(
                             )
                             .with_error(Some(message.clone()))
                             .with_requested_model(requested_model_field.clone());
+                            let params = with_since_launch(params, Some(stats.as_ref()));
                             log_request_complete(&params);
                             complete_snapshot = Some(params);
                         }
@@ -2957,6 +3062,7 @@ fn anthropic_sse_response(
                     )
                     .with_error(Some(message.into()))
                     .with_requested_model(requested_model_field.clone());
+                    let params = with_since_launch(params, Some(stats.as_ref()));
                     log_request_complete(&params);
                     complete_snapshot = Some(params);
                 }
@@ -2991,6 +3097,7 @@ fn anthropic_sse_response(
                 .with_tokens(in_tok, out_tok)
                 .with_ttft_ms(ttft_ms)
                 .with_requested_model(requested_model_field.clone());
+                let params = with_since_launch(params, Some(stats.as_ref()));
                 log_request_complete(&params);
                 complete_snapshot = Some(params);
             }
@@ -3158,6 +3265,7 @@ async fn responses_handler(
                     None,
                     Some(err_msg),
                     Some(requested_model.as_str()),
+                    Some(stats.as_ref()),
                 );
             }
             map_provider_err(e)
@@ -3204,6 +3312,7 @@ async fn responses_handler(
                 None,
                 Some(err_msg),
                 Some(requested_model.as_str()),
+                Some(stats.as_ref()),
             );
         }
         map_provider_err(e)
@@ -3215,6 +3324,7 @@ async fn responses_handler(
             &canon_resp,
             started.elapsed().as_secs_f64() * 1000.0,
             Some(requested_model.as_str()),
+            Some(stats.as_ref()),
         );
     }
     let resp =
@@ -6030,7 +6140,14 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         let err = call_chat_handler(state.clone(), bad_req).await.unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)));
 
-        let resp = stats_handler(State(state)).await.into_response();
+        let resp = stats_handler(
+            State(state),
+            Query(StatsQuery {
+                format: Some("json".into()),
+            }),
+        )
+        .await
+        .into_response();
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
@@ -8127,7 +8244,8 @@ rule = [
     #[test]
     fn test_subprocess_omni_binary_stats_route_exists() {
         // WHY: /stats is the replacement for the removed provider-specific
-        // binaries' stats endpoints; the production router must expose JSON.
+        // binaries' stats endpoints. Default is human text; JSON via query or
+        // /stats/json.
         let port = free_port();
         let stats_path = temp_stats_path();
         let _guard = TempStats(stats_path.clone());
@@ -8142,11 +8260,34 @@ rule = [
             &[("OMNI_PROVIDERS", "claude")],
         );
         assert!(wait_for_200_health(port, Duration::from_secs(6)));
-        let resp = get(port, "/stats");
-        assert_eq!(resp.status, 200);
-        let v = omni_common::test_support::parse_json(&resp.body);
+
+        let text = get(port, "/stats");
+        assert_eq!(text.status, 200);
+        assert!(
+            text.body.contains("Omni LLM Provider Stats"),
+            "default /stats should be human text: {}",
+            text.body
+        );
+        assert!(
+            text.body.contains("Since launch"),
+            "human stats should include since-launch window: {}",
+            text.body
+        );
+
+        let json_q = get(port, "/stats?format=json");
+        assert_eq!(json_q.status, 200);
+        let v = omni_common::test_support::parse_json(&json_q.body);
         assert!(v["uptime_seconds"].is_u64(), "stats shape missing: {v}");
         assert!(v["models"].is_object(), "stats models missing: {v}");
+        assert!(
+            v["requests_since_launch"].is_u64(),
+            "since-launch missing: {v}"
+        );
+
+        let json_path = get(port, "/stats/json");
+        assert_eq!(json_path.status, 200);
+        let v2 = omni_common::test_support::parse_json(&json_path.body);
+        assert_eq!(v2["uptime_seconds"], v["uptime_seconds"]);
     }
 
     #[test]
