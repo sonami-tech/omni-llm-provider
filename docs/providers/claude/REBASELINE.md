@@ -129,26 +129,22 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
 - Recovered vectors are local to this repo and covered by Rust tests.
 - Default workspace tests pass without credentials or network.
 
-## Current 2.1.207 Status
+## Current 2.1.211 Status
 
-On 2026-07-11, Claude Code 2.1.207 was captured and model behavior was verified
+On 2026-07-16, Claude Code 2.1.211 was captured and model behavior was verified
 for default, `opus`, `sonnet`, and `haiku` flows. Headers still use SDK package
 `0.94.0`, runtime `v26.3.0`, Anthropic version `2023-06-01`, and
-`claude-cli/2.1.207 (external, sdk-cli)`.
+`claude-cli/2.1.211 (external, sdk-cli)`.
 
-2.1.207 is the current `latest` profile. Drift versus 2.1.197:
+2.1.211 is the current `latest` profile. Drift versus 2.1.207 is a pure version
+bump (UA / billing `cc_version` only). Catalog, per-model betas, wire defaults
+(opus/sonnet 64k/no-temp/high; haiku 32k/no-temp/no-effort), and the no-cch
+billing shape are live-confirmed unchanged.
 
-- CLI version string only for UA / billing `cc_version`.
-- Sonnet catalog id is now `claude-sonnet-5` (was `claude-sonnet-4-6`).
-- Sonnet wire is 64k / no temperature / `output_config.effort=high` (was 32k / temp=1).
-- Opus `output_config.effort` is `high` on the captured wire.
-- Haiku omits temperature (was temp=1).
-- Sonnet beta list matches explicit Opus (includes `mid-conversation-system`).
-
-Like 2.1.186/197 it emits the billing header with no `cch=` field, ending at
+Like 2.1.186/197/207 it emits the billing header with no `cch=` field, ending at
 `cc_entrypoint=sdk-cli;`. The `cc_version` suffix algorithm is unchanged: the
 existing Sha256Utf16SampleV1 suffix reproduces the captured
-`cc_version=2.1.207.aa4` exactly, and the live drift checker agrees against the
+`cc_version=2.1.211.08c` exactly, and the live drift checker agrees against the
 installed CLI. Because there is no checksum to recompute, this no-cch profile
 ships no clean-room cch vectors.
 

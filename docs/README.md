@@ -9,7 +9,7 @@ fingerprint logic remains isolated in provider crates.
 - `omni` - the only server binary. Routes by canonical upstream model id
   (`claude-sonnet-5`, `grok-4.5`, or the configured Codex model),
   documented shorthand alias (`sonnet`, `opus`, `haiku`, `fable`, `grok`,
-  `composer`, `build`, `gpt`), or optional provider prefix (`claude:...`,
+  `gpt`), or optional provider prefix (`claude:...`,
   `grok:...`, `codex:...`) when a caller needs to force a provider.
 
 ## Crates
@@ -112,8 +112,6 @@ Current shorthand aliases are resolved from provider-owned catalogs at startup:
 - `haiku` -> `claude-haiku-4-5-20251001`
 - `fable` -> `claude-fable-5`
 - `grok` -> `grok-4.5`
-- `composer` -> `grok-composer-2.5-fast`
-- `build` -> `grok-build`
 - `gpt` -> the current Codex model from `$CODEX_HOME/config.toml` or
   `~/.codex/config.toml`, falling back to the provider default
 

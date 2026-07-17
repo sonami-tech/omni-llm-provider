@@ -62,10 +62,18 @@ Omni refreshes Claude/Codex/Grok OAuth primary-login tokens in-place by default
 (atomic write-back of rotated refresh tokens). Disable with
 `--no-oauth-refresh`, `OMNI_NO_OAUTH_REFRESH=1`, or `OMNI_OAUTH_REFRESH=0` (or
 `false`/`off`/`no`) to keep CLI-delegated re-read only. Static API keys are
-never refreshed. Write-back preserves file mode, requires a rotated
-`refresh_token` in the grant, and refuses to clobber if the on-disk RT changed
-mid-refresh (concurrent CLI/Omni). Full flock parity with vendor CLI lockfiles
-is not claimed.
+never refreshed.
+
+Recovery shape (transparent to callers): on each credential load, re-read disk;
+if the access token is expired or within **15 minutes** of expiry (or after an
+upstream 401 force path), run up to **3** turns of refresh-under-lock then
+full re-read. Refresh is serialized with an in-process single-flight mutex per
+credential path plus a sibling `*.lock` flock (same naming as Grok's
+`auth.json.lock`). Spent-RT / `invalid_grant` and CAS peer-rotation are treated
+as success when disk already holds a fresh AT (peer or CLI won). After exhausted
+turns with a still-stale AT, fail closed with a specific error (no soft-warn
+continuing with a dead token). Write-back preserves file mode and requires a
+rotated `refresh_token` in the grant.
 
 Custom upstream endpoint configuration owns provider auth and must not fall
 back to default credentials:

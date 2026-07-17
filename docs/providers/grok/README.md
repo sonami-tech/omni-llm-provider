@@ -20,7 +20,7 @@ preambles. The maintained contract is:
 - fresh credential resolution per request (prefers `~/.grok/auth.json` OIDC),
 - grok-shell fingerprint headers for the pinned CLI version,
 - correct non-stream and stream decoding via the shared Responses parser,
-- model catalog kept current (latest pin: grok-shell 0.2.93; `grok-4.5` + composer).
+- model catalog kept current (latest pin: grok-shell 0.2.101; `grok-4.5` only).
 
 Default path credentials: `$XAI_CREDENTIALS_PATH`, then `~/.grok/auth.json`, then
 `~/.xai/.credentials.json`. Custom endpoint mode is different by design.

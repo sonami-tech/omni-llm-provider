@@ -44,13 +44,12 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{info, warn};
 
-/// Captured Grok OIDC token endpoint (grok-shell 0.2.93).
+/// Captured Grok OIDC token endpoint (grok-shell 0.2.101).
 pub const GROK_OAUTH_TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
 /// User-Agent template prefix; full UA is `grok-shell/<ver> (linux; x86_64)`.
-pub const GROK_OAUTH_USER_AGENT: &str = "grok-shell/0.2.93 (linux; x86_64)";
-
-/// Refresh when access token expires within this many milliseconds (5 minutes).
-const NEAR_EXPIRY_SKEW_MS: i64 = 5 * 60 * 1000;
+pub const GROK_OAUTH_USER_AGENT: &str = "grok-shell/0.2.101 (linux; x86_64)";
+/// Near-expiry skew (15 minutes); shared via omni-common.
+const NEAR_EXPIRY_SKEW_MS: i64 = omni_common::NEAR_EXPIRY_SKEW_MS;
 
 // Local error for credentials (kept small; mapped by callers to ProviderError or AppError).
 #[derive(Debug, thiserror::Error)]
@@ -291,39 +290,78 @@ impl GrokCredentials {
         path: &Path,
         force: bool,
     ) -> Result<Self, GrokCredentialsError> {
-        let bytes = tokio::fs::read(path).await?;
-        let creds = Self::from_bytes(&bytes)?;
-
         if !oauth_refresh_enabled() {
-            return Ok(creds);
-        }
-        // Static keys never refresh.
-        if creds.expires_at_ms.is_none() && !force {
-            return Ok(creds);
-        }
-        let should = force || needs_refresh(creds.expires_at_ms);
-        if !should {
-            return Ok(creds);
-        }
-        // Only OIDC files carry refresh material.
-        if extract_oidc_refresh_material(&bytes).is_err() {
-            return Ok(creds);
+            let bytes = tokio::fs::read(path).await?;
+            return Self::from_bytes(&bytes);
         }
 
-        match refresh_oauth_inplace(path, &oauth_token_url()).await {
-            Ok(()) => {
-                let bytes = tokio::fs::read(path).await?;
-                Self::from_bytes(&bytes)
+        let mut force = force;
+        let mut last_err: Option<GrokCredentialsError> = None;
+
+        for turn in 1..=omni_common::MAX_CREDENTIAL_RECOVERY_TURNS {
+            let bytes = tokio::fs::read(path).await?;
+            let creds = Self::from_bytes(&bytes)?;
+            // Static keys never refresh.
+            if creds.expires_at_ms.is_none() {
+                return Ok(creds);
             }
-            Err(e) => {
-                if creds.check_expired().is_ok() {
-                    warn!(error = %e, "grok OAuth refresh failed; using existing access token");
-                    Ok(creds)
-                } else {
-                    Err(e)
+            // Only OIDC files carry refresh material.
+            if extract_oidc_refresh_material(&bytes).is_err() {
+                return Ok(creds);
+            }
+            let near = needs_refresh(creds.expires_at_ms);
+            if !force && !near {
+                return Ok(creds);
+            }
+
+            info!(
+                turn,
+                force,
+                near,
+                path = %path.display(),
+                "grok OAuth recovery turn"
+            );
+            let path_buf = path.to_path_buf();
+            let force_this = force;
+            let locked = omni_common::with_oauth_refresh_lock(&path_buf, || {
+                let path_buf = path_buf.clone();
+                async move {
+                    let bytes = tokio::fs::read(&path_buf).await?;
+                    let under = GrokCredentials::from_bytes(&bytes)?;
+                    if under.expires_at_ms.is_none() {
+                        return Ok(());
+                    }
+                    if !force_this && !needs_refresh(under.expires_at_ms) {
+                        return Ok(());
+                    }
+                    if extract_oidc_refresh_material(&bytes).is_err() {
+                        return Ok(());
+                    }
+                    refresh_oauth_inplace(&path_buf, &oauth_token_url()).await
+                }
+            })
+            .await;
+
+            match locked {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(error = %e, turn, "grok OAuth refresh turn failed");
+                    last_err = Some(e);
+                }
+                Err(ioe) => {
+                    warn!(error = %ioe, turn, "grok OAuth refresh lock failed");
+                    last_err = Some(GrokCredentialsError::Read(ioe));
                 }
             }
+            force = false;
         }
+
+        let bytes = tokio::fs::read(path).await?;
+        let creds = Self::from_bytes(&bytes)?;
+        if !needs_refresh(creds.expires_at_ms) {
+            return Ok(creds);
+        }
+        Err(last_err.unwrap_or(GrokCredentialsError::Expired))
     }
 
     /// Parse either credential shape from raw bytes: the Grok CLI OIDC file (an object whose entry
@@ -648,6 +686,15 @@ pub async fn refresh_oauth_inplace(
         .map_err(|e| GrokCredentialsError::Refresh(e.to_string()))?;
     if !status.is_success() {
         let body_txt = String::from_utf8_lossy(&resp_bytes);
+        if omni_common::looks_like_refresh_token_spent(&body_txt)
+            && disk_access_token_is_fresh(path).await
+        {
+            info!(
+                path = %path.display(),
+                "grok OAuth refresh got spent-RT response; disk AT already fresh (peer won)"
+            );
+            return Ok(());
+        }
         return Err(GrokCredentialsError::Refresh(format!(
             "HTTP {status}: {body_txt}"
         )));
@@ -681,10 +728,11 @@ pub async fn refresh_oauth_inplace(
     match disk_rt {
         Some(rt) if rt == material.refresh_token || rt == new_rt => {}
         Some(_) => {
-            return Err(GrokCredentialsError::Refresh(
-                "auth.json refresh_token changed during OAuth refresh (concurrent writer); not clobbering"
-                    .into(),
-            ));
+            info!(
+                path = %path.display(),
+                "grok OAuth refresh CAS: peer rotated RT; not clobbering"
+            );
+            return Ok(());
         }
         None => {}
     }
@@ -696,6 +744,16 @@ pub async fn refresh_oauth_inplace(
     atomic_write(path, &out)?;
     info!(path = %path.display(), "grok OAuth refresh ok");
     Ok(())
+}
+
+async fn disk_access_token_is_fresh(path: &Path) -> bool {
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return false;
+    };
+    let Ok(creds) = GrokCredentials::from_bytes(&bytes) else {
+        return false;
+    };
+    !needs_refresh(creds.expires_at_ms)
 }
 
 #[cfg(test)]

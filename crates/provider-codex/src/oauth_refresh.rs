@@ -8,7 +8,7 @@
 //! `omni_common::oauth_refresh`). Static `OPENAI_API_KEY` entries are never
 //! refreshed.
 //!
-//! Wire contract: live capture codex 0.144.1 — see
+//! Wire contract: live capture codex 0.144.5 — see
 //! `/home/username/oauth-credential-renewal-handoff.md`.
 
 use std::path::Path;
@@ -25,10 +25,9 @@ pub const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// Originator header from capture.
 pub const CODEX_OAUTH_ORIGINATOR: &str = "codex_exec";
 /// User-Agent template matching capture (`codex_exec/<ver> …`).
-pub const CODEX_OAUTH_USER_AGENT: &str = "codex_exec/0.144.1 (linux; x86_64) unknown";
-
-/// Refresh when JWT exp is within this many seconds (5 minutes).
-const NEAR_EXPIRY_SKEW_SECS: i64 = 5 * 60;
+pub const CODEX_OAUTH_USER_AGENT: &str = "codex_exec/0.144.5 (linux; x86_64) unknown";
+/// Near-expiry skew (15 minutes); shared via omni-common.
+const NEAR_EXPIRY_SKEW_SECS: i64 = omni_common::NEAR_EXPIRY_SKEW_SECS;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CodexTokenGrant {
@@ -213,7 +212,9 @@ fn access_token_from_auth(file: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// If refresh is enabled and the ChatGPT access JWT is near expiry, refresh in-place.
+/// If refresh is enabled and the ChatGPT access JWT is near expiry (or `force`),
+/// run the recovery loop: re-read → refresh under lock → re-read, up to
+/// [`omni_common::MAX_CREDENTIAL_RECOVERY_TURNS`] turns.
 ///
 /// - No-ops for static API-key-only files (no `tokens.refresh_token`).
 /// - When `skip_if_static_api_key` is true (REST/env auth paths), also no-ops if a
@@ -229,26 +230,81 @@ pub async fn maybe_refresh_auth_json(
     if !oauth_refresh_enabled() {
         return Ok(());
     }
+
+    let mut force = force;
+    let mut last_err: Option<String> = None;
+
+    for turn in 1..=omni_common::MAX_CREDENTIAL_RECOVERY_TURNS {
+        let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
+        let file: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if skip_if_static_api_key
+            && file
+                .get("OPENAI_API_KEY")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty())
+        {
+            return Ok(());
+        }
+        let Some(access) = access_token_from_auth(&file) else {
+            return Ok(());
+        };
+        if refresh_token_from_auth(&file).is_none() {
+            return Ok(());
+        }
+        let near = needs_refresh_access_token(&access);
+        if !force && !near {
+            return Ok(());
+        }
+
+        info!(turn, force, near, path = %path.display(), "codex OAuth recovery turn");
+        let path_buf = path.to_path_buf();
+        let force_this = force;
+        let locked = omni_common::with_oauth_refresh_lock(&path_buf, || {
+            let path_buf = path_buf.clone();
+            async move {
+                let bytes = tokio::fs::read(&path_buf)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let file: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                let Some(access) = access_token_from_auth(&file) else {
+                    return Ok(());
+                };
+                if !force_this && !needs_refresh_access_token(&access) {
+                    return Ok(());
+                }
+                if refresh_token_from_auth(&file).is_none() {
+                    return Ok(());
+                }
+                refresh_oauth_inplace(&path_buf, &oauth_token_url()).await
+            }
+        })
+        .await;
+
+        match locked {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(error = %e, turn, "codex OAuth refresh turn failed");
+                last_err = Some(e);
+            }
+            Err(ioe) => {
+                warn!(error = %ioe, turn, "codex OAuth refresh lock failed");
+                last_err = Some(ioe.to_string());
+            }
+        }
+        force = false;
+    }
+
+    // Final disk check: fail closed if still near/past expiry.
     let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
     let file: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    if skip_if_static_api_key
-        && file
-            .get("OPENAI_API_KEY")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.trim().is_empty())
+    if let Some(access) = access_token_from_auth(&file)
+        && !needs_refresh_access_token(&access)
     {
         return Ok(());
     }
-    let Some(access) = access_token_from_auth(&file) else {
-        return Ok(());
-    };
-    if !force && !needs_refresh_access_token(&access) {
-        return Ok(());
-    }
-    if refresh_token_from_auth(&file).is_none() {
-        return Ok(());
-    }
-    refresh_oauth_inplace(path, &oauth_token_url()).await
+    Err(last_err.unwrap_or_else(|| {
+        "codex OAuth recovery exhausted; access token still near/past expiry".into()
+    }))
 }
 
 /// POST the JSON grant and atomically write back to `path`.
@@ -280,6 +336,15 @@ pub async fn refresh_oauth_inplace(path: &Path, token_url: &str) -> Result<(), S
     let resp_bytes = resp.bytes().await.map_err(|e| e.to_string())?;
     if !status.is_success() {
         let body_txt = String::from_utf8_lossy(&resp_bytes);
+        if omni_common::looks_like_refresh_token_spent(&body_txt)
+            && disk_access_token_is_fresh(path).await
+        {
+            info!(
+                path = %path.display(),
+                "codex OAuth refresh got spent-RT response; disk AT already fresh (peer won)"
+            );
+            return Ok(());
+        }
         return Err(format!("Codex OAuth refresh HTTP {status}: {body_txt}"));
     }
 
@@ -306,10 +371,11 @@ pub async fn refresh_oauth_inplace(path: &Path, token_url: &str) -> Result<(), S
             // Our RT still current, or peer already wrote the same grant.
         }
         Some(_) => {
-            return Err(
-                "auth.json refresh_token changed during OAuth refresh (concurrent writer); not clobbering"
-                    .into(),
+            info!(
+                path = %path.display(),
+                "codex OAuth refresh CAS: peer rotated RT; not clobbering"
             );
+            return Ok(());
         }
         None => {}
     }
@@ -322,19 +388,28 @@ pub async fn refresh_oauth_inplace(path: &Path, token_url: &str) -> Result<(), S
     Ok(())
 }
 
-/// Best-effort proactive refresh for REST paths that prefer `OPENAI_API_KEY` when present.
-pub async fn ensure_fresh_chatgpt_tokens(path: &Path) {
-    if let Err(e) = maybe_refresh_auth_json(path, false, true).await {
-        warn!(error = %e, path = %path.display(), "codex OAuth refresh failed");
+async fn disk_access_token_is_fresh(path: &Path) -> bool {
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return false;
+    };
+    let Ok(file) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    match access_token_from_auth(&file) {
+        Some(access) => !needs_refresh_access_token(&access),
+        None => false,
     }
+}
+
+/// Proactive refresh for REST paths that prefer `OPENAI_API_KEY` when present.
+pub async fn ensure_fresh_chatgpt_tokens(path: &Path) -> Result<(), String> {
+    maybe_refresh_auth_json(path, false, true).await
 }
 
 /// Proactive refresh for ChatGPT OAuth token consumers (conservative mode).
 /// Still refreshes tokens even when a sibling `OPENAI_API_KEY` exists.
-pub async fn ensure_fresh_chatgpt_oauth_tokens(path: &Path) {
-    if let Err(e) = maybe_refresh_auth_json(path, false, false).await {
-        warn!(error = %e, path = %path.display(), "codex OAuth refresh failed");
-    }
+pub async fn ensure_fresh_chatgpt_oauth_tokens(path: &Path) -> Result<(), String> {
+    maybe_refresh_auth_json(path, false, false).await
 }
 
 #[cfg(test)]
@@ -602,5 +677,67 @@ mod tests {
         let on_disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(on_disk["tokens"]["refresh_token"], "rt-via-maybe");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn concurrent_maybe_refresh_posts_once() {
+        // WHY: multi-request near-expiry must not double-spend the RT.
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path as url_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = env_lock();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(url_path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": fake_jwt(9_999_999_999),
+                "refresh_token": "rt-once",
+                "id_token": "id-once",
+                "expires_in": 864000
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let path = write_temp_auth(&format!(
+            r#"{{"tokens":{{"access_token":"{}","refresh_token":"rt-old","account_id":"a1"}}}}"#,
+            fake_jwt(1_000)
+        ));
+        let token_url = format!("{}/oauth/token", server.uri());
+        let old_flag = std::env::var_os("OMNI_OAUTH_REFRESH");
+        let old_url = std::env::var_os("OMNI_CODEX_OAUTH_TOKEN_URL");
+        unsafe {
+            std::env::set_var("OMNI_OAUTH_REFRESH", "1");
+            std::env::set_var("OMNI_CODEX_OAUTH_TOKEN_URL", &token_url);
+        }
+        let path = Arc::new(path);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let p = Arc::clone(&path);
+            handles.push(tokio::spawn(async move {
+                maybe_refresh_auth_json(p.as_path(), false, false)
+                    .await
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        unsafe {
+            match old_flag {
+                Some(v) => std::env::set_var("OMNI_OAUTH_REFRESH", v),
+                None => std::env::remove_var("OMNI_OAUTH_REFRESH"),
+            }
+            match old_url {
+                Some(v) => std::env::set_var("OMNI_CODEX_OAUTH_TOKEN_URL", v),
+                None => std::env::remove_var("OMNI_CODEX_OAUTH_TOKEN_URL"),
+            }
+        }
+        let on_disk: Value =
+            serde_json::from_slice(&std::fs::read(path.as_path()).unwrap()).unwrap();
+        let _ = std::fs::remove_file(path.as_path());
+        assert_eq!(on_disk["tokens"]["refresh_token"], "rt-once");
     }
 }

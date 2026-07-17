@@ -33,8 +33,10 @@ pub use http::{
     ChatMessageContent, from_canonical, sse_from_canonical_stream, to_canonical, unix_now_secs,
 };
 pub use oauth_refresh::{
-    OAuthRefreshProvider, global_oauth_refresh_enabled, oauth_refresh_enabled_for,
-    oauth_refresh_policy_summary, parse_bool_env,
+    MAX_CREDENTIAL_RECOVERY_TURNS, NEAR_EXPIRY_SKEW_MS, NEAR_EXPIRY_SKEW_SECS, OAuthRefreshProvider,
+    credential_lock_path, global_oauth_refresh_enabled, looks_like_refresh_token_spent,
+    oauth_refresh_enabled_for, oauth_refresh_policy_summary, parse_bool_env,
+    with_oauth_refresh_lock,
 };
 pub use replacements::{Replacements, ReplacementsError};
 pub use responses::{

@@ -112,20 +112,22 @@ wrapper around `tools.capture extract jsonl` for sanitized JSONL exports.
 
 ## Current Wire + Model Findings
 
-Re-baselined against grok-shell **0.2.93** on **2026-07-11**.
+Re-baselined against grok-shell **0.2.101** on **2026-07-16**.
 
 ### Default path (cli-chat-proxy.grok.com)
 
 Catalog (`/v1/models`):
 
 - `grok-4.5` (default; alias `grok`; reasoning efforts `low`/`medium`/`high`, default `high`)
-- `grok-composer-2.5-fast` (alias `composer`)
+
+`grok-composer-2.5-fast` is no longer advertised by the CLI on this version.
 
 Wire notes from live MITM of `grok --single`:
 - Host: `cli-chat-proxy.grok.com`, path `POST /v1/responses`
-- UA / version: `grok-shell/0.2.93 (linux; x86_64)`, `x-grok-client-version: 0.2.93`
+- UA / version: `grok-shell/0.2.101 (linux; x86_64)`, `x-grok-client-version: 0.2.101`
 - Fingerprint headers: `x-xai-token-auth`, `x-authenticateresponse`,
-  `x-grok-client-identifier`, `x-grok-model-override`, `accept: text/event-stream`
+  `x-grok-client-identifier`, `x-grok-client-mode: headless`,
+  `x-grok-model-override`, `accept: text/event-stream`
 - Main chat body: `model: "grok-4.5"`, `reasoning: { "effort": "high", "summary": "concise" }`,
   `include: ["reasoning.encrypted_content"]`, `store: false`, `stream: true`
 - Session-title side call still uses model `grok-build` (not advertised in `/v1/models`)

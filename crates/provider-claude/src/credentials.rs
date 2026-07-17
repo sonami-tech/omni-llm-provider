@@ -31,8 +31,8 @@ pub const CLAUDE_OAUTH_SCOPE: &str =
 /// User-Agent from live token-grant capture.
 pub const CLAUDE_OAUTH_USER_AGENT: &str = "axios/1.15.2";
 
-/// Refresh when access token expires within this many milliseconds (5 minutes).
-const NEAR_EXPIRY_SKEW_MS: i64 = 5 * 60 * 1000;
+/// Near-expiry skew (15 minutes); shared with Codex/Grok via omni-common.
+const NEAR_EXPIRY_SKEW_MS: i64 = omni_common::NEAR_EXPIRY_SKEW_MS;
 
 /// On-disk shape of `~/.claude/.credentials.json` (subset used for load).
 #[derive(Debug, Clone, Deserialize)]
@@ -101,15 +101,16 @@ impl Credentials {
     }
 
     /// Read and parse the credentials file without blocking the async executor.
-    /// When OAuth refresh is enabled and the access token is expired or near
-    /// expiry, attempts an in-place refresh before returning.
+    /// When OAuth refresh is enabled and the access token is expired or within
+    /// 15 minutes of expiry, runs the recovery loop (re-read → refresh under
+    /// lock → re-read) before returning.
     pub async fn load_fresh_async(path: &Path) -> Result<Self, UpstreamError> {
         Self::load_fresh_async_with_refresh(path, RefreshTrigger::ProactiveNearExpiry).await
     }
 
-    /// Force an OAuth refresh (if enabled and a refresh token is present), then
-    /// re-read. Used on the 401-once retry path so a server-rejected access token
-    /// can be rotated even when wall-clock expiry still looks valid.
+    /// Force an OAuth refresh attempt (if enabled), then re-read through the same
+    /// recovery loop. Used on the 401-once retry path so a server-rejected access
+    /// token can be rotated even when wall-clock expiry still looks valid.
     pub async fn load_fresh_async_force_refresh(path: &Path) -> Result<Self, UpstreamError> {
         Self::load_fresh_async_with_refresh(path, RefreshTrigger::Force).await
     }
@@ -118,40 +119,75 @@ impl Credentials {
         path: &Path,
         trigger: RefreshTrigger,
     ) -> Result<Self, UpstreamError> {
+        if !oauth_refresh_enabled() {
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(UpstreamError::CredentialsRead)?;
+            return Self::from_bytes(&bytes);
+        }
+
+        let mut force = matches!(trigger, RefreshTrigger::Force);
+        let mut last_err: Option<UpstreamError> = None;
+
+        for turn in 1..=omni_common::MAX_CREDENTIAL_RECOVERY_TURNS {
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(UpstreamError::CredentialsRead)?;
+            let creds = Self::from_bytes(&bytes)?;
+            let near = needs_refresh(creds.expires_at_ms);
+            if !force && !near {
+                return Ok(creds);
+            }
+
+            info!(
+                turn,
+                force,
+                near,
+                path = %path.display(),
+                "claude OAuth recovery turn"
+            );
+            let path_buf = path.to_path_buf();
+            let force_this = force;
+            let locked = omni_common::with_oauth_refresh_lock(&path_buf, || {
+                let path_buf = path_buf.clone();
+                async move {
+                    let bytes = tokio::fs::read(&path_buf)
+                        .await
+                        .map_err(UpstreamError::CredentialsRead)?;
+                    let under = Credentials::from_bytes(&bytes)?;
+                    if !force_this && !needs_refresh(under.expires_at_ms) {
+                        // Peer (other request / CLI) already wrote a fresh AT.
+                        return Ok(());
+                    }
+                    refresh_oauth_inplace(&path_buf, &oauth_token_url()).await
+                }
+            })
+            .await;
+
+            match locked {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(error = %e, turn, "claude OAuth refresh turn failed");
+                    last_err = Some(e);
+                }
+                Err(ioe) => {
+                    warn!(error = %ioe, turn, "claude OAuth refresh lock failed");
+                    last_err = Some(UpstreamError::CredentialsRead(ioe));
+                }
+            }
+            // Always restart: next turn re-reads disk (including after successful write-back).
+            force = false;
+        }
+
         let bytes = tokio::fs::read(path)
             .await
             .map_err(UpstreamError::CredentialsRead)?;
         let creds = Self::from_bytes(&bytes)?;
-
-        if !oauth_refresh_enabled() {
+        if !needs_refresh(creds.expires_at_ms) {
             return Ok(creds);
         }
-
-        let should = match trigger {
-            RefreshTrigger::ProactiveNearExpiry => needs_refresh(creds.expires_at_ms),
-            RefreshTrigger::Force => true,
-        };
-        if !should {
-            return Ok(creds);
-        }
-
-        match refresh_oauth_inplace(path, &oauth_token_url()).await {
-            Ok(()) => {
-                let bytes = tokio::fs::read(path)
-                    .await
-                    .map_err(UpstreamError::CredentialsRead)?;
-                Self::from_bytes(&bytes)
-            }
-            Err(e) => {
-                // If the access token is still usable, prefer it over hard-failing the request.
-                if creds.check_expired().is_ok() {
-                    warn!(error = %e, "claude OAuth refresh failed; using existing access token");
-                    Ok(creds)
-                } else {
-                    Err(e)
-                }
-            }
-        }
+        // Clock still bad after recovery: fail closed (no soft-warn with dead token).
+        Err(last_err.unwrap_or(UpstreamError::TokenExpired))
     }
 
     fn from_bytes(bytes: &[u8]) -> Result<Self, UpstreamError> {
@@ -339,6 +375,16 @@ pub async fn refresh_oauth_inplace(path: &Path, token_url: &str) -> Result<(), U
     let resp_bytes = resp.bytes().await.map_err(UpstreamError::Transport)?;
     if !status.is_success() {
         let body_txt = String::from_utf8_lossy(&resp_bytes);
+        // Peer may have spent the RT; if disk already has a fresh AT, treat as success.
+        if omni_common::looks_like_refresh_token_spent(&body_txt)
+            && disk_access_token_is_fresh(path).await
+        {
+            info!(
+                path = %path.display(),
+                "claude OAuth refresh got spent-RT response; disk AT already fresh (peer won)"
+            );
+            return Ok(());
+        }
         return Err(UpstreamError::Decode(format!(
             "Claude OAuth token refresh failed HTTP {status}: {body_txt}"
         )));
@@ -374,10 +420,12 @@ pub async fn refresh_oauth_inplace(path: &Path, token_url: &str) -> Result<(), U
     match disk_rt {
         Some(rt) if rt == refresh_token || rt == new_rt => {}
         Some(_) => {
-            return Err(UpstreamError::Decode(
-                "credentials.json refreshToken changed during OAuth refresh (concurrent writer); not clobbering"
-                    .into(),
-            ));
+            // Peer already rotated; outer recovery loop re-reads their write-back.
+            info!(
+                path = %path.display(),
+                "claude OAuth refresh CAS: peer rotated RT; not clobbering"
+            );
+            return Ok(());
         }
         None => {}
     }
@@ -389,6 +437,17 @@ pub async fn refresh_oauth_inplace(path: &Path, token_url: &str) -> Result<(), U
     atomic_write(path, &out)?;
     info!(path = %path.display(), "claude OAuth refresh ok");
     Ok(())
+}
+
+/// True when on-disk access token is present and not within near-expiry skew.
+async fn disk_access_token_is_fresh(path: &Path) -> bool {
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return false;
+    };
+    let Ok(creds) = Credentials::from_bytes(&bytes) else {
+        return false;
+    };
+    !needs_refresh(creds.expires_at_ms)
 }
 
 #[cfg(test)]
@@ -640,5 +699,92 @@ mod tests {
         assert_eq!(c.access_token, "sk-ant-oat01-stale");
         assert!(on_disk.contains("rt-stale"));
         assert!(on_disk.contains("sk-ant-oat01-stale"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn concurrent_load_fresh_posts_refresh_once() {
+        // WHY: N parallel near-expiry loads must single-flight to one token POST.
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path as url_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = env_lock();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(url_path("/v1/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "sk-ant-oat01-once",
+                "refresh_token": "rt-once",
+                "expires_in": 28800,
+                "refresh_token_expires_in": 2160000,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let path = write_temp_creds(
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-old","refreshToken":"rt-old","expiresAt":1000,"subscriptionType":"max"}}"#,
+        );
+        let token_url = format!("{}/v1/oauth/token", server.uri());
+        let old_flag = std::env::var_os("OMNI_OAUTH_REFRESH");
+        let old_url = std::env::var_os("OMNI_CLAUDE_OAUTH_TOKEN_URL");
+        unsafe {
+            std::env::set_var("OMNI_OAUTH_REFRESH", "1");
+            std::env::set_var("OMNI_CLAUDE_OAUTH_TOKEN_URL", &token_url);
+        }
+        let path = Arc::new(path);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let p = Arc::clone(&path);
+            handles.push(tokio::spawn(async move {
+                Credentials::load_fresh_async(p.as_path()).await.unwrap()
+            }));
+        }
+        for h in handles {
+            let c = h.await.unwrap();
+            assert_eq!(c.access_token, "sk-ant-oat01-once");
+        }
+        unsafe {
+            match old_flag {
+                Some(v) => std::env::set_var("OMNI_OAUTH_REFRESH", v),
+                None => std::env::remove_var("OMNI_OAUTH_REFRESH"),
+            }
+            match old_url {
+                Some(v) => std::env::set_var("OMNI_CLAUDE_OAUTH_TOKEN_URL", v),
+                None => std::env::remove_var("OMNI_CLAUDE_OAUTH_TOKEN_URL"),
+            }
+        }
+        let _ = std::fs::remove_file(path.as_path());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn refresh_spent_rt_succeeds_when_disk_already_fresh() {
+        // WHY: peer-won / reuse must re-read disk and not fail the request.
+        use wiremock::matchers::{method, path as url_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = env_lock();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(url_path("/v1/oauth/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"error":"invalid_grant","error_description":"refresh_token_reused"}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let future_exp = chrono::Utc::now().timestamp_millis() + 60 * 60 * 1000;
+        let path = write_temp_creds(&format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"sk-ant-oat01-peer","refreshToken":"rt-peer","expiresAt":{future_exp},"subscriptionType":"max"}}}}"#
+        ));
+        let token_url = format!("{}/v1/oauth/token", server.uri());
+        // Force path goes through recovery; first turn sees near=false after force
+        // but refresh is attempted; spent-RT + fresh disk => Ok.
+        refresh_oauth_inplace(&path, &token_url).await.unwrap();
+        let c = Credentials::load_fresh(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(c.access_token, "sk-ant-oat01-peer");
     }
 }

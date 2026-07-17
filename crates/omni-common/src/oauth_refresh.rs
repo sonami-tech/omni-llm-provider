@@ -1,4 +1,6 @@
-//! Shared OAuth-refresh enable gate for Claude / Codex / Grok.
+//! Shared OAuth-refresh gate and cross-provider recovery coordination.
+//!
+//! ## Enable gate
 //!
 //! Default is **on**. Operators can force on/off globally or per provider via
 //! env (or the omni CLI, which writes the same env keys at startup):
@@ -11,6 +13,125 @@
 //! Resolution: provider env if set, else global, else on. Provider always beats
 //! global (so `OMNI_OAUTH_REFRESH=0` + `OMNI_CODEX_OAUTH_REFRESH=1` refreshes
 //! only Codex).
+//!
+//! ## Recovery shape
+//!
+//! Providers run a count-bounded loop (see [`MAX_CREDENTIAL_RECOVERY_TURNS`]):
+//! re-read disk → use AT if still good → else refresh under lock → always
+//! re-read again. Refresh posts are serialized with an in-process single-flight
+//! mutex per credential path plus a sibling `.lock` file flock (same naming as
+//! Grok CLI's `auth.json.lock`) so Omni and vendor CLIs do not double-spend RTs.
+
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::future::Future;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+
+use tokio::sync::Mutex as AsyncMutex;
+
+/// Refresh when the access token expires within this many seconds (15 minutes).
+pub const NEAR_EXPIRY_SKEW_SECS: i64 = 15 * 60;
+/// Same skew in milliseconds for providers that store absolute ms expiry.
+pub const NEAR_EXPIRY_SKEW_MS: i64 = NEAR_EXPIRY_SKEW_SECS * 1000;
+/// Max full read → (optional refresh) → re-read turns per credential load.
+pub const MAX_CREDENTIAL_RECOVERY_TURNS: u32 = 3;
+
+/// True when an IdP error body indicates the refresh token was already spent
+/// or revoked (peer may have written a fresh AT/RT to disk).
+pub fn looks_like_refresh_token_spent(body: &str) -> bool {
+    let b = body.to_ascii_lowercase();
+    b.contains("refresh_token_reused")
+        || b.contains("invalid_grant")
+        || b.contains("refresh token has been revoked")
+        || b.contains("token has been revoked")
+        || b.contains("token_revoked")
+}
+
+/// Sibling lock path matching common CLI style: `auth.json` → `auth.json.lock`.
+pub fn credential_lock_path(cred_path: &Path) -> PathBuf {
+    let mut name = cred_path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("credentials"));
+    name.push(".lock");
+    match cred_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+struct FlockGuard {
+    file: File,
+}
+
+impl Drop for FlockGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+fn acquire_flock_blocking(lock_path: &Path) -> io::Result<FlockGuard> {
+    if let Some(parent) = lock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Best-effort: exclusive create is not portable here; process mutex still applies.
+        let _ = &file;
+    }
+    Ok(FlockGuard { file })
+}
+
+fn process_mutex_for(path: &Path) -> Arc<AsyncMutex<()>> {
+    static MAP: OnceLock<StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>> = OnceLock::new();
+    let map = MAP.get_or_init(|| StdMutex::new(HashMap::new()));
+    let key = path.to_string_lossy().into_owned();
+    let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
+    guard
+        .entry(key)
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
+
+/// Run `f` while holding the in-process single-flight mutex and path flock for
+/// `cred_path`. Blocking flock is taken off the async worker via `spawn_blocking`.
+pub async fn with_oauth_refresh_lock<F, Fut, T>(cred_path: &Path, f: F) -> io::Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
+    let process = process_mutex_for(cred_path);
+    let _process_guard = process.lock().await;
+
+    let lock_path = credential_lock_path(cred_path);
+    let flock = tokio::task::spawn_blocking(move || acquire_flock_blocking(&lock_path))
+        .await
+        .map_err(io::Error::other)??;
+
+    let out = f().await;
+    drop(flock);
+    Ok(out)
+}
 
 /// Which provider's refresh gate to evaluate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,10 +175,7 @@ pub fn global_oauth_refresh_enabled() -> bool {
     if env_flag_truthy("OMNI_NO_OAUTH_REFRESH") {
         return false;
     }
-    match parse_bool_env("OMNI_OAUTH_REFRESH") {
-        None => true,
-        Some(v) => v,
-    }
+    parse_bool_env("OMNI_OAUTH_REFRESH").unwrap_or(true)
 }
 
 /// One-line effective policy for startup logs: `claude=on codex=on grok=off`.
@@ -235,5 +353,66 @@ mod tests {
             oauth_refresh_policy_summary(),
             "claude=off codex=on grok=off"
         );
+    }
+
+    #[test]
+    fn credential_lock_path_matches_cli_style() {
+        // WHY: Grok uses auth.json.lock; we must share the same sibling name.
+        let p = Path::new("/home/u/.grok/auth.json");
+        assert_eq!(
+            credential_lock_path(p),
+            PathBuf::from("/home/u/.grok/auth.json.lock")
+        );
+        assert_eq!(
+            credential_lock_path(Path::new("/h/.claude/.credentials.json")),
+            PathBuf::from("/h/.claude/.credentials.json.lock")
+        );
+    }
+
+    #[test]
+    fn looks_like_refresh_token_spent_detects_known_idp_errors() {
+        assert!(looks_like_refresh_token_spent("refresh_token_reused"));
+        assert!(looks_like_refresh_token_spent(
+            r#"{"error":"invalid_grant","error_description":"Refresh token has been revoked"}"#
+        ));
+        assert!(!looks_like_refresh_token_spent("rate_limit_exceeded"));
+    }
+
+    #[tokio::test]
+    async fn with_oauth_refresh_lock_serializes_concurrent_callers() {
+        // WHY: concurrent near-expiry loads must not all POST; single-flight is the fix.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = std::env::temp_dir().join(format!(
+            "omni-oauth-lock-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cred = dir.join("auth.json");
+        std::fs::write(&cred, b"{}").unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let path = cred.clone();
+            let counter = Arc::clone(&counter);
+            handles.push(tokio::spawn(async move {
+                with_oauth_refresh_lock(&path, || async {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    // While one holder runs, others must not enter (counter stays n until done).
+                    assert_eq!(counter.load(Ordering::SeqCst), n + 1);
+                })
+                .await
+                .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 8);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
