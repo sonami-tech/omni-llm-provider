@@ -14,3 +14,8 @@ __pycache__/
 
 # Raw MITM captures contain live bearer tokens and account identifiers.
 *.flow
+
+# Local runtime stats DB (default cwd path omni-stats.redb; never commit)
+omni-stats.redb
+*.redb
+*.redb-*
