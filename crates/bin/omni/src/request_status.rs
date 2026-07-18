@@ -352,7 +352,7 @@ fn redact_url_query_secrets(input: &str) -> String {
                 continue;
             }
             let val_end = out[val_start..]
-                .find(|c: char| c == '&' || c == ' ' || c == '\t' || c == '"' || c == '\'')
+                .find(['&', ' ', '\t', '"', '\''])
                 .map(|i| val_start + i)
                 .unwrap_or(out.len());
             out.replace_range(val_start..val_end, "REDACTED");
@@ -395,7 +395,7 @@ fn redact_auth_headers(input: &str) -> String {
                 continue;
             }
             let value_end = value_part
-                .find(|c: char| c == '"' || c == '\'' || c == ',' || c == '\n' || c == '\r')
+                .find(['"', '\'', ',', '\n', '\r'])
                 .map(|i| value_start + i)
                 .unwrap_or(out.len());
             out.replace_range(value_start..value_end, "REDACTED");
@@ -433,7 +433,7 @@ const JSON_SECRET_KEYS: &[&str] = &[
 /// Consumes through end of input, or a hard line boundary if present.
 fn unterminated_json_value_end(value_part: &str, value_start: usize) -> usize {
     value_part
-        .find(|c: char| c == '\n' || c == '\r')
+        .find(['\n', '\r'])
         .map(|i| value_start + i)
         .unwrap_or(value_start + value_part.len())
 }
@@ -502,8 +502,8 @@ fn redact_json_secret_fields(input: &str) -> String {
                     search_from = value_start + "\"REDACTED\"".len();
                     continue;
                 }
-                if value_part.starts_with('"') {
-                    if let Some(end_rel) = find_unescaped_quote_end(&value_part[1..], b'"') {
+                if let Some(after_open) = value_part.strip_prefix('"') {
+                    if let Some(end_rel) = find_unescaped_quote_end(after_open, b'"') {
                         let value_end = value_start + 1 + end_rel + 1;
                         out.replace_range(value_start..value_end, "\"REDACTED\"");
                         search_from = value_start + "\"REDACTED\"".len();
@@ -514,8 +514,8 @@ fn redact_json_secret_fields(input: &str) -> String {
                         out.replace_range(value_start..value_end, "\"REDACTED\"");
                         search_from = value_start + "\"REDACTED\"".len();
                     }
-                } else if value_part.starts_with('\'') {
-                    if let Some(end_rel) = find_unescaped_quote_end(&value_part[1..], b'\'') {
+                } else if let Some(after_open) = value_part.strip_prefix('\'') {
+                    if let Some(end_rel) = find_unescaped_quote_end(after_open, b'\'') {
                         let value_end = value_start + 1 + end_rel + 1;
                         out.replace_range(value_start..value_end, "\"REDACTED\"");
                         search_from = value_start + "\"REDACTED\"".len();
@@ -694,9 +694,9 @@ fn still_secret_shaped(s: &str) -> bool {
                 };
                 let after_colon = after_key + colon_rel + 1;
                 let value_part = s[after_colon..].trim_start();
-                if value_part.starts_with('"') {
-                    if let Some(end_rel) = find_unescaped_quote_end(&value_part[1..], b'"') {
-                        let inner = &value_part[1..1 + end_rel];
+                if let Some(after_open) = value_part.strip_prefix('"') {
+                    if let Some(end_rel) = find_unescaped_quote_end(after_open, b'"') {
+                        let inner = &after_open[..end_rel];
                         if inner != "REDACTED"
                             && !inner.is_empty()
                             && inner.len() >= RESIDUAL_SECRET_MIN_LEN
@@ -706,7 +706,7 @@ fn still_secret_shaped(s: &str) -> bool {
                         // Partial scrub: `"REDACTED"secret_suffix…` (naive closer
                         // left live material glued after the REDACTED closer).
                         if inner == "REDACTED"
-                            && residual_after_redacted_close(&value_part[1 + end_rel + 1..])
+                            && residual_after_redacted_close(&after_open[end_rel + 1..])
                         {
                             return true;
                         }
@@ -720,9 +720,9 @@ fn still_secret_shaped(s: &str) -> bool {
                         // Unterminated "value after secret key → fail-closed.
                         return true;
                     }
-                } else if value_part.starts_with('\'') {
-                    if let Some(end_rel) = find_unescaped_quote_end(&value_part[1..], b'\'') {
-                        let inner = &value_part[1..1 + end_rel];
+                } else if let Some(after_open) = value_part.strip_prefix('\'') {
+                    if let Some(end_rel) = find_unescaped_quote_end(after_open, b'\'') {
+                        let inner = &after_open[..end_rel];
                         if inner != "REDACTED"
                             && !inner.is_empty()
                             && inner.len() >= RESIDUAL_SECRET_MIN_LEN
@@ -730,7 +730,7 @@ fn still_secret_shaped(s: &str) -> bool {
                             return true;
                         }
                         if inner == "REDACTED"
-                            && residual_after_redacted_close(&value_part[1 + end_rel + 1..])
+                            && residual_after_redacted_close(&after_open[end_rel + 1..])
                         {
                             return true;
                         }
@@ -1212,14 +1212,11 @@ mod tests {
         // WHY: multi-occurrence query secrets must all scrub; early break left
         // later api_key= values unredacted.
         let raw = "upstream https://api.example.com/v1?api_key=SEC1&api_key=SEC2 failed";
-        match redact_error_for_log(raw) {
-            Some(s) => {
-                assert!(!s.contains("SEC1"), "{s}");
-                assert!(!s.contains("SEC2"), "{s}");
-                assert!(s.contains("REDACTED"), "{s}");
-            }
-            None => {} // fail-closed omit also acceptable
-        }
+        if let Some(s) = redact_error_for_log(raw) {
+            assert!(!s.contains("SEC1"), "{s}");
+            assert!(!s.contains("SEC2"), "{s}");
+            assert!(s.contains("REDACTED"), "{s}");
+        } // fail-closed omit also acceptable
         // Direct unit: both values become REDACTED even before residual check.
         let scrubbed = super::redact_url_query_secrets(raw);
         assert!(!scrubbed.contains("SEC1"), "{scrubbed}");
@@ -1231,14 +1228,11 @@ mod tests {
         // WHY: repeated JSON secret keys must all scrub; re-finding the first
         // already-REDACTED value must not stall before later keys.
         let raw = r#"upstream body {"api_key":"sekrit-aaa","api_key":"sekrit-bbb"}"#;
-        match redact_error_for_log(raw) {
-            Some(s) => {
-                assert!(!s.contains("sekrit-aaa"), "{s}");
-                assert!(!s.contains("sekrit-bbb"), "{s}");
-                assert!(s.contains("REDACTED"), "{s}");
-            }
-            None => {} // fail-closed omit also acceptable
-        }
+        if let Some(s) = redact_error_for_log(raw) {
+            assert!(!s.contains("sekrit-aaa"), "{s}");
+            assert!(!s.contains("sekrit-bbb"), "{s}");
+            assert!(s.contains("REDACTED"), "{s}");
+        } // fail-closed omit also acceptable
         let scrubbed = super::redact_json_secret_fields(raw);
         assert!(!scrubbed.contains("sekrit-aaa"), "{scrubbed}");
         assert!(!scrubbed.contains("sekrit-bbb"), "{scrubbed}");
@@ -1268,9 +1262,8 @@ mod tests {
         // WHY: multi-line errors place api_key= after \n; boundary must include newline
         // before control-char collapse turns it into a same-line key=value.
         let raw = "failed\napi_key=opaque_secret_123456";
-        match redact_error_for_log(raw) {
-            Some(s) => assert!(!s.contains("opaque_secret_123456"), "{s}"),
-            None => {}
+        if let Some(s) = redact_error_for_log(raw) {
+            assert!(!s.contains("opaque_secret_123456"), "{s}");
         }
     }
 
@@ -1297,9 +1290,8 @@ mod tests {
         // WHY: nested JSON dumps in error text use \"key\" form; redactors that
         // only match literal "key" would fail-open on opaque secrets.
         let raw = r#"body {\"api_key\":\"opaque_secret_123456\"}"#;
-        match redact_error_for_log(raw) {
-            Some(s) => assert!(!s.contains("opaque_secret_123456"), "{s}"),
-            None => {}
+        if let Some(s) = redact_error_for_log(raw) {
+            assert!(!s.contains("opaque_secret_123456"), "{s}");
         }
     }
 
@@ -1308,9 +1300,8 @@ mod tests {
         // WHY: bare number/bool after a secret key must not pass through as
         // error= material (fail-open if only quoted strings are scrubbed).
         let raw = r#"body {"api_key":123456789012345678}"#;
-        match redact_error_for_log(raw) {
-            Some(s) => assert!(!s.contains("123456789012345678"), "{s}"),
-            None => {}
+        if let Some(s) = redact_error_for_log(raw) {
+            assert!(!s.contains("123456789012345678"), "{s}");
         }
         assert!(still_secret_shaped(r#"{"api_key":123456789012345678}"#));
     }
@@ -1324,13 +1315,12 @@ mod tests {
             still_secret_shaped(glued),
             "residual must flag glued secret"
         );
-        match redact_error_for_log(glued) {
-            Some(s) => assert!(
+        if let Some(s) = redact_error_for_log(glued) {
+            assert!(
                 !s.contains("actualsecretvalue12345"),
                 "must scrub glued secret, got {s}"
-            ),
-            None => {} // fail-closed also OK
-        }
+            );
+        } // fail-closed also OK
         assert!(still_secret_shaped(
             "authorization: REDACTEDactualsecretvalue12345"
         ));
@@ -1340,13 +1330,10 @@ mod tests {
     fn redact_json_apikey_key_or_fail_closed() {
         // WHY: bare "apikey" (no underscore) is a common JSON secret field name.
         let raw = r#"upstream body {"apikey":"opaque_secret_123456"}"#;
-        match redact_error_for_log(raw) {
-            Some(s) => {
-                assert!(!s.contains("opaque_secret_123456"), "{s}");
-                assert!(s.contains("REDACTED"), "{s}");
-            }
-            None => {} // fail-closed omit also acceptable
-        }
+        if let Some(s) = redact_error_for_log(raw) {
+            assert!(!s.contains("opaque_secret_123456"), "{s}");
+            assert!(s.contains("REDACTED"), "{s}");
+        } // fail-closed omit also acceptable
     }
 
     #[test]
@@ -1360,14 +1347,11 @@ mod tests {
             r#"upstream body {"ApiKey":"opaque_secret_123456"}"#,
             r#"upstream body {"accessToken":"opaque_secret_123456"}"#,
         ] {
-            match redact_error_for_log(raw) {
-                Some(s) => {
-                    assert!(!s.contains("opaque_secret_123456"), "{s}");
-                    assert!(!s.contains("secretvaluehere123"), "{s}");
-                    assert!(s.contains("REDACTED"), "{s}");
-                }
-                None => {} // fail-closed omit also acceptable
-            }
+            if let Some(s) = redact_error_for_log(raw) {
+                assert!(!s.contains("opaque_secret_123456"), "{s}");
+                assert!(!s.contains("secretvaluehere123"), "{s}");
+                assert!(s.contains("REDACTED"), "{s}");
+            } // fail-closed omit also acceptable
             // Direct redactor must rewrite the value (not only residual omit).
             let scrubbed = super::redact_json_secret_fields(raw);
             assert!(!scrubbed.contains("opaque_secret_123456"), "{scrubbed}");
@@ -1386,13 +1370,10 @@ mod tests {
     fn redact_fragment_access_token_or_fail_closed() {
         // WHY: fragment-bound keys (#access_token=…) must redact like query pairs.
         let raw = "redirect https://example.com/cb#access_token=opaque_secret_123456 failed";
-        match redact_error_for_log(raw) {
-            Some(s) => {
-                assert!(!s.contains("opaque_secret_123456"), "{s}");
-                assert!(s.contains("REDACTED"), "{s}");
-            }
-            None => {} // fail-closed omit also acceptable
-        }
+        if let Some(s) = redact_error_for_log(raw) {
+            assert!(!s.contains("opaque_secret_123456"), "{s}");
+            assert!(s.contains("REDACTED"), "{s}");
+        } // fail-closed omit also acceptable
         let scrubbed = super::redact_url_query_secrets(raw);
         assert!(!scrubbed.contains("opaque_secret_123456"), "{scrubbed}");
     }
@@ -1433,35 +1414,28 @@ mod tests {
     fn redact_authorization_token_scheme_fully() {
         // WHY: non-Bearer schemes must not leave trailing credential material.
         let raw = "upstream Authorization: Token ghp_abcdefghijklmnopqrstuv failed";
-        match redact_error_for_log(raw) {
-            Some(s) => {
-                assert!(!s.contains("ghp_"), "{s}");
-                assert!(!s.contains("abcdefghijklmnopqrstuv"), "{s}");
-            }
-            None => {} // fail-closed also acceptable
-        }
+        if let Some(s) = redact_error_for_log(raw) {
+            assert!(!s.contains("ghp_"), "{s}");
+            assert!(!s.contains("abcdefghijklmnopqrstuv"), "{s}");
+        } // fail-closed also acceptable
     }
 
     #[test]
     fn redact_xai_key_or_fail_closed() {
         let raw = "auth failed with xai-abcdefghijklmnopqrstuvwxyz012345";
-        match redact_error_for_log(raw) {
-            Some(s) => {
-                assert!(!s.contains("abcdefghijklmnopqrstuvwxyz012345"), "{s}");
-                assert!(s.contains("xai-REDACTED") || s.contains("REDACTED"), "{s}");
-            }
-            None => {} // residual still secret-shaped → omit error=
-        }
+        if let Some(s) = redact_error_for_log(raw) {
+            assert!(!s.contains("abcdefghijklmnopqrstuvwxyz012345"), "{s}");
+            assert!(s.contains("xai-REDACTED") || s.contains("REDACTED"), "{s}");
+        } // residual still secret-shaped → omit error=
     }
 
     #[test]
     fn redact_eyj_jwt_fail_closed_or_omit() {
         // WHY: bare JWT blobs must not appear on complete lines.
         let raw = "token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig leaked";
-        match redact_error_for_log(raw) {
-            Some(s) => assert!(!s.contains("eyJ"), "{s}"),
-            None => {} // fail-closed preferred for residual JWT shape
-        }
+        if let Some(s) = redact_error_for_log(raw) {
+            assert!(!s.contains("eyJ"), "{s}");
+        } // fail-closed preferred for residual JWT shape
         // Explicit residual path: still_secret_shaped must catch bare eyJ.
         assert!(still_secret_shaped(
             "token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig"
@@ -1483,9 +1457,8 @@ mod tests {
         let raw = "password=this_is_a_long_secret_value_xx";
         // Our URL query redactor should catch password= after treating it
         // carefully; if something slips, fail-closed returns None.
-        match redact_error_for_log(raw) {
-            Some(s) => assert!(!s.contains("this_is_a_long_secret_value_xx"), "{s}"),
-            None => {}
+        if let Some(s) = redact_error_for_log(raw) {
+            assert!(!s.contains("this_is_a_long_secret_value_xx"), "{s}");
         }
     }
 
@@ -1578,13 +1551,10 @@ mod tests {
         // WHY: quote-started JSON secret values without a closing quote must not
         // skip past the key and leak the residual secret into error= logs.
         let raw = r#"body {"api_key":"opaque_secret_123456"#;
-        match redact_error_for_log(raw) {
-            Some(s) => {
-                assert!(!s.contains("opaque_secret_123456"), "{s}");
-                assert!(s.contains("REDACTED"), "{s}");
-            }
-            None => {} // fail-closed omit also acceptable
-        }
+        if let Some(s) = redact_error_for_log(raw) {
+            assert!(!s.contains("opaque_secret_123456"), "{s}");
+            assert!(s.contains("REDACTED"), "{s}");
+        } // fail-closed omit also acceptable
         // Direct redactor must rewrite (not skip) the unterminated value.
         let scrubbed = super::redact_json_secret_fields(raw);
         assert!(!scrubbed.contains("opaque_secret_123456"), "{scrubbed}");
@@ -1600,14 +1570,11 @@ mod tests {
         // leaving secret_suffix after "REDACTED"; residual must not treat that
         // as clean and leak the suffix into error= logs.
         let raw = r#"body {"api_key":"prefix\"secret_suffix_long_enough"}"#;
-        match redact_error_for_log(raw) {
-            Some(s) => {
-                assert!(!s.contains("secret_suffix"), "{s}");
-                assert!(!s.contains("prefix"), "{s}");
-                assert!(s.contains("REDACTED"), "{s}");
-            }
-            None => {} // fail-closed omit also acceptable
-        }
+        if let Some(s) = redact_error_for_log(raw) {
+            assert!(!s.contains("secret_suffix"), "{s}");
+            assert!(!s.contains("prefix"), "{s}");
+            assert!(s.contains("REDACTED"), "{s}");
+        } // fail-closed omit also acceptable
         // Direct redactor must consume through the true unescaped closer.
         let scrubbed = super::redact_json_secret_fields(raw);
         assert!(!scrubbed.contains("secret_suffix"), "{scrubbed}");
@@ -1682,9 +1649,8 @@ mod tests {
             "refreshToken=opaque_secret_123456",
             "clientSecret=opaque_secret_123456",
         ] {
-            match redact_error_for_log(raw) {
-                Some(s) => assert!(!s.contains("opaque_secret_123456"), "{s} from {raw}"),
-                None => {}
+            if let Some(s) = redact_error_for_log(raw) {
+                assert!(!s.contains("opaque_secret_123456"), "{s} from {raw}");
             }
         }
     }

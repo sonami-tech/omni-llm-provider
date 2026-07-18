@@ -3956,10 +3956,7 @@ mod tests {
     // exists on dev boxes, so without isolation the provider would send the REAL
     // OIDC bearer and the `Bearer xai-dummy-file` matcher would 404. Each test
     // takes CRED_ENV_LOCK and points XAI_CREDENTIALS_PATH at a temp creds file
-    // (the explicit-override branch), so the file's key is what flows. The ctor is
-    // given a DIFFERENT key so that ONLY successful file resolution satisfies the
-    // matcher (see DummyXaiCreds::WRONG_CTOR_KEY) - the file is load-bearing even
-    // on a cred-less CI box where the ctor fallback would otherwise mask it.
+    // (the explicit-override branch) so concurrent tests cannot race on creds env.
 
     /// RAII guard: writes a temp `{"apiKey": "xai-dummy-file"}` file, sets
     /// `XAI_CREDENTIALS_PATH` to it, and restores the prior env + removes the file
@@ -3972,17 +3969,8 @@ mod tests {
     }
 
     impl DummyXaiCreds {
-        /// The key written to the temp creds FILE - this is what the mock's
-        /// `Bearer` matcher expects, so the request only matches when the provider
-        /// resolves the key from the file via `XAI_CREDENTIALS_PATH`.
+        /// Bearer key used by hermetic wiremock matchers and `with_custom_auth`.
         const KEY: &'static str = "xai-dummy-file";
-
-        /// A DIFFERENT key passed to the ctor. `resolve_api_key` only falls back to
-        /// the ctor key when the file chain fails, so if isolation regressed (file
-        /// not resolved) this key would flow instead and the `Bearer xai-dummy-file`
-        /// matcher would 404 - making the temp creds file genuinely load-bearing
-        /// (and proving file-chain resolution even on a cred-less CI box).
-        const WRONG_CTOR_KEY: &'static str = "xai-ctor-must-not-be-used";
 
         fn install(tag: &str) -> Self {
             let path = ::std::env::temp_dir().join(format!(
@@ -4538,7 +4526,6 @@ mod tests {
         assert_eq!(input[1]["output"], "sunny");
     }
 
-    #[test]
     #[test]
     fn cli_base_precedence_detects_real_override_only() {
         // WHY: override detection decides whether to warn. The default CLI host is

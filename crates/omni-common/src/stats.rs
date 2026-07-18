@@ -200,8 +200,7 @@ impl Stats {
             .saturating_add(usage.output_tokens)
             .saturating_add(usage.cache_read_input_tokens)
             .saturating_add(usage.cache_creation_input_tokens);
-        self.tokens_since_launch
-            .fetch_add(tok, Ordering::Relaxed);
+        self.tokens_since_launch.fetch_add(tok, Ordering::Relaxed);
         if let Err(e) = self.record_response_inner(model, usage) {
             tracing::warn!("stats: record_response failed: {e}");
         }
@@ -501,8 +500,7 @@ impl StatsSnapshot {
         ));
         // Ratio sits under the cache counts it is derived from.
         if total_tok > 0 {
-            let ratio =
-                (self.total_cache_read_input_tokens as f64 / total_tok as f64) * 100.0;
+            let ratio = (self.total_cache_read_input_tokens as f64 / total_tok as f64) * 100.0;
             out.push_str(&format!("    Cache ratio:   {ratio:.1}%\n"));
         }
         out.push_str(&format!(
@@ -553,11 +551,7 @@ impl StatsSnapshot {
                 self.api_keys.iter().map(|(k, v)| (k, *v)).collect();
             keys.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
             for (key, count) in keys {
-                out.push_str(&format!(
-                    "  {} - {} requests\n",
-                    key,
-                    format_commas(count)
-                ));
+                out.push_str(&format!("  {} - {} requests\n", key, format_commas(count)));
             }
             out.push('\n');
         }
@@ -892,7 +886,10 @@ mod tests {
         let launch_i = text.find("Since launch").expect("Since launch section");
         let all_i = text.find("All time (durable)").expect("All time section");
         let model_i = text.find("Per-model").expect("Per-model section");
-        assert!(process_i < launch_i && launch_i < all_i && all_i < model_i, "{text}");
+        assert!(
+            process_i < launch_i && launch_i < all_i && all_i < model_i,
+            "{text}"
+        );
         // Cache ratio sits after cache counts, before total.
         let cache_read = text.find("Cache read:").expect("cache read");
         let cache_create = text.find("Cache create:").expect("cache create");

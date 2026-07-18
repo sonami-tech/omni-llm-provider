@@ -76,9 +76,9 @@ use axum::{
     },
     routing::{get, post},
 };
-use serde::Deserialize;
 use clap::Parser;
 use futures_util::StreamExt;
+use serde::Deserialize;
 use tracing::{Instrument, info, warn};
 use uuid::Uuid;
 
@@ -1717,9 +1717,8 @@ fn stats_json_response(state: &AppState) -> Response {
                     .into_response();
             }
         },
-        None => serde_json::to_string_pretty(&stats_disabled_json()).unwrap_or_else(|_| {
-            r#"{"stats_enabled":false,"note":"stats db unavailable"}"#.into()
-        }),
+        None => serde_json::to_string_pretty(&stats_disabled_json())
+            .unwrap_or_else(|_| r#"{"stats_enabled":false,"note":"stats db unavailable"}"#.into()),
     };
     (
         StatusCode::OK,
@@ -1891,7 +1890,10 @@ fn map_provider_err(e: ProviderError) -> AppError {
 /// Attach process-scoped cumulative totals when stats is enabled. Call after
 /// the adjacent `record_*` so the line includes the current request/tokens.
 /// No stats-clear API exists; only since-launch is emitted.
-fn with_since_launch(params: RequestCompleteParams, stats: Option<&Stats>) -> RequestCompleteParams {
+fn with_since_launch(
+    params: RequestCompleteParams,
+    stats: Option<&Stats>,
+) -> RequestCompleteParams {
     match stats {
         Some(s) => {
             let (req, tok) = s.since_launch_totals();
@@ -1975,6 +1977,7 @@ fn log_nonstream_response_complete(
 }
 
 /// Twin complete line for pre-send / transport errors (finish_reason=none).
+#[allow(clippy::too_many_arguments)] // internal logging helper; args map 1:1 to FinishSite + context
 fn log_terminal_error_complete(
     model: &str,
     duration_ms: f64,
@@ -2002,6 +2005,7 @@ fn is_error_finish_reason(finish_reason: Option<&str>) -> bool {
     matches!(finish_reason, Some("error")) || finish_reason.is_some_and(|r| r.starts_with("error:"))
 }
 
+#[allow(clippy::too_many_arguments)] // stream wrapper carries independent stats/logging identity fields
 fn wrap_stream_for_stats(
     mut stream: CanonicalStream,
     stats: Option<Arc<Stats>>,
@@ -2859,6 +2863,7 @@ fn anthropic_session_id(
     format!("anth:{request_id}")
 }
 
+#[allow(clippy::too_many_arguments)] // SSE response factory; args are independent stream/session fields
 fn anthropic_sse_response(
     mut upstream: provider_claude::anthropic_passthrough::RawFrameStream,
     stats: Option<Arc<Stats>>,
@@ -6177,12 +6182,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         // must not get Refresh (clients are not browsers watching a page).
         let (state, _guard) = state_with_stats(HashMap::new());
 
-        let human = stats_handler(
-            State(state.clone()),
-            Query(StatsQuery { format: None }),
-        )
-        .await
-        .into_response();
+        let human = stats_handler(State(state.clone()), Query(StatsQuery { format: None }))
+            .await
+            .into_response();
         assert_eq!(human.status(), StatusCode::OK);
         assert_eq!(
             human
@@ -6199,10 +6201,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             Some("no-store")
         );
         assert_eq!(
-            human
-                .headers()
-                .get("refresh")
-                .and_then(|v| v.to_str().ok()),
+            human.headers().get("refresh").and_then(|v| v.to_str().ok()),
             Some("5")
         );
 

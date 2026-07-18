@@ -584,6 +584,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env_lock serializes process env for the whole test
     async fn refresh_oauth_inplace_posts_capture_shape_and_writes_rotated_rt() {
         // WHY: shipped refresh path must hit the real grant shape and persist rotated RT.
         use wiremock::matchers::{body_partial_json, header, method, path as url_path};

@@ -1372,6 +1372,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_LOCK serializes process env for the whole test
     async fn refresh_oauth_inplace_posts_form_and_writes_rotated_rt() {
         // WHY: shipped Grok refresh must use form-urlencoded grant + persist rotated RT.
         use wiremock::matchers::{header, method, path as url_path};

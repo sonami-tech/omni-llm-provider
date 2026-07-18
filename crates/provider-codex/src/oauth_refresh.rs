@@ -518,6 +518,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env_lock serializes process env for the whole test
     async fn refresh_oauth_inplace_posts_json_and_writes_tokens() {
         // WHY: shipped Codex path must match capture headers/body and persist rotated RT.
         use wiremock::matchers::{body_partial_json, header, method, path as url_path};
