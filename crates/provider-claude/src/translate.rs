@@ -272,16 +272,9 @@ impl<'de> Deserialize<'de> for CacheControl {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessagesResponse {
     pub id: String,
-    #[serde(rename = "type")]
-    #[allow(dead_code)]
-    pub kind: String, // "message"
-    #[allow(dead_code)]
-    pub role: String, // "assistant"
     pub model: String,
     pub content: Vec<ResponseContentBlock>,
     pub stop_reason: Option<String>,
-    #[allow(dead_code)]
-    pub stop_sequence: Option<String>,
     pub usage: Usage,
 }
 
@@ -953,21 +946,6 @@ fn first_user_text_for_billing(req: &MessagesRequest) -> Option<&str> {
     }
 }
 
-// Apply inbound replacements (response scope) to assistant text + tool surfaces.
-#[allow(dead_code)]
-fn apply_response_replacements(
-    text: &str,
-    tool_calls: &mut [CanonicalToolCall],
-    repl: &Replacements,
-) -> String {
-    let t = repl.apply_response(text);
-    for tc in tool_calls.iter_mut() {
-        tc.name = repl.apply_response(&tc.name);
-        tc.arguments = repl.apply_response(&tc.arguments);
-    }
-    t
-}
-
 // ── From Anthropic response to Canonical ──
 
 pub fn build_canonical_response(
@@ -1056,7 +1034,7 @@ fn map_stop_reason(reason: Option<&str>, has_tool_calls: bool) -> &'static str {
 // ── Convenience: full outbound path exercised by provider (repl + identity) ──
 
 /// Given a canonical request, produce the *final* body JSON (post-replacements,
-/// post-identity, ready for finalize_body_json + cch).
+/// post-identity, ready for finalize_body_json).
 /// Returns the MessagesRequest and the first-user text (for context if needed).
 pub fn prepare_anthropic_request(
     canon: &CanonicalRequest,
@@ -1432,14 +1410,12 @@ mod tests {
     fn from_anth_response_to_canon() {
         let resp = MessagesResponse {
             id: "msg_1".into(),
-            kind: "message".into(),
-            role: "assistant".into(),
             model: "claude-haiku-4-5-20251001".into(),
             content: vec![ResponseContentBlock::Text {
                 text: "hi there".into(),
             }],
             stop_reason: Some("end_turn".into()),
-            stop_sequence: None,
+
             usage: Usage {
                 input_tokens: 5,
                 output_tokens: 2,
@@ -1537,8 +1513,7 @@ mod tests {
     fn auto_cache_false_is_byte_identical_to_baseline() {
         // WHY: the feature ships dark. With auto-cache off the outbound body must
         // be byte-for-byte identical to today's captured Claude Code baseline, so
-        // the default path keeps fingerprint parity (and the cch checksum, which is
-        // computed over the whole body, is unchanged). Proven by serializing the
+        // the default path keeps fingerprint parity. Proven by serializing the
         // SAME request with the flag off vs on and asserting the off form has no
         // cache_control key at all while the on form differs by exactly that key.
         let canon = CanonicalRequest {
@@ -1812,8 +1787,20 @@ mod tests {
         );
         let cases: &[WireCase] = &[
             ("fable", "claude-fable-5-1", 64_000, None, Some("high")),
-            ("claude-fable-5-1", "claude-fable-5-1", 64_000, None, Some("high")),
-            ("claude-fable-5", "claude-fable-5", 64_000, None, Some("high")),
+            (
+                "claude-fable-5-1",
+                "claude-fable-5-1",
+                64_000,
+                None,
+                Some("high"),
+            ),
+            (
+                "claude-fable-5",
+                "claude-fable-5",
+                64_000,
+                None,
+                Some("high"),
+            ),
             ("opus", "claude-opus-5", 64_000, None, Some("high")),
             ("sonnet", "claude-sonnet-5", 64_000, None, Some("high")),
             // The "haiku" alias resolves to the dated canonical; 2.1.220 omits
@@ -2354,8 +2341,6 @@ mod tests {
         // finish "tool_use" -> "tool_calls".
         let resp = MessagesResponse {
             id: "m".into(),
-            kind: "message".into(),
-            role: "assistant".into(),
             model: "claude-haiku-4-5-20251001".into(),
             content: vec![
                 ResponseContentBlock::ToolUse {
@@ -2368,7 +2353,7 @@ mod tests {
                 },
             ],
             stop_reason: Some("tool_use".into()),
-            stop_sequence: None,
+
             usage: Usage {
                 input_tokens: 10,
                 output_tokens: 3,
@@ -2392,8 +2377,6 @@ mod tests {
         // as additive reasoning metadata without polluting assistant text.
         let resp = MessagesResponse {
             id: "m".into(),
-            kind: "message".into(),
-            role: "assistant".into(),
             model: "claude-haiku-4-5-20251001".into(),
             content: vec![
                 ResponseContentBlock::Thinking {
@@ -2405,7 +2388,7 @@ mod tests {
                 },
             ],
             stop_reason: Some("end_turn".into()),
-            stop_sequence: None,
+
             usage: Usage {
                 input_tokens: 1,
                 output_tokens: 2,
@@ -2435,8 +2418,6 @@ mod tests {
         .unwrap();
         let resp = MessagesResponse {
             id: "m".into(),
-            kind: "message".into(),
-            role: "assistant".into(),
             model: "haiku".into(),
             content: vec![ResponseContentBlock::ToolUse {
                 id: "t".into(),
@@ -2444,7 +2425,7 @@ mod tests {
                 input: serde_json::json!({}),
             }],
             stop_reason: Some("tool_use".into()),
-            stop_sequence: None,
+
             usage: Usage {
                 input_tokens: 1,
                 output_tokens: 1,

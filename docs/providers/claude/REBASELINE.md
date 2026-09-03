@@ -32,8 +32,8 @@ use an older Omni release from git history.
 - `tools/providers/claude/fingerprint/capture_baseline.sh` (thin wrapper; prefer the shared CLI for new work)
 - `tools/providers/claude/fingerprint/extract_flow.py` (compatibility wrapper around `tools.capture extract flow`)
 - `tools/providers/claude/fingerprint/BASELINE_HEADERS.md`
-- `tools/providers/claude/fingerprint/CCH_ALGORITHM.md`
-- `tools/providers/claude/fingerprint/vectors/`
+- Historical cch algorithm (not a live step):
+  `docs/providers/claude/CCH_ALGORITHM.md`
 
 Live extraction requires the `mitmproxy` Python package in the same interpreter
 as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture`).
@@ -95,9 +95,9 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
      (`python3 -m tools.capture catalog --provider claude --flow-file ...`).
      If that listing is empty, stop. Do not keep the previous pin's catalog.
    - Confirm all pinned catalog models are accepted.
-   - Confirm the billing suffix and cch behavior.
-   - If any checksum or body mutation cannot be reproduced exactly, do not
-     promote the new pin.
+   - Confirm the billing suffix and no-cch header (or captured cch shape if
+     a newer CLI reintroduces `cch=`).
+   - If a newer Claude Code reintroduces `cch=`, stop and keep CCH code.
 
 4. Update code (overwrite the single active pin; do not append a profile ladder):
 
@@ -107,15 +107,12 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
      from this pin's listing only.
    - Rename shared constants if the pin version changes (do not keep historical
      `*_VERSION` symbol names that disagree with the live pin).
-   - Update active-pin goldens and local vectors. History lives in git tags and
-     older Omni releases, not in-tree multi-profile selection.
+   - Update active-pin goldens. History lives in git tags and older Omni
+     releases, not in-tree multi-profile selection.
 
-5. Regenerate clean-room cch vectors:
-
-   ```sh
-   uv run --script tools/providers/claude/fingerprint/check_claude_code_drift.py \
-     --emit-vectors tools/providers/claude/fingerprint/vectors
-   ```
+5. Vector regeneration is not a live step. Historical cch lives in
+   `docs/providers/claude/CCH_ALGORITHM.md`. The drift checker verifies
+   version + no-cch billing header + suffix only.
 
 6. Update docs:
 
@@ -139,31 +136,29 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
 
 ## Done Criteria
 
-- Drift checker agrees with the pinned version and cch.
+- Drift checker agrees with the pinned version and no-cch billing header.
 - Captured fields are represented in source.
-- Recovered vectors are local to this repo and covered by Rust tests.
 - Default workspace tests pass without credentials or network.
 
-## Current 2.1.257 Status
+## Current 2.1.259 Status
 
-On 2026-09-01, Claude Code 2.1.257 was captured and model behavior was verified
-for default, `opus`, `sonnet`, `haiku`, `fable`, and `claude-fable-5` flows.
+On 2026-09-03, Claude Code 2.1.259 was captured and model behavior was verified
+for default, `opus`, `sonnet`, `haiku`, and `fable` flows.
 Headers use SDK package `0.112.1`, runtime `v26.3.0`, Anthropic version
-`2023-06-01`, and `claude-cli/2.1.257 (external, sdk-cli)`.
+`2023-06-01`, and `claude-cli/2.1.259 (external, sdk-cli)`.
 
-2.1.257 is the current active pin. Drift versus 2.1.232:
-
-1. CLI version string (UA + billing `cc_version`).
-2. Catalog adds `claude-fable-5-1` (alias `fable`). Explicit `claude-fable-5`
-   is still accepted on the wire.
+2.1.259 is the current active pin. Drift versus 2.1.257 is the CLI version
+string (UA + billing `cc_version`). Catalog still advertises `claude-fable-5-1`
+(alias `fable`), `claude-opus-5`, `claude-sonnet-5`, and
+`claude-haiku-4-5-20251001`. Explicit `claude-fable-5` stays pass-through plus
+a wire/beta override.
 
 Per-model betas, wire defaults, stainless package/runtime, identity preamble,
 and the no-`x-client-request-id` header set are otherwise live-confirmed
 unchanged.
 
-Like 2.1.186/197/207/211/220/221/228/232 it emits the billing header with no
-`cch=` field, ending at `cc_entrypoint=sdk-cli;`. The `cc_version` suffix
-algorithm is unchanged: the existing Sha256Utf16SampleV1 suffix reproduces the
-captured `cc_version=2.1.257.27e` exactly, and the live drift checker agrees
-against the installed CLI. Because there is no checksum to recompute, this
-no-cch profile ships no clean-room cch vectors.
+Like 2.1.186+ it emits the billing header with no `cch=` field, ending at
+`cc_entrypoint=sdk-cli;`. The `cc_version` suffix algorithm is unchanged: the
+existing Sha256Utf16SampleV1 suffix reproduces the captured
+`cc_version=2.1.259.cc8` exactly. Because there is no checksum to recompute,
+this no-cch profile ships no clean-room cch vectors.

@@ -1,6 +1,6 @@
 # Claude CLI Baseline Wire Fingerprint
 
-Active baseline: Claude Code 2.1.257, captured 2026-09-01 (single pin; issue #12).
+Active baseline: Claude Code 2.1.259, captured 2026-09-03 (single pin; issue #12).
 
 Raw mitmproxy `.flow` files are not committed because they contain live bearer
 tokens and account identifiers. Keep raw captures on tmpfs and inspect them with
@@ -10,7 +10,7 @@ tokens and account identifiers. Keep raw captures on tmpfs and inspect them with
 
 | Profile | Claude Code | SDK package | Runtime | Entrypoint | Source |
 |---|---|---|---|---|---|
-| `cc-2.1.257-sdk-cli` | `2.1.257` | `0.112.1` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/default, 2026-09-01 |
+| `cc-2.1.259-sdk-cli` | `2.1.259` | `0.112.1` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/Fable/default, 2026-09-03 |
 
 Only one pin is compiled. Rebaseline overwrites this row; do not append a
 historical ladder. Older Omni releases retain older wire.
@@ -44,7 +44,7 @@ Header names and dynamic values are pinned in
 - `anthropic-version: 2023-06-01`
 - `x-app: cli`
 
-## 2.1.257 Model Surface (active)
+## 2.1.259 Model Surface (active)
 
 | Input | Wire model | Beta list | max_tokens | temperature | output_config.effort |
 |---|---|---|---:|---:|---|
@@ -55,19 +55,19 @@ Header names and dynamic values are pinned in
 | `claude-fable-5` | `claude-fable-5` | opus (+fallback-credit) | 64000 | omitted | `high` |
 | `haiku` | `claude-haiku-4-5-20251001` | haiku | 32000 | omitted | omitted |
 
-Default beta (2.1.257, same membership as 2.1.232):
+Default beta (2.1.259, same membership as 2.1.257):
 
 ```text
 claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11
 ```
 
-Explicit Opus beta (2.1.257, same membership as 2.1.232):
+Explicit Opus beta (2.1.259, same membership as 2.1.257):
 
 ```text
 claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11
 ```
 
-Billing (no cch): `cc_version=2.1.257.27e; cc_entrypoint=sdk-cli;` for prompt `Say OK`.
+Billing (no cch): `cc_version=2.1.259.cc8; cc_entrypoint=sdk-cli;` for prompt `Say OK`.
 Stainless package on this pin is `0.112.1`. The captured header set excludes `x-client-request-id`.
 The short identity block is `You are a Claude agent, built on Anthropic's Claude Agent SDK.`
 
@@ -133,8 +133,8 @@ oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,p
 - Claude Code `--tools ""` still sends a default SDK tool surface. Omni only
   sends consumer-provided tools.
 - `stream: true` is the CLI default.
-- cch behavior is version-specific. See
-  `tools/providers/claude/fingerprint/CCH_ALGORITHM.md`.
+- Live pin billing has no `cch=` field. Historical algorithm:
+  `docs/providers/claude/CCH_ALGORITHM.md`.
 
 ## Maintenance
 
@@ -144,9 +144,4 @@ Run this after Claude Code updates:
 uv run --script tools/providers/claude/fingerprint/check_claude_code_drift.py
 ```
 
-Regenerate vectors only after the pinned profile has been updated:
-
-```sh
-uv run --script tools/providers/claude/fingerprint/check_claude_code_drift.py \
-  --emit-vectors tools/providers/claude/fingerprint/vectors
-```
+Vector regeneration is not a live step.

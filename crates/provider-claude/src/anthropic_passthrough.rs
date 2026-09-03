@@ -19,7 +19,7 @@ use crate::translate::{
     finalize_claude_wire_request,
 };
 use crate::upstream::RawFrame;
-use crate::{ClaudeProvider, ProviderError, UpstreamError};
+use crate::{ClaudeProvider, ProviderError};
 
 /// A client-supplied `/v1/messages` body, deserialized into a closed allowlist.
 ///
@@ -742,17 +742,21 @@ impl omni_core::AnthropicNativeSurface for ClaudeProvider {
     }
 }
 
-#[allow(dead_code)]
-fn _assert_upstream_error_send_sync(_: UpstreamError) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::CLAUDE_CODE_SYSTEM_PREAMBLE;
+    use crate::UpstreamError;
     use crate::fingerprint::{RequestContext, default_profile};
 
     fn empty_repl() -> Replacements {
         Replacements::empty()
+    }
+
+    #[test]
+    fn upstream_error_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<UpstreamError>();
     }
 
     fn parse_client(body: Value) -> ClientMessagesRequest {

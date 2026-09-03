@@ -1,24 +1,28 @@
-# Claude Code cch fingerprint
+# Claude Code cch fingerprint (historical)
 
-Active Omni pin: Claude Code `2.1.257` (no `cch` field on the wire). This
-document records the historical `cch` rewrite algorithm used by earlier Claude
-Code releases and by clean-room vectors under `vectors/`. Rebaseline overwrites
-the single active pin; it does not reintroduce a multi-profile ladder.
+**Historical.** Live Omni no longer computes or rewrites `cch=`. The active pin
+(Claude Code `2.1.259`, captured 2026-09-03) emits a billing header that ends at
+`cc_entrypoint=sdk-cli;` with no checksum field. The `cc_version` suffix
+(`Sha256Utf16SampleV1`) is still live.
 
-This document is the repo-canonical record for the `cch` field in Claude
-Code's billing marker. If this conflicts with an agent memory note, update the
-memory to point here.
+This document records the `cch` rewrite algorithm used by earlier Claude Code
+releases (`2.1.142` through `2.1.175`) and by retired clean-room vectors. It is
+not a live rebaseline step. Rebaseline overwrites the single active pin; it does
+not reintroduce a multi-profile ladder.
 
-## Wire behavior
+This document is the repo-canonical record for the historical `cch` field. If
+this conflicts with an agent memory note, update the memory to point here.
 
-Claude Code first builds this system text block:
+## Wire behavior (historical)
+
+Claude Code first built this system text block:
 
 ```text
 x-anthropic-billing-header: cc_version=2.1.158.175; cc_entrypoint=sdk-cli; cch=00000;
 ```
 
-Before the final HTTP request leaves the process, Claude Code rewrites the five
-zeroes. The rewrite is deterministic for the exact request-body bytes.
+Before the final HTTP request left the process, Claude Code rewrote the five
+zeroes. The rewrite was deterministic for the exact request-body bytes.
 
 Algorithm recovered for `2.1.142` and re-verified for `2.1.150`, `2.1.154`, and
 `2.1.158` through `2.1.165`:
@@ -41,31 +45,23 @@ Algorithm recovered for `2.1.175`:
 5. Take `hash & 0xfffff`, format as five lowercase hex digits, and overwrite
    the five `00000` bytes.
 
-The body length does not change. A non-sentinel value such as `cch=abcde;` is
+The body length did not change. A non-sentinel value such as `cch=abcde;` was
 left untouched.
 
-Omni computes the checksum over the exact JSON bytes Omni sends. Those bytes do
-not have to match Claude Code's field order for the checksum to be internally
-consistent, but any future attempt at byte-for-byte Claude Code body matching
-must re-check serializer order.
+## Historical Omni notes
 
-## Omni implementation notes
+These notes describe the retired compiled rewrite path. They are not live:
 
-- The active profile owns the checksum behavior; do not infer it from the
-  version number alone.
-- The visible billing header still starts with `cch=00000;`; the final-body
-  hook rewrites it immediately before logging/sending the upstream body.
-- The rewrite targets the first matching billing header under the serialized
-  `system` field, not a bare `cch=00000` substring. This avoids corrupting user
-  message text that happens to contain the sentinel.
-- `--no-preamble` or any body without the billing sentinel is left unchanged.
-- Retries recompute from the original `serde_json::Value`; because this
-  algorithm only depends on body bytes, logging and retry sends remain
-  deterministic.
+- The visible billing header started with `cch=00000;`; a final-body hook
+  rewrote it immediately before logging/sending the upstream body.
+- The rewrite targeted the first matching billing header under the serialized
+  `system` field, not a bare `cch=00000` substring.
+- `--no-preamble` or any body without the billing sentinel was left unchanged.
+- Retries recomputed from the original `serde_json::Value`.
 
-## Verified fixtures
+## Verified fixtures (historical)
 
-The following captured Claude Code final bodies validate the seed and checksum.
+The following captured Claude Code final bodies validated the seed and checksum.
 To verify a row, replace the listed final `cch` value with `00000`, compute the
 algorithm above, and compare.
 
@@ -77,14 +73,13 @@ algorithm above, and compare.
 | two billing markers; first sentinel rewritten | `7afbb` |
 | watchpoint marker body | `c159b` |
 
-Rust unit tests in `crates/provider-claude/src/fingerprint.rs` lock these fixtures in.
-
-Clean-room vectors also pin full real Claude Code bodies for `2.1.162`,
-`2.1.165`, and `2.1.175` under `tools/providers/claude/fingerprint/vectors/`.
+Clean-room vectors for `2.1.162`, `2.1.165`, and `2.1.175` lived under
+`tools/providers/claude/fingerprint/vectors/` and were deleted when live CCH
+left the compiled crates. History is in git.
 
 ## Reverse-engineering playbook
 
-Use this if a future Claude Code release changes the behavior:
+Use this if a future Claude Code release reintroduces `cch=`:
 
 1. Run a fake local Anthropic server and point Claude Code at it with
    `ANTHROPIC_BASE_URL`. Capture the final HTTP request bodies.
@@ -123,11 +118,6 @@ tools/providers/claude/fingerprint/check_claude_code_drift.py
 ```
 
 The script captures a live local Claude Code request against a fake Anthropic
-server, reports the installed version, and verifies whether the observed final
-body still matches the pinned checksum algorithm.
-
-## 2.1.175 Status
-
-Claude Code 2.1.175 is supported as the default profile. The recovered transform
-above is covered by clean-room vectors for Fable, Opus, Sonnet, and Haiku, and by
-the opt-in drift checker.
+server, reports the installed version, and verifies the no-cch billing header
+plus `cc_version` suffix against the live pin. Vector regeneration is not a
+live step.

@@ -39,8 +39,8 @@ as `claude:sonnet` only when you need to force a provider.
 
 Omni ships one Claude Code pin. That pin must reproduce the captured wire
 fingerprint byte-for-byte: version string, `anthropic-beta` flags, stainless
-versions, `x-anthropic-billing-header` cch checksum when the pin uses cch,
-billing suffix, system preamble, model catalog, and wire defaults. An inexact
+versions, no-cch `x-anthropic-billing-header`, `cc_version` suffix,
+system preamble, model catalog, and wire defaults. An inexact
 fingerprint is a failure, not a partial success.
 
 Rebaseline overwrites this single pin (issue #12). Multi-version flags are

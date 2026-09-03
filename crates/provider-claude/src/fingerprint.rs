@@ -4,10 +4,10 @@
 //! **CRITICAL INVARIANT (Claude Code fingerprint exactness):**
 //! The single active Claude Code pin must reproduce that version's wire
 //! fingerprint **byte-for-byte** - the version string, `anthropic-beta` flags,
-//! stainless versions, the `x-anthropic-billing-header` cch checksum (when the
-//! pin uses cch), the model catalog, wire defaults, and identity preamble
-//! injection. This exactness is the entire point of provider-claude: an
-//! inexact fingerprint is eventually rejected by Anthropic's subscription
+//! stainless versions, the `x-anthropic-billing-header` no-cch shape, the
+//! `cc_version` suffix, the model catalog, wire defaults, and identity
+//! preamble injection. This exactness is the entire point of provider-claude:
+//! an inexact fingerprint is eventually rejected by Anthropic's subscription
 //! OAuth gate. "Close" is a failure, not a partial success.
 //!
 //! All code that contributes to the serialized request body or the header
@@ -15,9 +15,9 @@
 //! wire types + identity prepend). It never leaks into omni-common or
 //! omni-core.
 //!
-//! Active baseline: Claude Code 2.1.257 (captured 2026-09-01). Single pin only
-//! (issue #12). No cch field on this pin; cch algorithms remain for vectors and
-//! future pins that reintroduce checksums.
+//! Active baseline: Claude Code 2.1.259 (captured 2026-09-03). Single pin only
+//! (issue #12). Billing ends at `cc_entrypoint=sdk-cli;` with no `cch=` field.
+//! Historical checksum rewrite lives in `docs/providers/claude/CCH_ALGORITHM.md`.
 //!
 //! Ported/adapted directly from reference-src-claude/upstream/fingerprint.rs
 //! (the authoritative source for the invariant).
@@ -77,24 +77,11 @@ struct BillingScheme {
     suffix_algorithm: BillingSuffixAlgorithm,
     seed: &'static str,
     sample_indices: &'static [usize],
-    cch: BillingCchMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BillingSuffixAlgorithm {
     Sha256Utf16SampleV1,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Static / FinalBodyChecksum* kept for algorithm tests and future pins
-enum BillingCchMode {
-    Static(&'static str),
-    FinalBodyChecksum,
-    FinalBodyChecksumSkipModelsAndMaxTokens,
-    /// No `cch=` segment in the billing header at all. Observed on Claude Code
-    /// 2.1.186+: the header ends at `cc_entrypoint=<entrypoint>;` with no
-    /// trailing checksum field. The body is sent unmodified.
-    None,
 }
 
 impl FingerprintProfile {
@@ -166,88 +153,21 @@ impl FingerprintProfile {
     }
 
     pub fn billing_header_text(&self, first_user_text: &str) -> String {
-        if matches!(self.billing.cch, BillingCchMode::None) {
-            // 2.1.186+: no trailing cch field; header ends at cc_entrypoint.
-            return format!(
-                "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint={};",
-                self.claude_cli_version,
-                self.billing_suffix(first_user_text),
-                self.entrypoint,
-            );
-        }
+        // Live pin (2.1.186+): no trailing cch field; header ends at cc_entrypoint.
         format!(
-            "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint={}; cch={};",
+            "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint={};",
             self.claude_cli_version,
             self.billing_suffix(first_user_text),
             self.entrypoint,
-            self.billing.cch.placeholder()
         )
     }
 
     pub fn finalize_body_json(
         &self,
         body: &serde_json::Value,
-        ctx: &RequestContext,
+        _ctx: &RequestContext,
     ) -> Result<Vec<u8>, serde_json::Error> {
-        let bytes = serde_json::to_vec(body)?;
-        Ok(self.finalize_body_bytes(bytes, ctx))
-    }
-
-    fn finalize_body_bytes(&self, bytes: Vec<u8>, _ctx: &RequestContext) -> Vec<u8> {
-        match self.billing.cch {
-            BillingCchMode::Static(_) | BillingCchMode::None => bytes,
-            BillingCchMode::FinalBodyChecksum => {
-                self.finalize_body_cch_checksum(bytes, claude_code_cch_checksum)
-            }
-            BillingCchMode::FinalBodyChecksumSkipModelsAndMaxTokens => self
-                .finalize_body_cch_checksum(
-                    bytes,
-                    claude_code_cch_checksum_skip_models_and_max_tokens,
-                ),
-        }
-    }
-
-    fn finalize_body_cch_checksum(
-        &self,
-        mut bytes: Vec<u8>,
-        checksum_fn: fn(&[u8]) -> u64,
-    ) -> Vec<u8> {
-        let Some(offset) = self.find_billing_cch_placeholder(&bytes) else {
-            return bytes;
-        };
-        let checksum = checksum_fn(&bytes);
-        let replacement = format!("{checksum:05x}");
-        debug_assert_eq!(replacement.len(), 5);
-        bytes[offset..offset + 5].copy_from_slice(replacement.as_bytes());
-        bytes
-    }
-
-    fn find_billing_cch_placeholder(&self, bytes: &[u8]) -> Option<usize> {
-        let system_start = find_subslice(bytes, br#""system":"#)?;
-        let prefix = format!(
-            "x-anthropic-billing-header: cc_version={}.",
-            self.claude_cli_version
-        );
-        let tail = format!("; cc_entrypoint={}; cch=00000;", self.entrypoint);
-        let search = &bytes[system_start..];
-        let mut cursor = 0;
-        while cursor < search.len() {
-            let prefix_rel = find_subslice(&search[cursor..], prefix.as_bytes())?;
-            let prefix_pos = system_start + cursor + prefix_rel;
-            let suffix_pos = prefix_pos + prefix.len() + 3;
-            let suffix_end = suffix_pos + tail.len();
-            if suffix_end <= bytes.len()
-                && bytes[prefix_pos + prefix.len()..suffix_pos]
-                    .iter()
-                    .all(u8::is_ascii_hexdigit)
-                && bytes[suffix_pos..suffix_end] == *tail.as_bytes()
-            {
-                let cch_rel = tail.find("00000").expect("tail contains cch placeholder");
-                return Some(suffix_pos + cch_rel);
-            }
-            cursor += prefix_rel + prefix.len();
-        }
-        None
+        serde_json::to_vec(body)
     }
 
     fn billing_suffix(&self, first_user_text: &str) -> String {
@@ -262,50 +182,15 @@ impl FingerprintProfile {
     }
 }
 
-impl BillingCchMode {
-    fn placeholder(self) -> &'static str {
-        match self {
-            BillingCchMode::Static(value) => value,
-            BillingCchMode::FinalBodyChecksum
-            | BillingCchMode::FinalBodyChecksumSkipModelsAndMaxTokens => "00000",
-            // No cch segment is emitted; the placeholder is never used.
-            BillingCchMode::None => "",
-        }
-    }
-}
-
 const BILLING_SUFFIX_SEED_V1: &str = "59cf53e54c78";
 const BILLING_SUFFIX_INDICES_V1: [usize; 3] = [4, 7, 20];
-#[allow(dead_code)]
-const BILLING_SCHEME_V1_CCH_00000: BillingScheme = BillingScheme {
-    suffix_algorithm: BillingSuffixAlgorithm::Sha256Utf16SampleV1,
-    seed: BILLING_SUFFIX_SEED_V1,
-    sample_indices: &BILLING_SUFFIX_INDICES_V1,
-    cch: BillingCchMode::Static("00000"),
-};
-#[allow(dead_code)]
-const BILLING_SCHEME_V1_CCH_XXH64_BODY: BillingScheme = BillingScheme {
-    suffix_algorithm: BillingSuffixAlgorithm::Sha256Utf16SampleV1,
-    seed: BILLING_SUFFIX_SEED_V1,
-    sample_indices: &BILLING_SUFFIX_INDICES_V1,
-    cch: BillingCchMode::FinalBodyChecksum,
-};
-#[cfg(test)]
-const BILLING_SCHEME_V1_CCH_XXH64_SKIP_MODELS_AND_MAX_TOKENS: BillingScheme = BillingScheme {
-    suffix_algorithm: BillingSuffixAlgorithm::Sha256Utf16SampleV1,
-    seed: BILLING_SUFFIX_SEED_V1,
-    sample_indices: &BILLING_SUFFIX_INDICES_V1,
-    cch: BillingCchMode::FinalBodyChecksumSkipModelsAndMaxTokens,
-};
-// 2.1.186: the version suffix is still computed (cc_version=...a80), but the
-// billing header carries no cch field and the body is not rewritten. Verified
-// 2026-06-22 against two independent live captures (mitmproxy reverse proxy and
-// the drift checker's capture server): the header ends at `cc_entrypoint=sdk-cli;`.
+// Live pin: the version suffix is still computed, but the billing header
+// carries no cch field and the body is serialized as-is. Captured 2026-09-03
+// against Claude Code 2.1.259: the header ends at `cc_entrypoint=sdk-cli;`.
 const BILLING_SCHEME_V1_NO_CCH: BillingScheme = BillingScheme {
     suffix_algorithm: BillingSuffixAlgorithm::Sha256Utf16SampleV1,
     seed: BILLING_SUFFIX_SEED_V1,
     sample_indices: &BILLING_SUFFIX_INDICES_V1,
-    cch: BillingCchMode::None,
 };
 
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -413,17 +298,17 @@ pub const WIRE_DEFAULTS: WireDefaults = WireDefaults {
     output_effort: Some("high"),
 };
 
-pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.257-sdk-cli";
+pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.259-sdk-cli";
 
-// Captured 2026-09-01 against installed Claude Code 2.1.257 via the shared
+// Captured 2026-09-03 against installed Claude Code 2.1.259 via the shared
 // tools.capture framework (mitmproxy reverse proxy + real claude CLI, clean tmpfs
-// HOME), for default, explicit opus, sonnet, and haiku. This is the sole active
-// pin (issue #12). Catalog, per-model betas, stainless, preamble, and header set
-// match 2.1.232. Drift is the CLI version string. No cch field.
-// Captured cc_version=2.1.257.27e for prompt "Say OK".
-pub const PROFILE_CLAUDE_2_1_257_SDK_CLI: FingerprintProfile = FingerprintProfile {
+// HOME), for default, explicit opus, sonnet, haiku, and fable. This is the sole
+// active pin (issue #12). Catalog, per-model betas, stainless, preamble, and
+// header set match 2.1.257. Drift is the CLI version string. No cch field.
+// Captured cc_version=2.1.259.cc8 for prompt "Say OK".
+pub const PROFILE_CLAUDE_2_1_259_SDK_CLI: FingerprintProfile = FingerprintProfile {
     name: DEFAULT_PROFILE_NAME,
-    claude_cli_version: "2.1.257",
+    claude_cli_version: "2.1.259",
     stainless_package_version: "0.112.1",
     stainless_runtime_version: "v26.3.0",
     entrypoint: "sdk-cli",
@@ -438,7 +323,7 @@ pub const PROFILE_CLAUDE_2_1_257_SDK_CLI: FingerprintProfile = FingerprintProfil
 };
 
 pub fn default_profile() -> &'static FingerprintProfile {
-    &PROFILE_CLAUDE_2_1_257_SDK_CLI
+    &PROFILE_CLAUDE_2_1_259_SDK_CLI
 }
 
 pub fn is_claude_code_billing_header(text: &str) -> bool {
@@ -560,7 +445,7 @@ fn build_headers_with_profile(
     insert(&mut h, "anthropic-dangerous-direct-browser-access", "true");
     insert(&mut h, "anthropic-version", ANTHROPIC_VERSION);
     insert(&mut h, "x-app", "cli");
-    // 2.1.257 capture does not send x-client-request-id.
+    // 2.1.259 capture does not send x-client-request-id.
 
     h
 }
@@ -640,187 +525,6 @@ fn append_javascript_utf8(out: &mut Vec<u8>, units: &[u16]) {
     }
 }
 
-const CCH_XXH64_SEED: u64 = 0x4d659218e32a3268;
-const XXH64_PRIME1: u64 = 11_400_714_785_074_694_791;
-const XXH64_PRIME2: u64 = 14_029_467_366_897_019_727;
-const XXH64_PRIME3: u64 = 1_609_587_929_392_839_161;
-const XXH64_PRIME4: u64 = 9_650_029_242_287_828_579;
-const XXH64_PRIME5: u64 = 2_870_177_450_012_600_261;
-
-fn claude_code_cch_checksum(bytes: &[u8]) -> u64 {
-    xxh64(bytes, CCH_XXH64_SEED) & 0xfffff
-}
-
-fn claude_code_cch_checksum_skip_models_and_max_tokens(bytes: &[u8]) -> u64 {
-    xxh64(
-        &body_for_cch_skip_models_and_max_tokens(bytes),
-        CCH_XXH64_SEED,
-    ) & 0xfffff
-}
-
-fn body_for_cch_skip_models_and_max_tokens(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut cursor = 0;
-    while let Some((range_start, range_end)) = find_next_max_tokens_range(bytes, cursor) {
-        append_with_model_values_removed(&mut out, &bytes[cursor..range_start]);
-        cursor = range_end;
-    }
-    append_with_model_values_removed(&mut out, &bytes[cursor..]);
-    out
-}
-
-fn find_next_max_tokens_range(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
-    let found = find_subslice(&bytes[start..], br#""max_tokens":"#)? + start;
-    let value_start = found + br#""max_tokens":"#.len();
-    let mut value_end = value_start;
-    while value_end < bytes.len() && bytes[value_end].is_ascii_digit() {
-        value_end += 1;
-    }
-    if value_end == value_start {
-        return Some((found, value_end));
-    }
-    if found > start && bytes[found - 1] == b',' {
-        Some((found - 1, value_end))
-    } else if value_end < bytes.len() && bytes[value_end] == b',' {
-        Some((found, value_end + 1))
-    } else {
-        Some((found, value_end))
-    }
-}
-
-fn append_with_model_values_removed(out: &mut Vec<u8>, bytes: &[u8]) {
-    let mut cursor = 0;
-    while let Some(rel) = find_subslice(&bytes[cursor..], br#""model":""#) {
-        let start = cursor + rel;
-        let value_start = start + br#""model":""#.len();
-        let Some(value_end) = find_json_string_end(bytes, value_start) else {
-            break;
-        };
-        out.extend_from_slice(&bytes[cursor..value_start]);
-        cursor = value_end;
-    }
-    out.extend_from_slice(&bytes[cursor..]);
-}
-
-fn find_json_string_end(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut idx = start;
-    while idx < bytes.len() {
-        match bytes[idx] {
-            b'\\' => idx = idx.saturating_add(2),
-            b'"' => return Some(idx),
-            _ => idx += 1,
-        }
-    }
-    None
-}
-
-fn xxh64(bytes: &[u8], seed: u64) -> u64 {
-    let mut offset = 0;
-    let mut h64;
-
-    if bytes.len() >= 32 {
-        let mut v1 = seed.wrapping_add(XXH64_PRIME1).wrapping_add(XXH64_PRIME2);
-        let mut v2 = seed.wrapping_add(XXH64_PRIME2);
-        let mut v3 = seed;
-        let mut v4 = seed.wrapping_sub(XXH64_PRIME1);
-
-        while offset <= bytes.len() - 32 {
-            v1 = xxh64_round(v1, read_u64_le(bytes, offset));
-            v2 = xxh64_round(v2, read_u64_le(bytes, offset + 8));
-            v3 = xxh64_round(v3, read_u64_le(bytes, offset + 16));
-            v4 = xxh64_round(v4, read_u64_le(bytes, offset + 24));
-            offset += 32;
-        }
-
-        h64 = v1
-            .rotate_left(1)
-            .wrapping_add(v2.rotate_left(7))
-            .wrapping_add(v3.rotate_left(12))
-            .wrapping_add(v4.rotate_left(18));
-        h64 = xxh64_merge_round(h64, v1);
-        h64 = xxh64_merge_round(h64, v2);
-        h64 = xxh64_merge_round(h64, v3);
-        h64 = xxh64_merge_round(h64, v4);
-    } else {
-        h64 = seed.wrapping_add(XXH64_PRIME5);
-    }
-
-    h64 = h64.wrapping_add(bytes.len() as u64);
-
-    while offset + 8 <= bytes.len() {
-        let k1 = xxh64_round(0, read_u64_le(bytes, offset));
-        h64 ^= k1;
-        h64 = h64
-            .rotate_left(27)
-            .wrapping_mul(XXH64_PRIME1)
-            .wrapping_add(XXH64_PRIME4);
-        offset += 8;
-    }
-
-    if offset + 4 <= bytes.len() {
-        h64 ^= (read_u32_le(bytes, offset) as u64).wrapping_mul(XXH64_PRIME1);
-        h64 = h64
-            .rotate_left(23)
-            .wrapping_mul(XXH64_PRIME2)
-            .wrapping_add(XXH64_PRIME3);
-        offset += 4;
-    }
-
-    while offset < bytes.len() {
-        h64 ^= (bytes[offset] as u64).wrapping_mul(XXH64_PRIME5);
-        h64 = h64.rotate_left(11).wrapping_mul(XXH64_PRIME1);
-        offset += 1;
-    }
-
-    xxh64_avalanche(h64)
-}
-
-fn xxh64_round(acc: u64, input: u64) -> u64 {
-    acc.wrapping_add(input.wrapping_mul(XXH64_PRIME2))
-        .rotate_left(31)
-        .wrapping_mul(XXH64_PRIME1)
-}
-
-fn xxh64_merge_round(acc: u64, val: u64) -> u64 {
-    let mut acc = acc ^ xxh64_round(0, val);
-    acc = acc.wrapping_mul(XXH64_PRIME1).wrapping_add(XXH64_PRIME4);
-    acc
-}
-
-fn xxh64_avalanche(mut h64: u64) -> u64 {
-    h64 ^= h64 >> 33;
-    h64 = h64.wrapping_mul(XXH64_PRIME2);
-    h64 ^= h64 >> 29;
-    h64 = h64.wrapping_mul(XXH64_PRIME3);
-    h64 ^= h64 >> 32;
-    h64
-}
-
-fn read_u64_le(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(
-        bytes[offset..offset + 8]
-            .try_into()
-            .expect("xxh64 chunk length must be 8"),
-    )
-}
-
-fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(
-        bytes[offset..offset + 4]
-            .try_into()
-            .expect("xxh64 chunk length must be 4"),
-    )
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
 fn insert(h: &mut HeaderMap, name: &'static str, value: &str) {
     let n = HeaderName::from_static(name);
     if let Ok(v) = HeaderValue::from_str(value) {
@@ -837,26 +541,6 @@ mod tests {
             access_token: "sk-ant-oat01-test-token".into(),
             expires_at_ms: None,
             subscription_type: Some("max".into()),
-        }
-    }
-
-    /// Synthetic cch-emitting profile for rewrite-path tests only.
-    /// The active pin uses NO_CCH; these tests guard the algorithm still in tree.
-    fn cch_rewrite_profile() -> FingerprintProfile {
-        FingerprintProfile {
-            name: "test-cch-rewrite",
-            claude_cli_version: "2.1.175",
-            stainless_package_version: "0.94.0",
-            stainless_runtime_version: "v24.3.0",
-            entrypoint: "sdk-cli",
-            beta_reply: BETA_DEFAULT,
-            model_beta_overrides: &[],
-            system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
-            models: MODEL_CATALOG,
-            preserve_explicit_model: true,
-            wire_defaults: WIRE_DEFAULTS,
-            model_wire_overrides: &[],
-            billing: BILLING_SCHEME_V1_CCH_XXH64_SKIP_MODELS_AND_MAX_TOKENS,
         }
     }
 
@@ -1031,13 +715,13 @@ mod tests {
         // WHY: issue #12 ships exactly one pin. These bytes are the gate: UA,
         // stainless, catalog ids, and per-model beta lists must match capture.
         let profile = default_profile();
-        assert_eq!(profile.name, "cc-2.1.257-sdk-cli");
-        assert_eq!(profile.claude_cli_version, "2.1.257");
+        assert_eq!(profile.name, "cc-2.1.259-sdk-cli");
+        assert_eq!(profile.claude_cli_version, "2.1.259");
         assert_eq!(profile.stainless_package_version, "0.112.1");
         assert_eq!(profile.stainless_runtime_version, "v26.3.0");
         assert_eq!(
             profile.user_agent(),
-            "claude-cli/2.1.257 (external, sdk-cli)"
+            "claude-cli/2.1.259 (external, sdk-cli)"
         );
         assert_eq!(
             profile.resolve_model("fable").unwrap().canonical,
@@ -1093,7 +777,7 @@ mod tests {
     #[test]
     fn billing_suffix_matches_claude_code_probe() {
         // Historical suffix vectors lock the algorithm across past versions.
-        // Active pin: 2.1.257 / "Say OK" -> 27e; header has no cch field.
+        // Active pin: 2.1.259 / "Say OK" -> cc8; header has no cch field.
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.142"), "73b");
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.150"), "5bd");
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.154"), "cea");
@@ -1110,14 +794,10 @@ mod tests {
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.228"), "a3a");
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.232"), "1d9");
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.257"), "27e");
+        assert_eq!(claude_code_version_suffix("Say OK", "2.1.259"), "cc8");
         assert_eq!(
             default_profile().billing_header_text("Say OK"),
-            "x-anthropic-billing-header: cc_version=2.1.257.27e; cc_entrypoint=sdk-cli;"
-        );
-        // Synthetic cch profile still emits sentinel form for rewrite tests.
-        assert_eq!(
-            cch_rewrite_profile().billing_header_text("Say OK"),
-            "x-anthropic-billing-header: cc_version=2.1.175.174; cc_entrypoint=sdk-cli; cch=00000;"
+            "x-anthropic-billing-header: cc_version=2.1.259.cc8; cc_entrypoint=sdk-cli;"
         );
     }
 
@@ -1133,44 +813,10 @@ mod tests {
             header.ends_with("; cc_entrypoint=sdk-cli;"),
             "active pin unexpected header tail: {header}"
         );
-        let cch_header = cch_rewrite_profile().billing_header_text("Say OK");
-        assert!(
-            cch_header.contains("cch=00000;"),
-            "cch rewrite profile must emit sentinel: {cch_header}"
-        );
     }
 
     #[test]
-    fn finalized_body_writes_profile_checksum() {
-        // WHY: cch rewrite must replace the 00000 sentinel in-place without
-        // changing body length. Active pin has no cch; synthetic profile guards
-        // the algorithm kept for vectors and future pins that reintroduce cch.
-        let profile = cch_rewrite_profile();
-        let ctx = RequestContext::new_reply();
-        let body = serde_json::json!({
-            "system": [
-                {
-                    "type": "text",
-                    "text": profile.billing_header_text("Say OK"),
-                }
-            ],
-            "messages": []
-        });
-        let placeholder = serde_json::to_vec(&body).unwrap();
-        let bytes = profile.finalize_body_json(&body, &ctx).unwrap();
-        let json = String::from_utf8(bytes).unwrap();
-        let expected = format!(
-            "{:05x}",
-            claude_code_cch_checksum_skip_models_and_max_tokens(&placeholder)
-        );
-
-        assert!(json.contains(&format!("cch={expected};")));
-        assert_eq!(json.len(), placeholder.len());
-        assert!(!json.contains("cch=00000;"));
-    }
-
-    #[test]
-    fn omni_serialized_body_cch_snapshot_stays_stable() {
+    fn omni_serialized_body_stays_no_cch() {
         let profile = default_profile();
         let ctx = RequestContext::new_reply();
         let body = serde_json::json!({
@@ -1206,43 +852,7 @@ mod tests {
             !json.contains("cch="),
             "active pin body unexpectedly contains a cch field: {json}"
         );
-
-        // Rewrite algorithm snapshot on synthetic cch profile.
-        let cch_profile = cch_rewrite_profile();
-        let cch_body = serde_json::json!({
-            "model": "claude-haiku-4-5",
-            "max_tokens": 4096,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Say OK"}
-                    ]
-                }
-            ],
-            "system": [
-                {
-                    "type": "text",
-                    "text": cch_profile.billing_header_text("Say OK"),
-                },
-                {
-                    "type": "text",
-                    "text": cch_profile.system_preamble,
-                }
-            ],
-            "stream": false
-        });
-        let cch_json =
-            String::from_utf8(cch_profile.finalize_body_json(&cch_body, &ctx).unwrap()).unwrap();
-        let marker = "cc_entrypoint=sdk-cli; cch=";
-        let idx = cch_json
-            .find(marker)
-            .expect("snapshot body missing cch marker");
-        let got = &cch_json[idx + marker.len()..idx + marker.len() + 5];
-        assert_eq!(
-            got, "827ab",
-            "cch rewrite snapshot changed (re-derive literal)"
-        );
+        assert_eq!(json.as_bytes(), serde_json::to_vec(&body).unwrap());
     }
 
     #[test]
@@ -1266,38 +876,6 @@ mod tests {
     }
 
     #[test]
-    fn finalized_body_does_not_rewrite_user_text_sentinel() {
-        let profile = cch_rewrite_profile();
-        let ctx = RequestContext::new_reply();
-        let user_text = "leave user cch=00000 untouched";
-        let body = serde_json::json!({
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_text}
-                    ]
-                }
-            ],
-            "system": [
-                {
-                    "type": "text",
-                    "text": profile.billing_header_text("Say OK"),
-                }
-            ]
-        });
-        let bytes = profile.finalize_body_json(&body, &ctx).unwrap();
-        let json = String::from_utf8(bytes).unwrap();
-
-        assert!(json.contains(user_text));
-        assert_eq!(json.matches("cch=00000").count(), 1);
-        assert!(json.contains(
-            "x-anthropic-billing-header: cc_version=2.1.175.174; cc_entrypoint=sdk-cli; cch="
-        ));
-        assert!(!json.contains("cc_entrypoint=sdk-cli; cch=00000;"));
-    }
-
-    #[test]
     fn finalized_body_without_billing_sentinel_is_unchanged() {
         let profile = default_profile();
         let ctx = RequestContext::new_reply();
@@ -1316,7 +894,10 @@ mod tests {
     }
 
     #[test]
-    fn finalized_body_preserves_non_sentinel_cch() {
+    fn finalized_body_preserves_stale_inbound_cch_bytes() {
+        // WHY: finalize_body_json serializes only. Stale inbound cch= in a body
+        // is not rewritten here; identity injection replaces billing headers
+        // before serialize.
         let profile = default_profile();
         let ctx = RequestContext::new_reply();
         let body = serde_json::json!({
@@ -1330,274 +911,6 @@ mod tests {
         });
         let expected = serde_json::to_vec(&body).unwrap();
         assert_eq!(profile.finalize_body_json(&body, &ctx).unwrap(), expected);
-    }
-
-    #[test]
-    fn finalized_body_rewrites_only_first_billing_sentinel() {
-        let profile = cch_rewrite_profile();
-        let ctx = RequestContext::new_reply();
-        let body = serde_json::json!({
-            "system": [
-                {
-                    "type": "text",
-                    "text": profile.billing_header_text("Say OK"),
-                },
-                {
-                    "type": "text",
-                    "text": profile.billing_header_text("Say OK"),
-                }
-            ],
-            "messages": []
-        });
-        let bytes = profile.finalize_body_json(&body, &ctx).unwrap();
-        let json = String::from_utf8(bytes).unwrap();
-
-        assert_eq!(json.matches("x-anthropic-billing-header:").count(), 2);
-        assert_eq!(json.matches("cc_entrypoint=sdk-cli; cch=00000;").count(), 1);
-    }
-
-    #[test]
-    fn static_cch_mode_preserves_sentinel() {
-        let profile = FingerprintProfile {
-            name: "test-static",
-            claude_cli_version: "2.1.142",
-            stainless_package_version: "0.94.0",
-            stainless_runtime_version: "v24.3.0",
-            entrypoint: "sdk-cli",
-            beta_reply: BETA_DEFAULT,
-            model_beta_overrides: &[],
-            system_preamble: CLAUDE_CODE_SYSTEM_PREAMBLE,
-            models: MODEL_CATALOG,
-            preserve_explicit_model: false,
-            wire_defaults: WIRE_DEFAULTS,
-            model_wire_overrides: &[],
-            billing: BILLING_SCHEME_V1_CCH_00000,
-        };
-        let ctx = RequestContext::new_reply();
-        let body = serde_json::json!({
-            "system": [
-                {
-                    "type": "text",
-                    "text": profile.billing_header_text("Say OK"),
-                }
-            ],
-            "messages": []
-        });
-        let bytes = profile.finalize_body_json(&body, &ctx).unwrap();
-        let json = String::from_utf8(bytes).unwrap();
-
-        assert_eq!(json, serde_json::to_string(&body).unwrap());
-        assert!(json.contains("cch=00000;"));
-    }
-
-    #[test]
-    fn cch_checksum_matches_recovered_claude_code_captures() {
-        let cases = [
-            (
-                "3bc55",
-                r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":[{"type":"text","text":"Say OK"}]}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.142.73b; cc_entrypoint=sdk-cli; cch=3bc55;"}],"max_tokens":1,"stream":true}"#,
-            ),
-            (
-                "06b67",
-                r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":[{"type":"text","text":"Say OK"}]}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.142.73b; cc_entrypoint=sdk-cli; cch=06b67;"}],"max_tokens":2,"stream":true}"#,
-            ),
-            (
-                "9bce0",
-                r#"{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":[{"type":"text","text":"factor"}]}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.142.73b; cc_entrypoint=sdk-cli; cch=9bce0;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","cache_control":{"type":"ephemeral"}}],"stream":true}"#,
-            ),
-            (
-                "4dc19",
-                r#"{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.142.73b; cc_entrypoint=sdk-cli; cch=4dc19;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","cache_control":{"type":"ephemeral"}}],"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":[{"type":"text","text":"factor"}]}],"stream":true}"#,
-            ),
-            (
-                "7afbb",
-                r#"{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":[{"type":"text","text":"factor"}]}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.142.73b; cc_entrypoint=sdk-cli; cch=7afbb;"},{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.142.73b; cc_entrypoint=sdk-cli; cch=00000;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","cache_control":{"type":"ephemeral"}}],"stream":true}"#,
-            ),
-            (
-                "c159b",
-                r#"{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":[{"type":"text","text":"WATCHPOINT_MARKER_CCP_CCH_7a9d3f41"}]}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.142.73b; cc_entrypoint=sdk-cli; cch=c159b;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","cache_control":{"type":"ephemeral"}}],"stream":true}"#,
-            ),
-        ];
-
-        for (expected, final_body) in cases {
-            let placeholder_body =
-                final_body.replacen(&format!("cch={expected};"), "cch=00000;", 1);
-            assert_eq!(
-                format!(
-                    "{:05x}",
-                    claude_code_cch_checksum(placeholder_body.as_bytes())
-                ),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn cch_matches_real_2_1_162_clean_room_capture_vectors() {
-        // WHY: committed capture vectors prove xxh64 + finalize match live Claude
-        // Code wire cch over rich body shapes (not only synthetic bodies).
-        let vectors = [
-            (
-                "claude-haiku-4-5",
-                include_str!(
-                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.162-claude-haiku-4-5.json"
-                ),
-            ),
-            (
-                "claude-sonnet-4-6",
-                include_str!(
-                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.162-claude-sonnet-4-6.json"
-                ),
-            ),
-            (
-                "claude-opus-4-8",
-                include_str!(
-                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.162-claude-opus-4-8.json"
-                ),
-            ),
-        ];
-        for (model, body) in vectors {
-            let marker = "cc_entrypoint=sdk-cli; cch=";
-            let idx = body
-                .find(marker)
-                .unwrap_or_else(|| panic!("no billing cch marker in {model} vector"));
-            let start = idx + marker.len();
-            let embedded = &body[start..start + 5];
-            let placeholder_body = body.replacen(
-                &format!("{marker}{embedded};"),
-                &format!("{marker}00000;"),
-                1,
-            );
-            assert_ne!(
-                placeholder_body, body,
-                "{model}: cch substitution was a no-op"
-            );
-            assert_eq!(
-                format!(
-                    "{:05x}",
-                    claude_code_cch_checksum(placeholder_body.as_bytes())
-                ),
-                embedded,
-                "cch != real Claude Code 2.1.162 cch for the {model} capture vector"
-            );
-        }
-    }
-
-    #[test]
-    fn cch_matches_real_2_1_165_clean_room_capture_vectors() {
-        let vectors = [
-            (
-                "claude-haiku-4-5",
-                include_str!(
-                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.165-claude-haiku-4-5.json"
-                ),
-            ),
-            (
-                "claude-sonnet-4-6",
-                include_str!(
-                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.165-claude-sonnet-4-6.json"
-                ),
-            ),
-            (
-                "claude-opus-4-8",
-                include_str!(
-                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.165-claude-opus-4-8.json"
-                ),
-            ),
-        ];
-        for (model, body) in vectors {
-            let marker = "cc_entrypoint=sdk-cli; cch=";
-            let idx = body
-                .find(marker)
-                .unwrap_or_else(|| panic!("no billing cch marker in {model} vector"));
-            let start = idx + marker.len();
-            let embedded = &body[start..start + 5];
-            let placeholder_body = body.replacen(
-                &format!("{marker}{embedded};"),
-                &format!("{marker}00000;"),
-                1,
-            );
-            assert_ne!(
-                placeholder_body, body,
-                "{model}: cch substitution was a no-op"
-            );
-            assert_eq!(
-                format!(
-                    "{:05x}",
-                    claude_code_cch_checksum(placeholder_body.as_bytes())
-                ),
-                embedded,
-                "cch != real Claude Code 2.1.165 cch for the {model} capture vector"
-            );
-        }
-    }
-
-    #[test]
-    fn cch_matches_real_2_1_175_clean_room_capture_vectors() {
-        let vectors = [
-            (
-                "claude-fable-5",
-                include_str!(
-                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.175-claude-fable-5.json"
-                ),
-            ),
-            (
-                "claude-haiku-4-5",
-                include_str!(
-                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.175-claude-haiku-4-5.json"
-                ),
-            ),
-            (
-                "claude-sonnet-4-6",
-                include_str!(
-                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.175-claude-sonnet-4-6.json"
-                ),
-            ),
-            (
-                "claude-opus-4-8",
-                include_str!(
-                    "../../../tools/providers/claude/fingerprint/vectors/vector-2.1.175-claude-opus-4-8.json"
-                ),
-            ),
-        ];
-        for (model, body) in vectors {
-            let marker = "cc_entrypoint=sdk-cli; cch=";
-            let idx = body
-                .find(marker)
-                .unwrap_or_else(|| panic!("no billing cch marker in {model} vector"));
-            let start = idx + marker.len();
-            let embedded = &body[start..start + 5];
-            let placeholder_body = body.replacen(
-                &format!("{marker}{embedded};"),
-                &format!("{marker}00000;"),
-                1,
-            );
-            assert_ne!(
-                placeholder_body, body,
-                "{model}: cch substitution was a no-op"
-            );
-            assert_eq!(
-                format!(
-                    "{:05x}",
-                    claude_code_cch_checksum_skip_models_and_max_tokens(
-                        placeholder_body.as_bytes()
-                    )
-                ),
-                embedded,
-                "cch != real Claude Code 2.1.175 cch for the {model} capture vector"
-            );
-        }
-    }
-
-    #[test]
-    fn xxh64_matches_independent_small_input_vectors() {
-        assert_eq!(xxh64(b"", CCH_XXH64_SEED), 0xb8b30e7de65b46c5);
-        assert_eq!(xxh64(b"abc", CCH_XXH64_SEED), 0xdfc4f4d6913699b6);
-        assert_eq!(xxh64(b"hello", CCH_XXH64_SEED), 0xfc8105d2d40e53f1);
-        assert_eq!(
-            xxh64(b"123456789abcdef", CCH_XXH64_SEED),
-            0xd491c6f888304d64
-        );
     }
 
     #[test]
@@ -1654,21 +967,6 @@ mod tests {
                      cc_entrypoint=sdk-cli;"
                 ),
                 "billing_header_text diverged from suffix oracle for first_user_text {input:?}"
-            );
-        }
-
-        let cch_profile = cch_rewrite_profile();
-        let cver = cch_profile.claude_cli_version;
-        for input in inputs {
-            let expected_suffix = claude_code_version_suffix(input, cver);
-            let header = cch_profile.billing_header_text(input);
-            assert_eq!(
-                header,
-                format!(
-                    "x-anthropic-billing-header: cc_version={cver}.{expected_suffix}; \
-                     cc_entrypoint=sdk-cli; cch=00000;"
-                ),
-                "cch billing_header_text diverged from suffix oracle for {input:?}"
             );
         }
     }

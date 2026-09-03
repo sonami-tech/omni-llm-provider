@@ -5099,8 +5099,20 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "composer is no longer in the grok-shell 1.0.13 catalog: {ids:?}"
         );
         assert!(
-            ids.iter().any(|id| id.starts_with("claude-")),
-            "claude real catalog entries missing: {ids:?}"
+            ids.iter().any(|id| id == "claude-fable-5-1"),
+            "claude fable catalog entry missing: {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| id == "claude-opus-5"),
+            "claude opus catalog entry missing: {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| id == "claude-sonnet-5"),
+            "claude sonnet catalog entry missing: {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| id == "claude-haiku-4-5-20251001"),
+            "claude haiku catalog entry missing: {ids:?}"
         );
         assert!(
             !ids.iter()

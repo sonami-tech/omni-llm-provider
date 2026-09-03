@@ -95,13 +95,6 @@ impl RequestCompleteParams {
         self
     }
 
-    #[allow(dead_code)] // API for call sites that observe cache presence.
-    pub fn with_cache(mut self, read: Option<u64>, creation: Option<u64>) -> Self {
-        self.cache_read = read;
-        self.cache_creation = creation;
-        self
-    }
-
     pub fn with_ttft_ms(mut self, ttft_ms: Option<f64>) -> Self {
         self.ttft_ms = ttft_ms;
         self

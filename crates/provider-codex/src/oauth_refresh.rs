@@ -8,7 +8,7 @@
 //! `omni_common::oauth_refresh`). Static `OPENAI_API_KEY` entries are never
 //! refreshed.
 //!
-//! Wire contract: live capture of Codex CLI 0.152.0 UA (2026-09-01). Refresh
+//! Wire contract: live capture of Codex CLI 0.153.1 UA (2026-09-03). Refresh
 //! capture was not re-run; the OAuth UA version string tracks the live pin.
 
 use std::path::Path;
@@ -26,7 +26,7 @@ pub const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// Originator header from capture.
 pub const CODEX_OAUTH_ORIGINATOR: &str = "codex_exec";
 /// User-Agent template matching capture (`codex_exec/<ver> …`).
-pub const CODEX_OAUTH_USER_AGENT: &str = "codex_exec/0.152.0 (linux; x86_64) unknown";
+pub const CODEX_OAUTH_USER_AGENT: &str = "codex_exec/0.153.1 (linux; x86_64) unknown";
 /// Near-expiry skew (15 minutes); shared via omni-common.
 const NEAR_EXPIRY_SKEW_SECS: i64 = omni_common::NEAR_EXPIRY_SKEW_SECS;
 
@@ -35,9 +35,6 @@ pub struct CodexTokenGrant {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub id_token: Option<String>,
-    /// Present on the wire; access lifetime is taken from JWT `exp` after write-back.
-    #[allow(dead_code)]
-    pub expires_in: Option<i64>,
 }
 
 /// Gate for in-Omni Codex OAuth refresh.
@@ -518,7 +515,6 @@ mod tests {
             access_token: "new-at".into(),
             refresh_token: Some("new-rt".into()),
             id_token: Some("new-id".into()),
-            expires_in: Some(864000),
         };
         apply_grant_to_auth_json(&mut file, &grant, "2026-07-09T12:00:00+00:00").unwrap();
         assert_eq!(file["tokens"]["access_token"], "new-at");

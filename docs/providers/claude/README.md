@@ -4,8 +4,9 @@ Claude-specific behavior lives in `crates/provider-claude`.
 
 ## Source Of Truth
 
-- Active fingerprint pin, cch, beta flags, preamble, wire defaults:
+- Active fingerprint pin, billing header, beta flags, preamble, wire defaults:
   `crates/provider-claude/src/fingerprint.rs`
+- Historical cch algorithm (not live): `docs/providers/claude/CCH_ALGORITHM.md`
 - Model catalog: `crates/provider-claude/src/models.rs`
 - Credentials: `crates/provider-claude/src/credentials.rs`
 - Upstream HTTP and streaming: `crates/provider-claude/src/upstream.rs`
@@ -18,7 +19,7 @@ Claude-specific behavior lives in `crates/provider-claude`.
 
 Omni ships one Claude Code pin. That pin must reproduce the captured wire
 fingerprint exactly enough for the Claude OAuth subscription path: version
-string, `anthropic-beta`, stainless versions, billing header cch (when used),
+string, `anthropic-beta`, stainless versions, no-cch billing header,
 billing suffix, system preamble, model catalog, and wire defaults.
 
 Rebaseline overwrites this single pin. Historical multi-version selection and

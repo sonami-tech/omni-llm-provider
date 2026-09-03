@@ -4,9 +4,9 @@
 //! to protect the fingerprint invariant.
 //!
 //! This crate owns:
-//! - Fingerprint profiles, cch checksum computation + injection, billing headers
+//! - Fingerprint profiles, no-cch billing headers, `cc_version` suffix
 //! - `~/.claude/.credentials.json` fresh-read + 401 retry refresh
-//! - Exact Anthropic Messages wire types (serde order is load-bearing for cch)
+//! - Exact Anthropic Messages wire types
 //! - Identity injection (billing marker + canonical "You are Claude Code..." preamble)
 //! - Wire defaults, per-model beta lists, model catalog + resolution (claude-specific)
 //! - Translation adapters CanonicalRequest <-> MessagesRequest (using above)
@@ -15,12 +15,12 @@
 //! It depends on omni-common (only for Replacements + Stats concepts) and
 //! omni-core (Canonical* + LlmProvider trait) for the shared contract.
 //!
-//! NOTHING Claude-specific (cch, betas, preamble, profiles, CLAUDE_CODE_* consts,
-//! billing suffix, xxh64, stainless header values, etc.) is allowed in omni-* crates.
+//! NOTHING Claude-specific (betas, preamble, profiles, CLAUDE_CODE_* consts,
+//! billing suffix, stainless header values, etc.) is allowed in omni-* crates.
 //!
 //! The original invariant is preserved by porting the reference-src-claude
 //! logic with its unit-test pins (header names/values, beta per-model lists,
-//! billing suffix vectors, cch snapshots) intact.
+//! billing suffix vectors) intact.
 
 pub mod anthropic_passthrough;
 pub mod bootstrap;
@@ -517,9 +517,9 @@ impl LlmProvider for ClaudeProvider {
         let creds = self.credentials_for_request().await?;
         let redactor = ClaudeErrorRedactor::for_credentials(&creds);
 
-        // 4. Send (this does finalize_body_json which patches the 5-hex cch,
-        //    builds the full header set with per-profile betas / stainless / ua,
-        //    and does the 401-once refresh).
+        // 4. Send (this does finalize_body_json serialize, builds the full header
+        //    set with per-profile betas / stainless / ua, and does the 401-once
+        //    refresh).
         let raw_resp = self
             .client
             .send_messages_json(&creds, &ctx, &body_val)
@@ -655,7 +655,7 @@ mod tests {
         assert_eq!(provider_id(), "claude");
         let p = ClaudeProvider::new().expect("default profile constructs");
         assert_eq!(p.id(), "claude");
-        assert_eq!(p.profile().name, "cc-2.1.257-sdk-cli");
+        assert_eq!(p.profile().name, "cc-2.1.259-sdk-cli");
     }
 
     #[test]
@@ -1227,8 +1227,8 @@ mod tests {
         // WHY: single-pin world (issue #12) — test helpers must still construct
         // a provider on the shipped fingerprint, not a deleted historical profile.
         let p = ClaudeProvider::new_for_test(crate::fingerprint::default_profile());
-        assert_eq!(p.profile().name, "cc-2.1.257-sdk-cli");
-        assert_eq!(p.profile().claude_cli_version, "2.1.257");
+        assert_eq!(p.profile().name, "cc-2.1.259-sdk-cli");
+        assert_eq!(p.profile().claude_cli_version, "2.1.259");
     }
 
     #[test]
@@ -1414,7 +1414,7 @@ mod tests {
     }
 
     /// The minimal-but-complete Anthropic non-stream response body. Includes every
-    /// field `MessagesResponse` requires (id/type/role/model/content/usage); the
+    /// field `MessagesResponse` requires (id/model/content/usage); the
     /// caller overrides `content` + `stop_reason` for the tool-call variant.
     fn anth_text_response_json() -> serde_json::Value {
         serde_json::json!({

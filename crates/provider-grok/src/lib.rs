@@ -63,11 +63,11 @@ const DEFAULT_BASE_URL: &str = "https://cli-chat-proxy.grok.com";
 /// User-Agent template for CLI-parity requests. `{version}` is filled from the
 /// pinned catalog version (`self.version`, e.g. "1.0.13") so the UA and
 /// `x-grok-client-version` cannot drift from the catalog the request claims.
-/// Verified live against grok-shell 1.0.13 (2026-09-01; first captured 0.2.60 on
+/// Verified live against grok-shell 1.0.13 (2026-09-03; first captured 0.2.60 on
 /// 2026-06-23, UA template unchanged across bumps including the 1.0.x line).
 const CLI_USER_AGENT_TEMPLATE: &str = "grok-shell/{version} (linux; x86_64)";
 
-// Grok catalog, re-baselined 2026-09-01 via live capture (docs/providers/grok/CAPTURE.md).
+// Grok catalog, re-baselined 2026-09-03 via live capture (docs/providers/grok/CAPTURE.md).
 //
 // What the installed grok-shell CLI advertises on cli-chat-proxy.grok.com /v1/models:
 // `grok-4.6` and `grok-4.5`. Settings default_model is grok-4.6. The `grok models`
@@ -1525,16 +1525,10 @@ fn flush_grok_responses_message(
     *has_image = false;
 }
 
-/// Internal typed response shapes (subset of xAI chat.completions response for robust mapping).
-/// Many fields are parsed for wire fidelity / future use (e.g. service_tier, fingerprints, detailed token breakdowns)
-/// but not yet surfaced in CanonicalResponse; allow(dead_code) keeps the compiler clean per project rules
-/// while we keep the full shapes (not a minimal projection).
+/// Internal typed response shapes (subset of xAI chat.completions response).
 #[derive(Debug, Deserialize, Default)]
-#[allow(dead_code)]
 struct XaiChatCompletion {
     id: Option<String>,
-    object: Option<String>,
-    created: Option<u64>,
     model: Option<String>,
     choices: Option<Vec<XaiChoice>>,
     usage: Option<XaiUsage>,
@@ -1543,61 +1537,47 @@ struct XaiChatCompletion {
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[allow(dead_code)]
 struct XaiChoice {
-    index: Option<i32>,
     message: Option<XaiAssistantMessage>,
     finish_reason: Option<String>,
-    logprobs: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[allow(dead_code)]
 struct XaiAssistantMessage {
-    role: Option<String>,
     content: Option<String>,
     refusal: Option<Value>,
     tool_calls: Option<Vec<XaiToolCall>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[allow(dead_code)]
 struct XaiToolCall {
     id: Option<String>,
-    #[serde(rename = "type")]
-    type_: Option<String>,
     function: Option<XaiFunctionCall>,
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[allow(dead_code)]
 struct XaiFunctionCall {
     name: Option<String>,
     arguments: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[allow(dead_code)]
 struct XaiUsage {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
-    total_tokens: Option<u64>,
     prompt_tokens_details: Option<XaiPromptDetails>,
     completion_tokens_details: Option<XaiCompletionDetails>,
     num_sources_used: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[allow(dead_code)]
 struct XaiPromptDetails {
     cached_tokens: Option<u64>,
-    text_tokens: Option<u64>,
     audio_tokens: Option<u64>,
     image_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[allow(dead_code)]
 struct XaiCompletionDetails {
     reasoning_tokens: Option<u64>,
     audio_tokens: Option<u64>,
@@ -2497,7 +2477,6 @@ mod tests {
                     ..Default::default()
                 }),
                 finish_reason: Some("stop".into()),
-                ..Default::default()
             }]),
             usage: Some(XaiUsage {
                 prompt_tokens: Some(10),
@@ -2540,12 +2519,10 @@ mod tests {
                             name: Some("get_weather".into()),
                             arguments: Some(r#"{"city":"sf"}"#.into()),
                         }),
-                        ..Default::default()
                     }]),
                     ..Default::default()
                 }),
                 finish_reason: Some("tool_calls".into()),
-                ..Default::default()
             }]),
             usage: None,
             ..Default::default()
@@ -2685,16 +2662,14 @@ mod tests {
                     content: Some("ok".into()),
                     refusal: Some(serde_json::json!("policy")),
                     tool_calls: None,
-                    ..Default::default()
                 }),
                 finish_reason: Some("stop".into()),
-                ..Default::default()
             }]),
             usage: Some(XaiUsage {
                 prompt_tokens: Some(2),
                 completion_tokens: Some(1),
                 prompt_tokens_details: Some(XaiPromptDetails {
-                    text_tokens: Some(2),
+                    cached_tokens: Some(2),
                     ..Default::default()
                 }),
                 completion_tokens_details: Some(XaiCompletionDetails {
@@ -2728,7 +2703,6 @@ mod tests {
                     ..Default::default()
                 }),
                 finish_reason: Some("stop".into()),
-                ..Default::default()
             }]),
             usage: Some(XaiUsage {
                 prompt_tokens: Some(5),
@@ -2737,7 +2711,6 @@ mod tests {
                     cached_tokens: Some(1),
                     audio_tokens: Some(5),
                     image_tokens: Some(4),
-                    ..Default::default()
                 }),
                 completion_tokens_details: Some(XaiCompletionDetails {
                     reasoning_tokens: Some(7),
@@ -2746,9 +2719,7 @@ mod tests {
                     rejected_prediction_tokens: Some(9),
                 }),
                 num_sources_used: Some(3),
-                ..Default::default()
             }),
-            ..Default::default()
         };
         let canon = from_xai_chat_response(raw, &empty_repl());
         assert_eq!(
@@ -3301,10 +3272,8 @@ mod tests {
                         content: Some("fallback".into()),
                         refusal: Some(json!("policy violation")),
                         tool_calls: None,
-                        ..Default::default()
                     }),
                     finish_reason: Some("stop".into()),
-                    ..Default::default()
                 }]),
                 usage: None,
                 ..Default::default()
@@ -3320,10 +3289,8 @@ mod tests {
                         content: Some("fallback".into()),
                         refusal: None,
                         tool_calls: None,
-                        ..Default::default()
                     }),
                     finish_reason: Some("stop".into()),
-                    ..Default::default()
                 }]),
                 usage: None,
                 ..Default::default()
@@ -3339,10 +3306,8 @@ mod tests {
                         content: Some("fallback".into()),
                         refusal: Some(json!({"type":"other"})),
                         tool_calls: None,
-                        ..Default::default()
                     }),
                     finish_reason: Some("stop".into()),
-                    ..Default::default()
                 }]),
                 usage: None,
                 ..Default::default()
@@ -4077,12 +4042,10 @@ mod tests {
                             name: Some("adder".into()),
                             arguments: Some(r#"{"a":2,"b":3}"#.into()),
                         }),
-                        ..Default::default()
                     }]),
                     ..Default::default()
                 }),
                 finish_reason: Some("tool_calls".into()),
-                ..Default::default()
             }]),
             usage: Some(XaiUsage {
                 prompt_tokens: Some(8),
@@ -4129,12 +4092,10 @@ mod tests {
                             name: Some("adder".into()),
                             arguments: Some(r#"{"x":2,"y":2}"#.into()),
                         }),
-                        ..Default::default()
                     }]),
                     ..Default::default()
                 }),
                 finish_reason: Some("tool_calls".into()),
-                ..Default::default()
             }]),
             usage: None,
             ..Default::default()
