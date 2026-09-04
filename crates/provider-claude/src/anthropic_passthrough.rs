@@ -1525,7 +1525,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_body_finalizes_cch_after_identity() {
+    fn prepared_body_has_billing_marker_and_no_cch_sentinel() {
         let body = serde_json::json!({
             "model": "claude-haiku-4-5",
             "max_tokens": 100,

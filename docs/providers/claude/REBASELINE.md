@@ -97,7 +97,11 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
    - Confirm all pinned catalog models are accepted.
    - Confirm the billing suffix and no-cch header (or captured cch shape if
      a newer CLI reintroduces `cch=`).
-   - If a newer Claude Code reintroduces `cch=`, stop and keep CCH code.
+   - If a newer Claude Code reintroduces `cch=`, stop. The live cch rewrite
+     no longer exists in the crates; restore it from git history as a starting
+     point (removed in 243b7ce, so `243b7ce^` holds the last live version) and
+     re-derive the current algorithm with the reverse-engineering playbook in
+     `docs/providers/claude/CCH_ALGORITHM.md`.
 
 4. Update code (overwrite the single active pin; do not append a profile ladder):
 

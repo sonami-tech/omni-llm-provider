@@ -5,8 +5,9 @@
 //! `~/.claude/.credentials.json`, re-read per request.
 //!
 //! Port/adapted from reference-src-claude/upstream/* .
-//! The client, cch finalization, 401 refresh, and header construction
-//! are load-bearing for the fingerprint invariant and live ONLY here.
+//! The client, the `finalize_body_json` call sites, 401 refresh, and header
+//! construction are load-bearing for the fingerprint invariant and live ONLY
+//! here.
 
 pub mod errors {
     //! Upstream error types and retry classification.
@@ -960,8 +961,8 @@ impl UpstreamClient {
     ///
     /// NOTE: the body is sent VERBATIM (not run through `finalize_body_json`):
     /// count_tokens counts the client body as-sent and carries no injected
-    /// billing-header placeholder, so there is no cch to finalize. This matches
-    /// the native-surface decision to count the client's own body.
+    /// billing header. This matches the native-surface decision to count the
+    /// client's own body.
     pub async fn count_tokens(
         &self,
         creds: &Credentials,

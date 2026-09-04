@@ -66,8 +66,9 @@ pub type NativeAnthropicSseStream =
 
 /// Optional capability: raw Anthropic Messages / count_tokens.
 ///
-/// Implementors own fingerprint, cch, credentials, and wire defaults. The edge
-/// only prepares body identity (model strip), then calls these methods.
+/// Implementors own fingerprint, stale-cch handling, credentials, and wire
+/// defaults. The edge only prepares body identity (model strip), then calls
+/// these methods.
 #[async_trait]
 pub trait AnthropicNativeSurface: Send + Sync {
     /// Parse + shape a client `/v1/messages` body for upstream (identity injection

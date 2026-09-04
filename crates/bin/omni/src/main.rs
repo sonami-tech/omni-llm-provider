@@ -35,8 +35,8 @@
 //! Prefix takes precedence. Provider keys in the map and for prefixes are "claude", "grok", "codex".
 //!
 //! ## Boundaries
-//! - Claude fingerprint logic, cch, betas, preamble, and fresh credential reads
-//!   stay in `provider-claude`.
+//! - Claude fingerprint logic, stale-cch handling, betas, preamble, and fresh
+//!   credential reads stay in `provider-claude`.
 //! - Grok wire mapping and fresh xAI credential reads stay in `provider-grok`.
 //! - Codex config/auth and Responses wire mapping stay in `provider-codex`.
 //! - Auth and stats are server concerns handled here with `omni-common`.
@@ -1822,7 +1822,8 @@ async fn anthropic_messages_inner(
 ) -> Result<Response, AppError> {
     let request_id = request_id_from(&request);
     let short_request_id = request_id.chars().take(8).collect::<String>();
-    // Retain original bytes for Claude native path (cch/fingerprint isolation).
+    // Retain original bytes for Claude native path (prepare from the client body,
+    // not a canonical round-trip).
     let raw_bytes = read_anthropic_body_bytes(request).await?;
     let requested_model = peek_model_string(&raw_bytes).unwrap_or_else(|| "<missing>".into());
 

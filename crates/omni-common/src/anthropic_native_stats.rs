@@ -1,8 +1,8 @@
 //! Edge-facing Anthropic Messages stats helpers for the native path.
 //!
 //! These parse Anthropic JSON shapes only (usage objects, content deltas). They
-//! do not touch fingerprints, cch, or provider credentials. Used by the thin
-//! edge when relaying `AnthropicNativeSurface` streams/responses.
+//! do not touch fingerprints, stale-cch handling, or provider credentials. Used
+//! by the thin edge when relaying `AnthropicNativeSurface` streams/responses.
 
 use serde_json::Value;
 

@@ -802,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn billing_cch_stays_on_known_safe_sentinel() {
+    fn billing_header_omits_cch_and_ends_at_entrypoint() {
         let profile = default_profile();
         let header = profile.billing_header_text("Say OK");
         assert!(
@@ -876,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn finalized_body_without_billing_sentinel_is_unchanged() {
+    fn finalized_body_without_billing_header_is_plain_serialize() {
         let profile = default_profile();
         let ctx = RequestContext::new_reply();
         let body = serde_json::json!({

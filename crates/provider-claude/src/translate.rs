@@ -2,8 +2,8 @@
 //! Plus identity (preamble + billing) injection and outbound/inbound replacements hook.
 //!
 //! **Isolation note:** The wire structs here (MessagesRequest etc) control
-//! exact JSON serialization order and presence for cch computation and the
-//! OAuth gate. They are deliberately private to provider-claude.
+//! exact JSON field presence and shape for the OAuth gate. They are
+//! deliberately private to provider-claude.
 //!
 //! Adapted from reference-src-claude/translate/{anthropic.rs, build.rs,
 //! from_anthropic.rs, tool_translate.rs, ...} and routes/completions_v2.rs
@@ -11,7 +11,7 @@
 //!
 //! The canonical types are intentionally lossy (flat Text only today); the
 //! adapter here maps the supported subset while still routing the request
-//! through the full fingerprint + cch + identity path.
+//! through the full fingerprint + identity path.
 
 use std::collections::BTreeMap;
 
@@ -32,7 +32,7 @@ use crate::fingerprint::FingerprintProfile;
 use crate::models::ModelDef;
 // UpstreamError kept commented for future use in count_tokens etc; no current non-test refs.
 
-// ── Native Anthropic Messages API wire types (exact shapes for cch) ──
+// ── Native Anthropic Messages API wire types (exact shapes for the gate) ──
 
 /// Outbound `POST /v1/messages` body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -868,7 +868,7 @@ fn translate_tool_choice(
 
 // ── Identity injection (the preamble + dynamic billing marker) ──
 
-/// Prepend the Claude Code billing marker (dynamic cch placeholder) + system
+/// Prepend the Claude Code billing marker (dynamic `cc_version` suffix) + system
 /// preamble to the request's system field (forcing block form).
 ///
 /// Replacements MUST have already been applied to the request body texts
@@ -1173,7 +1173,8 @@ fn apply_client_effort_to_output_config(
 /// 1. outbound model id (verbatim pin vs profile canonical)
 /// 2. prompt replacements (before identity, so the billing suffix sees final text)
 /// 3. wire defaults (fills only still-unset fields)
-/// 4. identity injection (the billing suffix is computed over the final body)
+/// 4. identity injection (the billing suffix is derived from the
+///    post-replacement first user text)
 /// 5. auto-cache marker (LAST: a pure top-level appendage; it does not touch the
 ///    system/message prefix identity computed by step 4)
 ///
@@ -1220,8 +1221,8 @@ pub fn finalize_claude_wire_request(
     // Thinking budget does not influence max_tokens here (issue #19).
     apply_profile_wire_defaults(req, profile);
 
-    // 4. Identity: the billing suffix is computed over the final body and
-    // uses the (post-replacement) first user text.
+    // 4. Identity: runs after wire defaults; the billing suffix is derived from
+    // the (post-replacement) first user text.
     prepend_claude_code_identity(req, profile, inject_identity);
 
     // 5. Auto-cache marker LAST. A single top-level `cache_control` puts Anthropic
@@ -1621,9 +1622,9 @@ mod tests {
 
     #[test]
     fn identity_injects_billing_at_system_0_then_preamble() {
-        // Invariant: cch/billing marker is ALWAYS first in system blocks (before
-        // preamble), because suffix is computed on first user text and cch
-        // finalizer searches from "system" for the billing sentinel.
+        // Invariant: the billing marker is ALWAYS first in system blocks and the
+        // preamble comes right after it. That is the captured Claude Code order
+        // the OAuth gate expects (see CLAUDE_CODE_SYSTEM_PREAMBLE).
         let mut req = MessagesRequest {
             model: "haiku".into(),
             max_tokens: 1,
@@ -1738,8 +1739,8 @@ mod tests {
     #[test]
     fn prepare_uses_post_repl_first_user_for_billing_suffix() {
         // Prompt-before-identity gate: repls (tool/prompt scope) run on texts
-        // BEFORE billing_header_text is called, so suffix (and thus cch body)
-        // is derived from post-repl bytes. Critical for gate fingerprint.
+        // BEFORE billing_header_text is called, so the cc_version suffix is
+        // derived from post-repl bytes. Critical for gate fingerprint.
         let repl = Replacements::parse(
             r#"rule = [ { scope = "prompt", search = "FOO", replace = "BAR" } ]"#,
         )

@@ -505,7 +505,7 @@ impl LlmProvider for ClaudeProvider {
             self.supports_auto_cache(),
         )?;
 
-        // 3. Serialize for finalize (cch lives in the billing text inside system).
+        // 3. Convert the typed request into the JSON value that finalize serializes.
         let body_val = serde_json::to_value(&anth_req).map_err(|e| {
             ProviderError::Other(anyhow::Error::msg(format!("anth serialize: {e}")))
         })?;
@@ -557,7 +557,7 @@ impl LlmProvider for ClaudeProvider {
 
         // Same outbound build as send(): replacements -> exact wire request ->
         // identity injection. Streaming only flips the `stream` flag, so the
-        // fingerprint body (betas, cch, preamble, wire defaults) is identical to
+        // fingerprint body (betas, billing, preamble, wire defaults) is identical to
         // the non-stream path. Build, serialize, then set stream=true on the
         // JSON value (the typed builder set Some(false)).
         let repl = Replacements::empty();
@@ -988,13 +988,13 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn claude_send_exercises_full_fingerprint_path() {
         // Live test: exercises the complete path end-to-end against the real
-        // Anthropic upstream (canonical -> translate -> identity/cch finalize ->
+        // Anthropic upstream (canonical -> translate -> identity + serialize ->
         // headers + body -> real call -> from_anth -> canonical).
         //
         // Guarded so `cargo test` stays hermetic and green even on credentialed
         // developer machines. Credential presence alone is not enough: set
         // OMNI_LIVE_TESTS=1 to spend provider quota. The byte-exact wire pins
-        // (fingerprint, cch, translate) are asserted by offline unit tests above;
+        // (fingerprint, billing, translate) are asserted by offline unit tests above;
         // this test only proves live wiring when explicitly requested.
         //
         // Holds CREDS_ENV_LOCK across the gate + send so it cannot race a hermetic
@@ -1232,7 +1232,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_invariants_cch_billing_system0_and_preamble_exact() {
+    fn identity_invariants_billing_system0_and_preamble_exact() {
         let req = sample_req("inv");
         let profile = default_profile();
         let repl = Replacements::empty();
