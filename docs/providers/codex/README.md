@@ -82,6 +82,46 @@ forwards them to the upstream Responses-compatible body:
 - `metadata`
 - `parallel_tool_calls`
 - `service_tier`
+- `text`
+
+Each is copied through unchanged, with one exception: when a non-null
+`response_format` is also present, Omni merges the translated format into the
+`text` object it forwards. See the merge rules below.
+
+Codex also accepts Chat Completions `response_format`, but never forwards that
+key. Responses has no `response_format`, so Omni translates it into
+`text.format` and drops the original (issue #32). Translation rules:
+
+- `{"type": "text"}` and `{"type": "json_object"}` map 1:1 into `text.format`.
+- `{"type": "json_schema", ...}` unwraps the nested `json_schema` object into a
+  flat `text.format` carrying `type`, `name`, and `schema`, plus `description`
+  and `strict` when present. Null `description` / `strict` are omitted.
+- `response_format: null` counts as absent. Omni does not invent `text`.
+
+These `response_format` shapes are a 400:
+
+- A non-null non-object, or a missing or non-string `type`.
+- Any `type` other than `text`, `json_object`, or `json_schema`.
+- An unknown field under `response_format`, or under
+  `response_format.json_schema`.
+- For `json_schema`: a missing or non-object `json_schema` wrapper, a missing
+  or non-string `name`, a missing or non-object `schema`, a non-null
+  non-string `description`, or a non-null non-boolean `strict`.
+
+The merge into `text` keeps client intent:
+
+- No `text` extra: Omni creates `{"format": <mapped>}`.
+- `text` without `format`: Omni adds `format` and keeps siblings such as
+  `verbosity`.
+- `text.format` already equal to the mapped value: accepted unchanged.
+- `text.format` set to anything else: 400, never a silent overwrite.
+- `text` present but not an object, `text: null` included: 400. A null `text`
+  is not treated as absent the way `response_format: null` is. These rules
+  apply only when a non-null `response_format` is also present. On its own,
+  `text` is forwarded exactly as the client sent it.
+
+Both Codex transports build the request from the same body builder, so the REST
+path and the ChatGPT WebSocket path send the same `text` and `text.format`.
 
 Unsupported extras fail loudly.
 
