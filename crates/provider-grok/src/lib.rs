@@ -2668,10 +2668,17 @@ mod tests {
             usage: Some(XaiUsage {
                 prompt_tokens: Some(2),
                 completion_tokens: Some(1),
-                prompt_tokens_details: Some(XaiPromptDetails {
-                    cached_tokens: Some(2),
-                    ..Default::default()
-                }),
+                // WHY (issue #40): this fixture models a prompt-cache MISS.
+                // It previously set the never-read `text_tokens: 2`; when
+                // 243b7ce trimmed that field off XaiPromptDetails the literal
+                // was rewritten to `cached_tokens: Some(2)`, which invented a
+                // fully cached 2-token prompt the modeled response never had.
+                // A miss reports `cached_tokens` as absent or zero (see
+                // grok_prompt_cache_key_reads_across_turns_live, which needs a
+                // hit to raise cache_read above zero), so the details object
+                // stays present with no cache read instead of carrying a
+                // fabricated value.
+                prompt_tokens_details: Some(XaiPromptDetails::default()),
                 completion_tokens_details: Some(XaiCompletionDetails {
                     reasoning_tokens: Some(10),
                     ..Default::default()
@@ -2685,6 +2692,10 @@ mod tests {
         assert_eq!(canon.content, "ok");
         assert_eq!(canon.refusal.as_deref(), Some("policy"));
         assert_eq!(canon.usage.input_tokens, 2);
+        assert_eq!(
+            canon.usage.cache_read, 0,
+            "fixture models a cache miss: details carry no cache read"
+        );
         assert_eq!(canon.usage.reasoning_tokens, 10);
     }
 
