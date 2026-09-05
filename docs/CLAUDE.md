@@ -5,7 +5,7 @@
 
 ## Layout
 
-- `crates/provider-claude/src/fingerprint.rs` - active fingerprint pin, cch
+- `crates/provider-claude/src/fingerprint.rs` - active fingerprint pin, no-cch
   billing header, per-model betas, system preamble, model catalog, and wire
   defaults.
 - `crates/provider-claude/src/credentials.rs` - fresh reads from
@@ -20,8 +20,9 @@
 - `crates/bin/omni` - server routing, auth, stats, `/v1/models`, `/stats`, and
   Claude-only Anthropic inbound route registration.
 
-Nothing Claude-specific, including cch, betas, preamble, fingerprint pin,
-billing suffixes, or Claude Code header values, belongs in `omni`.
+Nothing Claude-specific, including stale-cch handling, betas, preamble,
+fingerprint pin, billing suffixes, or Claude Code header values, belongs in
+`omni`.
 
 ## Run
 
@@ -52,7 +53,7 @@ and prove Anthropic accepts the current pin when the account has capacity.
 Omni's `/v1/messages` and `/v1/messages/count_tokens` routes are native
 Anthropic inbound routes for Claude only. They do not use canonical OpenAI
 framing, but they still run through the same Claude provider fingerprint,
-credential, retry, identity, and cch machinery before reaching Anthropic.
+credential, retry, and identity machinery before reaching Anthropic.
 
 `ANTHROPIC_BASE_URL` switches Claude to a custom Anthropic-compatible gateway.
 In that mode, gateway auth is taken from `ANTHROPIC_AUTH_TOKEN`,

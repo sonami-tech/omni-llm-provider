@@ -115,7 +115,9 @@ oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,p
 ## Body Notes
 
 - `system` is an array of text blocks.
-- The first `system` block is the billing marker:
+- The first `system` block is the billing marker. Under 2.1.175 it was built
+  with the `cch=00000` sentinel and rewritten before send
+  (`docs/providers/claude/CCH_ALGORITHM.md`):
 
   ```text
   x-anthropic-billing-header: cc_version=2.1.175.174; cc_entrypoint=sdk-cli; cch=00000;

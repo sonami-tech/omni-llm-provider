@@ -1,11 +1,11 @@
 # Grok Gate (xAI Access Controls, Headers, and Credential Handling)
 
 ## Overview
-Unlike the Claude Code Provider's heavy "core invariant" (byte-exact wire fingerprint, `x-anthropic-billing-header` cch checksum, specific betas, preamble injection, per-profile wire defaults, etc. that must be reproduced to pass Anthropic's subscription OAuth gate), the Grok/xAI "gate" is lightweight and standard.
+Unlike the Claude Code Provider's heavy "core invariant" (byte-exact wire fingerprint, `x-anthropic-billing-header`, specific betas, preamble injection, per-profile wire defaults, etc. that must be reproduced to pass Anthropic's subscription OAuth gate), the Grok/xAI "gate" is lightweight and standard.
 
 xAI does **not** require:
 - Any Claude-Code-style fingerprint emulation
-- cch checksums
+- Billing-header checksums
 - Mandatory system preambles or identity blocks
 - Per-release profiles or stainless version pinning
 - Special TLS client hellos

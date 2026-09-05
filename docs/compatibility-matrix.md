@@ -1,6 +1,6 @@
 # Compatibility Matrix
 
-Last updated: 2026-08-28.
+Last updated: 2026-09-04.
 
 Normal tests are hermetic and quota-free. Live provider checks remain opt-in via
 `OMNI_LIVE_TESTS=1`.
@@ -33,7 +33,7 @@ Unsupported typed media parts fail loudly with a request error.
 | Thinking wire emit | Yes | No | No |
 | Hosted/computer tools | Passthrough | No (400) | No (400) |
 | `count_tokens` | Yes | No (400) | No (400) |
-| Fingerprint / cch | Yes | No | No |
+| Claude Code fingerprint | Yes | No | No |
 | Official `cache_control` | Native passthrough | Translated | Translated |
 | Body `prompt_cache_key` | 400 | 400 | 400 |
 
@@ -44,6 +44,7 @@ Shipped cache translation: `docs/cache-translation.md`.
 
 | Feature | Claude | Grok | Codex |
 |---|---:|---:|---:|
+| `store` passthrough | No | No | Yes |
 | `previous_response_id` | No | No | Yes |
 | `metadata` passthrough | No | No | Yes |
 | `service_tier` passthrough | No | Yes | Yes |

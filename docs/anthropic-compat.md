@@ -5,7 +5,7 @@ OpenAI chat (`resolve_provider_and_model`).
 
 | Resolved provider | Behavior |
 |---|---|
-| **claude** | Native Anthropic passthrough (fingerprint, cch). No Anthropic→canonical. |
+| **claude** | Native Anthropic passthrough (fingerprint, billing header). No Anthropic→canonical. |
 | **grok** / **codex** | Translated through canonical. Best-effort Anthropic shape. |
 | other / missing | Anthropic-shaped 400 |
 
@@ -83,5 +83,5 @@ After SSE `message_start`, failures are SSE `error` frames only (no happy
 ## Client tips
 
 Point Anthropic clients at Omni with explicit `grok:…` or `codex:…` model ids
-when multiple providers are enabled. Claude Code preamble/cch are not applied
-on Grok/Codex.
+when multiple providers are enabled. The Claude Code preamble and billing
+header are not applied on Grok/Codex.

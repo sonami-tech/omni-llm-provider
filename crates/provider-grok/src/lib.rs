@@ -2667,6 +2667,12 @@ mod tests {
             }]),
             usage: Some(XaiUsage {
                 prompt_tokens: Some(2),
+                // WHY (issue #40): unlike OpenAI, xAI reports reasoning tokens
+                // IN ADDITION TO completion_tokens rather than as a subset of
+                // them, so completion_tokens: 1 next to reasoning_tokens: 10 is
+                // the real wire shape for a long think ending in one visible
+                // "ok" token, not an arithmetic error. Do not "repair" it by
+                // summing the two.
                 completion_tokens: Some(1),
                 // WHY (issue #40): this fixture models a prompt-cache MISS.
                 // It previously set the never-read `text_tokens: 2`; when
@@ -2677,7 +2683,10 @@ mod tests {
                 // grok_prompt_cache_key_reads_across_turns_live, which needs a
                 // hit to raise cache_read above zero), so the details object
                 // stays present with no cache read instead of carrying a
-                // fabricated value.
+                // fabricated value. Canonical usage cannot tell that present
+                // empty object from an absent one, so the wire half of the
+                // shape is pinned by xai_usage_keeps_present_empty_prompt_details
+                // rather than by the cache_read assertion below.
                 prompt_tokens_details: Some(XaiPromptDetails::default()),
                 completion_tokens_details: Some(XaiCompletionDetails {
                     reasoning_tokens: Some(10),
@@ -2693,10 +2702,63 @@ mod tests {
         assert_eq!(canon.refusal.as_deref(), Some("policy"));
         assert_eq!(canon.usage.input_tokens, 2);
         assert_eq!(
+            canon.usage.output_tokens, 1,
+            "output_tokens mirrors completion_tokens verbatim and is never summed \
+             with the separately reported reasoning tokens"
+        );
+        assert_eq!(
             canon.usage.cache_read, 0,
             "fixture models a cache miss: details carry no cache read"
         );
         assert_eq!(canon.usage.reasoning_tokens, 10);
+    }
+
+    #[test]
+    fn xai_usage_keeps_present_empty_prompt_details() {
+        // WHY (issue #40): the cache-miss fixture above claims xAI's real miss
+        // shape, a `prompt_tokens_details` OBJECT that carries no
+        // `cached_tokens`. A canonical cache_read assertion cannot prove that
+        // shape: xai_usage_to_canonical uses `unwrap_or(0)`, which yields 0 for
+        // a present empty object and for an absent one alike. Pin the
+        // distinction where it is observable, at the parse step, and pin the
+        // positive control so a zero cache_read means "read and empty" rather
+        // than "never read".
+        let miss: XaiUsage = serde_json::from_value(json!({
+            "prompt_tokens": 2,
+            "completion_tokens": 1,
+            "prompt_tokens_details": {},
+            "completion_tokens_details": {"reasoning_tokens": 10}
+        }))
+        .unwrap();
+        assert!(
+            miss.prompt_tokens_details.is_some(),
+            "a present but empty details object must survive parsing as Some"
+        );
+
+        let absent: XaiUsage = serde_json::from_value(json!({
+            "prompt_tokens": 2,
+            "completion_tokens": 1
+        }))
+        .unwrap();
+        assert!(
+            absent.prompt_tokens_details.is_none(),
+            "an omitted details object must parse as None"
+        );
+
+        let hit: XaiUsage = serde_json::from_value(json!({
+            "prompt_tokens": 2,
+            "completion_tokens": 1,
+            "prompt_tokens_details": {"cached_tokens": 2}
+        }))
+        .unwrap();
+
+        assert_eq!(xai_usage_to_canonical(miss).cache_read, 0);
+        assert_eq!(xai_usage_to_canonical(absent).cache_read, 0);
+        assert_eq!(
+            xai_usage_to_canonical(hit).cache_read,
+            2,
+            "only a real cached_tokens may raise cache_read"
+        );
     }
 
     #[test]

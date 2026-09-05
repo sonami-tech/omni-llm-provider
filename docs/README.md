@@ -49,9 +49,9 @@ Design narrative: [`DESIGN.md`](DESIGN.md). Decision record:
 - `crates/omni-common` - OpenAI-compatible HTTP conversion and SSE framing,
   Responses conversion, auth middleware, persistent stats, replacements, error
   envelope, session derivation.
-- `crates/provider-claude` - Claude-specific fingerprint pin, cch,
-  credentials, Anthropic Messages translation, identity injection, wire defaults,
-  and model catalog.
+- `crates/provider-claude` - Claude-specific fingerprint pin, no-cch billing
+  header, credentials, Anthropic Messages translation, identity injection,
+  wire defaults, and model catalog.
 - `crates/provider-grok` - xAI Grok provider and OpenAI-compatible xAI wire
   mapping.
 - `crates/provider-codex` - Codex configuration-backed provider, Codex/OpenAI

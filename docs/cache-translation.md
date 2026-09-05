@@ -116,9 +116,9 @@ Example: Anthropic `ttl: "30m"` is not a legal Anthropic field. Clamp-down
 applies only when the inbound value is legal for that interface and the
 chosen backend cannot copy it.
 
-Claude fingerprint/cch injection must stay in a stable prefix. If Omni
-rewrites `system` or `tools` after the client’s cache marks, cache will miss
-even when field translation is correct.
+Claude fingerprint and billing header injection must stay in a stable prefix.
+If Omni rewrites `system` or `tools` after the client’s cache marks, cache will
+miss even when field translation is correct.
 
 ## Compatibility vs fail-loud
 

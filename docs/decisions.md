@@ -101,10 +101,10 @@
 
 ## Provider Boundaries
 
-- Claude: cch, betas, preamble, profiles, model aliases, credentials, and
-  Anthropic wire defaults stay in `provider-claude`. Native Anthropic inbound
-  reconciliation, raw JSON passthrough, raw SSE forwarding, and count-token body
-  shaping also stay there.
+- Claude: stale-cch handling, betas, preamble, profiles, model aliases,
+  credentials, and Anthropic wire defaults stay in `provider-claude`. Native
+  Anthropic inbound reconciliation, raw JSON passthrough, raw SSE forwarding,
+  and count-token body shaping also stay there.
 - Grok: xAI request/response mapping, streaming parsing, credential resolution,
   and model catalog stay in `provider-grok`.
 - Codex: Codex config discovery, auth parsing, provider override handling, and

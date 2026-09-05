@@ -69,8 +69,8 @@ Provider implementations remain separate crates:
 
 - Users run one local endpoint for Claude, Grok, and Codex.
 - Auth, stats, HTTP routes, and model-list behavior have one implementation.
-- Provider crates still protect provider invariants; no Claude cch or
-  fingerprint logic moves into `omni`.
+- Provider crates still protect provider invariants; no Claude stale-cch
+  handling or fingerprint logic moves into `omni`.
 - Model routing uses provider-owned catalogs. Bare canonical ids and documented
   aliases route when they uniquely match an enabled provider. `claude:`,
   `grok:`, and `codex:` prefixes remain as an explicit provider escape hatch.
@@ -95,7 +95,7 @@ Anthropic inbound is **dual-mode** (same shared model resolver as chat):
 
 | Resolved provider | Path |
 |---|---|
-| **claude** | Native passthrough: fingerprint, cch, raw JSON/SSE. Original body is not run through Anthropic→canonical. |
+| **claude** | Native passthrough: fingerprint, billing header, raw JSON/SSE. Original body is not run through Anthropic→canonical. |
 | **grok** / **codex** | Translated: Anthropic → Canonical → `LlmProvider` → Anthropic JSON/SSE (`omni-common::anthropic`). Best-effort protocol fidelity; lossy fields documented in `docs/anthropic-compat.md`. |
 
 Claude native path stays in `provider-claude`. Mappers live in `omni-common`;

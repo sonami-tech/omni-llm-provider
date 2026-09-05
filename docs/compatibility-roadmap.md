@@ -3,7 +3,7 @@
 This document tracks go-forward compatibility work across sessions. It covers
 the active compatibility plan only.
 
-Last updated: 2026-08-16.
+Last updated: 2026-09-04.
 
 ## Current Status
 
@@ -103,10 +103,10 @@ Done when:
 - Unsupported Responses tools and item types fail clearly.
 - Responses streaming and non-streaming tests cover new fields.
 
-Result: Codex forwards `previous_response_id`, `metadata`, `service_tier`,
-`text`, and `parallel_tool_calls`. Chat `response_format` is translated to
-Responses `text.format`. Grok continues to forward
-its chat-compatible extras such as `service_tier`, `response_format`, and
+Result: Codex forwards `store`, `previous_response_id`, `metadata`,
+`service_tier`, `text`, and `parallel_tool_calls`. Chat `response_format` is
+translated to Responses `text.format`. Grok continues to forward its
+chat-compatible extras such as `service_tier`, `response_format`, and
 `parallel_tool_calls`; Responses-native state fields remain unsupported for
 Grok. Claude OpenAI-compatible provider extras remain unsupported.
 

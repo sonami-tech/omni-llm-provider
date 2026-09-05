@@ -20,7 +20,7 @@
 - For built-in tools (web_search, x_search, code_execution): use specific tool objects in the request, or search_parameters.
 
 ## Interesting Findings
-- No byte-exact fingerprint/cch/preamble like Claude. Much lighter "gate".
+- No byte-exact fingerprint/preamble like Claude. Much lighter "gate".
 - Reasoning models (grok-4.3 etc.) support "reasoning_effort": "low"|"medium"|"high" (in body).
 - Built-in server-side tools are a big differentiator; they execute on xAI side and return citations/usage.
 - Responses API is preferred for multi-turn agent loops (previous_response_id).

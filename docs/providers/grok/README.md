@@ -13,8 +13,8 @@ Grok-specific behavior lives in `crates/provider-grok`.
 
 ## Invariant
 
-Grok does not currently require Claude-style billing cch or injected identity
-preambles. The maintained contract is:
+Grok does not currently require Claude-style billing headers or injected
+identity preambles. The maintained contract is:
 
 - CLI-parity wire to `cli-chat-proxy.grok.com` (`POST /v1/responses`),
 - fresh credential resolution per request (prefers `~/.grok/auth.json` OIDC),
