@@ -2,7 +2,7 @@
 
 Codex-specific behavior lives in `crates/provider-codex`.
 
-Single pin: Codex CLI **0.153.1**. `--codex-version` / `OMNI_CODEX_VERSION` and
+Single pin: Codex CLI **0.153.4**. `--codex-version` / `OMNI_CODEX_VERSION` and
 match-system flags are removed (issue #12). Rebaseline overwrites this pin;
 older wire needs an older Omni release.
 

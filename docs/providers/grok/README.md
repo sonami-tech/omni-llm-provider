@@ -20,7 +20,7 @@ identity preambles. The maintained contract is:
 - fresh credential resolution per request (prefers `~/.grok/auth.json` OIDC),
 - grok-shell fingerprint headers for the pinned CLI version,
 - correct non-stream and stream decoding via the shared Responses parser,
-- model catalog kept current (single pin: grok-shell 1.0.13; `grok-4.6` default,
+- model catalog kept current (single pin: grok-shell 1.0.30; `grok-4.6` default,
   plus `grok-4.5`). Catalog source is clean-HOME `GET /v1/models` on
   `cli-chat-proxy.grok.com`, not the operator `grok models` UI.
 

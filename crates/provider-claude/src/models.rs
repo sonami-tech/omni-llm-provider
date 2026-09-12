@@ -15,7 +15,7 @@ pub struct ModelDef {
     pub max_tokens: u64,
 }
 
-/// Active Claude Code model catalog (pin 2.1.259).
+/// Active Claude Code model catalog (pin 2.1.269).
 /// Fable alias is `claude-fable-5-1`. Opus is `claude-opus-5`, sonnet is
 /// `claude-sonnet-5`, and haiku is dated. Explicit `claude-fable-5` stays
 /// pass-through plus a wire/beta override, not a second advertised row.

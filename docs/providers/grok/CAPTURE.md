@@ -123,7 +123,7 @@ wrapper around `tools.capture extract jsonl` for sanitized JSONL exports.
 
 ## Current Wire + Model Findings
 
-Re-baselined against grok-shell **1.0.13** on **2026-09-03**.
+Re-baselined against grok-shell **1.0.30** on **2026-09-12**.
 
 ### Default path (cli-chat-proxy.grok.com)
 
@@ -139,7 +139,7 @@ default (for example `gpt-luna` from `[models] default` in
 
 Wire notes from live MITM of `grok --single`:
 - Host: `cli-chat-proxy.grok.com`, path `POST /v1/responses`
-- UA / version: `grok-shell/1.0.13 (linux; x86_64)`, `x-grok-client-version: 1.0.13`
+- UA / version: `grok-shell/1.0.30 (linux; x86_64)`, `x-grok-client-version: 1.0.30`
 - Fingerprint headers: `x-xai-token-auth`, `x-authenticateresponse`,
   `x-grok-client-identifier`, `x-grok-client-mode: headless`,
   `x-grok-model-override`, `accept: text/event-stream`
@@ -149,8 +149,8 @@ Wire notes from live MITM of `grok --single`:
 - Session-title side call uses the selected chat model (not `grok-build`)
 - CLI also sends session/compaction headers (`x-compaction-at`,
   `x-compactions-remaining`, `x-grok-doom-loop-check`,
-  `x-grok-exact-repetition-check`); Omni still omits those on single-shot
-  requests
+  `x-grok-exact-repetition-check`, `x-grok-conv-group-id`); Omni still omits
+  those on single-shot requests
 
 `/v1/models` emits only canonical upstream ids. Omni accepts aliases inbound only.
 

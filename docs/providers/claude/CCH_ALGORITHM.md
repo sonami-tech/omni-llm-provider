@@ -1,7 +1,7 @@
 # Claude Code cch fingerprint (historical)
 
 **Historical.** Live Omni no longer computes or rewrites `cch=`. The active pin
-(Claude Code `2.1.259`, captured 2026-09-03) emits a billing header that ends at
+(Claude Code `2.1.269`, captured 2026-09-12) emits a billing header that ends at
 `cc_entrypoint=sdk-cli;` with no checksum field. The `cc_version` suffix
 (`Sha256Utf16SampleV1`) is still live.
 

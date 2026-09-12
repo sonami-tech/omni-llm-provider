@@ -45,10 +45,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{info, warn};
 
-/// Captured Grok OIDC token endpoint (grok-shell 1.0.13).
+/// Captured Grok OIDC token endpoint (grok-shell 1.0.30).
 pub const GROK_OAUTH_TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
 /// User-Agent template prefix; full UA is `grok-shell/<ver> (linux; x86_64)`.
-pub const GROK_OAUTH_USER_AGENT: &str = "grok-shell/1.0.13 (linux; x86_64)";
+pub const GROK_OAUTH_USER_AGENT: &str = "grok-shell/1.0.30 (linux; x86_64)";
 /// Near-expiry skew (15 minutes); shared via omni-common.
 const NEAR_EXPIRY_SKEW_MS: i64 = omni_common::NEAR_EXPIRY_SKEW_MS;
 

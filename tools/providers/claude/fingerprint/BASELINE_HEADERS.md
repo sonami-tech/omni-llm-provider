@@ -1,6 +1,6 @@
 # Claude CLI Baseline Wire Fingerprint
 
-Active baseline: Claude Code 2.1.259, captured 2026-09-03 (single pin; issue #12).
+Active baseline: Claude Code 2.1.269, captured 2026-09-12 (single pin; issue #12).
 
 Raw mitmproxy `.flow` files are not committed because they contain live bearer
 tokens and account identifiers. Keep raw captures on tmpfs and inspect them with
@@ -10,7 +10,7 @@ tokens and account identifiers. Keep raw captures on tmpfs and inspect them with
 
 | Profile | Claude Code | SDK package | Runtime | Entrypoint | Source |
 |---|---|---|---|---|---|
-| `cc-2.1.259-sdk-cli` | `2.1.259` | `0.112.1` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/Fable/default, 2026-09-03 |
+| `cc-2.1.269-sdk-cli` | `2.1.269` | `0.112.1` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/Fable/default, 2026-09-12 |
 
 Only one pin is compiled. Rebaseline overwrites this row; do not append a
 historical ladder. Older Omni releases retain older wire.
@@ -44,32 +44,44 @@ Header names and dynamic values are pinned in
 - `anthropic-version: 2023-06-01`
 - `x-app: cli`
 
-## 2.1.259 Model Surface (active)
+## 2.1.269 Model Surface (active)
 
 | Input | Wire model | Beta list | max_tokens | temperature | output_config.effort |
 |---|---|---|---:|---:|---|
-| no `--model` | `claude-opus-5` | default (+fallback-credit) | 64000 | omitted | `high` |
-| `opus` | `claude-opus-5` | opus (+fallback-credit) | 64000 | omitted | `high` |
-| `sonnet` | `claude-sonnet-5` | opus list (no fallback) | 64000 | omitted | `high` |
-| `fable` | `claude-fable-5-1` | opus (+fallback-credit) | 64000 | omitted | `high` |
-| `claude-fable-5` | `claude-fable-5` | opus (+fallback-credit) | 64000 | omitted | `high` |
+| no `--model` | `claude-opus-5` | default (+fallback-credit + tool-changes) | 64000 | omitted | `high` |
+| `opus` | `claude-opus-5` | opus (+fallback-credit + tool-changes) | 64000 | omitted | `high` |
+| `sonnet` | `claude-sonnet-5` | sonnet (no fallback, no tool-changes) | 64000 | omitted | `high` |
+| `fable` | `claude-fable-5-1` | fable (+fallback-credit + per-turn-control + tool-changes) | 64000 | omitted | `high` |
+| `claude-fable-5` | `claude-fable-5` | fable (+fallback-credit + per-turn-control + tool-changes) | 64000 | omitted | `high` |
 | `haiku` | `claude-haiku-4-5-20251001` | haiku | 32000 | omitted | omitted |
 
-Default beta (2.1.259, same membership as 2.1.257):
+Default beta (2.1.269; adds `mid-conversation-tool-changes-2026-07-01` vs 2.1.259):
 
 ```text
-claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11
+claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11
 ```
 
-Explicit Opus beta (2.1.259, same membership as 2.1.257):
+Explicit Opus beta (2.1.269; adds `mid-conversation-tool-changes-2026-07-01` vs 2.1.259):
 
 ```text
-claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11
+claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11
 ```
 
-Billing (no cch): `cc_version=2.1.259.cc8; cc_entrypoint=sdk-cli;` for prompt `Say OK`.
+Fable beta (2.1.269; diverges from opus with `per-turn-control-2026-07-01`):
+
+```text
+claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11
+```
+
+Sonnet and haiku beta lists are unchanged from 2.1.259.
+
+Billing (no cch): `cc_version=2.1.269.4a3; cc_entrypoint=sdk-cli;` for prompt `Say OK`.
 Stainless package on this pin is `0.112.1`. The captured header set excludes `x-client-request-id`.
 The short identity block is `You are a Claude agent, built on Anthropic's Claude Agent SDK.`
+CLI also sends `thinking: {type: adaptive, display: omitted}` with effort models
+and haiku `thinking: {type: enabled, budget_tokens: 31999}`. Omni still maps
+client effort to `output_config.effort` and does not copy those CLI-only
+thinking objects as pin defaults.
 
 ## 2.1.175 Model Surface
 
