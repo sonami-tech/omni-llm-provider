@@ -465,6 +465,9 @@ fn map_upstream_err_with(e: UpstreamError, redactor: &ClaudeErrorRedactor) -> Pr
             let body = redactor.redact(&body);
             ProviderError::upstream_status(status, format!("anthropic {status}: {body}"))
         }
+        UpstreamError::HeadersTimeout => {
+            ProviderError::upstream_status(504, redactor.redact(&e.to_string()))
+        }
         UpstreamError::Transport(_) | UpstreamError::Decode(_) => {
             ProviderError::upstream(redactor.redact(&e.to_string()))
         }
@@ -626,9 +629,18 @@ impl LlmProvider for ClaudeProvider {
             // stream that DID see message_stop already emitted its Finish via
             // `finish_events` (which sets `finished`), so this guard prevents a
             // duplicate terminal chunk on the normal completed path.
+            // message_stop already called finish_events. On EOF, a latched
+            // stop_reason is a success Finish. No stop_reason is Err, not a
+            // synthesized Finish { "stop" }.
             if !conv.finished {
-                for tail in conv.finish_events() {
-                    yield tail;
+                if conv.stop_reason.is_some() {
+                    for tail in conv.finish_events() {
+                        yield tail;
+                    }
+                } else {
+                    Err(ProviderError::upstream(
+                        "claude stream ended without stop_reason",
+                    ))?;
                 }
             }
         };
@@ -1715,11 +1727,7 @@ mod tests {
             // send_stream flips the wire body to stream:true; pin it so a regression
             // that stopped requesting a stream can't pass against an SSE-only mock.
             .and(body_partial_json(serde_json::json!({"stream": true})))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(sse_body),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
             .expect(1)
             .mount(&server)
             .await;
@@ -1797,11 +1805,7 @@ mod tests {
             // send_stream flips the wire body to stream:true; pin it so a regression
             // that stopped requesting a stream can't pass against an SSE-only mock.
             .and(body_partial_json(serde_json::json!({"stream": true})))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(sse_body),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
             .expect(1)
             .mount(&server)
             .await;
@@ -1839,6 +1843,82 @@ mod tests {
                 finish_reason: Some("stop".into())
             })
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn claude_streaming_eof_without_stop_reason_yields_err() {
+        // Content deltas, no stop_reason, no message_stop: Err, not Finish "stop".
+        // Chat SSE for that Err is a named event: error.
+        let _guard = CREDS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _creds = TempCreds::install("stream-eof-err");
+
+        let sse_body = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(query_param("beta", "true"))
+            .and(header(
+                "authorization",
+                format!("Bearer {}", TempCreds::dummy_token()).as_str(),
+            ))
+            .and(body_partial_json(serde_json::json!({"stream": true})))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let p = ClaudeProvider::new_for_test_with_base(default_profile(), server.uri())
+            .expect("test provider against mock base");
+        let stream = p
+            .send_stream(sample_req("hi"))
+            .await
+            .expect("hermetic claude stream must open");
+        let events: Vec<Result<CanonicalStreamEvent, ProviderError>> = stream.collect().await;
+        assert!(
+            events.iter().any(|event| event.is_err()),
+            "EOF without stop_reason must yield Err: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Ok(CanonicalStreamEvent::Finish { finish_reason: Some(reason) })
+                    if reason == "stop"
+            )),
+            "must not synthesize Finish stop: {events:?}"
+        );
+
+        let replay: CanonicalStream = Box::pin(futures_util::stream::iter(events));
+        let sse =
+            omni_common::sse_from_canonical_stream(replay, "m".into(), "chatcmpl-x".into(), 1);
+        use axum::response::IntoResponse;
+        let resp = sse.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("event: error"), "{text}");
+        assert!(text.contains("upstream stream error"), "{text}");
+        assert!(!text.contains("\"finish_reason\":\"stop\""), "{text}");
+        assert!(!text.contains("finish_reason\":\"error"), "{text}");
+    }
+
+    #[test]
+    fn headers_timeout_maps_to_504_and_is_not_retried() {
+        let err = UpstreamError::HeadersTimeout;
+        assert!(!err.is_transient());
+        let mapped = map_upstream_err_with(err, &ClaudeErrorRedactor::default());
+        match mapped {
+            ProviderError::Upstream {
+                status: Some(504),
+                message,
+            } => assert!(message.contains("upstream headers timeout"), "{message}"),
+            other => panic!("expected 504, got {other:?}"),
+        }
     }
 
     #[test]

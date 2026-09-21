@@ -27,3 +27,4 @@ anyhow.workspace = true
 [dev-dependencies]
 omni-common = { path = "../omni-common", features = ["test-support"] }
 wiremock = "0.6.5"
+axum.workspace = true

@@ -37,8 +37,9 @@ pub use env::{env_nonempty, headers_from_env, parse_custom_headers};
 pub use error::{AppError, classify_upstream};
 pub use http::{
     ChatCompletionRequest, ChatCompletionResponse, ChatContentPart, ChatImageUrl, ChatMessage,
-    ChatMessageContent, MAX_REASONING_EFFORT_LEN, from_canonical, sse_from_canonical_stream,
-    to_canonical, to_canonical_with_headers, unix_now_secs, validate_reasoning_effort_lexical,
+    ChatMessageContent, MAX_REASONING_EFFORT_LEN, from_canonical, is_allowed_chat_finish_reason,
+    is_sse_content_type, sse_from_canonical_stream, to_canonical, to_canonical_with_headers,
+    unix_now_secs, validate_reasoning_effort_lexical,
 };
 pub use oauth_refresh::{
     MAX_CREDENTIAL_RECOVERY_TURNS, NEAR_EXPIRY_SKEW_MS, NEAR_EXPIRY_SKEW_SECS,
@@ -52,4 +53,8 @@ pub use responses::{
     sse_from_canonical_stream_responses,
 };
 pub use stats::{ActiveRequestGuard, Stats, StatsSnapshot, TokenUsage};
-pub use timeouts::{OAUTH_REQUEST_TIMEOUT, UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_REQUEST_TIMEOUT};
+pub use timeouts::{
+    OAUTH_REQUEST_TIMEOUT, UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_ERROR_BODY_PREFIX,
+    UPSTREAM_ERROR_BODY_READ_TIMEOUT, UPSTREAM_HEADERS_TIMEOUT, UPSTREAM_REQUEST_TIMEOUT,
+    map_upstream_headers_wait, timeout_upstream_headers,
+};

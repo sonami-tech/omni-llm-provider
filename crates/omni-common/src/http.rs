@@ -875,6 +875,40 @@ fn chunk_tool_call(
     })
 }
 
+/// OpenAI Chat Completions finish_reason values. Anything else is illegal on
+/// the wire (`error` is not in this set).
+pub fn is_allowed_chat_finish_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "stop" | "length" | "tool_calls" | "content_filter" | "function_call"
+    )
+}
+
+fn is_chat_error_finish_reason(reason: &str) -> bool {
+    reason == "error" || reason.starts_with("error:")
+}
+
+/// Client-facing Chat mid-stream error. Fixed text: upstream decode payloads
+/// are not fully redacted, so they stay in server logs only.
+const CHAT_STREAM_ERROR_DATA: &str =
+    r#"{"error":{"message":"upstream stream error","type":"server_error","code":null}}"#;
+
+fn chat_stream_error_event() -> Event {
+    Event::default().event("error").data(CHAT_STREAM_ERROR_DATA)
+}
+
+/// Whether `Content-Type` is the SSE media type.
+///
+/// A missing header is not SSE. Parameters after `;` are ignored. The compare
+/// is the media type, not a raw prefix (`text/event-streamfoo` is not SSE).
+pub fn is_sse_content_type(header: Option<&str>) -> bool {
+    let Some(header) = header else {
+        return false;
+    };
+    let media = header.split(';').next().unwrap_or("").trim();
+    media.eq_ignore_ascii_case("text/event-stream")
+}
+
 /// Build the terminal `chat.completion.chunk` carrying the finish reason.
 fn chunk_finish(chat_id: &str, created: u64, model: &str, reason: &str) -> serde_json::Value {
     serde_json::json!({
@@ -895,13 +929,15 @@ fn chunk_finish(chat_id: &str, created: u64, model: &str, reason: &str) -> serde
 /// Each [`CanonicalStreamEvent`] becomes one `data: {chunk}` SSE event:
 /// - `TextDelta` -> a content-delta chunk
 /// - `ToolCallDelta` -> a tool-call-delta chunk
-/// - `Finish` -> a finish-reason chunk (default "stop" when none)
+/// - `Finish` -> a finish-reason chunk when the reason is in the OpenAI set
+///   (default "stop" when none). An `error` / `error:` reason is a named
+///   `event: error`, not a chunk. Any other label is coerced to `stop`.
 /// - `Usage` is not emitted as a chunk (OpenAI streams omit usage by default).
 ///
 /// The stream is always terminated by a literal `data: [DONE]` event, matching
-/// the OpenAI streaming protocol. An error in the underlying stream is mapped to
-/// a finish chunk with reason "error" followed by `[DONE]` so the consumer
-/// always sees a clean termination.
+/// the OpenAI streaming protocol. A stream `Err`, or an end with no `Finish`
+/// and no `Err`, is a named `event: error` with a fixed message, then `[DONE]`.
+/// Polling stops after the first `Finish` or `Err`.
 pub fn sse_from_canonical_stream(
     stream: CanonicalStream,
     requested_model: String,
@@ -956,23 +992,45 @@ fn async_stream_chunks(
                 }
                 Ok(CanonicalStreamEvent::Finish { finish_reason }) => {
                     finished = true;
-                    let reason = finish_reason.unwrap_or_else(|| "stop".to_string());
-                    let v = chunk_finish(&chat_id, created, &requested_model, &reason);
-                    yield Ok(Event::default().data(v.to_string()));
+                    match finish_reason.as_deref() {
+                        Some(reason) if is_chat_error_finish_reason(reason) => {
+                            tracing::warn!(
+                                finish_reason = reason,
+                                "chat stream error finish"
+                            );
+                            yield Ok(chat_stream_error_event());
+                        }
+                        Some(reason) if is_allowed_chat_finish_reason(reason) => {
+                            let v = chunk_finish(&chat_id, created, &requested_model, reason);
+                            yield Ok(Event::default().data(v.to_string()));
+                        }
+                        Some(reason) => {
+                            tracing::warn!(
+                                finish_reason = reason,
+                                "coercing unknown chat finish_reason to stop"
+                            );
+                            let v = chunk_finish(&chat_id, created, &requested_model, "stop");
+                            yield Ok(Event::default().data(v.to_string()));
+                        }
+                        None => {
+                            let v = chunk_finish(&chat_id, created, &requested_model, "stop");
+                            yield Ok(Event::default().data(v.to_string()));
+                        }
+                    }
+                    break;
                 }
                 Err(e) => {
                     finished = true;
-                    let v = chunk_finish(&chat_id, created, &requested_model, "error");
                     tracing::warn!(error = %e, "canonical stream error mid-flight");
-                    yield Ok(Event::default().data(v.to_string()));
+                    yield Ok(chat_stream_error_event());
+                    break;
                 }
             }
         }
         if !finished {
-            // Upstream ended without an explicit Finish; synthesize one so the
-            // client still sees a terminal chunk before [DONE].
-            let v = chunk_finish(&chat_id, created, &requested_model, "stop");
-            yield Ok(Event::default().data(v.to_string()));
+            // No Finish and no Err. Do not synthesize a successful stop.
+            tracing::warn!("chat stream ended without Finish");
+            yield Ok(chat_stream_error_event());
         }
         // OpenAI streaming sentinel.
         yield Ok(Event::default().data("[DONE]"));
@@ -1960,5 +2018,113 @@ mod tests {
             !text.contains("\"usage\""),
             "usage not emitted in default stream"
         );
+    }
+
+    async fn render_sse(
+        events: Vec<Result<CanonicalStreamEvent, omni_core::ProviderError>>,
+    ) -> String {
+        use axum::response::IntoResponse;
+        let canon: CanonicalStream = Box::pin(futures_util::stream::iter(events));
+        let sse = sse_from_canonical_stream(canon, "m".into(), "chatcmpl-x".into(), 7);
+        let resp = sse.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn sse_content_type_is_media_type_not_raw_prefix() {
+        assert!(is_sse_content_type(Some("text/event-stream")));
+        assert!(is_sse_content_type(Some(
+            "text/event-stream; charset=utf-8"
+        )));
+        assert!(is_sse_content_type(Some("Text/Event-Stream")));
+        assert!(!is_sse_content_type(None));
+        assert!(!is_sse_content_type(Some("application/json")));
+        assert!(!is_sse_content_type(Some("text/event-streamfoo")));
+        assert!(!is_sse_content_type(Some("")));
+    }
+
+    #[test]
+    fn allowed_chat_finish_reasons_are_the_openai_set() {
+        for reason in [
+            "stop",
+            "length",
+            "tool_calls",
+            "content_filter",
+            "function_call",
+        ] {
+            assert!(is_allowed_chat_finish_reason(reason), "{reason}");
+        }
+        assert!(!is_allowed_chat_finish_reason("error"));
+        assert!(!is_allowed_chat_finish_reason("error: overloaded"));
+        assert!(!is_allowed_chat_finish_reason(
+            "model_context_window_exceeded"
+        ));
+    }
+
+    #[tokio::test]
+    async fn sse_mid_stream_err_is_named_error_event_not_illegal_finish() {
+        use omni_core::ProviderError;
+        let text = render_sse(vec![
+            Ok(CanonicalStreamEvent::TextDelta("partial".into())),
+            Err(ProviderError::upstream("boom secret")),
+        ])
+        .await;
+        assert!(text.contains("event: error"), "{text}");
+        assert!(text.contains("upstream stream error"), "{text}");
+        assert!(text.contains("[DONE]"), "{text}");
+        assert!(!text.contains("finish_reason\":\"error"), "{text}");
+        assert!(!text.contains("boom secret"), "{text}");
+        assert!(!text.contains("\"finish_reason\":\"stop\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn sse_eof_without_finish_is_error_event_not_synthesized_stop() {
+        let text = render_sse(vec![Ok(CanonicalStreamEvent::TextDelta("partial".into()))]).await;
+        assert!(text.contains("event: error"), "{text}");
+        assert!(text.contains("[DONE]"), "{text}");
+        assert!(!text.contains("\"finish_reason\":\"stop\""), "{text}");
+        assert!(!text.contains("finish_reason\":\"error"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn sse_unknown_finish_reason_coerces_to_stop() {
+        let text = render_sse(vec![Ok(CanonicalStreamEvent::Finish {
+            finish_reason: Some("model_context_window_exceeded".into()),
+        })])
+        .await;
+        assert!(text.contains("\"finish_reason\":\"stop\""), "{text}");
+        assert!(!text.contains("model_context_window_exceeded"), "{text}");
+        assert!(!text.contains("event: error"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn sse_error_prefix_finish_is_fixed_error_event() {
+        let text = render_sse(vec![Ok(CanonicalStreamEvent::Finish {
+            finish_reason: Some("error: overloaded".into()),
+        })])
+        .await;
+        assert!(text.contains("event: error"), "{text}");
+        assert!(text.contains("upstream stream error"), "{text}");
+        assert!(!text.contains("overloaded"), "{text}");
+        assert!(!text.contains("finish_reason\":\"error"), "{text}");
+        assert!(text.trim_end().ends_with("[DONE]"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn sse_stops_polling_after_first_finish() {
+        let text = render_sse(vec![
+            Ok(CanonicalStreamEvent::Finish {
+                finish_reason: Some("stop".into()),
+            }),
+            Err(omni_core::ProviderError::upstream("late")),
+        ])
+        .await;
+        assert!(text.contains("\"finish_reason\":\"stop\""), "{text}");
+        assert!(!text.contains("event: error"), "{text}");
+        assert!(!text.contains("late"), "{text}");
+        assert_eq!(text.matches("[DONE]").count(), 1, "{text}");
     }
 }

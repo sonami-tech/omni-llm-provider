@@ -30,7 +30,9 @@ use omni_common::responses_upstream::{
     self, ErrorRedactor, ResponsesSseBuffer, ResponsesStreamParser,
 };
 use omni_common::{
-    UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_REQUEST_TIMEOUT, env_nonempty, headers_from_env,
+    UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_ERROR_BODY_PREFIX, UPSTREAM_ERROR_BODY_READ_TIMEOUT,
+    UPSTREAM_REQUEST_TIMEOUT, env_nonempty, headers_from_env, is_sse_content_type,
+    map_upstream_headers_wait, timeout_upstream_headers,
 };
 use omni_core::{
     CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
@@ -616,94 +618,87 @@ impl GrokProvider {
             .unwrap_or(req.model.as_str())
             .to_string();
         let body = to_grok_responses_request(&req, self.active_catalog(), true)?;
-        let headers = self.cli_headers(&creds, &model)?;
+        let mut headers = self.cli_headers(&creds, &model)?;
         let url = format!("{}/v1/responses", base);
         let client = self.client.clone();
         // Redactor carries the EXACT resolved bearer/key so a non-prefixed operator
         // token cannot leak through an upstream error body (Finding 4).
-        let redactor = GrokErrorRedactor::for_credentials(&creds);
+        let mut redactor = GrokErrorRedactor::for_credentials(&creds);
         let can_replay = self.uses_disk_cli_auth();
         let version = self.version;
 
-        let stream = async_stream::stream! {
-            let mut headers = headers;
-            let mut redactor = redactor;
-            let mut send_result = client
-                .post(&url)
-                .headers(headers.clone())
-                .json(&body)
-                .send()
-                .await;
+        let mut http_resp = map_upstream_headers_wait(
+            timeout_upstream_headers(
+                client
+                    .post(&url)
+                    .headers(headers.clone())
+                    .json(&body)
+                    .send(),
+            )
+            .await,
+            |e| {
+                ProviderError::upstream(
+                    redactor.redact(&format!("network error calling grok: {e}")),
+                )
+            },
+        )?;
 
-            // Stream-open only: one force-refresh + one reopen on default-path 401.
-            if can_replay
-                && send_result
-                    .as_ref()
-                    .is_ok_and(|resp| resp.status().as_u16() == 401)
-            {
-                match GrokCredentials::load_resolved_cli_async_force_refresh().await {
-                    Ok(fresh) if fresh.check_expired().is_ok() => {
-                        match Self::cli_headers_for(version, &fresh, &model) {
-                            Ok(next_headers) => {
-                                warn!("upstream 401 on stream open, re-read Grok credentials");
-                                headers = next_headers;
-                                redactor = GrokErrorRedactor::for_credentials(&fresh);
-                                send_result = client
-                                    .post(&url)
-                                    .headers(headers.clone())
-                                    .json(&body)
-                                    .send()
-                                    .await;
-                            }
-                            Err(e) => {
-                                yield Err(e);
-                                return;
-                            }
+        // Stream-open only: one force-refresh + one reopen on default-path 401.
+        if can_replay && http_resp.status().as_u16() == 401 {
+            match GrokCredentials::load_resolved_cli_async_force_refresh().await {
+                Ok(fresh) if fresh.check_expired().is_ok() => {
+                    match Self::cli_headers_for(version, &fresh, &model) {
+                        Ok(next_headers) => {
+                            warn!("upstream 401 on stream open, re-read Grok credentials");
+                            headers = next_headers;
+                            redactor = GrokErrorRedactor::for_credentials(&fresh);
+                            http_resp = map_upstream_headers_wait(
+                                timeout_upstream_headers(
+                                    client
+                                        .post(&url)
+                                        .headers(headers.clone())
+                                        .json(&body)
+                                        .send(),
+                                )
+                                .await,
+                                |e| {
+                                    ProviderError::upstream(
+                                        redactor
+                                            .redact(&format!("network error calling grok: {e}")),
+                                    )
+                                },
+                            )?;
                         }
+                        Err(e) => return Err(e),
                     }
-                    _ => {}
                 }
+                _ => {}
             }
+        }
 
-            let http_resp = match send_result {
-                Ok(resp) => resp,
-                Err(e) => {
-                    yield Err(ProviderError::upstream(redactor.redact(&format!(
-                        "network error calling grok: {e}"
-                    ))));
-                    return;
-                }
-            };
+        let status = http_resp.status();
+        if !status.is_success() {
+            let status_code = status.as_u16();
+            let err_body = redactor.redact(&read_capped_error_body(http_resp).await);
+            error!(%status, body = %err_body, "grok upstream stream error");
+            return Err(ProviderError::upstream_status(
+                status_code,
+                format!("grok {status}: {err_body}"),
+            ));
+        }
 
-            let status = http_resp.status();
-            if !status.is_success() {
-                let err_body = redactor.redact(
-                    &http_resp
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| "<no body>".to_string()),
-                );
-                error!(%status, body = %err_body, "grok upstream stream error");
-                yield Err(ProviderError::upstream_status(status.as_u16(), redactor.redact(&format!(
-                    "grok {status}: {err_body}"
-                ))));
-                return;
-            }
+        let content_type = http_resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        if !is_sse_content_type(content_type) {
+            let got = content_type.unwrap_or("missing");
+            return Err(ProviderError::upstream(format!(
+                "grok stream expected text/event-stream, got {got}"
+            )));
+        }
 
-            if let Some(content_type) = http_resp
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                && !content_type
-                    .to_ascii_lowercase()
-                    .starts_with("text/event-stream")
-            {
-                yield Err(ProviderError::upstream(format!(
-                    "grok stream expected text/event-stream, got {content_type}"
-                )));
-                return;
-            }
-
+        let stream = async_stream::stream! {
             let mut bytes = http_resp.bytes_stream();
             let mut sse = ResponsesSseBuffer::default();
             let mut parser = ResponsesStreamParser::new("grok", redactor.clone());
@@ -829,11 +824,13 @@ impl GrokProvider {
         let url = format!("{}/chat/completions", self.base_url);
         tracing::trace!(%url, "POST custom grok chat completions");
 
+        let auth_headers = self.auth_headers().await?;
+        let redactor = GrokErrorRedactor::for_auth_header_values(&auth_headers);
         let mut request = self
             .client
             .post(&url)
             .header("Content-Type", "application/json");
-        for (name, value) in self.auth_headers().await? {
+        for (name, value) in &auth_headers {
             request = request.header(name, value);
         }
         let http_resp =
@@ -843,16 +840,17 @@ impl GrokProvider {
 
         let status = http_resp.status();
         if !status.is_success() {
-            let err_body = redact(
-                &http_resp
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "<no body>".to_string()),
-            );
+            // Non-stream body reads stay unbounded. Exact-secret scrub still applies.
+            let status_code = status.as_u16();
+            let raw = http_resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "<no body>".to_string());
+            let err_body = redactor.redact(&raw);
             error!(%status, body = %err_body, "xAI upstream error");
             return Err(ProviderError::upstream_status(
-                status.as_u16(),
-                format!("xAI {}: {}", status, err_body),
+                status_code,
+                format!("xAI {status}: {err_body}"),
             ));
         }
 
@@ -879,40 +877,44 @@ impl GrokProvider {
         let url = format!("{}/chat/completions", self.base_url);
 
         let auth_headers = self.auth_headers().await?;
+        let redactor = GrokErrorRedactor::for_auth_header_values(&auth_headers);
         let client = self.client.clone();
 
+        let mut request = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream");
+        for (name, value) in &auth_headers {
+            request = request.header(name, value);
+        }
+        let http_resp = map_upstream_headers_wait(
+            timeout_upstream_headers(request.json(&body).send()).await,
+            |e| ProviderError::upstream(format!("network error calling xAI: {e}")),
+        )?;
+
+        let status = http_resp.status();
+        if !status.is_success() {
+            let status_code = status.as_u16();
+            let err_body = redactor.redact(&read_capped_error_body(http_resp).await);
+            error!(%status, body = %err_body, "xAI upstream stream error");
+            return Err(ProviderError::upstream_status(
+                status_code,
+                format!("xAI {status}: {err_body}"),
+            ));
+        }
+
+        let content_type = http_resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        if !is_sse_content_type(content_type) {
+            let got = content_type.unwrap_or("missing");
+            return Err(ProviderError::upstream(format!(
+                "grok stream expected text/event-stream, got {got}"
+            )));
+        }
+
         let stream = async_stream::stream! {
-            let mut request = client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .header("Accept", "text/event-stream");
-            for (name, value) in auth_headers {
-                request = request.header(name, value);
-            }
-            let send_result = request.json(&body).send().await;
-
-            let http_resp = match send_result {
-                Ok(r) => r,
-                Err(e) => {
-                    yield Err(ProviderError::upstream(format!("network error calling xAI: {}", e)));
-                    return;
-                }
-            };
-
-            let status = http_resp.status();
-            if !status.is_success() {
-                // Read the error body first, same as the non-stream path.
-                let err_body = redact(
-                    &http_resp
-                    .text()
-                    .await
-                        .unwrap_or_else(|_| "<no body>".to_string()),
-                );
-                error!(%status, body = %err_body, "xAI upstream stream error");
-                yield Err(ProviderError::upstream_status(status.as_u16(), format!("xAI {}: {}", status, err_body)));
-                return;
-            }
-
             // Consume the raw byte stream, reframing into SSE lines (a JSON object may span
             // multiple byte chunks; SseBuffer holds partial lines across chunk boundaries) and
             // mapping each `data:` frame to canonical events. The last non-null finish_reason is
@@ -1008,6 +1010,60 @@ impl GrokErrorRedactor {
         secrets.dedup();
         Self { secrets }
     }
+
+    /// Exact secrets from resolved custom-auth headers: each full header value,
+    /// plus the bare bearer when the header is Authorization. `for_credentials`
+    /// does not see this auth mode.
+    fn for_auth_header_values(headers: &[(String, String)]) -> Self {
+        let mut secrets = Vec::new();
+        for (name, value) in headers {
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            secrets.push(value.to_string());
+            if name.eq_ignore_ascii_case("authorization")
+                && let Some(token) = bare_bearer(value)
+            {
+                secrets.push(token.to_string());
+            }
+        }
+        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        secrets.dedup();
+        Self { secrets }
+    }
+}
+
+fn bare_bearer(value: &str) -> Option<&str> {
+    let mut parts = value.splitn(2, char::is_whitespace);
+    let scheme = parts.next()?.trim();
+    let token = parts.next()?.trim();
+    if scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() {
+        Some(token)
+    } else {
+        None
+    }
+}
+
+async fn read_capped_error_body(mut resp: reqwest::Response) -> String {
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(UPSTREAM_ERROR_BODY_READ_TIMEOUT, async {
+        while buf.len() < UPSTREAM_ERROR_BODY_PREFIX {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    let room = UPSTREAM_ERROR_BODY_PREFIX - buf.len();
+                    let n = chunk.len().min(room);
+                    buf.extend_from_slice(&chunk[..n]);
+                    if n < chunk.len() {
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+    })
+    .await;
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 impl ErrorRedactor for GrokErrorRedactor {
@@ -1906,8 +1962,8 @@ impl LlmProvider for GrokProvider {
     /// Native SSE streaming.
     ///
     /// Default path uses the CLI Responses wire; custom endpoints use chat/completions SSE.
-    /// The HTTP request is issued *inside* the returned stream so the call site gets the
-    /// stream immediately and any upstream failure surfaces as the first `Err` item.
+    /// `Ok` means the upstream accepted the stream (HTTP success and SSE content-type).
+    /// A pre-body failure is `Err` from this method, not the first stream item.
     async fn send_stream(&self, req: CanonicalRequest) -> Result<CanonicalStream, ProviderError> {
         tracing::trace!(
             provider = "grok",
@@ -4473,10 +4529,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_stream_upstream_error_is_first_item() {
-        // WHY: send_stream issues the HTTP call inside the stream, so a connection failure must
-        // surface as the FIRST yielded Err (not a panic, not an empty stream). Uses an impossible
-        // port as the "mock" upstream (same pattern as test_send_mocked_upstream_error). No creds: the
-        // ctor key is the fallback, so we never hit the Auth branch.
+        // WHY: a connection failure is a pre-body error. send_stream must return
+        // Err, not Ok plus a first stream item. Uses an impossible port as the
+        // "mock" upstream (same pattern as test_send_mocked_upstream_error). No
+        // creds: the ctor key is the fallback, so we never hit the Auth branch.
         let p = GrokProvider::new_for_test("xai-dummy", "http://127.0.0.1:1");
         let req = CanonicalRequest {
             model: "grok-4.3".into(),
@@ -4486,16 +4542,15 @@ mod tests {
             }],
             ..Default::default()
         };
-        let mut stream = p
-            .send_stream(req)
-            .await
-            .expect("send_stream returns the stream eagerly");
-        let first = stream
-            .next()
-            .await
-            .expect("stream must yield at least one item");
-        match first {
-            Err(ProviderError::Upstream { message: s, .. }) => {
+        let err = match p.send_stream(req).await {
+            Err(err) => err,
+            Ok(_) => panic!("dead upstream is Err from send_stream, not a stream item"),
+        };
+        match err {
+            ProviderError::Upstream {
+                message: s,
+                status: None,
+            } => {
                 assert!(
                     s.contains("network error calling grok")
                         || s.contains("network error calling xAI")
@@ -4503,7 +4558,7 @@ mod tests {
                     "got: {s}"
                 )
             }
-            other => panic!("expected leading Upstream error for bad port, got {other:?}"),
+            other => panic!("expected status-less Upstream error for bad port, got {other:?}"),
         }
     }
 
@@ -4832,11 +4887,7 @@ mod tests {
             .and(body_partial_json(
                 json!({"stream": true, "stream_options": {"include_usage": true}}),
             ))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(sse_body),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
             .expect(1)
             .mount(&server)
             .await;
@@ -4905,13 +4956,10 @@ mod tests {
                 "authorization",
                 format!("Bearer {}", DummyXaiCreds::KEY).as_str(),
             ))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(
-                        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
-                    ),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                "text/event-stream",
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -5627,16 +5675,10 @@ mod tests {
             .await;
 
         let provider = GrokProvider::new_for_test_with_user(SECRET, None, server.uri());
-        let mut stream = provider
-            .send_stream(base_req_model("grok-build"))
-            .await
-            .expect("stream opens");
-        let err = stream
-            .next()
-            .await
-            .expect("an event")
-            .expect_err("401 must surface an error")
-            .to_string();
+        let err = match provider.send_stream(base_req_model("grok-build")).await {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("401 must surface an error from send_stream"),
+        };
         assert!(
             !err.contains(SECRET),
             "non-prefixed bearer leaked in stream: {err}"
@@ -5666,15 +5708,10 @@ mod tests {
             .await;
 
         let provider = GrokProvider::new_for_test_with_user("bearer-token", None, server.uri());
-        let mut stream = provider
-            .send_stream(base_req_model("grok-build"))
-            .await
-            .expect("stream opens");
-        let err = stream
-            .next()
-            .await
-            .expect("an event")
-            .expect_err("429 must surface an error");
+        let err = match provider.send_stream(base_req_model("grok-build")).await {
+            Err(err) => err,
+            Ok(_) => panic!("429 must surface an error from send_stream"),
+        };
         assert!(
             matches!(
                 err,
@@ -5685,6 +5722,65 @@ mod tests {
             ),
             "CLI stream HTTP error must carry the upstream status, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn custom_chat_pre_body_error_scrubs_bearer_and_header_secret() {
+        // Custom auth can send a bearer and a header that lack sk-/xai-/eyJ.
+        // Both the stream and non-stream pre-body bodies are client-visible
+        // through classify_upstream, so the exact values must be gone and the
+        // rest of the upstream text must stay.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const BEARER: &str = "plain-bearer-zz";
+        const HEADER_SECRET: &str = "header-secret-zz";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string(format!(
+                "overloaded-visible {BEARER} Bearer {BEARER} {HEADER_SECRET}"
+            )))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = GrokProvider::new(None)
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_custom_auth(
+                Some(BEARER.into()),
+                None,
+                vec![("X-Gateway-Token".into(), HEADER_SECRET.into())],
+            );
+        let req = base_req_model("grok-4.5");
+
+        let stream_err = match provider.send_stream(req.clone()).await {
+            Err(err) => err,
+            Ok(_) => panic!("stream 503 is Err from send_stream"),
+        };
+        assert_scrubbed_custom_chat_error(&stream_err, BEARER, HEADER_SECRET);
+
+        let send_err = provider.send(req).await.expect_err("non-stream 503 is Err");
+        assert_scrubbed_custom_chat_error(&send_err, BEARER, HEADER_SECRET);
+    }
+
+    fn assert_scrubbed_custom_chat_error(err: &ProviderError, bearer: &str, header_secret: &str) {
+        let ProviderError::Upstream {
+            status: Some(503),
+            message,
+        } = err
+        else {
+            panic!("expected upstream 503, got {err:?}");
+        };
+        assert!(message.contains("overloaded-visible"), "{message}");
+        let client = omni_common::classify_upstream(Some(503), message.clone()).to_string();
+        assert!(!client.contains(bearer), "bearer leaked: {client}");
+        assert!(
+            !client.contains(header_secret),
+            "header secret leaked: {client}"
+        );
+        assert!(client.contains("overloaded-visible"), "{client}");
     }
 
     #[tokio::test]

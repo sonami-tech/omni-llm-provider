@@ -11,6 +11,11 @@ pub trait LlmProvider: Send + Sync {
     async fn send(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError>;
     /// Streaming send: returns a stream of [`CanonicalStreamEvent`]s.
     ///
+    /// `Ok` means the upstream accepted the stream (HTTP success and an SSE
+    /// content-type, or a WebSocket connect plus `response.create` sent), not
+    /// "HTTP will start later". A pre-body failure is `Err` before `Ok`.
+    /// This does not wait for the first token.
+    ///
     /// The default implementation adapts [`send`](Self::send) into a single-shot
     /// stream (run to completion, then emit the buffered content/tool-calls/usage
     /// followed by a terminal `Finish`). Providers with native server-sent-event

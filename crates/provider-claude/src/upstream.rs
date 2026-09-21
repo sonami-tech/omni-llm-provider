@@ -42,19 +42,26 @@ pub mod errors {
 
         #[error("response decode: {0}")]
         Decode(String),
+
+        /// Pre-body headers wait exceeded `UPSTREAM_HEADERS_TIMEOUT`.
+        /// Not transient: do not retry it, and do not reuse Anthropic 504.
+        #[error("upstream headers timeout")]
+        HeadersTimeout,
     }
 
     impl UpstreamError {
         /// Classify whether the operation should be retried.
         ///
-        /// 5xx and transient network errors are retryable. 429 is NOT retried — it
+        /// 5xx and transient network errors are retryable. 429 is NOT retried. It
         /// is surfaced as-is per the locked rate-limit-passthrough decision (the
         /// retry loops also guard 429 explicitly before consulting this, so the
         /// invariant holds in one place here). 401/403/400 are terminal.
+        /// `HeadersTimeout` is not retried.
         pub fn is_transient(&self) -> bool {
             match self {
                 UpstreamError::Transport(e) => e.is_timeout() || e.is_connect() || e.is_request(),
                 UpstreamError::Anthropic { status, .. } => *status >= 500,
+                UpstreamError::HeadersTimeout => false,
                 _ => false,
             }
         }
@@ -68,6 +75,7 @@ pub mod errors {
                 UpstreamError::Transport(e) if e.is_timeout() => 504,
                 UpstreamError::Transport(_) => 502,
                 UpstreamError::Decode(_) => 502,
+                UpstreamError::HeadersTimeout => 504,
             }
         }
     }
@@ -135,6 +143,8 @@ mod error_tests {
         };
         assert!(!anth_4.is_transient());
         assert!(!UpstreamError::TokenExpired.is_transient());
+        assert!(!UpstreamError::HeadersTimeout.is_transient());
+        assert_eq!(UpstreamError::HeadersTimeout.surface_status(), 504);
     }
 
     #[test]
@@ -763,7 +773,9 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use omni_common::{
-    UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_REQUEST_TIMEOUT, headers_from_env, parse_custom_headers,
+    UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_ERROR_BODY_PREFIX, UPSTREAM_ERROR_BODY_READ_TIMEOUT,
+    UPSTREAM_REQUEST_TIMEOUT, headers_from_env, is_sse_content_type, parse_custom_headers,
+    timeout_upstream_headers,
 };
 
 use crate::credentials::Credentials;
@@ -1225,24 +1237,36 @@ impl UpstreamClient {
         body: Vec<u8>,
     ) -> Result<BoxByteStream, UpstreamError> {
         let headers = self.build_headers(creds, ctx)?;
-        let resp = self
+        let send = self
             .http
             .post(self.messages_url())
             .headers(headers)
             .body(body)
-            .send()
-            .await?;
+            .send();
+        let resp = map_claude_headers_wait(timeout_upstream_headers(send).await)?;
 
         let status = resp.status();
         if !status.is_success() {
-            let bytes = resp.bytes().await?;
-            let body_str = String::from_utf8_lossy(&bytes).into_owned();
+            // Keep the HTTP status even when the body read fails or times out.
+            let status_code = status.as_u16();
+            let body_str = read_capped_error_body(resp).await;
             let parsed = errors::parse_anthropic_error(&body_str);
             return Err(UpstreamError::Anthropic {
-                status: status.as_u16(),
+                status: status_code,
                 body: body_str,
                 parsed,
             });
+        }
+
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        if !is_sse_content_type(content_type) {
+            let got = content_type.unwrap_or("missing");
+            return Err(UpstreamError::Decode(format!(
+                "claude stream expected text/event-stream, got {got}"
+            )));
         }
 
         let boxed: BoxByteStream = Box::pin(resp.bytes_stream());
@@ -1352,3 +1376,56 @@ fn insert_authorization_bearer(headers: &mut HeaderMap, token: &str) {
 }
 
 type BoxByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+
+fn map_claude_headers_wait<T>(
+    waited: Result<Result<T, reqwest::Error>, tokio::time::error::Elapsed>,
+) -> Result<T, UpstreamError> {
+    match waited {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(UpstreamError::Transport(err)),
+        Err(_) => Err(UpstreamError::HeadersTimeout),
+    }
+}
+
+/// Read at most 8 KiB of an error body within 1s. A failed or timed-out read
+/// returns the prefix already received (possibly empty) and never a transport
+/// error, so the caller can keep the HTTP status.
+async fn read_capped_error_body(mut resp: reqwest::Response) -> String {
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(UPSTREAM_ERROR_BODY_READ_TIMEOUT, async {
+        while buf.len() < UPSTREAM_ERROR_BODY_PREFIX {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    let room = UPSTREAM_ERROR_BODY_PREFIX - buf.len();
+                    let n = chunk.len().min(room);
+                    buf.extend_from_slice(&chunk[..n]);
+                    if n < chunk.len() {
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+    })
+    .await;
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+#[cfg(test)]
+mod headers_wait_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn elapsed_is_headers_timeout_not_transport() {
+        let elapsed = tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            std::future::pending::<()>(),
+        )
+        .await
+        .expect_err("pending future must elapse");
+        let waited: Result<Result<(), reqwest::Error>, _> = Err(elapsed);
+        let err = map_claude_headers_wait(waited).expect_err("elapsed");
+        assert!(matches!(err, UpstreamError::HeadersTimeout));
+        assert!(!err.is_transient());
+    }
+}

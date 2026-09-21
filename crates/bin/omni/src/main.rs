@@ -87,9 +87,9 @@ use omni_common::to_canonical;
 use omni_common::{
     ActiveRequestGuard, ApiKeyId, AppError, ChatCompletionRequest, ConversationLog, Stats,
     TokenUsage, accumulate_anthropic_stream_usage, anthropic_to_canonical, canonical_to_anthropic,
-    from_canonical, is_anthropic_content_delta, parse_anthropic_object_no_dup_keys,
-    peek_model_string, sse_from_canonical_stream_anthropic, to_canonical_with_headers,
-    token_usage_from_anthropic_response,
+    from_canonical, is_allowed_chat_finish_reason, is_anthropic_content_delta,
+    parse_anthropic_object_no_dup_keys, peek_model_string, sse_from_canonical_stream_anthropic,
+    to_canonical_with_headers, token_usage_from_anthropic_response,
 };
 use omni_core::{
     AnthropicNativeSurface, BootstrappedProvider, CanonicalResponse, CanonicalStream,
@@ -1365,7 +1365,7 @@ async fn chat_completions_handler(
     // The actual delegation (thin by design).
     let _active = state.stats.as_deref().map(ActiveRequestGuard::new);
     let started = Instant::now();
-    let canon_resp: CanonicalResponse = provider.send(canon).await.map_err(|e| {
+    let mut canon_resp: CanonicalResponse = provider.send(canon).await.map_err(|e| {
         let err_msg = e.to_string();
         if let Some(stats) = &state.stats {
             stats.record_error(&stats_key, &err_msg);
@@ -1383,6 +1383,29 @@ async fn chat_completions_handler(
         map_provider_err(e)
     })?;
 
+    // error / error: is HTTP 502 before success accounting. Do not coerce it
+    // to stop. Unknown non-error labels stay success and are coerced below.
+    if is_error_finish_reason(canon_resp.finish_reason.as_deref()) {
+        let err_msg = canon_resp
+            .finish_reason
+            .clone()
+            .unwrap_or_else(|| "error".to_string());
+        if let Some(stats) = &state.stats {
+            stats.record_error(&stats_key, &err_msg);
+            log_terminal_error_complete(
+                &stats_key,
+                started.elapsed().as_secs_f64() * 1000.0,
+                true,
+                false,
+                canon_resp.finish_reason.clone(),
+                Some(err_msg.clone()),
+                Some(requested_model.as_str()),
+                Some(stats.as_ref()),
+            );
+        }
+        return Err(omni_common::classify_upstream(None, err_msg));
+    }
+
     if let Some(stats) = &state.stats {
         record_response_stats(stats, &stats_key, &canon_resp, started);
         log_nonstream_response_complete(
@@ -1392,6 +1415,16 @@ async fn chat_completions_handler(
             Some(requested_model.as_str()),
             Some(stats.as_ref()),
         );
+    }
+
+    if let Some(reason) = canon_resp.finish_reason.clone()
+        && !is_allowed_chat_finish_reason(&reason)
+    {
+        warn!(
+            finish_reason = %reason,
+            "coercing unknown chat finish_reason to stop"
+        );
+        canon_resp.finish_reason = Some("stop".to_string());
     }
 
     // Echo the resolved canonical provider model, not shorthand aliases.
@@ -5378,11 +5411,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             .and(path("/v1/messages"))
             .and(query_param("beta", "true"))
             .and(body_partial_json(serde_json::json!({"stream": true})))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(sse_body),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
             .expect(1)
             .mount(&server)
             .await;
@@ -7060,7 +7089,11 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             .await
             .unwrap();
         let sse_body = String::from_utf8_lossy(&body);
-        assert!(sse_body.contains("finish_reason\":\"error"), "{sse_body}");
+        assert!(sse_body.contains("event: error"), "{sse_body}");
+        assert!(sse_body.contains("upstream stream error"), "{sse_body}");
+        assert!(sse_body.contains("[DONE]"), "{sse_body}");
+        assert!(!sse_body.contains("finish_reason\":\"error"), "{sse_body}");
+        assert!(!sse_body.contains("boom"), "{sse_body}");
 
         let snap = state.stats.as_ref().unwrap().snapshot();
         let model = &snap.models["grok:grok-4.3"];
@@ -7155,10 +7188,13 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             .await
             .unwrap();
         let sse_body = String::from_utf8_lossy(&body);
+        assert!(sse_body.contains("event: error"), "{sse_body}");
+        assert!(sse_body.contains("upstream stream error"), "{sse_body}");
         assert!(
-            sse_body.contains("finish_reason\":\"error: overloaded"),
-            "{sse_body}"
+            !sse_body.contains("overloaded"),
+            "client event must not copy the finish label: {sse_body}"
         );
+        assert!(!sse_body.contains("finish_reason\":\"error"), "{sse_body}");
 
         let snap = state.stats.as_ref().unwrap().snapshot();
         let model = &snap.models["grok:grok-4.3"];
@@ -7174,9 +7210,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
 
     #[tokio::test]
     async fn test_stats_missing_finish_stream_records_error_not_success_response() {
-        // WHY: a canonical stream without Finish is malformed. The SSE framer
-        // may synthesize a client terminal for compatibility, but stats must
-        // not record that provider stream as a successful response.
+        // WHY: a canonical stream without Finish is malformed. Chat SSE emits
+        // event: error, not a synthesized stop, and stats must not record a
+        // successful response.
         #[derive(Debug)]
         struct MissingFinishStreamProvider;
         #[async_trait::async_trait]
@@ -7251,7 +7287,11 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             .await
             .unwrap();
         let sse_body = String::from_utf8_lossy(&body);
-        assert!(sse_body.contains("finish_reason\":\"stop"), "{sse_body}");
+        assert!(sse_body.contains("event: error"), "{sse_body}");
+        assert!(
+            !sse_body.contains("\"finish_reason\":\"stop\""),
+            "{sse_body}"
+        );
 
         let snap = state.stats.as_ref().unwrap().snapshot();
         let model = &snap.models["grok:grok-4.3"];
@@ -7271,12 +7311,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
 
     #[tokio::test]
     async fn test_http_completions_stream_is_routed_not_rejected() {
-        // WHY: streaming is now a first-class path. A stream:true request must be
-        // ROUTED to the provider's send_stream (and, when reachable, framed as an
-        // SSE response), never rejected with the old "streaming not supported"
-        // 400. We use the grok test provider pointed at a dead port: routing +
-        // stream-open is exercised; the dead upstream surfaces as a ServerError
-        // (NOT a BadRequest stream-rejection), proving the stream branch is live.
+        // WHY: streaming is a first-class path, but a dead open is classified
+        // JSON, not HTTP 200 SSE. Routing must still reach the provider (not a
+        // BadRequest "streaming not supported" rejection).
         let mut map: HashMap<String, ProviderEntry> = HashMap::new();
         map.insert("grok".into(), grok_entry("http://127.0.0.1:1"));
         let state = state_with(map);
@@ -7299,25 +7336,13 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         };
         let res = call_chat_handler(state, req).await;
         match res {
-            // Dead upstream: stream-open failed -> mapped to a server error. The
-            // key assertion is that it is NOT the old BadRequest rejection.
-            Err(AppError::ServerError(_)) => {}
             Err(AppError::BadRequest(msg)) => {
                 panic!("stream must not be rejected as bad request: {msg}")
             }
-            Err(other) => panic!("unexpected error from stream route: {other:?}"),
-            Ok(resp) => {
-                // If a stream did open, it must be an SSE response.
-                let ct = resp
-                    .headers()
-                    .get(axum::http::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
-                assert!(
-                    ct.contains("text/event-stream"),
-                    "streaming response must be SSE, got content-type {ct:?}"
-                );
+            Err(err) => {
+                assert_classified_json(err, 502).await;
             }
+            Ok(resp) => panic!("dead upstream must not be HTTP 200 SSE, got {resp:?}"),
         }
     }
 
@@ -9248,40 +9273,480 @@ rule = [
 
     #[tokio::test]
     async fn test_responses_stream_is_routed_to_sse_with_failed_event_on_dead_upstream() {
-        // WHY: grok's send_stream defers the HTTP call into the stream body, so
-        // even a dead upstream yields an SSE response whose terminal event is
-        // response.failed. This pins both halves hermetically: stream:true is
-        // routed (not rejected) AND errors surface in Responses SSE framing.
+        // WHY: a dead upstream is a pre-body failure. stream:true is still
+        // routed to the provider, and the client gets classified JSON, not
+        // HTTP 200 SSE with response.failed.
         let mut map: HashMap<String, ProviderEntry> = HashMap::new();
         map.insert("grok".into(), grok_entry("http://127.0.0.1:1"));
         let state = state_with(map);
         let req = responses_req(r#"{"model":"grok:grok-4.3","input":"ping","stream":true}"#);
         let res = call_responses_handler(state, req).await;
-        let resp = match res {
-            Ok(r) => r,
-            Err(e) => panic!("stream must not be rejected; got error {e:?}"),
-        };
+        match res {
+            Err(AppError::BadRequest(msg)) => {
+                panic!("stream must not be rejected as bad request: {msg}")
+            }
+            Err(err) => {
+                assert_classified_json(err, 502).await;
+            }
+            Ok(resp) => panic!("dead upstream must not be HTTP 200 SSE, got {resp:?}"),
+        }
+    }
+
+    async fn assert_classified_json(err: AppError, status: u16) -> String {
+        use axum::response::IntoResponse;
+        let resp = err.into_response();
+        assert_eq!(resp.status().as_u16(), status, "classified status");
         let ct = resp
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         assert!(
-            ct.contains("text/event-stream"),
-            "Responses stream must be SSE, got content-type {ct:?}"
+            ct.starts_with("application/json"),
+            "classified JSON content-type, got {ct}"
         );
-        let body_bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        assert!(
+            !ct.contains("text/event-stream"),
+            "pre-body failure must not be SSE: {ct}"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
-        let body = String::from_utf8_lossy(&body_bytes);
-        assert!(
-            body.contains("event: response.failed"),
-            "dead upstream must terminate the stream with response.failed: {body}"
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let v: Value = serde_json::from_str(&text).expect("error body is JSON");
+        assert!(v["error"]["message"].is_string(), "{text}");
+        text
+    }
+
+    fn simple_chat(model: &str, stream: bool) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            extras: serde_json::Value::Null,
+        }
+    }
+
+    fn grok_arc_entry(provider: Arc<dyn LlmProvider>) -> ProviderEntry {
+        ProviderEntry {
+            provider,
+            anthropic_native: None,
+            models: {
+                let (m, _) = grok_models_and_catalog();
+                m
+            },
+            catalog: {
+                let (_, c) = grok_models_and_catalog();
+                c
+            },
+            extras_allowed: provider_grok::extras_allowed,
+        }
+    }
+
+    async fn serve_http_once(status_line: &str, extra_headers: &str, body: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let raw = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n{extra_headers}\r\n{body}",
+            body.len()
         );
-        assert!(
-            !body.contains("[DONE]"),
-            "Responses SSE has no [DONE] sentinel"
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(raw.as_bytes()).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn test_chat_pre_body_503_is_classified_json_for_each_opener() {
+        // Grok custom-chat.
+        let custom = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("overloaded-custom"))
+            .expect(1)
+            .mount(&custom)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("grok".into(), grok_entry(&custom.uri()));
+        let body =
+            match call_chat_handler(state_with(map), simple_chat("grok:grok-4.3", true)).await {
+                Err(err) => assert_classified_json(err, 503).await,
+                Ok(resp) => panic!("custom-chat 503 must not be 200 SSE: {resp:?}"),
+            };
+        assert!(body.contains("overloaded-custom"), "{body}");
+
+        // Grok CLI.
+        let cli = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("overloaded-cli"))
+            .expect(1)
+            .mount(&cli)
+            .await;
+        let provider = provider_grok::GrokProvider::new_for_test("k", cli.uri());
+        let mut map = HashMap::new();
+        map.insert(
+            "grok".into(),
+            entry_from_bootstrap(
+                "grok",
+                provider_grok::from_provider(provider).expect("grok bootstrap"),
+            )
+            .expect("grok entry"),
         );
+        let body =
+            match call_chat_handler(state_with(map), simple_chat("grok:grok-4.3", true)).await {
+                Err(err) => assert_classified_json(err, 503).await,
+                Ok(resp) => panic!("CLI 503 must not be 200 SSE: {resp:?}"),
+            };
+        assert!(body.contains("overloaded-cli"), "{body}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_chat_codex_rest_503_is_classified_json() {
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let server = MockServer::start().await;
+        let _home = TempCodexHome::install_for_mock(&server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("overloaded-codex"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("codex".into(), codex_entry());
+        let body =
+            match call_chat_handler(state_with(map), simple_chat("codex:gpt-5.5", true)).await {
+                Err(err) => assert_classified_json(err, 503).await,
+                Ok(resp) => panic!("Codex REST 503 must not be 200 SSE: {resp:?}"),
+            };
+        assert!(body.contains("overloaded-codex"), "{body}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_chat_codex_401_retry_then_503_is_classified_json() {
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let token_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "codex-after-401",
+                "refresh_token": "rt-after-401",
+                "id_token": "id-after-401",
+                "expires_in": 864000
+            })))
+            .expect(1)
+            .mount(&token_server)
+            .await;
+        let infer = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(header("authorization", "Bearer codex-stale"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("stale"))
+            .expect(1)
+            .mount(&infer)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(header("authorization", "Bearer codex-after-401"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("overloaded-after-401"))
+            .expect(1)
+            .mount(&infer)
+            .await;
+
+        let dir = std::env::temp_dir().join(format!("omni-codex-401-503-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            format!(
+                "model = \"gpt-5.5\"\nopenai_base_url = \"{}\"\n",
+                infer.uri()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"tokens":{"access_token":"codex-stale","refresh_token":"rt-old","account_id":"acct-1"}}"#,
+        )
+        .unwrap();
+        let _env = TempEnvVars::set(&[
+            ("CODEX_HOME", Some(dir.to_str().unwrap())),
+            ("OMNI_OAUTH_REFRESH", Some("1")),
+            (
+                "OMNI_CODEX_OAUTH_TOKEN_URL",
+                Some(&format!("{}/oauth/token", token_server.uri())),
+            ),
+            ("CODEX_API_KEY", None),
+            ("OPENAI_API_KEY", None),
+            ("CODEX_ACCESS_TOKEN", None),
+            ("OMNI_CODEX_BASE_URL", None),
+        ]);
+        let mut map = HashMap::new();
+        map.insert("codex".into(), codex_entry());
+        let body =
+            match call_chat_handler(state_with(map), simple_chat("codex:gpt-5.5", true)).await {
+                Err(err) => assert_classified_json(err, 503).await,
+                Ok(resp) => panic!("401-then-503 must not be 200 SSE: {resp:?}"),
+            };
+        assert!(body.contains("overloaded-after-401"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_chat_missing_and_non_sse_content_type_are_not_200_sse() {
+        let missing = serve_http_once("200 OK", "", "{}").await;
+        let mut map = HashMap::new();
+        map.insert("grok".into(), grok_entry(&missing));
+        match call_chat_handler(state_with(map), simple_chat("grok:grok-4.3", true)).await {
+            Err(err) => {
+                let body = assert_classified_json(err, 502).await;
+                assert!(body.contains("text/event-stream"), "{body}");
+            }
+            Ok(resp) => panic!("missing content-type must not be 200 SSE: {resp:?}"),
+        }
+
+        let json = serve_http_once("200 OK", "Content-Type: application/json\r\n", "{}").await;
+        let mut map = HashMap::new();
+        map.insert("grok".into(), grok_entry(&json));
+        match call_chat_handler(state_with(map), simple_chat("grok:grok-4.3", true)).await {
+            Err(err) => {
+                let body = assert_classified_json(err, 502).await;
+                assert!(body.contains("application/json"), "{body}");
+            }
+            Ok(resp) => panic!("non-SSE content-type must not be 200 SSE: {resp:?}"),
+        }
+    }
+
+    struct UpstreamStatusProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for UpstreamStatusProvider {
+        fn id(&self) -> &'static str {
+            "status-504"
+        }
+
+        async fn send(
+            &self,
+            _req: omni_core::CanonicalRequest,
+        ) -> Result<CanonicalResponse, ProviderError> {
+            Err(ProviderError::upstream_status(
+                504,
+                "upstream headers timeout",
+            ))
+        }
+
+        async fn send_stream(
+            &self,
+            _req: omni_core::CanonicalRequest,
+        ) -> Result<CanonicalStream, ProviderError> {
+            Err(ProviderError::upstream_status(
+                504,
+                "upstream headers timeout",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_and_responses_mirror_504() {
+        let mut map = HashMap::new();
+        map.insert(
+            "grok".into(),
+            grok_arc_entry(Arc::new(UpstreamStatusProvider)),
+        );
+        let state = state_with(map);
+        match call_chat_handler(state.clone(), simple_chat("grok:grok-4.3", true)).await {
+            Err(err) => assert_classified_json(err, 504).await,
+            Ok(resp) => panic!("chat stream 504 must not be SSE: {resp:?}"),
+        };
+        match call_chat_handler(state.clone(), simple_chat("grok:grok-4.3", false)).await {
+            Err(err) => assert_classified_json(err, 504).await,
+            Ok(resp) => panic!("chat 504 must not be 200: {resp:?}"),
+        };
+        let req = responses_req(r#"{"model":"grok:grok-4.3","input":"ping","stream":true}"#);
+        match call_responses_handler(state.clone(), req).await {
+            Err(err) => assert_classified_json(err, 504).await,
+            Ok(resp) => panic!("responses stream 504 must not be SSE: {resp:?}"),
+        };
+        let req = responses_req(r#"{"model":"grok:grok-4.3","input":"ping"}"#);
+        match call_responses_handler(state, req).await {
+            Err(err) => assert_classified_json(err, 504).await,
+            Ok(resp) => panic!("responses 504 must not be 200: {resp:?}"),
+        };
+    }
+
+    #[derive(Clone, Copy)]
+    enum ChatFinishMode {
+        Error,
+        ErrorPrefix,
+        None,
+        Unknown,
+        Tools,
+    }
+
+    struct ChatFinishProvider(ChatFinishMode);
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ChatFinishProvider {
+        fn id(&self) -> &'static str {
+            "chat-finish"
+        }
+
+        async fn send(
+            &self,
+            req: omni_core::CanonicalRequest,
+        ) -> Result<CanonicalResponse, ProviderError> {
+            let (finish_reason, tool_calls) = match self.0 {
+                ChatFinishMode::Error => (Some("error".into()), vec![]),
+                ChatFinishMode::ErrorPrefix => (Some("error: overloaded".into()), vec![]),
+                ChatFinishMode::None => (None, vec![]),
+                ChatFinishMode::Unknown => (Some("model_context_window_exceeded".into()), vec![]),
+                ChatFinishMode::Tools => (
+                    None,
+                    vec![omni_core::CanonicalToolCall {
+                        id: "call_1".into(),
+                        name: "f".into(),
+                        arguments: "{}".into(),
+                    }],
+                ),
+            };
+            Ok(CanonicalResponse {
+                model: req.model,
+                content: "ok".into(),
+                tool_calls,
+                finish_reason,
+                usage: omni_core::CanonicalUsage {
+                    output_tokens: 9,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+        }
+
+        async fn send_stream(
+            &self,
+            _req: omni_core::CanonicalRequest,
+        ) -> Result<CanonicalStream, ProviderError> {
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(CanonicalStreamEvent::Usage(omni_core::CanonicalUsage {
+                    output_tokens: 4,
+                    ..Default::default()
+                })),
+                Ok(CanonicalStreamEvent::Finish {
+                    finish_reason: Some("model_context_window_exceeded".into()),
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_nonstream_error_prefix_is_502_not_success() {
+        for mode in [ChatFinishMode::Error, ChatFinishMode::ErrorPrefix] {
+            let mut map = HashMap::new();
+            map.insert(
+                "grok".into(),
+                grok_arc_entry(Arc::new(ChatFinishProvider(mode))),
+            );
+            let (state, _guard) = state_with_stats(map);
+            match call_chat_handler(state.clone(), simple_chat("grok:grok-4.3", false)).await {
+                Err(err) => {
+                    let body = assert_classified_json(err, 502).await;
+                    assert!(!body.contains("\"finish_reason\""), "{body}");
+                }
+                Ok(resp) => panic!("error finish must not be 200: {resp:?}"),
+            }
+            let snap = state.stats.as_ref().unwrap().snapshot();
+            assert_eq!(snap.errors, 1);
+            assert_eq!(snap.models["grok:grok-4.3"].output_tokens, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_nonstream_none_and_unknown_coerce_to_stop() {
+        let mut map = HashMap::new();
+        map.insert(
+            "grok".into(),
+            grok_arc_entry(Arc::new(ChatFinishProvider(ChatFinishMode::None))),
+        );
+        let resp = call_chat_handler(state_with(map), simple_chat("grok:grok-4.3", false))
+            .await
+            .expect("none is success");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+
+        let mut map = HashMap::new();
+        map.insert(
+            "grok".into(),
+            grok_arc_entry(Arc::new(ChatFinishProvider(ChatFinishMode::Unknown))),
+        );
+        let (state, _guard) = state_with_stats(map);
+        let resp = call_chat_handler(state.clone(), simple_chat("grok:grok-4.3", false))
+            .await
+            .expect("unknown non-error finish is success");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("\"finish_reason\":\"stop\""), "{text}");
+        assert!(!text.contains("model_context_window_exceeded"), "{text}");
+        let snap = state.stats.as_ref().unwrap().snapshot();
+        assert_eq!(snap.errors, 0);
+        assert_eq!(snap.models["grok:grok-4.3"].output_tokens, 9);
+
+        let mut map = HashMap::new();
+        map.insert(
+            "grok".into(),
+            grok_arc_entry(Arc::new(ChatFinishProvider(ChatFinishMode::Tools))),
+        );
+        let resp = call_chat_handler(state_with(map), simple_chat("grok:grok-4.3", false))
+            .await
+            .expect("tool default is success");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream_unknown_finish_coerces_to_stop_and_counts_success() {
+        let mut map = HashMap::new();
+        map.insert(
+            "grok".into(),
+            grok_arc_entry(Arc::new(ChatFinishProvider(ChatFinishMode::Unknown))),
+        );
+        let (state, _guard) = state_with_stats(map);
+        let resp = call_chat_handler(state.clone(), simple_chat("grok:grok-4.3", true))
+            .await
+            .expect("stream opens");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("\"finish_reason\":\"stop\""), "{text}");
+        assert!(!text.contains("model_context_window_exceeded"), "{text}");
+        assert!(!text.contains("event: error"), "{text}");
+        let snap = state.stats.as_ref().unwrap().snapshot();
+        assert_eq!(snap.errors, 0);
+        assert_eq!(snap.models["grok:grok-4.3"].output_tokens, 4);
     }
 
     #[tokio::test]

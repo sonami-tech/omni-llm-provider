@@ -28,7 +28,9 @@ use omni_common::responses_upstream::{
     self, ErrorRedactor, ResponsesSseBuffer, ResponsesSseEvent, ResponsesStreamParser,
 };
 use omni_common::{
-    UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_REQUEST_TIMEOUT, env_nonempty, headers_from_env,
+    UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_ERROR_BODY_PREFIX, UPSTREAM_ERROR_BODY_READ_TIMEOUT,
+    UPSTREAM_REQUEST_TIMEOUT, env_nonempty, headers_from_env, is_sse_content_type,
+    map_upstream_headers_wait, timeout_upstream_headers,
 };
 use omni_core::{
     CanonicalBlock, CanonicalCacheMark, CanonicalCacheMode, CanonicalCacheRetention,
@@ -312,17 +314,20 @@ impl CodexProvider {
         let mut headers = conservative_codex_headers(self.version, &auth)?;
         let mut redactor = CodexErrorRedactor::for_secrets([auth.access_token.clone()]);
 
-        let mut preflight = self
-            .client
-            .get(models_url.clone())
-            .headers(headers.clone())
-            .send()
-            .await
-            .map_err(|e| {
+        let mut preflight = map_upstream_headers_wait(
+            timeout_upstream_headers(
+                self.client
+                    .get(models_url.clone())
+                    .headers(headers.clone())
+                    .send(),
+            )
+            .await,
+            |e| {
                 ProviderError::upstream(
                     redactor.redact(&format!("codex conservative models preflight error: {e}")),
                 )
-            })?;
+            },
+        )?;
         if preflight.status().as_u16() == 401
             && config.uses_default_cli_file_auth()
             && config.force_refresh_cli_oauth().await.is_ok()
@@ -330,65 +335,63 @@ impl CodexProvider {
             auth = config.chatgpt_auth().await?;
             headers = conservative_codex_headers(self.version, &auth)?;
             redactor = CodexErrorRedactor::for_secrets([auth.access_token.clone()]);
-            preflight = self
-                .client
-                .get(models_url)
-                .headers(headers.clone())
-                .send()
-                .await
-                .map_err(|e| {
+            preflight = map_upstream_headers_wait(
+                timeout_upstream_headers(
+                    self.client.get(models_url).headers(headers.clone()).send(),
+                )
+                .await,
+                |e| {
                     ProviderError::upstream(
                         redactor.redact(&format!("codex conservative models preflight error: {e}")),
                     )
-                })?;
+                },
+            )?;
         }
         let status = preflight.status();
-        let bytes = preflight.bytes().await.map_err(|e| {
-            ProviderError::upstream(redactor.redact(&format!(
-                "codex conservative models preflight read error: {e}"
-            )))
-        })?;
         if !status.is_success() {
+            let status_code = status.as_u16();
+            let prefix = read_capped_error_body(preflight).await;
             return Err(ProviderError::upstream_status(
-                status.as_u16(),
+                status_code,
                 redactor.redact(&format!(
-                    "codex conservative models preflight HTTP {status}: {}",
-                    String::from_utf8_lossy(&bytes)
+                    "codex conservative models preflight HTTP {status}: {prefix}"
                 )),
             ));
         }
+        // Success body is unused. Do not unbounded-read it.
+        drop(preflight);
 
         let ws_url = config.conservative_responses_ws_url()?;
         let ws_request = conservative_ws_request(&ws_url, self.version, &auth)?;
         let body = codex_response_create_body(&req)?;
+        let open_redactor = redactor.clone();
+        let mut ws = match timeout_upstream_headers(async move {
+            let (mut ws, _) = connect_async(ws_request)
+                .await
+                .map_err(|e| map_ws_open_error(e, &open_redactor))?;
+            let frame = serde_json::to_string(&body).map_err(|e| {
+                ProviderError::upstream(format!("encode codex conservative response.create: {e}"))
+            })?;
+            ws.send(Message::Text(frame.into())).await.map_err(|e| {
+                ProviderError::upstream(
+                    open_redactor.redact(&format!("codex conservative websocket send error: {e}")),
+                )
+            })?;
+            Ok::<_, ProviderError>(ws)
+        })
+        .await
+        {
+            Ok(Ok(ws)) => ws,
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                return Err(ProviderError::upstream_status(
+                    504,
+                    "upstream headers timeout",
+                ));
+            }
+        };
 
         let stream = async_stream::stream! {
-            let (mut ws, _) = match connect_async(ws_request).await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    yield Err(ProviderError::upstream(redactor.redact(&format!(
-                        "codex conservative websocket connect error: {e}"
-                    ))));
-                    return;
-                }
-            };
-
-            let frame = match serde_json::to_string(&body) {
-                Ok(frame) => frame,
-                Err(e) => {
-                    yield Err(ProviderError::upstream(format!(
-                        "encode codex conservative response.create: {e}"
-                    )));
-                    return;
-                }
-            };
-            if let Err(e) = ws.send(Message::Text(frame.into())).await {
-                yield Err(ProviderError::upstream(redactor.redact(&format!(
-                    "codex conservative websocket send error: {e}"
-                ))));
-                return;
-            }
-
             let mut parser = ResponsesStreamParser::new("codex", redactor.clone());
             let mut saw_event = false;
             let mut finished = false;
@@ -519,87 +522,83 @@ impl LlmProvider for CodexProvider {
             header::HeaderValue::from_static("text/event-stream"),
         );
         let body = codex_responses_body(&req, true)?;
-        let error_redactor = CodexErrorRedactor::from_request(&url, &headers);
+        let mut error_redactor = CodexErrorRedactor::from_request(&url, &headers);
         let client = self.client.clone();
         let can_replay = config.rest_401_replay_allowed();
         let replay_config = config.clone();
 
+        let mut http_resp = map_upstream_headers_wait(
+            timeout_upstream_headers(
+                client
+                    .post(url.clone())
+                    .headers(headers.clone())
+                    .json(&body)
+                    .send(),
+            )
+            .await,
+            |e| {
+                ProviderError::upstream(error_redactor.redact(&format!("codex network error: {e}")))
+            },
+        )?;
+
+        if can_replay
+            && http_resp.status().as_u16() == 401
+            && replay_config.force_refresh_cli_auth().await.is_ok()
+        {
+            match replay_config.headers().await {
+                Ok(mut next_headers) => {
+                    next_headers.insert(
+                        header::CONTENT_TYPE,
+                        header::HeaderValue::from_static("application/json"),
+                    );
+                    next_headers.insert(
+                        header::ACCEPT,
+                        header::HeaderValue::from_static("text/event-stream"),
+                    );
+                    headers = next_headers;
+                    error_redactor = CodexErrorRedactor::from_request(&url, &headers);
+                    http_resp = map_upstream_headers_wait(
+                        timeout_upstream_headers(
+                            client
+                                .post(url.clone())
+                                .headers(headers.clone())
+                                .json(&body)
+                                .send(),
+                        )
+                        .await,
+                        |e| {
+                            ProviderError::upstream(
+                                error_redactor.redact(&format!("codex network error: {e}")),
+                            )
+                        },
+                    )?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        let status = http_resp.status();
+        if !status.is_success() {
+            let status_code = status.as_u16();
+            let err_body = error_redactor.redact(&read_capped_error_body(http_resp).await);
+            return Err(ProviderError::upstream_status(
+                status_code,
+                format!("codex HTTP {status}: {err_body}"),
+            ));
+        }
+
+        let content_type = http_resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        if !is_sse_content_type(content_type) {
+            let got = content_type.unwrap_or("missing");
+            return Err(ProviderError::upstream(format!(
+                "codex stream expected text/event-stream, got {got}"
+            )));
+        }
+
         let stream = async_stream::stream! {
-            let mut headers = headers;
-            let mut error_redactor = error_redactor;
-            let mut send_result = client
-                .post(url.clone())
-                .headers(headers.clone())
-                .json(&body)
-                .send()
-                .await;
-
-            if can_replay
-                && send_result
-                    .as_ref()
-                    .is_ok_and(|resp| resp.status().as_u16() == 401)
-                && replay_config.force_refresh_cli_auth().await.is_ok()
-            {
-                match replay_config.headers().await {
-                    Ok(mut next_headers) => {
-                        next_headers.insert(
-                            header::CONTENT_TYPE,
-                            header::HeaderValue::from_static("application/json"),
-                        );
-                        next_headers.insert(
-                            header::ACCEPT,
-                            header::HeaderValue::from_static("text/event-stream"),
-                        );
-                        headers = next_headers;
-                        error_redactor = CodexErrorRedactor::from_request(&url, &headers);
-                        send_result = client
-                            .post(url.clone())
-                            .headers(headers.clone())
-                            .json(&body)
-                            .send()
-                            .await;
-                    }
-                    Err(e) => {
-                        yield Err(e);
-                        return;
-                    }
-                }
-            }
-
-            let http_resp = match send_result {
-                Ok(resp) => resp,
-                Err(e) => {
-                    yield Err(ProviderError::upstream(error_redactor.redact(&format!("codex network error: {e}"))));
-                    return;
-                }
-            };
-
-            let status = http_resp.status();
-            if !status.is_success() {
-                let err_body = error_redactor.redact(
-                    &http_resp
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| "<no body>".to_string()),
-                );
-                yield Err(ProviderError::upstream_status(status.as_u16(), error_redactor.redact(&format!("codex HTTP {status}: {err_body}"))));
-                return;
-            }
-
-            if let Some(content_type) = http_resp
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                && !content_type
-                    .to_ascii_lowercase()
-                    .starts_with("text/event-stream")
-            {
-                yield Err(ProviderError::upstream(format!(
-                    "codex stream expected text/event-stream, got {content_type}"
-                )));
-                return;
-            }
-
             let mut bytes = http_resp.bytes_stream();
             let mut sse = ResponsesSseBuffer::default();
             let mut parser = ResponsesStreamParser::new("codex", error_redactor.clone());
@@ -2226,6 +2225,54 @@ fn redact(input: &str) -> String {
     responses_upstream::redact_prefixed_secrets(input, &["sk-", "xai-", "eyJ"])
 }
 
+fn map_ws_open_error(
+    err: tokio_tungstenite::tungstenite::Error,
+    redactor: &CodexErrorRedactor,
+) -> ProviderError {
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            let status = response.status().as_u16();
+            let body = match response.body() {
+                Some(bytes) => {
+                    let bytes = &bytes[..bytes.len().min(UPSTREAM_ERROR_BODY_PREFIX)];
+                    String::from_utf8_lossy(bytes).into_owned()
+                }
+                None => String::new(),
+            };
+            ProviderError::upstream_status(
+                status,
+                redactor.redact(&format!(
+                    "codex conservative websocket handshake HTTP {status}: {body}"
+                )),
+            )
+        }
+        other => ProviderError::upstream(redactor.redact(&format!(
+            "codex conservative websocket connect error: {other}"
+        ))),
+    }
+}
+
+async fn read_capped_error_body(mut resp: reqwest::Response) -> String {
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(UPSTREAM_ERROR_BODY_READ_TIMEOUT, async {
+        while buf.len() < UPSTREAM_ERROR_BODY_PREFIX {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    let room = UPSTREAM_ERROR_BODY_PREFIX - buf.len();
+                    let n = chunk.len().min(room);
+                    buf.extend_from_slice(&chunk[..n]);
+                    if n < chunk.len() {
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+    })
+    .await;
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 fn is_upstream_status(err: &ProviderError, want: u16) -> bool {
     matches!(
         err,
@@ -3444,6 +3491,113 @@ model = "gpt-5.5"
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"], "hi");
         assert!(body.get("stream").is_none());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn conservative_ws_handshake_http_503_is_send_stream_err() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let body = b"overloaded";
+            let resp = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.write_all(body).await;
+        });
+        let _home = TempCodexHome::new(
+            r#"
+model = "gpt-5.5"
+"#,
+            Some(
+                r#"{"OPENAI_API_KEY":"sk-rest","tokens":{"access_token":"eyJ-test-oauth","account_id":"acct-test"}}"#,
+            ),
+        );
+        let models_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/backend-api/codex/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("unused"))
+            .expect(1)
+            .mount(&models_server)
+            .await;
+        let ws_base = format!("http://{addr}");
+        let _env = EnvRestore::set(&[
+            (
+                "OMNI_CODEX_CONSERVATIVE_BASE_URL_FOR_TEST",
+                Some(models_server.uri()),
+            ),
+            (
+                "OMNI_CODEX_CONSERVATIVE_WS_BASE_URL_FOR_TEST",
+                Some(ws_base),
+            ),
+        ]);
+        let provider = CodexProvider::new().unwrap();
+        let err = match provider
+            .send_stream(CanonicalRequest {
+                model: "gpt-5.5".into(),
+                messages: vec![CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Text("hi".into()),
+                }],
+                ..Default::default()
+            })
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("handshake 503 is Err from send_stream"),
+        };
+        assert!(
+            matches!(
+                err,
+                ProviderError::Upstream {
+                    status: Some(503),
+                    ..
+                }
+            ),
+            "expected upstream 503, got {err:?}"
+        );
+    }
+
+    struct EnvRestore {
+        old: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvRestore {
+        fn set(vars: &[(&'static str, Option<String>)]) -> Self {
+            let old = vars
+                .iter()
+                .map(|(name, _)| (*name, std::env::var_os(name)))
+                .collect();
+            for (name, value) in vars {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+            Self { old }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in &self.old {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -5470,13 +5624,20 @@ requires_openai_auth = false
             .await;
 
         let provider = CodexProvider::new().unwrap();
-        let err = collect_stream_events(&provider)
+        let err = match provider
+            .send_stream(CanonicalRequest {
+                model: "gpt-custom".into(),
+                messages: vec![CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Text("hi".into()),
+                }],
+                ..Default::default()
+            })
             .await
-            .into_iter()
-            .next()
-            .unwrap()
-            .unwrap_err()
-            .to_string();
+        {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("non-SSE content-type is a pre-body error"),
+        };
         assert!(err.contains("expected text/event-stream"), "{err}");
     }
 
