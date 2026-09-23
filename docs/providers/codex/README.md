@@ -2,7 +2,7 @@
 
 Codex-specific behavior lives in `crates/provider-codex`.
 
-Single pin: Codex CLI **0.153.4**. `--codex-version` / `OMNI_CODEX_VERSION` and
+Single pin: Codex CLI **0.156.0**. `--codex-version` / `OMNI_CODEX_VERSION` and
 match-system flags are removed (issue #12). Rebaseline overwrites this pin;
 older wire needs an older Omni release.
 
@@ -130,7 +130,10 @@ Unsupported extras fail loudly.
 Rebaseline overwrites the single pin, including the model catalog. The catalog
 source is `codex debug models --bundled` (`visibility=list` slugs). A custom
 Responses `base_url` is not a reason to skip. If that command fails or lists
-no models, stop. Do not keep the previous pin's catalog.
+no models, stop. Do not keep the previous pin's catalog. The 2026-09-22
+capture returned a successful Responses POST on the configured custom endpoint;
+`visibility=list` includes Astra, Sol, Terra, Luna, and 5.5. The user-agent
+comes from that successful exec, not the bundled catalog.
 
 ```sh
 python3 -m tools.capture catalog --provider codex
@@ -160,7 +163,13 @@ or create a tmpfs workdir.
 
 The shared CLI copies `config.toml` and `auth.json` into an isolated
 `CODEX_HOME`, runs `codex exec -c 'mcp_servers={}' -` with the prompt on stdin,
-and records traffic through a local mitmproxy. Live runs remove the tmpfs workdir
+and records traffic through a local mitmproxy. If the selected custom provider
+uses `OPENAI_API_KEY` or `CODEX_API_KEY` as `env_key`, explicitly set
+`OMNI_CAPTURE_CODEX_ENV_KEY_HOST` to the selected non-reserved provider's
+HTTPS `base_url` hostname before a live capture; otherwise the runner refuses
+to forward an ambient key. The reserved `openai` provider, active Codex
+profiles, and URLs with userinfo or non-ASCII/escaped host syntax cannot use
+this exception. Do not set the approval variable from an untrusted config. Live runs remove the tmpfs workdir
 (including staged credential copies) by default. `KEEP_FLOW=1` retains the
 workdir and raw flow on tmpfs and prints warnings. Extract with:
 

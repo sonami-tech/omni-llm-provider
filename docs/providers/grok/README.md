@@ -20,8 +20,8 @@ identity preambles. The maintained contract is:
 - fresh credential resolution per request (prefers `~/.grok/auth.json` OIDC),
 - grok-shell fingerprint headers for the pinned CLI version,
 - correct non-stream and stream decoding via the shared Responses parser,
-- model catalog kept current (single pin: grok-shell 1.0.30; `grok-4.6` default,
-  plus `grok-4.5`). Catalog source is clean-HOME `GET /v1/models` on
+- model catalog kept current (single pin: grok-shell 1.0.41; `grok-4.7` default,
+  plus `grok-4.7-build-fast`, `grok-4.6`, and `grok-4.5`). Catalog source is clean-HOME `GET /v1/models` on
   `cli-chat-proxy.grok.com`, not the operator `grok models` UI.
 
 `--grok-version` / `OMNI_GROK_VERSION` and match-system flags are removed
@@ -44,7 +44,7 @@ Capture and refresh-capture work uses `python3 -m tools.capture`; see
 ## Reasoning effort
 
 Maps explicit client effort to xAI `low|medium|high`, plus `xhigh` on
-`grok-4.6` (aliases `minimal`→`low`, `max`→`high`). Explicit `"none"` omits the
+`grok-4.7`, `grok-4.7-build-fast`, and `grok-4.6` (aliases `minimal`→`low`, `max`→`high`). Explicit `"none"` omits the
 field. Unmappable values, including `xhigh` on `grok-4.5`, fail loud (issue #20).
 
 **Omit when client omits (issue #18):** if the client does not set effort, Omni

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import socket
 from dataclasses import dataclass
 from pathlib import Path
@@ -140,7 +141,40 @@ def build_provider_env(
             env["REQUESTS_CA_BUNDLE"] = ca
             env["NODE_EXTRA_CA_CERTS"] = ca
 
-    # Keep ambient API keys out of the isolated capture env.
+    # An ambient Codex key may be used only for an explicitly approved
+    # selected HTTPS endpoint, never merely because a custom config names it.
+    codex_env_key: str | None = None
+    codex_host: str | None = None
+    codex_config = staged.clean_codex_home / "config.toml" if staged.clean_codex_home else None
+    if provider == "codex" and codex_config is not None and codex_config.is_file():
+        import tomllib
+        from urllib.parse import urlparse
+
+        config = tomllib.loads(codex_config.read_text(encoding="utf-8"))
+        selected = config.get("model_provider", "openai")
+        providers = config.get("model_providers", {})
+        if isinstance(providers, dict) and selected != "openai":
+            provider_config = providers.get(selected, {})
+            if isinstance(provider_config, dict):
+                key = provider_config.get("env_key")
+                base_url = provider_config.get("base_url")
+                if isinstance(key, str) and key in {"OPENAI_API_KEY", "CODEX_API_KEY"}:
+                    codex_env_key = key
+                    if (
+                        isinstance(base_url, str)
+                        and not config.get("profile")
+                        and not config.get("profiles")
+                        and not os.environ.get("CODEX_PROFILE")
+                    ):
+                        parsed = urlparse(base_url)
+                        if (
+                            parsed.scheme == "https"
+                            and re.fullmatch(r"[A-Za-z0-9.-]+(?::[0-9]{1,5})?", parsed.netloc)
+                            and parsed.hostname
+                            and (parsed.port is None or 0 < parsed.port <= 65535)
+                        ):
+                            codex_host = parsed.hostname
+
     for key in (
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
@@ -150,6 +184,15 @@ def build_provider_env(
         "XAI_API_KEY",
     ):
         env.pop(key, None)
+    if codex_env_key and os.environ.get(codex_env_key):
+        approved_host = os.environ.get("OMNI_CAPTURE_CODEX_ENV_KEY_HOST", "").strip()
+        if codex_host is None or approved_host != codex_host:
+            raise RuntimeError(
+                "Codex env key requires an HTTPS base_url in the selected "
+                "non-reserved provider and matching OMNI_CAPTURE_CODEX_ENV_KEY_HOST"
+            )
+        env[codex_env_key] = os.environ[codex_env_key]
+    env.pop("OMNI_CAPTURE_CODEX_ENV_KEY_HOST", None)
 
     env["PATH"] = path_value
     return env

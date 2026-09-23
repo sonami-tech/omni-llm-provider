@@ -15,8 +15,8 @@ pub struct ModelDef {
     pub max_tokens: u64,
 }
 
-/// Active Claude Code model catalog (pin 2.1.269).
-/// Fable alias is `claude-fable-5-1`. Opus is `claude-opus-5`, sonnet is
+/// Active Claude Code model catalog (pin 2.1.280).
+/// Fable alias is `claude-fable-5-1`. Opus is `claude-opus-5-5`, sonnet is
 /// `claude-sonnet-5`, and haiku is dated. Explicit `claude-fable-5` stays
 /// pass-through plus a wire/beta override, not a second advertised row.
 pub static MODEL_CATALOG: &[ModelDef] = &[
@@ -28,11 +28,11 @@ pub static MODEL_CATALOG: &[ModelDef] = &[
         max_tokens: 64_000,
     },
     ModelDef {
-        canonical: "claude-opus-5",
+        canonical: "claude-opus-5-5",
         cli_name: "opus",
         aliases: &["opus"],
         context_window: 1_000_000,
-        max_tokens: 64_000,
+        max_tokens: 128_000,
     },
     ModelDef {
         canonical: "claude-sonnet-5",
@@ -152,8 +152,11 @@ mod tests {
     #[test]
     fn resolve_canonical_names() {
         assert_eq!(
-            profile().resolve_model("claude-opus-5").unwrap().canonical,
-            "claude-opus-5"
+            profile()
+                .resolve_model("claude-opus-5-5")
+                .unwrap()
+                .canonical,
+            "claude-opus-5-5"
         );
         assert_eq!(
             profile()
@@ -174,7 +177,7 @@ mod tests {
     fn resolve_short_aliases() {
         assert_eq!(
             profile().resolve_model("opus").unwrap().canonical,
-            "claude-opus-5"
+            "claude-opus-5-5"
         );
         assert_eq!(
             profile().resolve_model("sonnet").unwrap().canonical,
@@ -252,7 +255,7 @@ mod tests {
         let list = profile().models_list();
         assert_eq!(list.len(), 4);
         assert_eq!(list[0].id, "claude-fable-5-1");
-        assert_eq!(list[1].id, "claude-opus-5");
+        assert_eq!(list[1].id, "claude-opus-5-5");
         assert_eq!(list[2].id, "claude-sonnet-5");
         assert_eq!(list[3].id, "claude-haiku-4-5-20251001");
         assert_eq!(list[0].context_window, 1_000_000);
@@ -267,7 +270,7 @@ mod tests {
     #[test]
     fn resolve_canonical_exact() {
         assert_eq!(
-            profile().resolve_model("claude-opus-5").unwrap().cli_name,
+            profile().resolve_model("claude-opus-5-5").unwrap().cli_name,
             "opus"
         );
         assert_eq!(

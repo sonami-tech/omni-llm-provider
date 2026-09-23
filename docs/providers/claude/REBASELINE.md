@@ -144,27 +144,18 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
 - Captured fields are represented in source.
 - Default workspace tests pass without credentials or network.
 
-## Current 2.1.269 Status
+## Current 2.1.280 Status
 
-On 2026-09-12, Claude Code 2.1.269 was captured and model behavior was verified
-for default, `opus`, `sonnet`, `haiku`, and `fable` flows.
-Headers use SDK package `0.112.1`, runtime `v26.3.0`, Anthropic version
-`2023-06-01`, and `claude-cli/2.1.269 (external, sdk-cli)`.
+On 2026-09-22 the clean-HOME general capture returned HTTP 200 for default,
+`opus`, `sonnet`, `haiku`, and `fable`. The observed catalog contains
+`claude-opus-5-5`, `claude-sonnet-5`, `claude-haiku-4-5-20251001`, and
+`claude-fable-5-1`. Fable acceptance is now proven by a successful POST,
+not inferred from a rate limit. The explicit `claude-fable-5` path was not
+recaptured; its prior pass-through and wire override remain unchanged.
 
-2.1.269 is the current active pin. Drift versus 2.1.259 is the CLI version
-string (UA + billing `cc_version`) plus two new betas:
-`mid-conversation-tool-changes-2026-07-01` on default and explicit opus, and
-`per-turn-control-2026-07-01` plus that tool-changes beta on fable. Sonnet and
-haiku beta lists are unchanged. Catalog still advertises `claude-fable-5-1`
-(alias `fable`), `claude-opus-5`, `claude-sonnet-5`, and
-`claude-haiku-4-5-20251001`. Explicit `claude-fable-5` stays pass-through plus
-a wire/beta override.
-
-Wire defaults, stainless package/runtime, identity preamble, and the
-no-`x-client-request-id` header set are otherwise live-confirmed unchanged.
-
-Like 2.1.186+ it emits the billing header with no `cch=` field, ending at
-`cc_entrypoint=sdk-cli;`. The `cc_version` suffix algorithm is unchanged: the
-existing Sha256Utf16SampleV1 suffix reproduces the captured
-`cc_version=2.1.269.4a3` exactly. Because there is no checksum to recompute,
-this no-cch profile ships no clean-room cch vectors.
+Default and explicit Opus use 128000 max tokens, medium effort, and a new
+`per-turn-control-2026-07-01` beta. Sonnet, Haiku, and Fable settings
+match the prior pin. SDK package `0.112.1`, runtime `v26.3.0`, and
+Anthropic version `2023-06-01` were observed. Billing is
+`cc_version=2.1.280.7aa; cc_entrypoint=sdk-cli;` for `Say OK`; no `cch=`
+was emitted. The `Sha256Utf16SampleV1` suffix stays in use.

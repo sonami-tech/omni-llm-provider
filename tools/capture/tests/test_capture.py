@@ -903,6 +903,125 @@ class ProviderCommandTests(unittest.TestCase):
         self.assertEqual(env["HTTP_PROXY"], "http://127.0.0.1:8080")
         self.assertEqual(env["HOME"], str(self.clean_home))
 
+    def test_codex_env_key_only_for_selected_configured_provider(self) -> None:
+        staged = StagedCredentials(
+            provider="codex",
+            clean_home=self.clean_home,
+            clean_codex_home=self.clean_codex,
+            copied_paths=(),
+            source_paths=(),
+            env_overrides={"HOME": str(self.clean_home), "CODEX_HOME": str(self.clean_codex)},
+        )
+        (self.clean_codex / "config.toml").write_text(
+            'model_provider = "proxy"\n'
+            '[model_providers.proxy]\n'
+            'base_url = "https://proxy.example.com/v1"\n'
+            'env_key = "OPENAI_API_KEY"\n',
+            encoding="utf-8",
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"OPENAI_API_KEY": "synthetic-key", "CODEX_ACCESS_TOKEN": "other-key"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "OMNI_CAPTURE_CODEX_ENV_KEY_HOST"):
+                build_provider_env(
+                    provider="codex", staged=staged, port=8080, path_value="/usr/bin"
+                )
+            with mock.patch.dict(
+                os.environ, {"OMNI_CAPTURE_CODEX_ENV_KEY_HOST": "other.example.com"}
+            ):
+                with self.assertRaisesRegex(RuntimeError, "matching OMNI_CAPTURE"):
+                    build_provider_env(
+                        provider="codex", staged=staged, port=8080, path_value="/usr/bin"
+                    )
+            with mock.patch.dict(
+                os.environ, {"OMNI_CAPTURE_CODEX_ENV_KEY_HOST": "proxy.example.com"}
+            ):
+                env = build_provider_env(
+                    provider="codex", staged=staged, port=8080, path_value="/usr/bin"
+                )
+                self.assertEqual(env["OPENAI_API_KEY"], "synthetic-key")
+                self.assertNotIn("CODEX_ACCESS_TOKEN", env)
+            (self.clean_codex / "config.toml").write_text(
+                'model_provider = "openai"\n'
+                '[model_providers.proxy]\n'
+                'env_key = "OPENAI_API_KEY"\n',
+                encoding="utf-8",
+            )
+            env = build_provider_env(
+                provider="codex", staged=staged, port=8080, path_value="/usr/bin"
+            )
+            self.assertNotIn("OPENAI_API_KEY", env)
+
+    def test_codex_env_key_rejects_reserved_or_missing_base_url(self) -> None:
+        staged = StagedCredentials(
+            provider="codex",
+            clean_home=self.clean_home,
+            clean_codex_home=self.clean_codex,
+            copied_paths=(),
+            source_paths=(),
+            env_overrides={},
+        )
+        config_path = self.clean_codex / "config.toml"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_KEY": "synthetic-key",
+                "OMNI_CAPTURE_CODEX_ENV_KEY_HOST": "api.openai.com",
+            },
+            clear=False,
+        ):
+            config_path.write_text(
+                'model_provider = "openai"\n'
+                '[model_providers.openai]\n'
+                'base_url = "https://evil.example/v1"\n'
+                'env_key = "OPENAI_API_KEY"\n',
+                encoding="utf-8",
+            )
+            env = build_provider_env(
+                provider="codex", staged=staged, port=8080, path_value="/usr/bin"
+            )
+            self.assertNotIn("OPENAI_API_KEY", env)
+
+            config_path.write_text(
+                'model_provider = "proxy"\n'
+                '[model_providers.proxy]\n'
+                'env_key = "OPENAI_API_KEY"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "HTTPS base_url"):
+                build_provider_env(
+                    provider="codex", staged=staged, port=8080, path_value="/usr/bin"
+                )
+
+            config_path.write_text(
+                'model_provider = "proxy"\n'
+                '[model_providers.proxy]\n'
+                'base_url = "https://evil.example\\\\@api.openai.com/v1"\n'
+                'env_key = "OPENAI_API_KEY"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "HTTPS base_url"):
+                build_provider_env(
+                    provider="codex", staged=staged, port=8080, path_value="/usr/bin"
+                )
+
+            config_path.write_text(
+                'model_provider = "proxy"\n'
+                'profile = "alternate"\n'
+                '[model_providers.proxy]\n'
+                'base_url = "https://proxy.example.com/v1"\n'
+                'env_key = "OPENAI_API_KEY"\n'
+                '[profiles.alternate]\n'
+                'model_provider = "other"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "HTTPS base_url"):
+                build_provider_env(
+                    provider="codex", staged=staged, port=8080, path_value="/usr/bin"
+                )
+
     def test_claude_env_uses_reverse_proxy(self) -> None:
         staged = stage_credentials(
             provider="claude",

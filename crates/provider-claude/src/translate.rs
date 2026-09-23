@@ -2023,7 +2023,7 @@ mod tests {
                 None,
                 Some("high"),
             ),
-            ("opus", "claude-opus-5", 64_000, None, Some("high")),
+            ("opus", "claude-opus-5-5", 128_000, None, Some("medium")),
             ("sonnet", "claude-sonnet-5", 64_000, None, Some("high")),
             // The "haiku" alias resolves to the dated canonical; 2.1.220 omits
             // temperature on the wire (no temp=1) and has no output_config.

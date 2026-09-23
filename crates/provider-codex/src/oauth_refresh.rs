@@ -8,8 +8,8 @@
 //! `omni_common::oauth_refresh`). Static `OPENAI_API_KEY` entries are never
 //! refreshed.
 //!
-//! Wire contract: live capture of Codex CLI 0.153.4 UA (2026-09-12). Refresh
-//! capture was not re-run; the OAuth UA version string tracks the live pin.
+//! The 0.156.0 general exec captured the version, not the OAuth refresh UA
+//! shape. Keep the prior refresh shape until a refresh capture proves a change.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,7 +26,7 @@ pub const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// Originator header from capture.
 pub const CODEX_OAUTH_ORIGINATOR: &str = "codex_exec";
 /// User-Agent template matching capture (`codex_exec/<ver> …`).
-pub const CODEX_OAUTH_USER_AGENT: &str = "codex_exec/0.153.4 (linux; x86_64) unknown";
+pub const CODEX_OAUTH_USER_AGENT: &str = "codex_exec/0.156.0 (linux; x86_64) unknown";
 /// Near-expiry skew (15 minutes); shared via omni-common.
 const NEAR_EXPIRY_SKEW_SECS: i64 = omni_common::NEAR_EXPIRY_SKEW_SECS;
 

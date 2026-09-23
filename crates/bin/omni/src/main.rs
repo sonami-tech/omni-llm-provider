@@ -9,7 +9,7 @@
 //! - --providers claude,grok,codex   or   OMNI_PROVIDERS=... (comma sep, order preserved).
 //!   When omitted, Omni enables all locally detected providers.
 //! - --bind 127.0.0.1 by default, or --public as shorthand for --bind 0.0.0.0
-//! - Canonical model routing: real model ids (e.g. "claude-sonnet-5", "grok-4.6")
+//! - Canonical model routing: real model ids (e.g. "claude-sonnet-5", "grok-4.7")
 //!   route directly when they uniquely identify an enabled provider.
 //! - Alias routing: "opus", "sonnet", "haiku", "grok", and "gpt"
 //!   resolve to current provider-owned model ids when unique.
@@ -3139,9 +3139,9 @@ mod tests {
         );
 
         let (k, m) = resolve_provider_and_model("grok", &catalogs).unwrap();
-        assert_eq!((k.as_str(), m.as_str()), ("grok", "grok-4.6"));
+        assert_eq!((k.as_str(), m.as_str()), ("grok", "grok-4.7"));
 
-        // composer is no longer a Grok catalog alias (grok-shell 1.0.30).
+        // composer is no longer a Grok catalog alias (grok-shell 1.0.41).
         let err = resolve_provider_and_model("composer", &catalogs).unwrap_err();
         assert!(
             err.contains("unknown model"),
@@ -3200,10 +3200,10 @@ mod tests {
         let text = format_aliases_for_log(&providers).expect("aliases format");
         for expected in [
             "sonnet=claude-sonnet-5",
-            "opus=claude-opus-5",
+            "opus=claude-opus-5-5",
             "fable=claude-fable-5-1",
             "haiku=claude-haiku-4-5-20251001",
-            "grok=grok-4.6",
+            "grok=grok-4.7",
             "gpt=",
         ] {
             assert!(
@@ -3220,7 +3220,7 @@ mod tests {
             text.contains("fable=claude-fable-5-1"),
             "startup alias log must advertise live fable alias: {text}"
         );
-        // composer dropped from grok-shell 1.0.30 advertised catalog.
+        // composer dropped from grok-shell 1.0.41 advertised catalog.
         assert!(
             !text.contains("composer="),
             "startup alias log must not advertise retired composer alias: {text}"
@@ -3239,6 +3239,8 @@ mod tests {
         assert!(text.contains("claude=["));
         assert!(text.contains("claude-sonnet-5"));
         assert!(text.contains("grok=["));
+        assert!(text.contains("grok-4.7"));
+        assert!(text.contains("grok-4.7-build-fast"));
         assert!(text.contains("grok-4.6"));
         assert!(text.contains("grok-4.5"));
         assert!(
@@ -5146,23 +5148,25 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             .filter_map(|m| m["id"].as_str().map(str::to_string))
             .collect();
         assert!(
-            ids.iter().any(|id| id == "grok-4.6"),
+            ids.iter().any(|id| id == "grok-4.7"),
             "grok default catalog entry missing: {ids:?}"
         );
+        assert!(ids.iter().any(|id| id == "grok-4.7-build-fast"));
+        assert!(ids.iter().any(|id| id == "grok-4.6"));
         assert!(
             ids.iter().any(|id| id == "grok-4.5"),
             "grok real catalog entry missing: {ids:?}"
         );
         assert!(
             !ids.iter().any(|id| id == "grok-composer-2.5-fast"),
-            "composer is no longer in the grok-shell 1.0.30 catalog: {ids:?}"
+            "composer is no longer in the grok-shell 1.0.41 catalog: {ids:?}"
         );
         assert!(
             ids.iter().any(|id| id == "claude-fable-5-1"),
             "claude fable catalog entry missing: {ids:?}"
         );
         assert!(
-            ids.iter().any(|id| id == "claude-opus-5"),
+            ids.iter().any(|id| id == "claude-opus-5-5"),
             "claude opus catalog entry missing: {ids:?}"
         );
         assert!(
@@ -7624,8 +7628,8 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
-        // Bare alias "grok" resolves to the catalog default (currently grok-4.6).
-        assert_eq!(v["model"], "grok-4.6");
+        // Bare alias "grok" resolves to the catalog default (currently grok-4.7).
+        assert_eq!(v["model"], "grok-4.7");
     }
 
     #[tokio::test]
@@ -7675,8 +7679,8 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             },
         );
         let (state, _guard) = state_with_stats(providers);
-        // Use the current default-model triple (alias → grok-4.6).
-        for model in ["grok", "grok-4.6", "grok:grok-4.6"] {
+        // Use the current default-model triple (alias → grok-4.7).
+        for model in ["grok", "grok-4.7", "grok:grok-4.7"] {
             let req = ChatCompletionRequest {
                 model: model.into(),
                 messages: vec![ChatMessage {
@@ -7700,7 +7704,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         }
 
         let snap = state.stats.as_ref().unwrap().snapshot();
-        assert_eq!(snap.models["grok:grok-4.6"].requests, 3);
+        assert_eq!(snap.models["grok:grok-4.7"].requests, 3);
         assert_eq!(snap.models.len(), 1);
     }
 
@@ -7883,7 +7887,7 @@ rule = [
         assert_eq!(kc, "claude");
         assert_eq!(mc, "y");
         let (kg, mg) = resolve_provider_and_model("grok", &catalogs).unwrap();
-        assert_eq!((kg.as_str(), mg.as_str()), ("grok", "grok-4.6"));
+        assert_eq!((kg.as_str(), mg.as_str()), ("grok", "grok-4.7"));
         assert!(resolve_provider_and_model("bare", &catalogs).is_err());
     }
 

@@ -895,7 +895,7 @@ mod tests {
         // strict-family reject is deliberately gone (owner-decided pass-through).
         for (input, expected) in [
             // exact canonical -> canonical
-            ("claude-opus-5", "claude-opus-5"),
+            ("claude-opus-5-5", "claude-opus-5-5"),
             // short alias -> canonical
             ("sonnet", "claude-sonnet-5"),
             // family long-form: NOT a catalog alias -> forwards raw

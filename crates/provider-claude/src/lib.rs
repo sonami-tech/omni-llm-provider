@@ -667,7 +667,7 @@ mod tests {
         assert_eq!(provider_id(), "claude");
         let p = ClaudeProvider::new().expect("default profile constructs");
         assert_eq!(p.id(), "claude");
-        assert_eq!(p.profile().name, "cc-2.1.269-sdk-cli");
+        assert_eq!(p.profile().name, "cc-2.1.280-sdk-cli");
     }
 
     #[test]
@@ -1240,8 +1240,8 @@ mod tests {
         // WHY: single-pin world (issue #12) — test helpers must still construct
         // a provider on the shipped fingerprint, not a deleted historical profile.
         let p = ClaudeProvider::new_for_test(crate::fingerprint::default_profile());
-        assert_eq!(p.profile().name, "cc-2.1.269-sdk-cli");
-        assert_eq!(p.profile().claude_cli_version, "2.1.269");
+        assert_eq!(p.profile().name, "cc-2.1.280-sdk-cli");
+        assert_eq!(p.profile().claude_cli_version, "2.1.280");
     }
 
     #[test]
@@ -1302,7 +1302,7 @@ mod tests {
         // cli alias -> resolves
         assert_eq!(
             prof.resolve_model("opus").unwrap().canonical,
-            "claude-opus-5"
+            "claude-opus-5-5"
         );
         // unknown -> NO LONGER defaults: passes through raw
         assert!(prof.resolve_model("weird").is_none());

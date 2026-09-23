@@ -123,36 +123,26 @@ wrapper around `tools.capture extract jsonl` for sanitized JSONL exports.
 
 ## Current Wire + Model Findings
 
-Re-baselined against grok-shell **1.0.30** on **2026-09-12**.
+Re-baselined against grok-shell **1.0.41** on **2026-09-22**.
 
 ### Default path (cli-chat-proxy.grok.com)
 
-Catalog (`/v1/models`):
+The clean-HOME `GET /v1/models` returned HTTP 200 with `grok-4.7`,
+`grok-4.7-build-fast`, `grok-4.6`, and `grok-4.5`. The no-`--model`
+`POST /v1/responses` selected `grok-4.7` and returned HTTP 200.
+The catalog advertises low, medium, high, and xhigh effort for the
+4.7/4.7-build-fast/4.6 models, and low, medium, high for 4.5.
+Do not use operator `grok models` or `~/.grok/config.toml` overrides as
+catalog evidence.
 
-- `grok-4.6` (default; alias `grok`; reasoning efforts `low`/`medium`/`high`/`xhigh`; top-level and captured chat default `high`)
-- `grok-4.5` (still advertised; no inbound alias)
-
-An operator `grok models` listing may show custom models and a non-Grok
-default (for example `gpt-luna` from `[models] default` in
-`~/.grok/config.toml`). That is not the provider catalog. This pin uses only
-`cli-chat-proxy.grok.com /v1/models` from the clean-HOME capture.
-
-Wire notes from live MITM of `grok --single`:
-- Host: `cli-chat-proxy.grok.com`, path `POST /v1/responses`
-- UA / version: `grok-shell/1.0.30 (linux; x86_64)`, `x-grok-client-version: 1.0.30`
-- Fingerprint headers: `x-xai-token-auth`, `x-authenticateresponse`,
-  `x-grok-client-identifier`, `x-grok-client-mode: headless`,
-  `x-grok-model-override`, `accept: text/event-stream`
-- Main chat body: `model: "grok-4.6"`, `reasoning: { "effort": "high", "summary": "concise" }`,
-  `include: ["reasoning.encrypted_content", "no_inline_citations"]`, `store: false`, `stream: true`,
-  plus CLI-only `prompt_cache_key` (Omni sends cache fields only from client intent)
-- Session-title side call uses the selected chat model (not `grok-build`)
-- CLI also sends session/compaction headers (`x-compaction-at`,
-  `x-compactions-remaining`, `x-grok-doom-loop-check`,
-  `x-grok-exact-repetition-check`, `x-grok-conv-group-id`); Omni still omits
-  those on single-shot requests
-
-`/v1/models` emits only canonical upstream ids. Omni accepts aliases inbound only.
+The captured UA is `grok-shell/1.0.41 (linux; x86_64)` and
+`x-grok-client-version` is `1.0.41`. Token-auth, authenticate-response,
+client identifier, headless mode, model override, and SSE accept headers
+remain present. Default chat sends high/concise reasoning, encrypted-content
+and no-inline-citations includes, `store: false`, and `stream: true`.
+Omni still omits CLI-only session metadata and request preferences unless
+client intent requires them. `/v1/models` exposes canonical ids; `grok`
+remains an inbound alias for `grok-4.7`.
 
 ### Custom endpoint override
 
