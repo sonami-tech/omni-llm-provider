@@ -177,6 +177,8 @@ pub struct Tool {
     pub description: Option<String>,
     pub input_schema: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
 }
 
@@ -835,11 +837,13 @@ fn translate_tools(
     for t in tools {
         let name = repl.apply_prompt(&t.name);
         let description = t.description.as_ref().map(|d| repl.apply_prompt(d));
-        let input_schema = t.parameters.clone();
+        let input_schema = omni_core::provider_tool_schema(&t.parameters, false)?;
+        let strict = omni_core::claude_strict(&input_schema, t.strict).then_some(true);
         out.push(Tool {
             name,
             description,
             input_schema,
+            strict,
             cache_control: claude_cache_control(t.cache.as_ref(), request_ttl),
         });
     }
@@ -2826,5 +2830,56 @@ mod tests {
             vec!["Keep me.".to_string()],
             "hoisted system must survive when identity injection is off"
         );
+    }
+}
+
+#[cfg(test)]
+mod issue_51_tool_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn chat(schema: Value, strict: bool) -> Result<Value, ProviderError> {
+        let req: omni_common::ChatCompletionRequest = serde_json::from_value(json!({"model":"sonnet","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":schema,"strict":strict}}],"tool_choice":"required"})).unwrap();
+        let canon = omni_common::to_canonical(&req).unwrap();
+        let wire = prepare_anthropic_request(
+            &canon,
+            crate::fingerprint::default_profile(),
+            &Replacements::empty(),
+            false,
+            false,
+        )?;
+        Ok(serde_json::to_value(wire).unwrap())
+    }
+
+    #[test]
+    fn claude_flattens_and_preserves_choice() {
+        let schema = json!({"type":"object","properties":{"b":{"type":"string"}},"required":["b"],"oneOf":[{"properties":{"a":{"type":"number"}},"required":["a"]},{"properties":{"c":{"type":"boolean"}},"required":["c"]}]});
+        let wire = chat(schema, false).unwrap();
+        let tool = &wire["tools"][0];
+        assert!(tool.get("strict").is_none());
+        assert!(tool["input_schema"].get("oneOf").is_none());
+        for key in ["a", "b", "c"] {
+            assert!(tool["input_schema"]["properties"].get(key).is_some());
+        }
+        assert_eq!(tool["input_schema"]["required"], json!(["b"]));
+        assert_eq!(wire["tool_choice"]["type"], "any");
+        assert!(
+            chat(json!({"anyOf":[{"type":"object"},7]}), false)
+                .unwrap_err()
+                .to_string()
+                .contains("branch")
+        );
+    }
+
+    #[test]
+    fn claude_strict_downgrades_without_rewriting() {
+        let schema = json!({"type":"object","additionalProperties":false,"properties":{"x":{"anyOf":[{"type":"string"}]}}});
+        let wire = chat(schema.clone(), true).unwrap();
+        assert_eq!(wire["tools"][0]["strict"], true);
+        assert_eq!(wire["tools"][0]["input_schema"], schema);
+        let loose = json!({"type":"object","properties":{"x":{"anyOf":[{"type":"string"}]}}});
+        let wire = chat(loose.clone(), true).unwrap();
+        assert!(wire["tools"][0].get("strict").is_none());
+        assert_eq!(wire["tools"][0]["input_schema"], loose);
     }
 }

@@ -163,6 +163,7 @@ pub fn prepare_client_messages_request(
     reject_native_anthropic_cache_dialect(&raw_body)?;
     let client: ClientMessagesRequest = serde_json::from_value(raw_body.clone())
         .map_err(|e| ProviderError::BadRequest(format!("invalid Anthropic request: {e}")))?;
+    validate_native_tools(&client)?;
     let stream = client_requested_stream(&raw_body);
     let dropped = dropped_fields(&raw_body);
     let mut req =
@@ -198,6 +199,7 @@ pub fn prepare_count_tokens_request(
     reject_native_anthropic_cache_dialect(&raw_body)?;
     let client: ClientMessagesRequest = serde_json::from_value(raw_body.clone())
         .map_err(|e| ProviderError::BadRequest(format!("invalid Anthropic request: {e}")))?;
+    validate_native_tools(&client)?;
     let dropped = dropped_fields(&raw_body);
     let mut req = reconcile_client_request(&client, profile, replacements, false, false)?;
     req.stream = None;
@@ -238,6 +240,18 @@ fn reject_native_anthropic_cache_dialect(raw_body: &Value) -> Result<(), Provide
         .map_err(ProviderError::BadRequest)
 }
 
+fn validate_native_tools(client: &ClientMessagesRequest) -> Result<(), ProviderError> {
+    if let Some(tools) = &client.tools {
+        for tool in tools {
+            omni_core::validate_tool_schema(&tool.input_schema, tool.strict.unwrap_or(false), true)
+                .map_err(ProviderError::BadRequest)?;
+            omni_core::provider_tool_schema(&tool.input_schema, false)
+                .map_err(ProviderError::BadRequest)?;
+        }
+    }
+    Ok(())
+}
+
 fn reconcile_client_request(
     client: &ClientMessagesRequest,
     profile: &'static FingerprintProfile,
@@ -246,6 +260,13 @@ fn reconcile_client_request(
     stream: bool,
 ) -> Result<MessagesRequest, ProviderError> {
     let mut req = client.to_messages_request();
+    if let Some(tools) = req.tools.as_mut() {
+        for tool in tools {
+            tool.strict =
+                omni_core::claude_strict(&tool.input_schema, tool.strict.unwrap_or(false))
+                    .then_some(true);
+        }
+    }
     // Pure pass-through: resolve exact canonical/alias, otherwise forward the id
     // raw (no strict-family reject). The shared forge tail applies the model id,
     // this door's real prompt replacements, wire defaults, and identity - in
@@ -1543,5 +1564,58 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains("x-anthropic-billing-header:"));
         assert!(!text.contains("cch=00000"));
+    }
+}
+
+#[cfg(test)]
+mod issue_51_tool_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn native_anthropic_strict_passthrough_and_invalid_input() {
+        let make = |schema: Value, strict: Value| json!({"model":"sonnet","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"f","input_schema":schema,"strict":strict}]});
+        let schema = json!({"type":"object","additionalProperties":false,"properties":{"x":{"type":"string"}}});
+        let wire = prepare_client_messages_request(
+            make(schema.clone(), json!(true)),
+            crate::fingerprint::default_profile(),
+            &Replacements::empty(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(wire.body()["tools"][0]["strict"], true);
+        assert_eq!(wire.body()["tools"][0]["input_schema"], schema);
+        let loose = json!({"type":"object","properties":{"x":{"allOf":[{"type":"string"}]}}});
+        let wire = prepare_client_messages_request(
+            make(loose.clone(), json!(true)),
+            crate::fingerprint::default_profile(),
+            &Replacements::empty(),
+            false,
+        )
+        .unwrap();
+        assert!(wire.body()["tools"][0].get("strict").is_none());
+        assert_eq!(wire.body()["tools"][0]["input_schema"], loose);
+        assert!(matches!(
+            prepare_count_tokens_request(
+                make(json!({"anyOf":[{}]}), json!(false)),
+                crate::fingerprint::default_profile(),
+                &Replacements::empty()
+            ),
+            Err(ProviderError::BadRequest(_))
+        ));
+        for bad in [
+            json!({"anyOf":[{}]}),
+            json!({"type":"object","properties":{"x":{"allOf":[]}}}),
+        ] {
+            assert!(matches!(
+                prepare_client_messages_request(
+                    make(bad, json!(false)),
+                    crate::fingerprint::default_profile(),
+                    &Replacements::empty(),
+                    false
+                ),
+                Err(ProviderError::BadRequest(_))
+            ));
+        }
     }
 }

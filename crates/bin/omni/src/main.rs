@@ -4315,6 +4315,31 @@ requires_openai_auth = false
         .await
     }
 
+    #[tokio::test]
+    async fn test_issue_51_invalid_tools_return_400_before_provider_call() {
+        let mut providers = HashMap::new();
+        providers.insert("grok".into(), grok_entry("http://127.0.0.1:1"));
+        let state = state_with(providers);
+        let schema = serde_json::json!({"type":"object","properties":{"x":{"anyOf":[]}}});
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({"model":"grok:grok-4.6","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":schema}}]})).unwrap();
+        assert!(matches!(
+            call_chat_handler(state.clone(), chat).await,
+            Err(AppError::BadRequest(_))
+        ));
+        let responses: omni_common::ResponsesRequest = serde_json::from_value(serde_json::json!({"model":"grok:grok-4.6","input":"hi","tools":[{"type":"function","name":"f","parameters":schema}]})).unwrap();
+        assert!(matches!(
+            call_responses_handler(state.clone(), responses).await,
+            Err(AppError::BadRequest(_))
+        ));
+        let anthropic = serde_json::json!({"model":"grok:grok-4.6","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"f","input_schema":schema}]}).to_string();
+        assert_eq!(
+            call_anthropic_messages_handler(state, &anthropic)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
     #[test]
     fn test_mk_app_with_and_router_surfaces() {
         // WHY: build_router must register all production surfaces with the auth

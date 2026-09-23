@@ -772,6 +772,7 @@ mod tests {
                 name: "do_x".into(),
                 description: Some("do the x".into()),
                 parameters: serde_json::json!({"type":"object"}),
+                strict: false,
                 cache: None,
             }]),
             tool_choice: Some(omni_core::CanonicalToolChoice::Auto),

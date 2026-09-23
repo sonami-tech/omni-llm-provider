@@ -945,16 +945,17 @@ fn map_tools(tools: Option<&Value>) -> Result<Option<Vec<CanonicalTool>>, Anthro
                 "tools[{i}]: input_schema must be an object"
             )));
         }
-        let mut parameters = schema.clone();
-        // Ensure object properties default {}
-        if parameters.get("type").and_then(|t| t.as_str()) == Some("object")
-            && parameters.get("properties").is_none()
-        {
-            parameters
-                .as_object_mut()
-                .unwrap()
-                .insert("properties".into(), serde_json::json!({}));
-        }
+        let strict = match t.get("strict") {
+            None | Some(Value::Null | Value::Bool(false)) => false,
+            Some(Value::Bool(true)) => true,
+            _ => {
+                return Err(AnthropicMapError::new(format!(
+                    "tools[{i}].strict must be a boolean"
+                )));
+            }
+        };
+        omni_core::validate_tool_schema(schema, strict, true).map_err(AnthropicMapError::new)?;
+        let parameters = schema.clone();
         let description = t
             .get("description")
             .and_then(|d| d.as_str())
@@ -964,6 +965,7 @@ fn map_tools(tools: Option<&Value>) -> Result<Option<Vec<CanonicalTool>>, Anthro
             name: name.to_string(),
             description,
             parameters,
+            strict,
             cache,
         });
     }
@@ -1744,7 +1746,7 @@ mod tests {
         let c = anthropic_to_canonical(&body, "grok").unwrap();
         let tools = c.tools.unwrap();
         assert_eq!(tools[0].name, "get_weather");
-        assert_eq!(tools[0].parameters["properties"], json!({}));
+        assert!(tools[0].parameters.get("properties").is_none());
         match c.tool_choice {
             Some(CanonicalToolChoice::Specific { name }) => assert_eq!(name, "get_weather"),
             other => panic!("expected Specific, got {other:?}"),
@@ -2316,5 +2318,40 @@ mod tests {
         }
         assert!(saw_error, "expected SSE error on bare EOF");
         assert!(!saw_stop, "must not emit message_stop on error path");
+    }
+}
+
+#[cfg(test)]
+mod issue_51_tool_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn parse(schema: Value, strict: Value) -> Result<CanonicalRequest, AnthropicMapError> {
+        anthropic_to_canonical(
+            &json!({"model":"sonnet","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"f","input_schema":schema,"strict":strict}]}),
+            "codex",
+        )
+    }
+
+    #[test]
+    fn anthropic_validates_nested_combinators_and_strict() {
+        let schema = json!({"type":"object","properties":{"x":{"allOf":[{"type":"string"}]}}});
+        assert!(parse(schema.clone(), json!(true)).unwrap().tools.unwrap()[0].strict);
+        assert!(!parse(schema, Value::Null).unwrap().tools.unwrap()[0].strict);
+        for bad in [
+            json!({"anyOf":[{}]}),
+            json!({"type":"object","oneOf":[{}]}),
+            json!({"properties":{"x":{"anyOf":[]}}}),
+        ] {
+            assert!(parse(bad, Value::Null).is_err());
+        }
+        assert!(parse(json!({"properties":{"x":{"oneOf":[{}]}}}), json!(true)).is_err());
+        assert!(
+            parse(
+                json!({"properties":{"x":{"allOf":[{"$ref":"#/$defs/x"}]}}}),
+                json!(true)
+            )
+            .is_err()
+        );
     }
 }

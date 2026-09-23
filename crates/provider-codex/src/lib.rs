@@ -1732,6 +1732,7 @@ fn codex_responses_body(req: &CanonicalRequest, stream: bool) -> Result<Value, P
                         "name": tool.name,
                         "description": tool.description,
                         "parameters": tool.parameters,
+                        "strict": omni_core::codex_strict(&tool.parameters, tool.strict),
                     })
                 })
                 .collect(),
@@ -2958,6 +2959,7 @@ query_params = { api-version = "2026-01-01" }
                 name: "lookup".into(),
                 description: Some("Lookup".into()),
                 parameters: json!({"type":"object"}),
+                strict: false,
                 cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Specific {
@@ -5893,5 +5895,38 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             r2.usage.cache_read,
             r2.usage.input_tokens
         );
+    }
+}
+
+#[cfg(test)]
+mod issue_51_tool_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn codex_copies_invalid_provider_schema_and_emits_boolean_strict() {
+        for (schema, expected) in [
+            (
+                json!({"type":"object","additionalProperties":false,"properties":{"x":{"type":"string"}},"required":["x"]}),
+                true,
+            ),
+            (
+                json!({"type":"object","properties":{"x":{"type":"string"}}}),
+                false,
+            ),
+            (json!({"type":"string"}), false),
+            (
+                json!({"anyOf":[{"type":"object"},{"type":"string"}]}),
+                false,
+            ),
+            (json!({"oneOf":[{}],"allOf":[{}]}), false),
+        ] {
+            let req: omni_common::ChatCompletionRequest = serde_json::from_value(json!({"model":"gpt","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":schema,"strict":false}}]})).unwrap();
+            let mut canon = omni_common::to_canonical(&req).unwrap();
+            canon.tools.as_mut().unwrap()[0].strict = true;
+            let wire = codex_responses_body(&canon, false).unwrap();
+            assert_eq!(wire["tools"][0]["parameters"], schema);
+            assert_eq!(wire["tools"][0]["strict"], expected);
+        }
     }
 }

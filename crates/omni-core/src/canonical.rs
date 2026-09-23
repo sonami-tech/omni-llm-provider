@@ -197,6 +197,8 @@ pub struct CanonicalTool {
     pub name: String,
     pub description: Option<String>,
     pub parameters: serde_json::Value,
+    #[serde(default)]
+    pub strict: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CanonicalCacheMark>,
 }
@@ -516,6 +518,7 @@ mod tests {
             name: "f".into(),
             description: None,
             parameters: serde_json::json!({}),
+            strict: false,
             cache: None,
         };
     }
@@ -555,6 +558,7 @@ mod tests {
                 name: "get_info".into(),
                 description: Some("desc".into()),
                 parameters: serde_json::json!({"type":"object","properties":{"q":{"type":"string"}}}),
+                strict: false,
                 cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Specific {
@@ -800,6 +804,7 @@ mod tests {
                 name: "t".into(),
                 description: None,
                 parameters: serde_json::json!({}),
+                strict: false,
                 cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Auto),
@@ -829,6 +834,7 @@ mod tests {
                 name: sim_apply_prompt("foo-tool"),
                 description: None,
                 parameters: serde_json::json!({}),
+                strict: false,
                 cache: None,
             }]),
             ..Default::default()
@@ -1035,6 +1041,7 @@ mod tests {
             name: "search".into(),
             description: Some("web".into()),
             parameters: serde_json::json!({"type":"object"}),
+            strict: false,
             cache: None,
         }]);
         let tc = Some(CanonicalToolChoice::Specific {
@@ -1101,6 +1108,7 @@ mod tests {
                 name: "t".into(),
                 description: None,
                 parameters: serde_json::json!({}),
+                strict: false,
                 cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Auto),
@@ -1155,6 +1163,7 @@ mod tests {
                 name: "calc".into(),
                 description: None,
                 parameters: serde_json::json!({}),
+                strict: false,
                 cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Required),
@@ -1191,6 +1200,7 @@ mod tests {
                 name: "bar-tool".into(),
                 description: None,
                 parameters: serde_json::json!({}),
+                strict: false,
                 cache: None,
             }]),
             ..Default::default()

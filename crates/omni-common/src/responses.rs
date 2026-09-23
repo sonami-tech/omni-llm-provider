@@ -155,6 +155,8 @@ pub struct ResponsesTool {
     pub description: Option<String>,
     #[serde(default)]
     pub parameters: Option<serde_json::Value>,
+    #[serde(default)]
+    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -371,13 +373,16 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
                 if t.kind != "function" {
                     return Err(format!("unsupported tool type: {}", t.kind));
                 }
+                let parameters = t
+                    .parameters
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                omni_core::validate_tool_schema(&parameters, t.strict.unwrap_or(false), false)?;
                 out.push(CanonicalTool {
                     name: t.name.clone().unwrap_or_default(),
                     description: t.description.clone(),
-                    parameters: t
-                        .parameters
-                        .clone()
-                        .unwrap_or_else(|| serde_json::json!({})),
+                    parameters,
+                    strict: t.strict.unwrap_or(false),
                     cache: None,
                 });
             }
@@ -2992,5 +2997,39 @@ mod tests {
             last["response"]["incomplete_details"]["reason"],
             "content_filter"
         );
+    }
+}
+
+#[cfg(test)]
+mod issue_51_tool_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn parse(schema: Value, strict: Value) -> Result<omni_core::CanonicalRequest, String> {
+        let req: ResponsesRequest = serde_json::from_value(json!({"model":"gpt","input":"hi", "tools":[{"type":"function","name":"f","parameters":schema,"strict":strict}]})).unwrap();
+        responses_to_canonical(&req)
+    }
+
+    #[test]
+    fn responses_keep_schema_and_validate_strict() {
+        let schema = json!({"type":"object","properties":{"x":{"anyOf":[{"type":"string"}]}}});
+        assert_eq!(
+            parse(schema.clone(), json!(true)).unwrap().tools.unwrap()[0].parameters,
+            schema
+        );
+        assert!(
+            !parse(json!({"anyOf":[true]}), Value::Null)
+                .unwrap()
+                .tools
+                .unwrap()[0]
+                .strict
+        );
+        for bad in [
+            json!({"type":"object","anyOf":[{}]}),
+            json!({"type":"object","properties":{"x":{"allOf":[{}]}}}),
+        ] {
+            assert!(parse(bad, json!(true)).is_err());
+        }
+        assert!(parse(json!({"properties":{"x":{"anyOf":[]}}}), Value::Null).is_err());
     }
 }

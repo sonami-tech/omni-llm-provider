@@ -1171,21 +1171,27 @@ fn to_xai_chat_request(
         }
     }
 
-    let tools: Option<Vec<Value>> = req.tools.as_ref().map(|ts| {
-        ts.iter()
-            .map(|t| {
-                let desc = t.description.as_ref().map(|d| repl.apply_prompt(d));
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,  // note: if tool-name masking rules exist they were applied upstream or will be via repl on name too if caller chose
-                        "description": desc,
-                        "parameters": t.parameters.clone()
-                    }
+    let tools: Option<Vec<Value>> = req
+        .tools
+        .as_ref()
+        .map(|ts| {
+            ts.iter()
+                .map(|t| {
+                    let parameters = omni_core::provider_tool_schema(&t.parameters, true)
+                        .map_err(ProviderError::BadRequest)?;
+                    let desc = t.description.as_ref().map(|d| repl.apply_prompt(d));
+                    Ok(json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,  // note: if tool-name masking rules exist they were applied upstream or will be via repl on name too if caller chose
+                            "description": desc,
+                            "parameters": parameters
+                        }
+                    }))
                 })
-            })
-            .collect()
-    });
+                .collect::<Result<Vec<_>, ProviderError>>()
+        })
+        .transpose()?;
 
     let model = resolve_model_alias(&req.model, catalog).unwrap_or(req.model.as_str());
     let mut body = json!({
@@ -1381,14 +1387,16 @@ fn to_grok_responses_request(
             tools
                 .iter()
                 .map(|tool| {
-                    json!({
+                    let parameters = omni_core::provider_tool_schema(&tool.parameters, true)
+                        .map_err(ProviderError::BadRequest)?;
+                    Ok(json!({
                         "type": "function",
                         "name": tool.name,
-                        "parameters": tool.parameters,
+                        "parameters": parameters,
                         "description": tool.description,
-                    })
+                    }))
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, ProviderError>>()?,
         );
     }
 
@@ -2359,6 +2367,7 @@ mod tests {
                 name: "get_weather".into(),
                 description: Some("Get weather".into()),
                 parameters: json!({"type":"object","properties":{}}),
+                strict: false,
                 cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Specific {
@@ -2679,6 +2688,7 @@ mod tests {
                 name: "web".into(),
                 description: Some("web".into()),
                 parameters: serde_json::json!({"type":"object"}),
+                strict: false,
                 cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Auto),
@@ -3295,6 +3305,7 @@ mod tests {
                 name: "get_weather".into(),
                 description: Some("weather fn".into()),
                 parameters: json!({"type":"object"}),
+                strict: false,
                 cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Auto),
@@ -3325,6 +3336,7 @@ mod tests {
                 name: "calc".into(),
                 description: None,
                 parameters: json!({}),
+                strict: false,
                 cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Required),
@@ -3353,6 +3365,7 @@ mod tests {
                 name: "get_wx".into(),
                 description: Some("the weather tool here".into()),
                 parameters: json!({"type":"object"}),
+                strict: false,
                 cache: None,
             }]),
             ..Default::default()
@@ -4148,6 +4161,7 @@ mod tests {
                 name: "adder".into(),
                 description: Some("add two nums".into()),
                 parameters: json!({"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}}}),
+                strict: false,
                 cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Specific {
@@ -5150,6 +5164,7 @@ mod tests {
                 name: "get_weather".into(),
                 description: Some("look up weather".into()),
                 parameters: json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                strict: false,
                 cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Specific {
@@ -5859,5 +5874,51 @@ mod tests {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod issue_51_tool_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn canon(schema: Value) -> CanonicalRequest {
+        let req: omni_common::ChatCompletionRequest = serde_json::from_value(json!({"model":"grok","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":schema}}],"tool_choice":"required"})).unwrap();
+        omni_common::to_canonical(&req).unwrap()
+    }
+
+    #[test]
+    fn grok_keeps_object_unions_and_choice_on_both_wires() {
+        let schema = json!({"type":"object","properties":{"b":{"type":"string"}},"oneOf":[{"properties":{"a":{"type":"number"}}},{"type":"object"}]});
+        let req = canon(schema);
+        let chat = to_xai_chat_request(&req, &Replacements::empty(), GROK_CATALOG).unwrap();
+        let responses = to_grok_responses_request(&req, GROK_CATALOG, false).unwrap();
+        for (tool, choice) in [
+            (&chat["tools"][0]["function"], &chat["tool_choice"]),
+            (&responses["tools"][0], &responses["tool_choice"]),
+        ] {
+            assert_eq!(tool["parameters"]["oneOf"][0]["type"], "object");
+            assert_eq!(tool["parameters"]["properties"]["b"]["type"], "string");
+            assert!(tool.get("strict").is_none());
+            assert_eq!(choice, "required");
+        }
+        let req = canon(json!({"allOf":[{"properties":{"x":{"type":"string"}}}]}));
+        assert!(to_xai_chat_request(&req, &Replacements::empty(), GROK_CATALOG).unwrap()["tools"][0]["function"]["parameters"].get("allOf").is_none());
+        let nested = canon(
+            json!({"type":"object","properties":{"x":{"oneOf":[{"type":"string"},{"type":"number"}]}}}),
+        );
+        let wire = to_xai_chat_request(&nested, &Replacements::empty(), GROK_CATALOG).unwrap();
+        let property = &wire["tools"][0]["function"]["parameters"]["properties"]["x"];
+        assert!(property.get("oneOf").is_none());
+        assert_eq!(property["anyOf"].as_array().unwrap().len(), 2);
+        let req = canon(json!({"anyOf":[{},7]}));
+        assert!(matches!(
+            to_xai_chat_request(&req, &Replacements::empty(), GROK_CATALOG),
+            Err(ProviderError::BadRequest(_))
+        ));
+        assert!(matches!(
+            to_grok_responses_request(&req, GROK_CATALOG, false),
+            Err(ProviderError::BadRequest(_))
+        ));
     }
 }

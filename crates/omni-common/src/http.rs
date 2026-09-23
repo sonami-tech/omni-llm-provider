@@ -122,6 +122,8 @@ pub struct ChatToolFunction {
     pub description: Option<String>,
     #[serde(default)]
     pub parameters: Option<serde_json::Value>,
+    #[serde(default)]
+    pub strict: Option<bool>,
 }
 
 /// `tool_choice`: a bare mode string, a forced function selection, or an
@@ -446,14 +448,21 @@ pub fn to_canonical_with_headers(
                 if t.kind != "function" {
                     return Err(format!("unsupported tool type: {}", t.kind));
                 }
+                let parameters = t
+                    .function
+                    .parameters
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                omni_core::validate_tool_schema(
+                    &parameters,
+                    t.function.strict.unwrap_or(false),
+                    false,
+                )?;
                 out.push(CanonicalTool {
                     name: t.function.name.clone(),
                     description: t.function.description.clone(),
-                    parameters: t
-                        .function
-                        .parameters
-                        .clone()
-                        .unwrap_or_else(|| serde_json::json!({})),
+                    parameters,
+                    strict: t.function.strict.unwrap_or(false),
                     cache: None,
                 });
             }
@@ -2126,5 +2135,58 @@ mod tests {
         assert!(!text.contains("event: error"), "{text}");
         assert!(!text.contains("late"), "{text}");
         assert_eq!(text.matches("[DONE]").count(), 1, "{text}");
+    }
+}
+
+#[cfg(test)]
+mod issue_51_tool_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn parse(schema: Value, strict: Value) -> Result<CanonicalRequest, String> {
+        let mut function = json!({"name":"f", "parameters":schema});
+        function["strict"] = strict;
+        let req: ChatCompletionRequest = serde_json::from_value(json!({"model":"sonnet","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":function}]})).unwrap();
+        to_canonical(&req)
+    }
+
+    #[test]
+    fn chat_keeps_schema_and_strict_null_is_false() {
+        let schema = json!({"type":"object","properties":{"b":{"type":"string"}},"oneOf":[{"properties":{"a":{"type":"number"}}}]});
+        for flag in [Value::Null, json!(false)] {
+            let canon = parse(schema.clone(), flag).unwrap();
+            let tool = &canon.tools.unwrap()[0];
+            assert_eq!(tool.parameters, schema);
+            assert!(!tool.strict);
+        }
+        assert!(
+            parse(
+                json!({"type":"object","properties":{"x":{"anyOf":[{}]}}}),
+                json!(true)
+            )
+            .unwrap()
+            .tools
+            .unwrap()[0]
+                .strict
+        );
+    }
+
+    #[test]
+    fn chat_rejects_invalid_combinators_before_dispatch() {
+        for schema in [
+            json!({"oneOf":[]}),
+            json!({"properties":{"x":{"allOf":null}}}),
+            json!({"type":"object","oneOf":[{}]}),
+        ] {
+            assert!(parse(schema, json!(true)).is_err());
+        }
+        assert!(parse(json!({"type":"object","oneOf":[]}), Value::Null).is_err());
+        assert!(
+            parse(
+                json!({"type":"object","properties":{"x":{"oneOf":[{}]}}}),
+                json!(true)
+            )
+            .is_err()
+        );
     }
 }
