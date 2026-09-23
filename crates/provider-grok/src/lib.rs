@@ -2038,6 +2038,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn grok_keeps_resolvable_refs_on_both_wires() {
+        // WHY: allOf flatten must keep a property ref to root $defs, and Grok
+        // copies a oneOf branch ref instead of rejecting it.
+        let flattenable = json!({"$defs":{"q":{"type":"string"}},"allOf":[{"properties":{"query":{"$ref":"#/$defs/q"}},"required":["query"]}]});
+        let (chat, responses) = grok_wires(flattenable);
+        for parameters in [
+            chat["tools"][0]["function"]["parameters"].clone(),
+            responses["tools"][0]["parameters"].clone(),
+        ] {
+            assert_eq!(parameters["properties"]["query"]["$ref"], "#/$defs/q");
+            assert_eq!(parameters["required"], json!(["query"]));
+            assert!(parameters.get("allOf").is_none());
+        }
+        let copied = json!({"$defs":{"args":{"type":"object","properties":{"x":{"type":"string"}}}},"oneOf":[{"$ref":"#/$defs/args"}]});
+        let (chat, responses) = grok_wires(copied);
+        for parameters in [
+            chat["tools"][0]["function"]["parameters"].clone(),
+            responses["tools"][0]["parameters"].clone(),
+        ] {
+            assert_eq!(parameters["oneOf"][0]["$ref"], "#/$defs/args");
+            assert!(parameters.get("strict").is_none());
+        }
+    }
+
+    fn grok_wires(schema: Value) -> (Value, Value) {
+        let req: omni_common::ChatCompletionRequest = serde_json::from_value(json!({"model":"grok-4.3","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":schema}}],"tool_choice":"auto"})).unwrap();
+        let canon = omni_common::to_canonical(&req).unwrap();
+        assert!(matches!(canon.tool_choice, Some(CanonicalToolChoice::Auto)));
+        let chat = to_xai_chat_request(&canon, &empty_repl(), GROK_CATALOG).unwrap();
+        let responses = to_grok_responses_request(&canon, GROK_CATALOG, false).unwrap();
+        assert_eq!(chat["tool_choice"], "auto");
+        assert_eq!(responses["tool_choice"], "auto");
+        (chat, responses)
+    }
+
     fn empty_repl() -> Replacements {
         Replacements::empty()
     }
