@@ -802,10 +802,10 @@ fn canonical_block_to_anthropic(
                     } else {
                         file_data.as_str()
                     };
-                    if filename
-                        .as_deref()
-                        .is_some_and(|name| !name.to_ascii_lowercase().ends_with(".pdf"))
-                        || !file_data.starts_with("data:") && filename.is_none()
+                    if !file_data.starts_with("data:")
+                        && filename
+                            .as_deref()
+                            .is_none_or(|name| !name.to_ascii_lowercase().ends_with(".pdf"))
                     {
                         return Err(
                             "Claude file_data requires a PDF filename or application/pdf data URL"
@@ -1849,6 +1849,35 @@ mod tests {
             wire["content"][1]["source"],
             serde_json::json!({"type":"base64","media_type":"application/pdf","data":"abcd"})
         );
+    }
+
+    #[test]
+    fn pdf_data_url_accepts_filename_without_pdf_extension() {
+        let req = CanonicalRequest {
+            model: "haiku".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Blocks(vec![CanonicalBlock::File {
+                    source: CanonicalFileSource::Data {
+                        file_data: concat!("data:application/", "pdf;base64,YWJjZA==").into(),
+                    },
+                    filename: Some("invoice".into()),
+                    detail: None,
+                    cache: None,
+                }]),
+            }],
+            ..Default::default()
+        };
+        let profile = crate::fingerprint::default_profile();
+        let anth = build_messages_request_from_canonical(
+            &req,
+            profile.resolve_model("haiku"),
+            &empty_repl(),
+        )
+        .unwrap();
+        let wire = serde_json::to_value(&anth.messages[0]).unwrap();
+        assert_eq!(wire["content"][0]["title"], "invoice");
+        assert_eq!(wire["content"][0]["source"]["data"], "YWJjZA==");
     }
 
     #[test]
