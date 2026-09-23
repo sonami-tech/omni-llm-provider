@@ -2024,6 +2024,20 @@ mod tests {
     };
     use serde_json::json;
 
+    #[test]
+    fn grok_rejects_ref_branch_instead_of_losing_query() {
+        let schema = json!({"$defs":{"args":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},"allOf":[{"$ref":"#/$defs/args"}]});
+        let req: omni_common::ChatCompletionRequest = serde_json::from_value(json!({"model":"grok-4.3","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":schema}}]})).unwrap();
+        let canon = omni_common::to_canonical(&req).unwrap();
+        assert_eq!(canon.tools.as_ref().unwrap()[0].parameters, schema);
+        assert!(
+            matches!(to_xai_chat_request(&canon, &empty_repl(), GROK_CATALOG), Err(ProviderError::BadRequest(msg)) if msg.contains("$ref"))
+        );
+        assert!(
+            matches!(to_grok_responses_request(&canon, GROK_CATALOG, false), Err(ProviderError::BadRequest(msg)) if msg.contains("$ref"))
+        );
+    }
+
     fn empty_repl() -> Replacements {
         Replacements::empty()
     }

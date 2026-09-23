@@ -2264,6 +2264,18 @@ mod issue_51_tool_tests {
     }
 
     #[test]
+    fn chat_keeps_root_and_branch_refs_for_provider_validation() {
+        let def = json!({"properties":{"query":{"type":"string"}},"required":["query"]});
+        for schema in [
+            json!({"$defs":{"args":def},"$ref":"#/$defs/args"}),
+            json!({"$defs":{"args":def},"allOf":[{"$ref":"#/$defs/args"}]}),
+        ] {
+            let canon = parse(schema.clone(), json!(false)).unwrap();
+            assert_eq!(canon.tools.unwrap()[0].parameters, schema);
+        }
+    }
+
+    #[test]
     fn chat_rejects_invalid_combinators_before_dispatch() {
         for schema in [
             json!({"oneOf":[]}),

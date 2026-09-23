@@ -174,20 +174,39 @@ pub fn codex_strict(schema: &Value, requested: bool) -> bool {
         && object_rules(schema, true)
 }
 
-fn validate_branch_tree(schema: &Map<String, Value>) -> Result<(), String> {
+fn validate_branch_tree(schema: &Map<String, Value>, reject_refs: bool) -> Result<(), String> {
+    if reject_refs && schema.contains_key("$ref") {
+        return Err(
+            "tool schema root or combinator branch with $ref cannot be safely shaped".into(),
+        );
+    }
     if schema.get("type").is_some_and(|t| t != "object") {
         return Err("tool schema branch type must be object".into());
     }
     if let Some((_, branches)) = combinator(schema)? {
         for branch in branches {
             if let Some(obj) = branch.as_object() {
-                validate_branch_tree(obj)?;
+                validate_branch_tree(obj, reject_refs)?;
             } else if branch != &Value::Bool(true) {
                 return Err("tool schema branch must be an object or true".into());
             }
         }
     }
     Ok(())
+}
+
+fn refs_to_removed_branches(schema: &Value, kind: &str) -> bool {
+    let prefix = format!("#/{kind}/");
+    let exact = format!("#/{kind}");
+    let Value::Object(obj) = schema else {
+        return false;
+    };
+    obj.get("$ref")
+        .and_then(Value::as_str)
+        .is_some_and(|reference| reference == exact || reference.starts_with(&prefix))
+        || schema_children(obj)
+            .iter()
+            .any(|child| refs_to_removed_branches(child, kind))
 }
 
 fn required(obj: &Map<String, Value>) -> BTreeSet<String> {
@@ -314,12 +333,23 @@ fn grok_nested_unions(value: &mut Value) {
     }
 }
 
+/// Validate root and combinator branch shapes without modifying the schema.
+pub fn validate_provider_tool_shape(schema: &Value) -> Result<(), String> {
+    let obj = schema
+        .as_object()
+        .ok_or("tool schema root must be an object")?;
+    validate_branch_tree(obj, false)
+}
+
 pub fn provider_tool_schema(schema: &Value, grok: bool) -> Result<Value, String> {
     let obj = schema
         .as_object()
         .ok_or("tool schema root must be an object")?;
-    validate_branch_tree(obj)?;
+    validate_branch_tree(obj, false)?;
     let Some((kind, branches)) = combinator(obj)? else {
+        if obj.contains_key("$ref") {
+            return Err("tool schema root with $ref cannot be safely shaped".into());
+        }
         let mut copy = obj.clone();
         copy.entry("type").or_insert(json!("object"));
         copy.entry("properties").or_insert(json!({}));
@@ -329,7 +359,10 @@ pub fn provider_tool_schema(schema: &Value, grok: bool) -> Result<Value, String>
         }
         return Ok(result);
     };
-    if grok && kind != "allOf" && branches.iter().all(|v| v.is_object()) {
+    if obj.contains_key("$ref") {
+        return Err("tool schema root with $ref cannot be safely shaped".into());
+    }
+    if grok && kind != "allOf" && branches.iter().all(Value::is_object) {
         let mut copy = obj.clone();
         let mut normalized = branches.to_vec();
         for branch in &mut normalized {
@@ -351,6 +384,10 @@ pub fn provider_tool_schema(schema: &Value, grok: bool) -> Result<Value, String>
         let mut copy = root.as_object().unwrap().clone();
         copy.insert(kind.into(), root_union);
         return Ok(Value::Object(copy));
+    }
+    validate_branch_tree(obj, true)?;
+    if refs_to_removed_branches(schema, kind) {
+        return Err(format!("tool schema $ref targets removed {kind} branches"));
     }
     let flat = flatten(obj);
     let mut copy = obj.clone();
@@ -389,6 +426,53 @@ pub fn provider_tool_schema(schema: &Value, grok: bool) -> Result<Value, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_and_combinator_branch_refs_must_not_lose_arguments() {
+        let def =
+            json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]});
+        for schema in [
+            json!({"$defs":{"args":def},"$ref":"#/$defs/args"}),
+            json!({"$defs":{"args":def},"allOf":[{"$ref":"#/$defs/args"}]}),
+            json!({"$defs":{"args":def},"allOf":[{"anyOf":[{"$ref":"#/$defs/args"}]}]}),
+            json!({"allOf":[{"$defs":{"q":{"type":"string"}},"properties":{"query":{"$ref":"#/allOf/0/$defs/q"}},"required":["query"]}]}),
+            json!({"properties":{"query":{"$ref":"#/allOf/0/$defs/q"}},"required":["query"],"allOf":[{"$defs":{"q":{"type":"string"}}}]}),
+            json!({"$ref":"https://example.com/args"}),
+        ] {
+            for grok in [false, true] {
+                let err = provider_tool_schema(&schema, grok).unwrap_err();
+                assert!(err.contains("$ref"), "{schema}: {err}");
+            }
+        }
+        for kind in ["oneOf", "anyOf"] {
+            let schema = json!({"$defs":{"args":def},kind:[{"$ref":"#/$defs/args"}]});
+            assert!(
+                provider_tool_schema(&schema, false)
+                    .unwrap_err()
+                    .contains("$ref")
+            );
+            assert_eq!(
+                provider_tool_schema(&schema, true).unwrap()[kind][0]["$ref"],
+                "#/$defs/args"
+            );
+        }
+        let nested = json!({"properties":{"args":{"$ref":"#/$defs/args"}},"$defs":{"args":def}});
+        assert_eq!(
+            provider_tool_schema(&nested, false).unwrap()["properties"]["args"],
+            json!({"$ref":"#/$defs/args"})
+        );
+        let flattenable = json!({"$defs":{"q":{"type":"string"}},"allOf":[{"properties":{"query":{"$ref":"#/$defs/q"}},"required":["query"]}]});
+        for grok in [false, true] {
+            let wire = provider_tool_schema(&flattenable, grok).unwrap();
+            assert_eq!(wire["properties"]["query"], json!({"$ref":"#/$defs/q"}));
+            assert_eq!(wire["required"], json!(["query"]));
+        }
+        let copyable = json!({"$defs":{"args":def},"oneOf":[{"$ref":"#/$defs/args"}]});
+        assert_eq!(
+            provider_tool_schema(&copyable, true).unwrap()["oneOf"][0]["$ref"],
+            "#/$defs/args"
+        );
+    }
 
     #[test]
     fn flatten_preserves_root_and_nested_required() {

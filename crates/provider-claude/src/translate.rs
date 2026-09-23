@@ -3069,6 +3069,31 @@ mod issue_51_tool_tests {
     }
 
     #[test]
+    fn claude_rejects_ref_branch_instead_of_losing_query() {
+        let schema = json!({"$defs":{"args":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},"allOf":[{"$ref":"#/$defs/args"}]});
+        let req: omni_common::ChatCompletionRequest = serde_json::from_value(json!({"model":"sonnet","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":schema}}]})).unwrap();
+        let canon = omni_common::to_canonical(&req).unwrap();
+        assert_eq!(canon.tools.as_ref().unwrap()[0].parameters, schema);
+        assert!(
+            matches!(prepare_anthropic_request(&canon, crate::fingerprint::default_profile(), &Replacements::empty(), false, false), Err(ProviderError::BadRequest(msg)) if msg.contains("$ref"))
+        );
+        let dangling = json!({"properties":{"query":{"$ref":"#/allOf/0/$defs/q"}},"required":["query"],"allOf":[{"$defs":{"q":{"type":"string"}}}]});
+        assert!(
+            matches!(chat(dangling, false), Err(ProviderError::BadRequest(msg)) if msg.contains("$ref"))
+        );
+        let valid = json!({"$defs":{"q":{"type":"string"}},"allOf":[{"properties":{"query":{"$ref":"#/$defs/q"}},"required":["query"]}]});
+        let wire = chat(valid, false).unwrap();
+        assert_eq!(
+            wire["tools"][0]["input_schema"]["properties"]["query"]["$ref"],
+            "#/$defs/q"
+        );
+        assert_eq!(
+            wire["tools"][0]["input_schema"]["required"],
+            json!(["query"])
+        );
+    }
+
+    #[test]
     fn claude_flattens_and_preserves_choice() {
         let schema = json!({"type":"object","properties":{"b":{"type":"string"}},"required":["b"],"oneOf":[{"properties":{"a":{"type":"number"}},"required":["a"]},{"properties":{"c":{"type":"boolean"}},"required":["c"]}]});
         let wire = chat(schema, false).unwrap();

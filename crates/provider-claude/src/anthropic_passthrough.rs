@@ -245,7 +245,7 @@ fn validate_native_tools(client: &ClientMessagesRequest) -> Result<(), ProviderE
         for tool in tools {
             omni_core::validate_tool_schema(&tool.input_schema, tool.strict.unwrap_or(false), true)
                 .map_err(ProviderError::BadRequest)?;
-            omni_core::provider_tool_schema(&tool.input_schema, false)
+            omni_core::validate_provider_tool_shape(&tool.input_schema)
                 .map_err(ProviderError::BadRequest)?;
         }
     }
@@ -1593,6 +1593,20 @@ mod tests {
 mod issue_51_tool_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn native_anthropic_preserves_root_ref() {
+        let schema = json!({"$defs":{"args":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},"$ref":"#/$defs/args"});
+        let raw = json!({"model":"sonnet","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"f","input_schema":schema}]});
+        let wire = prepare_client_messages_request(
+            raw,
+            crate::fingerprint::default_profile(),
+            &Replacements::empty(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(wire.body()["tools"][0]["input_schema"], schema);
+    }
 
     #[test]
     fn native_anthropic_strict_passthrough_and_invalid_input() {
