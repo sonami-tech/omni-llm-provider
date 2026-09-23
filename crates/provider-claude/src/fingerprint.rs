@@ -15,7 +15,7 @@
 //! wire types + identity prepend). It never leaks into omni-common or
 //! omni-core.
 //!
-//! Active baseline: Claude Code 2.1.280 (captured 2026-09-22). Single pin only
+//! Active baseline: Claude Code 2.1.281 (captured 2026-09-23). Single pin only
 //! (issue #12). Billing ends at `cc_entrypoint=sdk-cli;` with no `cch=` field.
 //! Historical checksum rewrite lives in `docs/providers/claude/CCH_ALGORITHM.md`.
 //!
@@ -186,7 +186,7 @@ const BILLING_SUFFIX_SEED_V1: &str = "59cf53e54c78";
 const BILLING_SUFFIX_INDICES_V1: [usize; 3] = [4, 7, 20];
 // Live pin: the version suffix is still computed, but the billing header
 // carries no cch field and the body is serialized as-is. Captured 2026-09-22
-// against Claude Code 2.1.280: the header ends at `cc_entrypoint=sdk-cli;`.
+// against Claude Code 2.1.281: the header ends at `cc_entrypoint=sdk-cli;`.
 const BILLING_SCHEME_V1_NO_CCH: BillingScheme = BillingScheme {
     suffix_algorithm: BillingSuffixAlgorithm::Sha256Utf16SampleV1,
     seed: BILLING_SUFFIX_SEED_V1,
@@ -300,13 +300,13 @@ pub const WIRE_DEFAULTS: WireDefaults = WireDefaults {
     output_effort: Some("high"),
 };
 
-pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.280-sdk-cli";
+pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.281-sdk-cli";
 
-// Captured 2026-09-22 from five successful Claude Code 2.1.280 requests.
-// No cch; cc_version=2.1.280.7aa for prompt "Say OK".
-pub const PROFILE_CLAUDE_2_1_280_SDK_CLI: FingerprintProfile = FingerprintProfile {
+// Captured 2026-09-23 from five successful Claude Code 2.1.281 requests.
+// No cch; cc_version=2.1.281.3ee for prompt "Say OK".
+pub const PROFILE_CLAUDE_2_1_281_SDK_CLI: FingerprintProfile = FingerprintProfile {
     name: DEFAULT_PROFILE_NAME,
-    claude_cli_version: "2.1.280",
+    claude_cli_version: "2.1.281",
     stainless_package_version: "0.112.1",
     stainless_runtime_version: "v26.3.0",
     entrypoint: "sdk-cli",
@@ -321,7 +321,7 @@ pub const PROFILE_CLAUDE_2_1_280_SDK_CLI: FingerprintProfile = FingerprintProfil
 };
 
 pub fn default_profile() -> &'static FingerprintProfile {
-    &PROFILE_CLAUDE_2_1_280_SDK_CLI
+    &PROFILE_CLAUDE_2_1_281_SDK_CLI
 }
 
 pub fn is_claude_code_billing_header(text: &str) -> bool {
@@ -443,7 +443,7 @@ fn build_headers_with_profile(
     insert(&mut h, "anthropic-dangerous-direct-browser-access", "true");
     insert(&mut h, "anthropic-version", ANTHROPIC_VERSION);
     insert(&mut h, "x-app", "cli");
-    // 2.1.280 capture does not send x-client-request-id.
+    // 2.1.281 capture does not send x-client-request-id.
 
     h
 }
@@ -713,13 +713,13 @@ mod tests {
         // WHY: issue #12 ships exactly one pin. These bytes are the gate: UA,
         // stainless, catalog ids, and per-model beta lists must match capture.
         let profile = default_profile();
-        assert_eq!(profile.name, "cc-2.1.280-sdk-cli");
-        assert_eq!(profile.claude_cli_version, "2.1.280");
+        assert_eq!(profile.name, "cc-2.1.281-sdk-cli");
+        assert_eq!(profile.claude_cli_version, "2.1.281");
         assert_eq!(profile.stainless_package_version, "0.112.1");
         assert_eq!(profile.stainless_runtime_version, "v26.3.0");
         assert_eq!(
             profile.user_agent(),
-            "claude-cli/2.1.280 (external, sdk-cli)"
+            "claude-cli/2.1.281 (external, sdk-cli)"
         );
         assert_eq!(
             profile.resolve_model("fable").unwrap().canonical,
@@ -786,7 +786,8 @@ mod tests {
     #[test]
     fn billing_suffix_matches_claude_code_probe() {
         // Historical suffix vectors lock the algorithm across past versions.
-        // Active pin: 2.1.280 / "Say OK" -> 7aa; header has no cch field.
+        // Active pin: 2.1.281 / "Say OK" -> 3ee; header has no cch field.
+        // 2.1.280 stays as a historical vector for the same algorithm.
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.142"), "73b");
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.150"), "5bd");
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.154"), "cea");
@@ -806,9 +807,10 @@ mod tests {
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.259"), "cc8");
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.269"), "4a3");
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.280"), "7aa");
+        assert_eq!(claude_code_version_suffix("Say OK", "2.1.281"), "3ee");
         assert_eq!(
             default_profile().billing_header_text("Say OK"),
-            "x-anthropic-billing-header: cc_version=2.1.280.7aa; cc_entrypoint=sdk-cli;"
+            "x-anthropic-billing-header: cc_version=2.1.281.3ee; cc_entrypoint=sdk-cli;"
         );
     }
 

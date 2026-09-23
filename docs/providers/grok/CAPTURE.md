@@ -123,7 +123,8 @@ wrapper around `tools.capture extract jsonl` for sanitized JSONL exports.
 
 ## Current Wire + Model Findings
 
-Re-baselined against grok-shell **1.0.41** on **2026-09-22**.
+Re-baselined against grok-shell **1.0.41** on **2026-09-22**. A 2026-09-23
+general capture returned the same catalog, user-agent, and client version.
 
 ### Default path (cli-chat-proxy.grok.com)
 

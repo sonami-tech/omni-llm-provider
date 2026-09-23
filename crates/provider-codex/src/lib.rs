@@ -63,18 +63,22 @@ const CONSERVATIVE_WINDOW_ID: &str = "00000000-0000-4000-8000-000000000000:0";
 const DEFAULT_CODEX_MODEL: &str = "gpt-6-astra";
 const DEFAULT_AUTH_COMMAND_TIMEOUT_MS: u64 = 5_000;
 
-// Codex catalog from `codex debug models --bundled` on CLI 0.156.0 (2026-09-22).
-// Visibility=list slugs only: gpt-6-astra (default, priority 1), gpt-5.6-sol,
-// gpt-5.6-terra, gpt-5.6-luna, gpt-5.5. Hidden slugs stay out of the
-// caller catalog. `gpt` / `astra` map to astra; `mini` / `gpt-mini` map to luna.
+// Codex catalog from `codex debug models --bundled` on CLI 0.156.1 (2026-09-23).
+// Visibility=list slugs only, in dump order: gpt-6-astra (default, priority 1),
+// gpt-6-sol, gpt-6-luna, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5.
+// The dump has no alias field, so short names stay on the previous targets:
+// `gpt` / `astra` map to astra; `sol` maps to gpt-5.6-sol; `luna` / `mini` /
+// `gpt-mini` map to gpt-5.6-luna. Hidden slugs stay out of the caller catalog.
 // If that listing cannot be read, rebaseline must fail; do not keep a previous
 // pin's catalog. Custom Responses base_url does not change this source.
 /// Pinned Codex CLI version (UA + header fingerprint). Single live pin.
-pub const CODEX_VERSION: &str = "0.156.0";
+pub const CODEX_VERSION: &str = "0.156.1";
 
 /// Model catalog for the active pin.
 const CODEX_CATALOG: &[CatalogModel] = &[
     CatalogModel::new("gpt-6-astra", &["gpt", "astra"]),
+    CatalogModel::new("gpt-6-sol", &[]),
+    CatalogModel::new("gpt-6-luna", &[]),
     CatalogModel::new("gpt-5.6-sol", &["sol"]),
     CatalogModel::new("gpt-5.6-terra", &["terra"]),
     CatalogModel::new("gpt-5.6-luna", &["luna", "mini", "gpt-mini"]),
@@ -2694,8 +2698,9 @@ model = "gpt-native"
 
     #[test]
     fn active_catalog_advertises_verified_models_alongside_configured() {
-        // WHY: /v1/models must surface the verified single-pin catalog (astra
-        // plus 5.6 family and still-listed 5.5) AND the actually-configured model.
+        // WHY: /v1/models must surface the verified single-pin catalog (gpt-6
+        // astra/sol/luna, the 5.6 family, and still-listed 5.5) AND the
+        // actually-configured model.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _home = TempCodexHome::new("", None);
         // Clear any OMNI override from a prior test in the shared process.
@@ -2706,6 +2711,8 @@ model = "gpt-native"
         let provider = CodexProvider::new().unwrap();
         let ids: Vec<String> = provider.models_list().into_iter().map(|m| m.id).collect();
         assert!(ids.iter().any(|id| id == "gpt-6-astra"), "ids: {ids:?}");
+        assert!(ids.iter().any(|id| id == "gpt-6-sol"), "ids: {ids:?}");
+        assert!(ids.iter().any(|id| id == "gpt-6-luna"), "ids: {ids:?}");
         assert!(ids.iter().any(|id| id == "gpt-5.6-sol"), "ids: {ids:?}");
         assert!(ids.iter().any(|id| id == "gpt-5.6-terra"), "ids: {ids:?}");
         assert!(ids.iter().any(|id| id == "gpt-5.6-luna"), "ids: {ids:?}");
@@ -2726,14 +2733,16 @@ model = "gpt-native"
         // tests that mutate env.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _home = TempCodexHome::new("", None);
-        assert_eq!(CodexProvider::pinned_version(), "0.156.0");
+        assert_eq!(CodexProvider::pinned_version(), "0.156.1");
         let provider = CodexProvider::new().unwrap();
-        assert_eq!(provider.version, "0.156.0");
+        assert_eq!(provider.version, "0.156.1");
         let ids: Vec<_> = provider.active_catalog().iter().map(|m| m.id).collect();
         assert_eq!(
             ids,
             [
                 "gpt-6-astra",
+                "gpt-6-sol",
+                "gpt-6-luna",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
@@ -3146,8 +3155,8 @@ query_params = { api-version = "2026-01-01" }
             access_token: "eyJ-fake-oauth".into(),
             account_id: "11111111-2222-3333-4444-555555555555".into(),
         };
-        let headers = conservative_codex_headers("0.156.0", &auth).unwrap();
-        assert_eq!(headers.get("version").unwrap(), "0.156.0");
+        let headers = conservative_codex_headers("0.156.1", &auth).unwrap();
+        assert_eq!(headers.get("version").unwrap(), "0.156.1");
         assert_eq!(
             headers.get("authorization").unwrap(),
             "Bearer eyJ-fake-oauth"
@@ -3160,12 +3169,12 @@ query_params = { api-version = "2026-01-01" }
         assert_eq!(headers.get("originator").unwrap(), "codex_exec");
         assert_eq!(
             headers.get("user-agent").unwrap(),
-            "codex_exec/0.156.0 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.156.0)"
+            "codex_exec/0.156.1 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.156.1)"
         );
 
         let request = conservative_ws_request(
             "ws://127.0.0.1/backend-api/codex/responses",
-            "0.156.0",
+            "0.156.1",
             &auth,
         )
         .unwrap();
@@ -3180,7 +3189,7 @@ query_params = { api-version = "2026-01-01" }
             CONSERVATIVE_BETA_FEATURES
         );
         assert_eq!(ws_headers.get("originator").unwrap(), "codex_exec");
-        assert_eq!(ws_headers.get("version").unwrap(), "0.156.0");
+        assert_eq!(ws_headers.get("version").unwrap(), "0.156.1");
         assert_eq!(
             ws_headers.get("x-client-request-id").unwrap(),
             CONSERVATIVE_CLIENT_REQUEST_ID
@@ -3352,14 +3361,14 @@ requires_openai_auth = false
         );
         assert_eq!(
             headers.get("user-agent").unwrap().to_str().unwrap(),
-            "codex_exec/0.156.0 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.156.0)"
+            "codex_exec/0.156.1 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.156.1)"
         );
         assert_eq!(headers.get("originator").unwrap(), "codex_exec");
         assert_eq!(
             headers.get("openai-beta").unwrap(),
             CONSERVATIVE_OPENAI_BETA
         );
-        assert_eq!(headers.get("version").unwrap(), "0.156.0");
+        assert_eq!(headers.get("version").unwrap(), "0.156.1");
         assert_eq!(
             headers.get("x-codex-beta-features").unwrap(),
             CONSERVATIVE_BETA_FEATURES
@@ -3465,7 +3474,7 @@ model = "gpt-5.5"
             .and(header("authorization", "Bearer eyJ-test-oauth"))
             .and(header("chatgpt-account-id", "acct-test"))
             .and(header("originator", "codex_exec"))
-            .and(header("version", "0.156.0"))
+            .and(header("version", "0.156.1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "models": [{"slug": "gpt-5.5", "prefer_websockets": true}]
             })))

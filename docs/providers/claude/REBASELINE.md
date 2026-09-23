@@ -144,18 +144,19 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
 - Captured fields are represented in source.
 - Default workspace tests pass without credentials or network.
 
-## Current 2.1.280 Status
+## Current 2.1.281 Status
 
-On 2026-09-22 the clean-HOME general capture returned HTTP 200 for default,
+On 2026-09-23 the clean-HOME general capture returned HTTP 200 for default,
 `opus`, `sonnet`, `haiku`, and `fable`. The observed catalog contains
 `claude-opus-5-5`, `claude-sonnet-5`, `claude-haiku-4-5-20251001`, and
-`claude-fable-5-1`. Fable acceptance is now proven by a successful POST,
-not inferred from a rate limit. The explicit `claude-fable-5` path was not
-recaptured; its prior pass-through and wire override remain unchanged.
+`claude-fable-5-1`. Fable acceptance is a successful POST, not a rate
+limit. The explicit `claude-fable-5` path was not recaptured; its prior
+pass-through and wire override remain unchanged.
 
-Default and explicit Opus use 128000 max tokens, medium effort, and a new
-`per-turn-control-2026-07-01` beta. Sonnet, Haiku, and Fable settings
-match the prior pin. SDK package `0.112.1`, runtime `v26.3.0`, and
-Anthropic version `2023-06-01` were observed. Billing is
-`cc_version=2.1.280.7aa; cc_entrypoint=sdk-cli;` for `Say OK`; no `cch=`
-was emitted. The `Sha256Utf16SampleV1` suffix stays in use.
+Default and explicit Opus use 128000 max tokens and medium effort. Sonnet
+and Fable use 64000 and high effort. Haiku uses 32000 and omits
+`output_config`. SDK package `0.112.1`, runtime `v26.3.0`, and Anthropic
+version `2023-06-01` were observed. Billing is
+`cc_version=2.1.281.3ee; cc_entrypoint=sdk-cli;` for `Say OK`; no `cch=`
+was emitted. The `Sha256Utf16SampleV1` suffix stays in use. Beta lists
+match the previous pin.

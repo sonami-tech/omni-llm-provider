@@ -2,7 +2,7 @@
 
 Codex-specific behavior lives in `crates/provider-codex`.
 
-Single pin: Codex CLI **0.156.0**. `--codex-version` / `OMNI_CODEX_VERSION` and
+Single pin: Codex CLI **0.156.1**. `--codex-version` / `OMNI_CODEX_VERSION` and
 match-system flags are removed (issue #12). Rebaseline overwrites this pin;
 older wire needs an older Omni release.
 
@@ -130,9 +130,10 @@ Unsupported extras fail loudly.
 Rebaseline overwrites the single pin, including the model catalog. The catalog
 source is `codex debug models --bundled` (`visibility=list` slugs). A custom
 Responses `base_url` is not a reason to skip. If that command fails or lists
-no models, stop. Do not keep the previous pin's catalog. The 2026-09-22
-capture returned a successful Responses POST on the configured custom endpoint;
-`visibility=list` includes Astra, Sol, Terra, Luna, and 5.5. The user-agent
+no models, stop. Do not keep the previous pin's catalog. The 2026-09-23
+capture returned a successful Responses POST on the configured custom endpoint.
+`visibility=list` includes `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`,
+`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, and `gpt-5.5`. The user-agent
 comes from that successful exec, not the bundled catalog.
 
 ```sh

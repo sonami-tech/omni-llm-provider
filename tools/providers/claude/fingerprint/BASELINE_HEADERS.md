@@ -1,6 +1,6 @@
 # Claude CLI Baseline Wire Fingerprint
 
-Active baseline: Claude Code 2.1.280, captured 2026-09-22 (single pin; issue #12).
+Active baseline: Claude Code 2.1.281, captured 2026-09-23 (single pin; issue #12).
 
 Raw mitmproxy `.flow` files are not committed because they contain live bearer
 tokens and account identifiers. Keep raw captures on tmpfs and inspect them with
@@ -10,7 +10,7 @@ tokens and account identifiers. Keep raw captures on tmpfs and inspect them with
 
 | Profile | Claude Code | SDK package | Runtime | Entrypoint | Source |
 |---|---|---|---|---|---|
-| `cc-2.1.280-sdk-cli` | `2.1.280` | `0.112.1` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/Fable/default, 2026-09-22 |
+| `cc-2.1.281-sdk-cli` | `2.1.281` | `0.112.1` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/Fable/default, 2026-09-23 |
 
 Only one pin is compiled. Rebaseline overwrites this row; do not append a
 historical ladder. Older Omni releases retain older wire.
@@ -44,7 +44,7 @@ Header names and dynamic values are pinned in
 - `anthropic-version: 2023-06-01`
 - `x-app: cli`
 
-## 2.1.280 Model Surface (active)
+## 2.1.281 Model Surface (active)
 
 | Input | Wire model | Beta list | max_tokens | temperature | output_config.effort |
 |---|---|---|---:|---:|---|
@@ -60,7 +60,7 @@ The default and explicit Opus beta lists now include
 `per-turn-control-2026-07-01`. Sonnet, Fable, and Haiku beta bytes match the
 prior pin; exact lists are in `crates/provider-claude/src/fingerprint.rs`.
 
-Billing (no cch): `cc_version=2.1.280.7aa; cc_entrypoint=sdk-cli;` for
+Billing (no cch): `cc_version=2.1.281.3ee; cc_entrypoint=sdk-cli;` for
 prompt `Say OK`. Stainless package is `0.112.1`, runtime `v26.3.0`, and
 `x-client-request-id` is absent. The system identity remains
 `You are a Claude agent, built on Anthropic's Claude Agent SDK.`
