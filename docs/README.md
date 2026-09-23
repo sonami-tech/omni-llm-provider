@@ -76,6 +76,15 @@ Design narrative: [`DESIGN.md`](DESIGN.md). Decision record:
   auto-refreshes every 5s in browsers via the `Refresh` header).
 - `GET /health`, `GET /`.
 
+File input uses official Chat `file` and Responses `input_file` parts. Responses
+file cache breakpoints stay on the file block. Codex emits them on the file;
+Claude maps them to `cache_control`; Grok uses native prefix caching. Codex
+accepts file URL, data, and provider-local ID; Claude accepts PDF URL or PDF data;
+Grok Responses
+accepts URL or provider-local ID on agentic-capable models. Grok Chat rejects
+files. Unsupported file variants return a request error instead of losing the
+attachment. Omni does not upload files or translate IDs between providers.
+
 Current client compatibility gaps and priority notes are tracked in
 [`compatibility-gaps.md`](compatibility-gaps.md).
 The go-forward implementation tracker is

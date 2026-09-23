@@ -17,9 +17,9 @@ Normal tests are hermetic and quota-free. Live provider checks remain opt-in via
 | Image URL input | Yes | Yes | Yes | Yes | Yes |
 | Base64 image input | Yes | Yes | Yes | Yes | Yes |
 | Audio input | No | No | No | No | No |
-| File input | No | No | No | No | No |
+| File input | PDF `file_id` / `file_data` | `input_file` URL / ID / data | PDF URL / data; no OpenAI ID or detail | Responses URL / ID only; Chat rejects files | Responses URL / ID / data |
 
-Unsupported typed media parts fail loudly with a request error.
+Unsupported typed media parts and file variants that a selected backend cannot honor fail loudly with a request error. File IDs belong to the receiving provider; Omni does not upload or transfer files between providers. Grok file support uses its Responses route on agentic-capable models.
 
 ## Anthropic inbound (`POST /v1/messages`)
 

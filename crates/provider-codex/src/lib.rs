@@ -1683,7 +1683,9 @@ fn codex_responses_body(req: &CanonicalRequest, stream: bool) -> Result<Value, P
     let mut input = Vec::new();
     for message in &req.messages {
         if message.role == "system" || message.role == "developer" {
-            if message.content.has_cache_marks() {
+            if message.content.has_cache_marks()
+                || matches!(&message.content, CanonicalContent::Blocks(blocks) if blocks.iter().any(|block| matches!(block, CanonicalBlock::File { .. } | CanonicalBlock::Image { .. })))
+            {
                 // Marked instructions cannot live on the string `instructions`
                 // field. Emit a developer input item so breakpoints survive.
                 let mut marked = message.clone();
@@ -2046,6 +2048,25 @@ fn append_message_items(message: &CanonicalMessage, input: &mut Vec<Value>) {
                             }),
                             cache.as_ref(),
                         ));
+                    }
+                    CanonicalBlock::File {
+                        source,
+                        filename,
+                        detail,
+                        cache,
+                    } => {
+                        has_image = true;
+                        if cache.is_some() {
+                            has_breakpoint = true;
+                        }
+                        let mut part = source.as_responses_part();
+                        if let Some(filename) = filename {
+                            part["filename"] = json!(filename);
+                        }
+                        if let Some(detail) = detail {
+                            part["detail"] = json!(detail);
+                        }
+                        content_parts.push(openai_breakpoint_part(part, cache.as_ref()));
                     }
                     CanonicalBlock::ToolUse {
                         id,
@@ -3692,6 +3713,50 @@ requires_openai_auth = false
         assert_eq!(content[1]["type"], "input_image");
         assert_eq!(content[1]["image_url"], "https://example.com/a.png");
         assert_eq!(content[2]["image_url"], "data:image/png;base64,abcd");
+    }
+
+    #[test]
+    fn canonical_files_map_to_responses_with_breakpoint() {
+        let req = CanonicalRequest {
+            model: "gpt-5.5".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Blocks(vec![
+                    CanonicalBlock::Text {
+                        text: "read".into(),
+                        cache: None,
+                    },
+                    CanonicalBlock::File {
+                        source: omni_core::CanonicalFileSource::Url {
+                            file_url: "https://example.com/a.pdf".into(),
+                        },
+                        filename: None,
+                        detail: None,
+                        cache: Some(omni_core::CanonicalCacheMark::breakpoint()),
+                    },
+                    CanonicalBlock::File {
+                        source: omni_core::CanonicalFileSource::Data {
+                            file_data: "data:application/pdf;base64,abcd".into(),
+                        },
+                        filename: Some("b.pdf".into()),
+                        detail: Some("high".into()),
+                        cache: None,
+                    },
+                ]),
+            }],
+            ..Default::default()
+        };
+        let body = codex_responses_body(&req, false).unwrap();
+        let parts = body["input"][0]["content"].as_array().unwrap();
+        assert_eq!(parts[0], json!({ "type": "input_text", "text": "read" }));
+        assert_eq!(
+            parts[1],
+            json!({ "type": "input_file", "file_url": "https://example.com/a.pdf", "prompt_cache_breakpoint": {"mode": "explicit"} })
+        );
+        assert_eq!(
+            parts[2],
+            json!({ "type": "input_file", "file_data": "data:application/pdf;base64,abcd", "filename": "b.pdf", "detail": "high" })
+        );
     }
 
     fn chat_req_with_extras(extras: Value) -> CanonicalRequest {

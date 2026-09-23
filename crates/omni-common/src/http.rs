@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use omni_core::{
-    CanonicalBlock, CanonicalContent, CanonicalImageSource, CanonicalMessage, CanonicalReasoning,
-    CanonicalRequest, CanonicalResponse, CanonicalStream, CanonicalStreamEvent, CanonicalTool,
-    CanonicalToolCall, CanonicalToolChoice,
+    CanonicalBlock, CanonicalContent, CanonicalFileSource, CanonicalImageSource, CanonicalMessage,
+    CanonicalReasoning, CanonicalRequest, CanonicalResponse, CanonicalStream, CanonicalStreamEvent,
+    CanonicalTool, CanonicalToolCall, CanonicalToolChoice,
 };
 
 use crate::cache::{parse_openai_cache_intent, parse_prompt_cache_breakpoint};
@@ -96,6 +96,8 @@ pub struct ChatContentPart {
     pub text: Option<String>,
     #[serde(default)]
     pub image_url: Option<ChatImageUrl>,
+    #[serde(default)]
+    pub file: Option<ChatFile>,
     /// Official Chat Completions breakpoint on a supported part.
     #[serde(default)]
     pub prompt_cache_breakpoint: Option<Value>,
@@ -104,6 +106,16 @@ pub struct ChatContentPart {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatImageUrl {
     pub url: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatFile {
+    #[serde(default)]
+    pub file_id: Option<String>,
+    #[serde(default)]
+    pub file_data: Option<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
 }
 
 /// A tool definition in OpenAI's nested form. Only `function` tools are
@@ -641,8 +653,11 @@ fn chat_content_text(content: &Option<ChatMessageContent>) -> Result<String, Str
             for part in parts {
                 match part.kind.as_str() {
                     "text" => fragments.push(part.text.clone().unwrap_or_default()),
-                    "image_url" => {
-                        return Err("image_url content is not supported on tool messages".into());
+                    "image_url" | "file" => {
+                        return Err(format!(
+                            "{} content is not supported on tool messages",
+                            part.kind
+                        ));
                     }
                     other => return Err(format!("unsupported content part type: {other}")),
                 }
@@ -675,7 +690,7 @@ fn chat_content_to_canonical(
         Some(ChatMessageContent::Text(text)) => Ok(CanonicalContent::Text(text.clone())),
         Some(ChatMessageContent::Parts(parts)) => {
             let mut blocks = Vec::with_capacity(parts.len());
-            let mut has_image = false;
+            let mut has_media = false;
             let mut has_mark = false;
             for part in parts {
                 let cache = parse_prompt_cache_breakpoint(part.prompt_cache_breakpoint.as_ref())?;
@@ -698,12 +713,34 @@ fn chat_content_to_canonical(
                             source: CanonicalImageSource::from_image_url(url)?,
                             cache,
                         });
-                        has_image = true;
+                        has_media = true;
+                    }
+                    "file" => {
+                        let file = part.file.as_ref().ok_or("file content part missing file")?;
+                        let source = CanonicalFileSource::from_parts(
+                            file.file_id.as_deref(),
+                            None,
+                            file.file_data.as_deref(),
+                        )?;
+                        if file
+                            .filename
+                            .as_ref()
+                            .is_some_and(|name| name.trim().is_empty())
+                        {
+                            return Err("filename must not be empty".into());
+                        }
+                        blocks.push(CanonicalBlock::File {
+                            source,
+                            filename: file.filename.clone(),
+                            detail: None,
+                            cache,
+                        });
+                        has_media = true;
                     }
                     other => return Err(format!("unsupported content part type: {other}")),
                 }
             }
-            if has_image || has_mark {
+            if has_media || has_mark {
                 Ok(CanonicalContent::Blocks(blocks))
             } else {
                 Ok(CanonicalContent::Text(
@@ -1550,6 +1587,61 @@ mod tests {
             }
             CanonicalContent::Text(_) => panic!("image content must become blocks"),
         }
+    }
+
+    #[test]
+    fn chat_files_keep_order_and_cache_marks() {
+        let req = req_from_json(
+            r#"{"model":"m","messages":[{"role":"user","content":[
+            {"type":"text","text":"read"},
+            {"type":"file","file":{"filename":"a.pdf","file_data":"data:application/pdf;base64,abcd"},"prompt_cache_breakpoint":{"mode":"explicit"}},
+            {"type":"file","file":{"file_id":"file-1"}}
+        ]}]}"#,
+        );
+        let canon = to_canonical(&req).unwrap();
+        let CanonicalContent::Blocks(blocks) = &canon.messages[0].content else {
+            panic!("file must keep blocks")
+        };
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(&blocks[0], CanonicalBlock::Text { text, .. } if text == "read"));
+        assert!(
+            matches!(&blocks[1], CanonicalBlock::File { source: omni_core::CanonicalFileSource::Data { file_data }, filename: Some(filename), .. } if file_data == "data:application/pdf;base64,abcd" && filename == "a.pdf")
+        );
+        assert!(blocks[1].cache_mark().is_some());
+        assert!(canon.has_cache_marks());
+        assert!(
+            matches!(&blocks[2], CanonicalBlock::File { source: omni_core::CanonicalFileSource::Id { file_id }, .. } if file_id == "file-1")
+        );
+    }
+
+    #[test]
+    fn chat_files_reject_invalid_sources_and_tool_parts() {
+        for (part, field) in [
+            (r#"{"type":"file"}"#, "missing file"),
+            (r#"{"type":"file","file":{}}"#, "exactly one"),
+            (
+                r#"{"type":"file","file":{"file_id":"id","file_data":"abcd"}}"#,
+                "exactly one",
+            ),
+            (
+                r#"{"type":"file","file":{"file_id":"id","filename":" "}}"#,
+                "filename",
+            ),
+        ] {
+            let req = req_from_json(&format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":[{part}]}}]}}"#
+            ));
+            let err = to_canonical(&req).expect_err("invalid file must fail");
+            assert!(err.contains(field), "{part}: {err}");
+        }
+        let req = req_from_json(
+            r#"{"model":"m","messages":[{"role":"tool","tool_call_id":"call-1","content":[{"type":"file","file":{"file_id":"id"}}]}]}"#,
+        );
+        assert!(
+            to_canonical(&req)
+                .unwrap_err()
+                .contains("file content is not supported on tool")
+        );
     }
 
     #[test]

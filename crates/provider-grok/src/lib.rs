@@ -1117,6 +1117,9 @@ fn to_xai_chat_request(
                                 "image_url": { "url": source.as_image_url() },
                             }));
                         }
+                        CanonicalBlock::File { .. } => {
+                            return Err(ProviderError::BadRequest("Grok Chat does not support file parts; use a Grok Responses model with file_url or file_id".into()));
+                        }
                         CanonicalBlock::ToolUse {
                             id,
                             name,
@@ -1368,7 +1371,7 @@ fn to_grok_responses_request(
 
     let mut input: Vec<Value> = Vec::new();
     for message in &req.messages {
-        append_grok_responses_items(message, &mut input);
+        append_grok_responses_items(message, &mut input)?;
     }
 
     let mut body = json!({
@@ -1474,7 +1477,10 @@ fn grok_reasoning_effort(
 /// `input_text`, image -> `input_image`, ToolUse -> `function_call`, ToolResult ->
 /// `function_call_output`) but WITHOUT the Codex instructions hoist: system and
 /// developer roles stay as typed message items with their own role.
-fn append_grok_responses_items(message: &CanonicalMessage, input: &mut Vec<Value>) {
+fn append_grok_responses_items(
+    message: &CanonicalMessage,
+    input: &mut Vec<Value>,
+) -> Result<(), ProviderError> {
     match &message.content {
         CanonicalContent::Text(text) => {
             input.push(json!({
@@ -1501,6 +1507,26 @@ fn append_grok_responses_items(message: &CanonicalMessage, input: &mut Vec<Value
                             "type": "input_image",
                             "image_url": source.as_image_url(),
                         }));
+                    }
+                    CanonicalBlock::File {
+                        source,
+                        filename,
+                        detail,
+                        ..
+                    } => {
+                        if filename.is_some() || detail.is_some() {
+                            return Err(ProviderError::BadRequest(
+                                "Grok Responses cannot honor input_file filename or detail".into(),
+                            ));
+                        }
+                        if matches!(source, omni_core::CanonicalFileSource::Data { .. }) {
+                            return Err(ProviderError::BadRequest(
+                                "Grok Responses file_data is unsupported; use file_url or file_id"
+                                    .into(),
+                            ));
+                        }
+                        has_image = true;
+                        content_parts.push(source.as_responses_part());
                     }
                     CanonicalBlock::ToolUse {
                         id,
@@ -1553,6 +1579,7 @@ fn append_grok_responses_items(message: &CanonicalMessage, input: &mut Vec<Value
             );
         }
     }
+    Ok(())
 }
 
 /// Emit the buffered message item (if any) before/after a tool item, matching the
@@ -2672,6 +2699,89 @@ mod tests {
         assert_eq!(content[0]["text"], "look");
         assert_eq!(content[1]["image_url"]["url"], "https://example.com/a.png");
         assert_eq!(content[2]["image_url"]["url"], "data:image/png;base64,abcd");
+    }
+
+    #[test]
+    fn grok_responses_maps_file_url_but_chat_rejects_files() {
+        let req = CanonicalRequest {
+            model: "grok-4.7".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Blocks(vec![
+                    CanonicalBlock::Text {
+                        text: "read".into(),
+                        cache: None,
+                    },
+                    CanonicalBlock::File {
+                        source: omni_core::CanonicalFileSource::Url {
+                            file_url: "https://example.com/a.pdf".into(),
+                        },
+                        filename: None,
+                        detail: None,
+                        cache: Some(omni_core::CanonicalCacheMark::breakpoint()),
+                    },
+                ]),
+            }],
+            ..Default::default()
+        };
+        let body = to_grok_responses_request(&req, GROK_CATALOG, false).unwrap();
+        assert_eq!(
+            body["input"][0]["content"],
+            json!([
+                { "type": "input_text", "text": "read" },
+                { "type": "input_file", "file_url": "https://example.com/a.pdf" }
+            ])
+        );
+        assert!(
+            matches!(to_xai_chat_request(&req, &empty_repl(), GROK_CATALOG), Err(ProviderError::BadRequest(message)) if message.contains("file parts"))
+        );
+    }
+
+    #[test]
+    fn grok_responses_rejects_unmappable_file_fields() {
+        for (source, filename, detail, field) in [
+            (
+                omni_core::CanonicalFileSource::Data {
+                    file_data: "abcd".into(),
+                },
+                None,
+                None,
+                "file_data",
+            ),
+            (
+                omni_core::CanonicalFileSource::Id {
+                    file_id: "file-1".into(),
+                },
+                Some("a.pdf".into()),
+                None,
+                "filename",
+            ),
+            (
+                omni_core::CanonicalFileSource::Id {
+                    file_id: "file-1".into(),
+                },
+                None,
+                Some("high".into()),
+                "detail",
+            ),
+        ] {
+            let req = CanonicalRequest {
+                model: "grok-4.7".into(),
+                messages: vec![CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Blocks(vec![CanonicalBlock::File {
+                        source,
+                        filename,
+                        detail,
+                        cache: None,
+                    }]),
+                }],
+                ..Default::default()
+            };
+            assert!(
+                matches!(to_grok_responses_request(&req, GROK_CATALOG, false), Err(ProviderError::BadRequest(message)) if message.contains(field))
+            );
+        }
     }
 
     // --- additional comprehensive mapper + integration coverage ---

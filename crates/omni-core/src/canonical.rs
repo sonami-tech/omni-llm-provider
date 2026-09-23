@@ -58,7 +58,7 @@ pub struct CanonicalMessage {
 ///
 /// `Text` is the common case (a plain string). `Blocks` carries an ordered
 /// sequence of content blocks, used when a turn mixes text with tool-call,
-/// tool-result, or image data. Keeping `Text` as its own variant means every
+/// tool-result, image, or file data. Keeping `Text` as its own variant means every
 /// plain-text producer stays valid; only mixed-content turns need `Blocks`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CanonicalContent {
@@ -69,9 +69,9 @@ pub enum CanonicalContent {
 /// One block inside a [`CanonicalContent::Blocks`] sequence.
 ///
 /// These map 1:1 onto each backend's native content blocks:
-/// - Anthropic `ContentBlock::{Text, ToolUse, ToolResult, Image}`
+/// - Anthropic `ContentBlock::{Text, ToolUse, ToolResult, Image, Document}`
 /// - OpenAI/xAI assistant `tool_calls` + `role:"tool"` result messages
-/// - OpenAI/xAI typed content parts for images
+/// - OpenAI/xAI typed content parts for images and files
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum CanonicalBlock {
     /// Plain text within a multi-block message.
@@ -83,6 +83,14 @@ pub enum CanonicalBlock {
     /// Image input ordered with surrounding text.
     Image {
         source: CanonicalImageSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache: Option<CanonicalCacheMark>,
+    },
+    /// File input ordered with surrounding text and images.
+    File {
+        source: CanonicalFileSource,
+        filename: Option<String>,
+        detail: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache: Option<CanonicalCacheMark>,
     },
@@ -118,6 +126,7 @@ impl CanonicalBlock {
         match self {
             Self::Text { cache, .. }
             | Self::Image { cache, .. }
+            | Self::File { cache, .. }
             | Self::ToolUse { cache, .. }
             | Self::ToolResult { cache, .. } => cache.as_ref(),
         }
@@ -161,6 +170,60 @@ impl CanonicalImageSource {
             Self::Url { url } => url.clone(),
             Self::Base64 { media_type, data } => {
                 format!("data:{media_type};base64,{data}")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CanonicalFileSource {
+    Id { file_id: String },
+    Url { file_url: String },
+    Data { file_data: String },
+}
+
+impl CanonicalFileSource {
+    pub fn from_parts(
+        file_id: Option<&str>,
+        file_url: Option<&str>,
+        file_data: Option<&str>,
+    ) -> Result<Self, String> {
+        let sources = [file_id, file_url, file_data];
+        if sources.iter().filter(|source| source.is_some()).count() != 1 {
+            return Err("file part requires exactly one of file_id, file_url, file_data".into());
+        }
+        if let Some(id) = file_id {
+            if id.trim().is_empty() {
+                return Err("file_id must not be empty".into());
+            }
+            Ok(Self::Id { file_id: id.into() })
+        } else if let Some(url) = file_url {
+            if !url.starts_with("https://") {
+                return Err("file_url must use https://".into());
+            }
+            Ok(Self::Url {
+                file_url: url.into(),
+            })
+        } else {
+            let data = file_data.expect("one file source is present");
+            if data.trim().is_empty() {
+                return Err("file_data must not be empty".into());
+            }
+            Ok(Self::Data {
+                file_data: data.into(),
+            })
+        }
+    }
+
+    pub fn as_responses_part(&self) -> serde_json::Value {
+        match self {
+            Self::Id { file_id } => serde_json::json!({ "type": "input_file", "file_id": file_id }),
+            Self::Url { file_url } => {
+                serde_json::json!({ "type": "input_file", "file_url": file_url })
+            }
+            Self::Data { file_data } => {
+                serde_json::json!({ "type": "input_file", "file_data": file_data })
             }
         }
     }

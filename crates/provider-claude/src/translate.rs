@@ -22,9 +22,10 @@ use serde_json::Value;
 use omni_common::Replacements;
 use omni_core::{
     CanonicalBlock, CanonicalCacheMark, CanonicalCacheMode, CanonicalCacheTtl, CanonicalContent,
-    CanonicalImageSource, CanonicalMessage, CanonicalReasoning, CanonicalReasoningBlock,
-    CanonicalRequest, CanonicalResponse, CanonicalResponseMetadata, CanonicalTool,
-    CanonicalToolCall, CanonicalToolChoice, CanonicalUsage, ProviderError, clamp_duration,
+    CanonicalFileSource, CanonicalImageSource, CanonicalMessage, CanonicalReasoning,
+    CanonicalReasoningBlock, CanonicalRequest, CanonicalResponse, CanonicalResponseMetadata,
+    CanonicalTool, CanonicalToolCall, CanonicalToolChoice, CanonicalUsage, ProviderError,
+    clamp_duration,
 };
 
 use crate::anthropic_passthrough::apply_prompt_replacements;
@@ -153,6 +154,17 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    Document {
+        source: DocumentSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        citations: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +178,13 @@ pub enum ToolResultContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageSource {
+    Base64 { media_type: String, data: String },
+    Url { url: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DocumentSource {
     Base64 { media_type: String, data: String },
     Url { url: String },
 }
@@ -649,6 +668,7 @@ fn cap_claude_cache_slots(req: &mut MessagesRequest) {
             let cache_control = match block {
                 ContentBlock::Text { cache_control, .. }
                 | ContentBlock::Image { cache_control, .. }
+                | ContentBlock::Document { cache_control, .. }
                 | ContentBlock::ToolUse { cache_control, .. }
                 | ContentBlock::ToolResult { cache_control, .. } => cache_control,
                 ContentBlock::Thinking { .. } => continue,
@@ -680,6 +700,7 @@ fn claude_cache_slot_count(req: &MessagesRequest) -> usize {
             let marked = match block {
                 ContentBlock::Text { cache_control, .. }
                 | ContentBlock::Image { cache_control, .. }
+                | ContentBlock::Document { cache_control, .. }
                 | ContentBlock::ToolUse { cache_control, .. }
                 | ContentBlock::ToolResult { cache_control, .. } => cache_control.is_some(),
                 ContentBlock::Thinking { .. } => false,
@@ -754,6 +775,62 @@ fn canonical_block_to_anthropic(
             source: canonical_image_to_anthropic(source)?,
             cache_control: claude_cache_control(cache.as_ref(), request_ttl),
         },
+        CanonicalBlock::File {
+            source,
+            filename,
+            detail,
+            cache,
+        } => {
+            if detail.is_some() {
+                return Err("Claude documents cannot honor input_file detail".into());
+            }
+            let source = match source {
+                CanonicalFileSource::Url { file_url } => DocumentSource::Url {
+                    url: file_url.clone(),
+                },
+                CanonicalFileSource::Data { file_data } => {
+                    let data = if let Some(encoded) = file_data.strip_prefix("data:") {
+                        let (media_type, data) = encoded
+                            .split_once(";base64,")
+                            .ok_or("Claude file_data requires base64 data")?;
+                        if media_type != "application/pdf" || data.is_empty() {
+                            return Err(
+                                "Claude file_data requires application/pdf base64 data".into()
+                            );
+                        }
+                        data
+                    } else {
+                        file_data.as_str()
+                    };
+                    if filename
+                        .as_deref()
+                        .is_some_and(|name| !name.to_ascii_lowercase().ends_with(".pdf"))
+                        || !file_data.starts_with("data:") && filename.is_none()
+                    {
+                        return Err(
+                            "Claude file_data requires a PDF filename or application/pdf data URL"
+                                .into(),
+                        );
+                    }
+                    DocumentSource::Base64 {
+                        media_type: "application/pdf".into(),
+                        data: data.into(),
+                    }
+                }
+                CanonicalFileSource::Id { .. } => {
+                    return Err(
+                        "Claude cannot use an OpenAI file_id; use file_url or PDF file_data".into(),
+                    );
+                }
+            };
+            ContentBlock::Document {
+                source,
+                title: filename.clone(),
+                context: None,
+                citations: None,
+                cache_control: claude_cache_control(cache.as_ref(), request_ttl),
+            }
+        }
     })
 }
 
@@ -1712,6 +1789,117 @@ mod tests {
                 } if media_type == "image/png" && data == "abcd"));
             }
             other => panic!("expected blocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canonical_files_map_to_claude_documents_with_cache_control() {
+        use omni_core::{CanonicalBlock, CanonicalFileSource};
+        let req = CanonicalRequest {
+            model: "haiku".into(),
+            messages: vec![CanonicalMessage {
+                role: "user".into(),
+                content: CanonicalContent::Blocks(vec![
+                    CanonicalBlock::File {
+                        source: CanonicalFileSource::Url {
+                            file_url: "https://example.com/a.pdf".into(),
+                        },
+                        filename: None,
+                        detail: None,
+                        cache: Some(omni_core::CanonicalCacheMark::breakpoint()),
+                    },
+                    CanonicalBlock::File {
+                        source: CanonicalFileSource::Data {
+                            file_data: "data:application/pdf;base64,abcd".into(),
+                        },
+                        filename: Some("a.pdf".into()),
+                        detail: None,
+                        cache: None,
+                    },
+                    CanonicalBlock::File {
+                        source: CanonicalFileSource::Data {
+                            file_data: concat!("data:application/", "pdf;base64,YWJjZA==").into(),
+                        },
+                        filename: None,
+                        detail: None,
+                        cache: None,
+                    },
+                ]),
+            }],
+            ..Default::default()
+        };
+        let profile = crate::fingerprint::default_profile();
+        let anth = build_messages_request_from_canonical(
+            &req,
+            profile.resolve_model("haiku"),
+            &empty_repl(),
+        )
+        .unwrap();
+        let wire = serde_json::to_value(&anth.messages[0]).unwrap();
+        assert_eq!(wire["content"][0]["type"], "document");
+        assert_eq!(
+            wire["content"][0]["source"],
+            serde_json::json!({"type":"url","url":"https://example.com/a.pdf"})
+        );
+        assert_eq!(wire["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(wire["content"][1]["title"], "a.pdf");
+        assert_eq!(wire["content"][2]["source"]["type"], "base64");
+        assert_eq!(wire["content"][2]["source"]["data"], "YWJjZA==");
+        assert_eq!(
+            wire["content"][1]["source"],
+            serde_json::json!({"type":"base64","media_type":"application/pdf","data":"abcd"})
+        );
+    }
+
+    #[test]
+    fn canonical_files_reject_claude_unmappable_inputs() {
+        for (source, filename, detail, field) in [
+            (
+                CanonicalFileSource::Id {
+                    file_id: "file-1".into(),
+                },
+                None,
+                None,
+                "file_id",
+            ),
+            (
+                CanonicalFileSource::Data {
+                    file_data: "abcd".into(),
+                },
+                None,
+                None,
+                "PDF filename",
+            ),
+            (
+                CanonicalFileSource::Url {
+                    file_url: "https://example.com/a.pdf".into(),
+                },
+                None,
+                Some("high".into()),
+                "detail",
+            ),
+        ] {
+            let req = CanonicalRequest {
+                model: "haiku".into(),
+                messages: vec![CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Blocks(vec![CanonicalBlock::File {
+                        source,
+                        filename,
+                        detail,
+                        cache: None,
+                    }]),
+                }],
+                ..Default::default()
+            };
+            let profile = crate::fingerprint::default_profile();
+            let err = build_messages_request_from_canonical(
+                &req,
+                profile.resolve_model("haiku"),
+                &empty_repl(),
+            )
+            .unwrap_err();
+            assert!(err.contains(field), "{err}");
         }
     }
 

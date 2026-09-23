@@ -9,11 +9,11 @@
 //! convention only).
 //!
 //! Scope: text input (string or message items with `input_text`/`output_text`
-//! parts), image input (`input_image` with URL or base64 data URL), function
-//! tools, and full multi-turn tool conversations
+//! parts), image input (`input_image` with URL or base64 data URL), file input
+//! (`input_file`), function tools, and full multi-turn tool conversations
 //! (`function_call` / `function_call_output` items round-trip through canonical
 //! tool blocks), non-stream and stream. Input shapes the canonical layer still
-//! cannot represent (e.g. audio or file parts, non-function tools) are rejected
+//! cannot represent (e.g. audio parts, non-function tools) are rejected
 //! loudly with a clear error instead of degraded silently.
 //!
 //! The types below are the wire contract. The conversion and SSE-framing
@@ -33,9 +33,9 @@ use crate::canonical_mapping::{provider_metadata_json, usage_detail_json};
 use crate::http::{gateway_only_extra_keys, validate_reasoning_effort_lexical};
 
 use omni_core::{
-    CanonicalBlock, CanonicalContent, CanonicalImageSource, CanonicalMessage, CanonicalReasoning,
-    CanonicalRequest, CanonicalResponse, CanonicalResponseMetadata, CanonicalStream,
-    CanonicalStreamEvent, CanonicalTool, CanonicalToolChoice,
+    CanonicalBlock, CanonicalContent, CanonicalFileSource, CanonicalImageSource, CanonicalMessage,
+    CanonicalReasoning, CanonicalRequest, CanonicalResponse, CanonicalResponseMetadata,
+    CanonicalStream, CanonicalStreamEvent, CanonicalTool, CanonicalToolChoice,
 };
 
 /// The boxed SSE event stream produced by the Responses framer. Boxed so the
@@ -123,7 +123,7 @@ pub enum ResponsesInstructions {
     Parts(Vec<ResponsesContentPart>),
 }
 
-/// One typed content part. Supports text plus `input_image` with `image_url`.
+/// One typed content part. Supports text, images and files.
 /// Other media part types are rejected by name.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ResponsesContentPart {
@@ -133,6 +133,16 @@ pub struct ResponsesContentPart {
     pub text: Option<String>,
     #[serde(default)]
     pub image_url: Option<String>,
+    #[serde(default)]
+    pub file_id: Option<String>,
+    #[serde(default)]
+    pub file_url: Option<String>,
+    #[serde(default)]
+    pub file_data: Option<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
     #[serde(default)]
     pub prompt_cache_breakpoint: Option<serde_json::Value>,
 }
@@ -547,7 +557,7 @@ fn responses_content_to_canonical(
         Some(ResponsesInputContent::Parts(parts)) => {
             let mut text_fragments = Vec::new();
             let mut blocks = Vec::with_capacity(parts.len());
-            let mut has_image = false;
+            let mut has_media = false;
             let mut has_mark = false;
             for part in parts {
                 let cache = parse_prompt_cache_breakpoint(part.prompt_cache_breakpoint.as_ref())?;
@@ -568,12 +578,38 @@ fn responses_content_to_canonical(
                             source: CanonicalImageSource::from_image_url(image_url)?,
                             cache,
                         });
-                        has_image = true;
+                        has_media = true;
+                    }
+                    "input_file" => {
+                        let source = CanonicalFileSource::from_parts(
+                            part.file_id.as_deref(),
+                            part.file_url.as_deref(),
+                            part.file_data.as_deref(),
+                        )?;
+                        if part
+                            .filename
+                            .as_ref()
+                            .is_some_and(|name| name.trim().is_empty())
+                        {
+                            return Err("filename must not be empty".into());
+                        }
+                        if let Some(detail) = part.detail.as_deref() {
+                            if !matches!(detail, "auto" | "low" | "high") {
+                                return Err(format!("unsupported input_file detail: {detail}"));
+                            }
+                        }
+                        blocks.push(CanonicalBlock::File {
+                            source,
+                            filename: part.filename.clone(),
+                            detail: part.detail.clone(),
+                            cache,
+                        });
+                        has_media = true;
                     }
                     other => return Err(format!("unsupported content part type: {other}")),
                 }
             }
-            if has_image || has_mark {
+            if has_media || has_mark {
                 Ok(CanonicalContent::Blocks(blocks))
             } else {
                 Ok(CanonicalContent::Text(text_fragments.join("\n")))
@@ -2078,15 +2114,61 @@ mod tests {
     }
 
     #[test]
-    fn to_canonical_rejects_non_text_content_parts() {
+    fn responses_files_keep_order_and_cache_marks() {
         let req = parse(
-            r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_file","file_id":"file_1"}]}]}"#,
+            r#"{"model":"m","input":[{"role":"user","content":[
+            {"type":"input_text","text":"first"},
+            {"type":"input_file","file_url":"https://example.com/a.pdf","prompt_cache_breakpoint":{"mode":"explicit"}},
+            {"type":"input_file","file_id":"file-1"},
+            {"type":"input_file","filename":"b.pdf","file_data":"data:application/pdf;base64,abcd","detail":"high"},
+            {"type":"input_text","text":"last"}
+        ]}]}"#,
         );
-        let err = responses_to_canonical(&req).expect_err("must reject");
+        let canon = responses_to_canonical(&req).unwrap();
+        let CanonicalContent::Blocks(blocks) = &canon.messages[0].content else {
+            panic!("file must keep blocks")
+        };
+        assert_eq!(blocks.len(), 5);
+        assert!(matches!(&blocks[0], CanonicalBlock::Text { text, .. } if text == "first"));
         assert!(
-            err.contains("input_file"),
-            "error must name the unsupported part type, got: {err}"
+            matches!(&blocks[1], CanonicalBlock::File { source: omni_core::CanonicalFileSource::Url { file_url }, .. } if file_url == "https://example.com/a.pdf")
         );
+        assert!(blocks[1].cache_mark().is_some());
+        assert!(canon.has_cache_marks());
+        assert!(
+            matches!(&blocks[2], CanonicalBlock::File { source: omni_core::CanonicalFileSource::Id { file_id }, .. } if file_id == "file-1")
+        );
+        assert!(
+            matches!(&blocks[3], CanonicalBlock::File { source: omni_core::CanonicalFileSource::Data { file_data }, filename: Some(filename), detail: Some(detail), .. } if file_data == "data:application/pdf;base64,abcd" && filename == "b.pdf" && detail == "high")
+        );
+        assert!(matches!(&blocks[4], CanonicalBlock::Text { text, .. } if text == "last"));
+    }
+
+    #[test]
+    fn responses_files_reject_invalid_sources_and_detail() {
+        for (part, field) in [
+            (r#"{"type":"input_file"}"#, "exactly one"),
+            (
+                r#"{"type":"input_file","file_id":"file-1","file_url":"https://example.com/a.pdf"}"#,
+                "exactly one",
+            ),
+            (r#"{"type":"input_file","file_id":" "}"#, "file_id"),
+            (r#"{"type":"input_file","file_data":""}"#, "file_data"),
+            (
+                r#"{"type":"input_file","file_url":"http://example.com/a.pdf"}"#,
+                "file_url",
+            ),
+            (
+                r#"{"type":"input_file","file_id":"file-1","detail":"ultra"}"#,
+                "detail",
+            ),
+        ] {
+            let req = parse(&format!(
+                r#"{{"model":"m","input":[{{"role":"user","content":[{part}]}}]}}"#
+            ));
+            let err = responses_to_canonical(&req).expect_err("invalid file must fail");
+            assert!(err.contains(field), "{part}: {err}");
+        }
     }
 
     #[test]

@@ -364,6 +364,7 @@ fn apply_prompt_to_message_content(
                         *thinking = replacements.apply_prompt(thinking);
                     }
                     crate::translate::ContentBlock::Image { .. }
+                    | crate::translate::ContentBlock::Document { .. }
                     | crate::translate::ContentBlock::ToolResult { content: None, .. } => {}
                 }
             }
@@ -788,6 +789,27 @@ mod tests {
         match req.system.as_ref().expect("system present") {
             SystemField::Blocks(blocks) => blocks.iter().map(|b| b.text.clone()).collect(),
             SystemField::Text(_) => panic!("identity injection must force system blocks"),
+        }
+    }
+
+    #[test]
+    fn native_ingress_preserves_document_metadata() {
+        let body = serde_json::json!({
+            "model": "claude-sonnet-5", "max_tokens": 100,
+            "messages": [{ "role": "user", "content": [{
+                "type": "document",
+                "source": { "type": "url", "url": "https://example.com/a.pdf" },
+                "title": "Invoice A", "context": "Financial record",
+                "citations": { "enabled": true },
+                "cache_control": { "type": "ephemeral" }
+            }] }]
+        });
+        let wire = serde_json::to_value(parse_client(body.clone()).to_messages_request()).unwrap();
+        for key in ["source", "title", "context", "citations", "cache_control"] {
+            assert_eq!(
+                wire["messages"][0]["content"][0][key], body["messages"][0]["content"][0][key],
+                "{key}"
+            );
         }
     }
 

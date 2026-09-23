@@ -24,7 +24,7 @@ Implemented support now covers:
 
 ## Implementation Readiness
 
-1. Audio and file input support.
+1. Audio input support.
    - Needs explicit canonical media shape and provider mapping decisions.
    - Defer until concrete client need exists.
 
@@ -39,7 +39,7 @@ Implemented support now covers:
 
 1. Add optional live-provider smoke checks.
 2. Add hosted-tool mappings for one provider at a time.
-3. Add audio/file input support once provider behavior is chosen.
+3. Add audio input support once provider behavior is chosen.
 
 ## Resolved
 
@@ -57,15 +57,21 @@ Implemented support now covers:
      content arrays and Responses `input_image` parts, then mapped to Claude,
      Grok, and Codex.
 
-3. Broader Responses API support.
+3. File input support.
+   - Resolved: official Chat `file` and Responses `input_file` parts preserve
+     order and cache marks. Codex maps all Responses file sources; Claude maps
+     PDF URL/base64 documents; Grok Responses maps URL and provider-local IDs.
+     Unsupported variants fail clearly.
+
+4. Broader Responses API support.
    - Resolved: Codex forwards Responses state, metadata, service tier, and
      structured-output extras. Unsupported provider extras still fail loudly.
 
-4. Rich provider output preservation.
+5. Rich provider output preservation.
    - Resolved: optional canonical extension fields preserve usage details,
      provider metadata, annotations, and non-stream reasoning blocks.
 
-5. Compatibility matrix.
+6. Compatibility matrix.
    - Resolved: `docs/compatibility-matrix.md` tracks current support status.
 
 ## Notes
