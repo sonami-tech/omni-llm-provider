@@ -104,11 +104,18 @@ Done when:
 - Responses streaming and non-streaming tests cover new fields.
 
 Result: Codex forwards `store`, `previous_response_id`, `metadata`,
-`service_tier`, `text`, and `parallel_tool_calls`. Chat `response_format` is
-translated to Responses `text.format`. Grok continues to forward its
-chat-compatible extras such as `service_tier`, `response_format`, and
-`parallel_tool_calls`; Responses-native state fields remain unsupported for
-Grok. Claude OpenAI-compatible provider extras remain unsupported.
+`service_tier`, `text`, and `parallel_tool_calls`. Chat `response_format: null`
+acts as absent; non-null `response_format` is validated, translated into
+Responses `text.format`, and never forwarded as `response_format`. Without
+`text`, the translation creates it. With object `text`, it keeps sibling fields
+and adds `format`, or accepts an equal existing `format`. A conflicting
+`text.format` or non-object `text` (including null) is a 400 when merging;
+invalid non-null `response_format` is also a 400. Without non-null
+`response_format`, `text` is forwarded unchanged. Unsupported extras fail loudly.
+Grok continues to forward its chat-compatible extras such as
+`service_tier`, `response_format`, and `parallel_tool_calls`; Responses-native
+state fields remain unsupported for Grok. Claude OpenAI-compatible provider
+extras remain unsupported.
 
 Deferred: non-function hosted tools and additional provider-specific output item
 types.

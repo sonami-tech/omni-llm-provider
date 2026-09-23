@@ -95,7 +95,14 @@ Current allowlists:
 - Grok: `service_tier`, `search_parameters`, `response_format`,
   `parallel_tool_calls`, `seed`, `stop`, `n`, `tools`
 - Codex: `store`, `previous_response_id`, `metadata`,
-  `parallel_tool_calls`, `service_tier`, `text`; chat `response_format` is
-  translated to Responses `text.format`
+  `parallel_tool_calls`, `service_tier`, `text`; chat `response_format: null`
+  acts as absent. Non-null chat `response_format` is validated and translated
+  into Responses `text.format`, not forwarded as `response_format`. It creates
+  `text` when absent, or merges into object `text` while keeping siblings;
+  equal existing `format` is accepted. Conflicting `text.format`, non-object
+  `text` (including null) during a merge, and invalid non-null
+  `response_format` are 400. Without non-null `response_format`, `text` is
+  forwarded unchanged. Unsupported extras fail loudly.
+  See [Codex provider details](codex/README.md).
 - Claude OpenAI-compatible path: no provider extras passthrough
 - Claude native: closed Anthropic request allowlist only
