@@ -971,10 +971,8 @@ impl UpstreamClient {
     /// retry as the messages path, but posts to the count_tokens endpoint and
     /// returns the parsed `{"input_tokens": N}` JSON. 429 is NOT retried.
     ///
-    /// NOTE: the body is sent VERBATIM (not run through `finalize_body_json`):
-    /// count_tokens counts the client body as-sent and carries no injected
-    /// billing header. This matches the native-surface decision to count the
-    /// client's own body.
+    /// NOTE: the prepared count_tokens body is sent without `finalize_body_json`.
+    /// It carries no injected billing header.
     pub async fn count_tokens(
         &self,
         creds: &Credentials,
