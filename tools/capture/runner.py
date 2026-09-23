@@ -298,6 +298,12 @@ def run_capture(
             )
 
         extract_text = work.extract_path.read_text(encoding="utf-8")
+        if provider == "claude" and (
+            "cch=" in extract_text or b"cch=" in work.flow_path.read_bytes()
+        ):
+            raise CaptureError(
+                "Claude capture emitted cch=. Stop. Do not overwrite the pin."
+            )
 
         catalog_ids: list[str] | None = None
         if mode == "general":

@@ -46,6 +46,25 @@ def _claude_model(body: object) -> str | None:
     return model if isinstance(model, str) and model else None
 
 
+def _claude_emitted_cch(body: object) -> bool:
+    """True when a captured Claude body still contains the billing cch field."""
+    if isinstance(body, (bytes, bytearray)):
+        return b"cch=" in body
+    if isinstance(body, str):
+        return "cch=" in body
+    if isinstance(body, dict):
+        return "cch=" in json.dumps(body, ensure_ascii=False)
+    return False
+
+
+def _reject_claude_cch(body: object) -> None:
+    if _claude_emitted_cch(body):
+        raise _fail(
+            "claude",
+            "capture emitted cch=. Stop. Do not overwrite the pin",
+        )
+
+
 def _require_claude_acceptance(status: int | None, model: str) -> None:
     if status is None or not 200 <= status < 300:
         detail = f"POST /v1/messages for {model} has no successful HTTP response"
@@ -88,6 +107,7 @@ def catalog_ids_from_jsonl(path: Path, *, provider: str) -> list[str]:
                         obj = json.loads(body)
                     except json.JSONDecodeError:
                         obj = None
+                _reject_claude_cch(body if body is not None else obj)
                 model = _claude_model(obj)
                 if model:
                     status = rec.get("status")
@@ -122,8 +142,10 @@ def catalog_ids_from_flow(path: Path, *, provider: str) -> list[str]:
                         if isinstance(model, dict) and model.get("id"):
                             ids.append(str(model["id"]))
             if provider == "claude" and req.method == "POST" and "/v1/messages" in path_only:
+                raw_body = req.content or b""
+                _reject_claude_cch(raw_body)
                 try:
-                    obj = json.loads(req.content or b"")
+                    obj = json.loads(raw_body)
                 except json.JSONDecodeError:
                     continue
                 model = _claude_model(obj)

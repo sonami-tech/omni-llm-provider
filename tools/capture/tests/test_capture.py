@@ -1338,7 +1338,15 @@ class RunnerLiveTests(unittest.TestCase):
             keep_flow=keep_flow,
         )
 
-    def _run_successful_capture(self, work: CaptureWorkdir) -> dict[str, object]:
+    def _run_successful_capture(
+        self,
+        work: CaptureWorkdir,
+        *,
+        flow_bytes: bytes = b"flow",
+        extract_body: str = "# extract\n",
+        catalog: mock.Mock | None = None,
+    ) -> dict[str, object]:
+        work.flow_path.write_bytes(flow_bytes)
         completed = subprocess.CompletedProcess(args=["claude"], returncode=0)
 
         def fake_run(*_args, **_kwargs):
@@ -1365,7 +1373,7 @@ class RunnerLiveTests(unittest.TestCase):
                                         def _write_extract(*_args, **kwargs):
                                             out = kwargs.get("out")
                                             if out is not None:
-                                                out.write("# extract\n")
+                                                out.write(extract_body)
                                             return 0
 
                                         extract.side_effect = _write_extract
@@ -1381,7 +1389,9 @@ class RunnerLiveTests(unittest.TestCase):
                                         ):
                                             with mock.patch(
                                                 "tools.capture.runner.require_rebaseline_catalog",
-                                                return_value=["claude-opus-5"],
+                                                catalog
+                                                if catalog is not None
+                                                else mock.Mock(return_value=["claude-opus-5"]),
                                             ):
                                                 return run_capture(
                                                     provider="claude",
@@ -1565,6 +1575,31 @@ class RunnerLiveTests(unittest.TestCase):
         self.assertNotIn("extract_path", result)
         self.assertFalse(work.root.exists())
 
+    def test_claude_cch_stops_before_catalog_ids(self) -> None:
+        work = self._mock_workdir()
+        catalog = mock.Mock(return_value=["claude-opus-5"])
+        billing = (
+            b'{"model":"claude-opus-5","system":[{"text":'
+            b'"x-anthropic-billing-header: cc_entrypoint=sdk-cli; cch=abcde;"}]}'
+        )
+        with self.assertRaises(CaptureError) as ctx:
+            self._run_successful_capture(work, flow_bytes=billing, catalog=catalog)
+        self.assertIn("cch=", str(ctx.exception))
+        self.assertIn("Do not overwrite the pin", str(ctx.exception))
+        catalog.assert_not_called()
+        self.assertFalse(work.root.exists())
+
+        work = self._mock_workdir()
+        catalog = mock.Mock(return_value=["claude-opus-5"])
+        with self.assertRaises(CaptureError) as ctx:
+            self._run_successful_capture(
+                work,
+                extract_body="billing header `cch=<cch>`\n",
+                catalog=catalog,
+            )
+        self.assertIn("cch=", str(ctx.exception))
+        catalog.assert_not_called()
+
     def test_success_keep_flow_includes_paths(self) -> None:
         work = self._mock_workdir(keep_flow=True)
         work.flow_path.write_bytes(b"flow")
@@ -1684,6 +1719,53 @@ class CatalogTests(unittest.TestCase):
                 with self.assertRaises(CatalogError) as ctx:
                     catalog_ids_from_flow(path, provider="claude")
             self.assertIn("HTTP 429", str(ctx.exception))
+
+    def test_claude_flow_with_cch_does_not_return_catalog_ids(self) -> None:
+        from types import SimpleNamespace
+
+        from tools.capture.catalog import CatalogError, catalog_ids_from_flow
+
+        class Reader:
+            def __init__(self, _handle):
+                pass
+
+            def stream(self):
+                body = json.dumps(
+                    {
+                        "model": "claude-opus-5",
+                        "system": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "x-anthropic-billing-header: "
+                                    "cc_entrypoint=sdk-cli; cch=abcde;"
+                                ),
+                            }
+                        ],
+                    }
+                ).encode()
+                request = SimpleNamespace(
+                    method="POST",
+                    path="/v1/messages?beta=true",
+                    content=body,
+                )
+                return [
+                    SimpleNamespace(
+                        request=request,
+                        response=SimpleNamespace(status_code=200),
+                    )
+                ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "synthetic.flow"
+            path.touch()
+            with mock.patch(
+                "tools.capture.extract.require_mitmproxy_flow_reader", return_value=Reader
+            ):
+                with self.assertRaises(CatalogError) as ctx:
+                    catalog_ids_from_flow(path, provider="claude")
+        self.assertIn("cch=", str(ctx.exception))
+        self.assertIn("Do not overwrite the pin", str(ctx.exception))
 
     def test_grok_jsonl_reads_v1_models(self) -> None:
         from tools.capture.catalog import catalog_ids_from_jsonl
