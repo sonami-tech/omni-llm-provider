@@ -1500,6 +1500,72 @@ class RefreshHelperTests(unittest.TestCase):
 
 
 class CatalogTests(unittest.TestCase):
+    def test_claude_jsonl_requires_acceptance_for_every_model(self) -> None:
+        from tools.capture.catalog import CatalogError, require_rebaseline_catalog
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sanitized.jsonl"
+            records = [
+                {
+                    "method": "POST",
+                    "url": "https://api.anthropic.com/v1/messages?beta=true",
+                    "body": {"model": "claude-opus-5"},
+                    "status": 200,
+                },
+                {
+                    "method": "POST",
+                    "url": "https://api.anthropic.com/v1/messages",
+                    "body": {"model": "claude-fable-5-1"},
+                    "status": 429,
+                },
+            ]
+            path.write_text("\n".join(json.dumps(rec) for rec in records), encoding="utf-8")
+            with self.assertRaises(CatalogError) as ctx:
+                require_rebaseline_catalog("claude", jsonl_path=path)
+            self.assertIn("claude-fable-5-1", str(ctx.exception))
+            self.assertIn("HTTP 429", str(ctx.exception))
+            records[1]["status"] = 200
+            path.write_text("\n".join(json.dumps(rec) for rec in records), encoding="utf-8")
+            self.assertEqual(
+                require_rebaseline_catalog("claude", jsonl_path=path),
+                ["claude-opus-5", "claude-fable-5-1"],
+            )
+            del records[1]["status"]
+            path.write_text("\n".join(json.dumps(rec) for rec in records), encoding="utf-8")
+            with self.assertRaises(CatalogError):
+                require_rebaseline_catalog("claude", jsonl_path=path)
+
+    def test_claude_flow_requires_acceptance_for_every_model(self) -> None:
+        from types import SimpleNamespace
+
+        from tools.capture.catalog import CatalogError, catalog_ids_from_flow
+
+        def flow(model: str, status: int | None):
+            request = SimpleNamespace(
+                method="POST",
+                path="/v1/messages?beta=true",
+                content=json.dumps({"model": model}).encode(),
+            )
+            response = SimpleNamespace(status_code=status) if status is not None else None
+            return SimpleNamespace(request=request, response=response)
+
+        class Reader:
+            def __init__(self, _handle):
+                pass
+
+            def stream(self):
+                return [flow("claude-opus-5", 200), flow("claude-fable-5-1", 429)]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "synthetic.flow"
+            path.touch()
+            with mock.patch(
+                "tools.capture.extract.require_mitmproxy_flow_reader", return_value=Reader
+            ):
+                with self.assertRaises(CatalogError) as ctx:
+                    catalog_ids_from_flow(path, provider="claude")
+            self.assertIn("HTTP 429", str(ctx.exception))
+
     def test_grok_jsonl_reads_v1_models(self) -> None:
         from tools.capture.catalog import catalog_ids_from_jsonl
 

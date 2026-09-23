@@ -39,6 +39,21 @@ def _fail(provider: str, detail: str) -> CatalogError:
     )
 
 
+def _claude_model(body: object) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    model = body.get("model")
+    return model if isinstance(model, str) and model else None
+
+
+def _require_claude_acceptance(status: int | None, model: str) -> None:
+    if status is None or not 200 <= status < 300:
+        detail = f"POST /v1/messages for {model} has no successful HTTP response"
+        if status is not None:
+            detail += f" (HTTP {status})"
+        raise _fail("claude", detail + "; model acceptance is unproven")
+
+
 def catalog_ids_from_jsonl(path: Path, *, provider: str) -> list[str]:
     """Pull catalog ids from a sanitized JSONL capture (no secrets required)."""
     ids: list[str] = []
@@ -73,8 +88,11 @@ def catalog_ids_from_jsonl(path: Path, *, provider: str) -> list[str]:
                         obj = json.loads(body)
                     except json.JSONDecodeError:
                         obj = None
-                if isinstance(obj, dict) and obj.get("model"):
-                    ids.append(str(obj["model"]))
+                model = _claude_model(obj)
+                if model:
+                    status = rec.get("status")
+                    _require_claude_acceptance(status if isinstance(status, int) else None, model)
+                    ids.append(model)
     return _unique(ids)
 
 
@@ -108,8 +126,11 @@ def catalog_ids_from_flow(path: Path, *, provider: str) -> list[str]:
                     obj = json.loads(req.content or b"")
                 except json.JSONDecodeError:
                     continue
-                if isinstance(obj, dict) and obj.get("model"):
-                    ids.append(str(obj["model"]))
+                model = _claude_model(obj)
+                if model:
+                    status = flow.response.status_code if flow.response is not None else None
+                    _require_claude_acceptance(status, model)
+                    ids.append(model)
     return _unique(ids)
 
 
