@@ -367,6 +367,11 @@ impl CodexProvider {
         let ws_url = config.conservative_responses_ws_url()?;
         let ws_request = conservative_ws_request(&ws_url, self.version, &auth)?;
         let body = codex_response_create_body(&req)?;
+        // The HTTP edge reads this after send returns: one warning plus
+        // `x-omni-dropped`. The cap is not enforced on this path.
+        if let Some(requested) = req.max_tokens {
+            omni_common::note_dropped_output_cap(&req.model, requested);
+        }
         let open_redactor = redactor.clone();
         let mut ws = match timeout_upstream_headers(async move {
             let (mut ws, _) = connect_async(ws_request)
@@ -1277,8 +1282,11 @@ fn is_default_openai_base(base_url: &str) -> bool {
         .is_some_and(|url| url.as_str().trim_end_matches('/') == DEFAULT_OPENAI_BASE_URL)
 }
 
+// `cfg(test)` covers this crate's own tests. `test-support` covers the
+// server binary's tests, which compile this crate as a normal dependency.
+// `cargo run` does not enable the feature, so a debug server ignores it.
 fn conservative_chatgpt_base_url() -> String {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(base) = env_nonempty("OMNI_CODEX_CONSERVATIVE_BASE_URL_FOR_TEST") {
         return base.trim_end_matches('/').to_string();
     }
@@ -1286,7 +1294,7 @@ fn conservative_chatgpt_base_url() -> String {
 }
 
 fn conservative_chatgpt_ws_base_url() -> String {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(base) = env_nonempty("OMNI_CODEX_CONSERVATIVE_WS_BASE_URL_FOR_TEST") {
         return base.trim_end_matches('/').to_string();
     }
@@ -1581,10 +1589,13 @@ fn codex_response_create_body(req: &CanonicalRequest) -> Result<Value, ProviderE
     if let Some(obj) = body.as_object_mut() {
         // WebSocket frames are the stream; REST `stream: true` is not used.
         obj.remove("stream");
-        // ChatGPT's codex backend rejects max_output_tokens (HTTP 400). The
-        // public OpenAI Responses REST path still accepts it via
-        // `codex_responses_body`; only the WS response.create shape strips it.
+        // ChatGPT's codex backend rejects max_output_tokens,
+        // max_completion_tokens, and max_tokens. No equivalent output-cap
+        // field exists on this path. REST still sends max_output_tokens via
+        // `codex_responses_body`. This shape only strips the rejected fields.
         obj.remove("max_output_tokens");
+        obj.remove("max_completion_tokens");
+        obj.remove("max_tokens");
     }
     Ok(body)
 }
@@ -3252,6 +3263,8 @@ query_params = { api-version = "2026-01-01" }
             body.get("max_output_tokens").is_none(),
             "ChatGPT codex WS rejects max_output_tokens; must not appear on response.create: {body}"
         );
+        assert!(body.get("max_completion_tokens").is_none(), "{body}");
+        assert!(body.get("max_tokens").is_none(), "{body}");
         // REST body still carries the cap for OpenAI api.openai.com Responses.
         let rest = codex_responses_body(&req, false).unwrap();
         assert_eq!(rest["max_output_tokens"], 256);

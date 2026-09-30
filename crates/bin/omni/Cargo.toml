@@ -35,8 +35,11 @@ futures-util.workspace = true
 async-trait = "0.1"
 # Enable the build-and-locate helper used by the subprocess integration tests.
 omni-common = { path = "../../omni-common", features = ["test-support"] }
+# Hermetic ChatGPT WebSocket tests. `cargo run` does not enable this feature.
+provider-codex = { path = "../../provider-codex", features = ["test-support"] }
 tower = "0.5"
 # Captures tracing output so the correlation-span tests can assert request_id /
 # session_id actually reach the emitted log lines.
 tracing-test = "0.2"
+tokio-tungstenite.workspace = true
 wiremock = "0.6.5"

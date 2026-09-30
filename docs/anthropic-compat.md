@@ -60,6 +60,7 @@ thinking is never emitted on Grok/Codex Anthropic SSE/JSON.
 | `cache_control` | Translated per [`cache-translation.md`](cache-translation.md). Marks stay on content and tools. |
 | `prompt_cache_key` | 400. Not an Anthropic field; do not add an Omni dialect on this interface. |
 | `stop_sequences` | Grok → extras `stop`; Codex dropped. Response always `stop_sequence: null` |
+| `max_tokens` for Codex | Required. REST forwards it as `max_output_tokens`. ChatGPT WebSocket ignores it and does not enforce it (`x-omni-dropped: max_output_tokens`, one warning). The proxy does not truncate. |
 | Mid-conversation `role: "system"` | 400 |
 | Trailing assistant prefill | 400 |
 | `document` / hosted tools / computer use | 400 |

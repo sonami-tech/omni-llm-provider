@@ -58,6 +58,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1249,8 +1250,85 @@ fn stats_json_response(state: &AppState) -> Response {
         .into_response()
 }
 
+/// One warning and `x-omni-dropped` when this request's Codex WebSocket path
+/// removed a caller output cap. No-op when the cap was forwarded or absent.
+/// Success and upstream-error responses both get the header.
+fn observe_dropped_output_cap(response: Option<&mut Response>) {
+    let Some(dropped) = omni_common::dropped_output_cap() else {
+        return;
+    };
+    warn!(
+        model = %dropped.model,
+        route = %dropped.route,
+        requested = dropped.requested,
+        "chatgpt websocket dropped caller output cap"
+    );
+    let Some(response) = response else {
+        return;
+    };
+    response.headers_mut().insert(
+        header::HeaderName::from_static(omni_common::DROPPED_OUTPUT_CAP_HEADER),
+        header::HeaderValue::from_static(omni_common::DROPPED_OUTPUT_CAP_HEADER_VALUE),
+    );
+}
+
+async fn finish_with_dropped_output_cap<F>(
+    route: &'static str,
+    fut: F,
+) -> Result<axum::response::Response, AppError>
+where
+    F: Future<Output = Result<axum::response::Response, AppError>>,
+{
+    omni_common::with_inbound_route(route, async move {
+        match fut.await {
+            Ok(mut response) => {
+                observe_dropped_output_cap(Some(&mut response));
+                Ok(response)
+            }
+            Err(error) => {
+                // The cap is already gone. Put the header on the error
+                // response before it leaves this scope. Requests that did
+                // not drop a cap stay `Err` so existing callers still match.
+                if omni_common::dropped_output_cap().is_some() {
+                    let mut response = error.into_response();
+                    observe_dropped_output_cap(Some(&mut response));
+                    Ok(response)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    })
+    .await
+}
+
+async fn finish_anthropic_response<F>(fut: F) -> Response
+where
+    F: Future<Output = Response>,
+{
+    omni_common::with_inbound_route("/v1/messages", async move {
+        let mut response = fut.await;
+        observe_dropped_output_cap(Some(&mut response));
+        response
+    })
+    .await
+}
+
 /// Handler: POST /v1/chat/completions
 async fn chat_completions_handler(
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
+    api_key: Option<Extension<ApiKeyId>>,
+    request_id: Extension<RequestId>,
+    body: Json<ChatCompletionRequest>,
+) -> Result<axum::response::Response, AppError> {
+    finish_with_dropped_output_cap("/v1/chat/completions", async move {
+        chat_completions_inner(state, headers, api_key, request_id, body).await
+    })
+    .await
+}
+
+async fn chat_completions_inner(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     api_key: Option<Extension<ApiKeyId>>,
@@ -1836,15 +1914,18 @@ fn log_text(
 }
 
 async fn anthropic_messages_handler(
-    State(state): State<Arc<AppState>>,
+    state: State<Arc<AppState>>,
     headers: HeaderMap,
     api_key: Option<Extension<ApiKeyId>>,
     request: Request<Body>,
 ) -> Response {
-    match anthropic_messages_inner(state, headers, api_key, request).await {
-        Ok(response) => response,
-        Err(error) => anthropic_error_response(error),
-    }
+    finish_anthropic_response(async move {
+        match anthropic_messages_inner(state.0, headers, api_key, request).await {
+            Ok(response) => response,
+            Err(error) => anthropic_error_response(error),
+        }
+    })
+    .await
 }
 
 async fn anthropic_messages_inner(
@@ -2740,6 +2821,19 @@ fn anthropic_error_response(error: AppError) -> Response {
 /// BadRequest; non-stream returns the Responses envelope; stream:true returns
 /// Responses SSE events (response.created ... response.completed, no [DONE]).
 async fn responses_handler(
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
+    api_key: Option<Extension<ApiKeyId>>,
+    request_id: Extension<RequestId>,
+    body: Json<omni_common::ResponsesRequest>,
+) -> Result<axum::response::Response, AppError> {
+    finish_with_dropped_output_cap("/v1/responses", async move {
+        responses_inner(state, headers, api_key, request_id, body).await
+    })
+    .await
+}
+
+async fn responses_inner(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     api_key: Option<Extension<ApiKeyId>>,
@@ -3946,11 +4040,8 @@ mod tests {
 
     impl TempCodexHome {
         fn install_for_mock(base_url: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("omni-codex-home-{}", Uuid::new_v4()));
-            std::fs::create_dir_all(&dir).expect("create codex test home");
-            std::fs::write(
-                dir.join("config.toml"),
-                format!(
+            Self::install_with(
+                &format!(
                     r#"
 model = "gpt-codex-test"
 model_provider = "proxy"
@@ -3960,13 +4051,22 @@ wire_api = "responses"
 requires_openai_auth = false
 "#
                 ),
+                None,
             )
-            .expect("write codex config");
+        }
+
+        fn install_with(config: &str, auth: Option<&str>) -> Self {
+            let dir = std::env::temp_dir().join(format!("omni-codex-home-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("create codex test home");
+            std::fs::write(dir.join("config.toml"), config).expect("write codex config");
+            if let Some(auth) = auth {
+                std::fs::write(dir.join("auth.json"), auth).expect("write codex auth");
+            }
             let old = std::env::var_os("CODEX_HOME");
-            // No auth.json and no env credential: with requires_openai_auth=false
-            // and nothing else configured, the issue #1 fallback yields None, so
-            // these routing tests can assert no Authorization header is sent.
-            // Clear the ambient auth env so the result does not depend on the host.
+            // Clear ambient auth env so routing does not depend on the host.
+            // `install_for_mock` passes no auth file, so those tests also send
+            // no Authorization header. Callers that need a file credential pass
+            // `auth`.
             let auth_keys = ["CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"];
             let prev_auth_env = auth_keys
                 .iter()
@@ -4972,6 +5072,505 @@ requires_openai_auth = false
             !requests[0].headers.contains_key("authorization"),
             "codex no-auth custom provider must not receive default Authorization"
         );
+    }
+
+    fn assert_no_output_cap_header(resp: &Response) {
+        assert!(
+            resp.headers().get("x-omni-dropped").is_none(),
+            "REST or no-cap response must not set x-omni-dropped: {resp:?}"
+        );
+    }
+
+    fn output_cap_header(resp: &Response) -> String {
+        resp.headers()
+            .get("x-omni-dropped")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn cap_warning_lines<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+        lines
+            .iter()
+            .copied()
+            .filter(|line| line.contains("chatgpt websocket dropped caller output cap"))
+            .collect()
+    }
+
+    async fn spawn_cap_ws_server() -> (String, std::sync::Arc<StdMutex<Vec<Value>>>) {
+        use futures_util::SinkExt as _;
+        use tokio_tungstenite::accept_async;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bodies = std::sync::Arc::new(StdMutex::new(Vec::new()));
+        let stored = bodies.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let stored = stored.clone();
+                tokio::spawn(async move {
+                    let mut ws = accept_async(stream).await.expect("ws accept");
+                    let frame = ws.next().await.expect("ws frame").expect("ws frame ok");
+                    let body: Value =
+                        serde_json::from_str(frame.to_text().expect("text frame")).expect("json");
+                    stored.lock().unwrap_or_else(|p| p.into_inner()).push(body);
+                    for frame in [
+                        r#"{"type":"response.created","response":{"id":"resp_ws","status":"in_progress","model":"gpt-5.5"}}"#,
+                        r#"{"type":"response.output_text.delta","delta":"ok","output_index":0,"content_index":0}"#,
+                        r#"{"type":"response.completed","response":{"id":"resp_ws","status":"completed","model":"gpt-5.5","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+                    ] {
+                        ws.send(Message::Text(frame.to_string().into()))
+                            .await
+                            .expect("ws send");
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}"), bodies)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[traced_test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_codex_ws_dropped_output_cap_warns_and_sets_header() {
+        // WHY: issue #53. The ChatGPT WebSocket path drops a caller output cap.
+        // The shipped handlers must warn once and set x-omni-dropped, including
+        // on upstream errors. REST must forward the cap and emit neither signal.
+        // The split is the transport.
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (ws_base, ws_bodies) = spawn_cap_ws_server().await;
+        let models = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/backend-api/codex/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"slug": "gpt-5.5"}]
+            })))
+            .mount(&models)
+            .await;
+        let rest = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(|req: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                if body.get("max_output_tokens") == Some(&serde_json::json!(27)) {
+                    return ResponseTemplate::new(500).set_body_string("upstream down");
+                }
+                if body.get("stream") == Some(&Value::Bool(true)) {
+                    ResponseTemplate::new(200).set_body_raw(
+                        "event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n\
+event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_rest\",\"status\":\"completed\",\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+                        "text/event-stream",
+                    )
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": "resp_rest",
+                        "model": "gpt-5.5",
+                        "status": "completed",
+                        "output": [{"type":"message","content":[{"type":"output_text","text":"ok"}]}],
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            })
+            .mount(&rest)
+            .await;
+        let _env = TempEnvVars::set(&[
+            ("OMNI_CODEX_BASE_URL", None),
+            ("OMNI_CODEX_MODEL", None),
+            ("OMNI_CODEX_WIRE_API", None),
+            ("OMNI_CODEX_AUTH_TOKEN", None),
+            ("OMNI_CODEX_API_KEY", None),
+            ("OMNI_CODEX_CUSTOM_HEADERS", None),
+            ("CODEX_API_KEY", None),
+            ("OPENAI_API_KEY", None),
+            ("CODEX_ACCESS_TOKEN", None),
+            (
+                "OMNI_CODEX_CONSERVATIVE_BASE_URL_FOR_TEST",
+                Some(models.uri().as_str()),
+            ),
+            (
+                "OMNI_CODEX_CONSERVATIVE_WS_BASE_URL_FOR_TEST",
+                Some(ws_base.as_str()),
+            ),
+        ]);
+        let _ws_home = TempCodexHome::install_with(
+            r#"model = "gpt-5.5""#,
+            Some(r#"{"tokens":{"access_token":"eyJ-test-oauth","account_id":"acct-test"}}"#),
+        );
+        let mut map = HashMap::new();
+        map.insert("codex".into(), codex_entry());
+        let state = state_with(map);
+
+        let expect_drop = async |route: &str, requested: u32, resp: Response| {
+            assert_eq!(resp.status(), StatusCode::OK, "{route} status");
+            assert_eq!(
+                output_cap_header(&resp),
+                "max_output_tokens",
+                "{route} header"
+            );
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .expect("drain body");
+            logs_assert(|lines| {
+                let hits: Vec<_> = cap_warning_lines(lines)
+                    .into_iter()
+                    .filter(|line| {
+                        line.contains(route)
+                            && line.contains("gpt-5.5")
+                            && line.contains(&format!("requested={requested}"))
+                    })
+                    .collect();
+                if hits.len() == 1 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "expected one warning for {route} requested={requested}, got {}: {lines:?}",
+                        hits.len()
+                    ))
+                }
+            });
+        };
+
+        let chat = |cap: Option<u32>, field: &str, stream: bool| {
+            let mut body = serde_json::json!({
+                "model": "gpt-5.5",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": stream
+            });
+            if let Some(cap) = cap {
+                body[field] = serde_json::json!(cap);
+            }
+            serde_json::from_value::<ChatCompletionRequest>(body).unwrap()
+        };
+        let responses = |cap: Option<u32>, stream: bool| {
+            let mut body = serde_json::json!({
+                "model": "gpt-5.5",
+                "input": "hi",
+                "stream": stream
+            });
+            if let Some(cap) = cap {
+                body["max_output_tokens"] = serde_json::json!(cap);
+            }
+            serde_json::from_value::<omni_common::ResponsesRequest>(body).unwrap()
+        };
+        let messages = |cap: u32, stream: bool| {
+            serde_json::json!({
+                "model": "gpt-5.5",
+                "max_tokens": cap,
+                "stream": stream,
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+            .to_string()
+        };
+
+        expect_drop(
+            "/v1/chat/completions",
+            5,
+            call_chat_handler(state.clone(), chat(Some(5), "max_completion_tokens", false))
+                .await
+                .expect("ws chat"),
+        )
+        .await;
+        expect_drop(
+            "/v1/chat/completions",
+            7,
+            call_chat_handler(state.clone(), chat(Some(7), "max_tokens", true))
+                .await
+                .expect("ws chat stream"),
+        )
+        .await;
+        expect_drop(
+            "/v1/responses",
+            9,
+            call_responses_handler(state.clone(), responses(Some(9), false))
+                .await
+                .expect("ws responses"),
+        )
+        .await;
+        expect_drop(
+            "/v1/responses",
+            11,
+            call_responses_handler(state.clone(), responses(Some(11), true))
+                .await
+                .expect("ws responses stream"),
+        )
+        .await;
+        expect_drop(
+            "/v1/messages",
+            13,
+            call_anthropic_messages_handler(state.clone(), &messages(13, false)).await,
+        )
+        .await;
+        expect_drop(
+            "/v1/messages",
+            15,
+            call_anthropic_messages_handler(state.clone(), &messages(15, true)).await,
+        )
+        .await;
+
+        let quiet = call_chat_handler(state.clone(), chat(None, "max_tokens", false))
+            .await
+            .expect("ws chat without cap");
+        assert_eq!(quiet.status(), StatusCode::OK);
+        assert_no_output_cap_header(&quiet);
+        let _ = axum::body::to_bytes(quiet.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        logs_assert(|lines| {
+            let n = cap_warning_lines(lines).len();
+            if n == 6 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected 6 drop warnings before REST, got {n}: {lines:?}"
+                ))
+            }
+        });
+
+        let frames = ws_bodies.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(frames.len(), 7, "one websocket frame per ws request");
+        for frame in frames.iter() {
+            assert!(frame.get("max_output_tokens").is_none(), "{frame}");
+            assert!(frame.get("max_completion_tokens").is_none(), "{frame}");
+            assert!(frame.get("max_tokens").is_none(), "{frame}");
+        }
+        drop(frames);
+
+        // Connect fails after the cap is removed. Chat and Responses must
+        // still warn and set the header on the error response.
+        unsafe {
+            std::env::set_var(
+                "OMNI_CODEX_CONSERVATIVE_WS_BASE_URL_FOR_TEST",
+                "http://127.0.0.1:1",
+            );
+        }
+        let expect_drop_error = async |route: &str, requested: u32, resp: Response| {
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_GATEWAY,
+                "{route} error status"
+            );
+            assert_eq!(
+                output_cap_header(&resp),
+                "max_output_tokens",
+                "{route} error header"
+            );
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .expect("drain error body");
+            logs_assert(|lines| {
+                let hits: Vec<_> = cap_warning_lines(lines)
+                    .into_iter()
+                    .filter(|line| {
+                        line.contains(route)
+                            && line.contains("gpt-5.5")
+                            && line.contains(&format!("requested={requested}"))
+                    })
+                    .collect();
+                if hits.len() == 1 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "expected one error warning for {route} requested={requested}, got {}: {lines:?}",
+                        hits.len()
+                    ))
+                }
+            });
+        };
+        expect_drop_error(
+            "/v1/chat/completions",
+            17,
+            call_chat_handler(
+                state.clone(),
+                chat(Some(17), "max_completion_tokens", false),
+            )
+            .await
+            .expect("ws chat error"),
+        )
+        .await;
+        expect_drop_error(
+            "/v1/chat/completions",
+            19,
+            call_chat_handler(state.clone(), chat(Some(19), "max_tokens", true))
+                .await
+                .expect("ws chat stream error"),
+        )
+        .await;
+        expect_drop_error(
+            "/v1/responses",
+            23,
+            call_responses_handler(state.clone(), responses(Some(23), false))
+                .await
+                .expect("ws responses error"),
+        )
+        .await;
+        expect_drop_error(
+            "/v1/responses",
+            25,
+            call_responses_handler(state.clone(), responses(Some(25), true))
+                .await
+                .expect("ws responses stream error"),
+        )
+        .await;
+        logs_assert(|lines| {
+            let n = cap_warning_lines(lines).len();
+            if n == 10 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected 10 drop warnings after upstream errors, got {n}: {lines:?}"
+                ))
+            }
+        });
+        drop(_ws_home);
+
+        unsafe {
+            std::env::set_var(
+                "OMNI_CODEX_CONSERVATIVE_BASE_URL_FOR_TEST",
+                "http://127.0.0.1:1",
+            );
+            std::env::set_var(
+                "OMNI_CODEX_CONSERVATIVE_WS_BASE_URL_FOR_TEST",
+                "http://127.0.0.1:1",
+            );
+        }
+        let _rest_home = TempCodexHome::install_with(
+            &format!(
+                r#"
+model = "gpt-5.5"
+model_provider = "proxy"
+[model_providers.proxy]
+base_url = "{}"
+wire_api = "responses"
+requires_openai_auth = false
+"#,
+                rest.uri()
+            ),
+            None,
+        );
+
+        let mut rest_caps = Vec::new();
+        let rest_chat =
+            call_chat_handler(state.clone(), chat(Some(5), "max_completion_tokens", false))
+                .await
+                .expect("rest chat");
+        assert_eq!(rest_chat.status(), StatusCode::OK);
+        assert_no_output_cap_header(&rest_chat);
+        let _ = axum::body::to_bytes(rest_chat.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        rest_caps.push(5u32);
+        let rest_chat_stream = call_chat_handler(state.clone(), chat(Some(7), "max_tokens", true))
+            .await
+            .expect("rest chat stream");
+        assert_eq!(rest_chat_stream.status(), StatusCode::OK);
+        assert_no_output_cap_header(&rest_chat_stream);
+        let _ = axum::body::to_bytes(rest_chat_stream.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        rest_caps.push(7);
+        let rest_responses = call_responses_handler(state.clone(), responses(Some(9), false))
+            .await
+            .expect("rest responses");
+        assert_eq!(rest_responses.status(), StatusCode::OK);
+        assert_no_output_cap_header(&rest_responses);
+        let _ = axum::body::to_bytes(rest_responses.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        rest_caps.push(9);
+        let rest_responses_stream =
+            call_responses_handler(state.clone(), responses(Some(11), true))
+                .await
+                .expect("rest responses stream");
+        assert_eq!(rest_responses_stream.status(), StatusCode::OK);
+        assert_no_output_cap_header(&rest_responses_stream);
+        let _ = axum::body::to_bytes(rest_responses_stream.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        rest_caps.push(11);
+        let rest_messages =
+            call_anthropic_messages_handler(state.clone(), &messages(13, false)).await;
+        assert_eq!(rest_messages.status(), StatusCode::OK);
+        assert_no_output_cap_header(&rest_messages);
+        let _ = axum::body::to_bytes(rest_messages.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        rest_caps.push(13);
+        let rest_messages_stream =
+            call_anthropic_messages_handler(state.clone(), &messages(15, true)).await;
+        assert_eq!(rest_messages_stream.status(), StatusCode::OK);
+        assert_no_output_cap_header(&rest_messages_stream);
+        let _ = axum::body::to_bytes(rest_messages_stream.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        rest_caps.push(15);
+        let rest_err = call_chat_handler(
+            state.clone(),
+            chat(Some(27), "max_completion_tokens", false),
+        )
+        .await
+        .expect_err("REST error must stay Err");
+        let rest_err = rest_err.into_response();
+        assert_eq!(rest_err.status(), StatusCode::BAD_GATEWAY);
+        assert_no_output_cap_header(&rest_err);
+        let _ = axum::body::to_bytes(rest_err.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        rest_caps.push(27);
+        drop(_rest_home);
+
+        let _api_key_home = TempCodexHome::install_with(
+            &format!(
+                r#"
+model = "gpt-5.5"
+openai_base_url = "{}"
+"#,
+                rest.uri()
+            ),
+            Some(r#"{"OPENAI_API_KEY":"sk-rest-test"}"#),
+        );
+        let api_key = call_chat_handler(state, chat(Some(21), "max_completion_tokens", false))
+            .await
+            .expect("api key rest chat");
+        assert_eq!(api_key.status(), StatusCode::OK);
+        assert_no_output_cap_header(&api_key);
+        let _ = axum::body::to_bytes(api_key.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        rest_caps.push(21);
+
+        let requests = rest.received_requests().await.unwrap();
+        assert_eq!(requests.len(), rest_caps.len());
+        let mut forwarded = requests
+            .iter()
+            .map(|req| {
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                assert!(body.get("max_completion_tokens").is_none(), "{body}");
+                assert!(body.get("max_tokens").is_none(), "{body}");
+                body["max_output_tokens"]
+                    .as_u64()
+                    .expect("REST forwarded max_output_tokens") as u32
+            })
+            .collect::<Vec<_>>();
+        forwarded.sort();
+        rest_caps.sort();
+        assert_eq!(forwarded, rest_caps);
+
+        logs_assert(|lines| {
+            let n = cap_warning_lines(lines).len();
+            if n == 10 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "REST must not add drop warnings, got {n}: {lines:?}"
+                ))
+            }
+        });
     }
 
     #[tokio::test]

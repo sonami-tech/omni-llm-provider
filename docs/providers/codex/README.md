@@ -27,8 +27,8 @@ Codex is an OpenAI-compatible backend for Omni's OpenAI inbound surfaces:
 Codex streaming uses native Responses SSE parsing in `provider-codex`; it does
 not use buffered pseudo-streaming.
 
-Anthropic inbound stays Claude-only. Codex does not attempt Anthropic wire
-fidelity.
+Anthropic `/v1/messages` for a Codex model is translated. Codex does not
+attempt Anthropic wire fidelity. `max_tokens` stays required on that route.
 
 ## Config And Auth
 
@@ -122,6 +122,30 @@ The merge into `text` keeps client intent:
 
 Both Codex transports build the request from the same body builder, so the REST
 path and the ChatGPT WebSocket path send the same `text` and `text.format`.
+The output cap is the exception: see [Output cap](#output-cap).
+
+## Output cap
+
+Caller output caps are `max_completion_tokens` or `max_tokens` on
+`/v1/chat/completions`, `max_output_tokens` on `/v1/responses`, and
+`max_tokens` on `/v1/messages`. `/v1/messages` still requires `max_tokens`.
+
+The REST path (API key or custom gateway) forwards that cap as
+`max_output_tokens`. The ChatGPT WebSocket path does not. That backend
+rejects `max_output_tokens`, `max_completion_tokens`, and `max_tokens`, and
+it has no other output-cap field. The proxy removes the cap before
+`response.create`. It does not truncate the output.
+
+Which path runs follows the transport actually used, not the model name.
+ChatGPT OAuth on the default OpenAI-shaped config uses the WebSocket path.
+An API key or a custom gateway uses REST.
+
+When the WebSocket path drops a caller-supplied cap, the proxy logs one
+warning for that request (model, route, and requested value) and sets the
+response header `x-omni-dropped: max_output_tokens` on streaming and
+non-streaming responses, including when the upstream request fails after
+the drop. REST does not log that warning and does not set the header. A
+request with no cap sets neither.
 
 Unsupported extras fail loudly.
 

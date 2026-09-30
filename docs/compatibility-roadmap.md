@@ -16,6 +16,19 @@ Last updated: 2026-09-04.
 | 4. Rich Output Preservation | Done | Usage details, provider metadata, annotations, response metadata, and non-stream Claude reasoning blocks are additive canonical fields. |
 | 5. Compatibility Matrix | Done | `docs/compatibility-matrix.md` tracks supported request, Responses, and rich-output behavior. |
 
+## Codex output cap
+
+Settled with the compatibility matrix, not an open phase. The ChatGPT
+WebSocket path does not enforce a caller output cap. It ignores `max_tokens`
+because that backend rejects `max_output_tokens`, `max_completion_tokens`,
+and `max_tokens`, and it has no other output-cap field. The proxy does not
+truncate the stream. It logs one warning (model, route, and requested value)
+and sets `x-omni-dropped: max_output_tokens` on streaming and non-streaming
+responses, including when the upstream request fails after the drop. The REST path (API key or custom gateway) forwards the cap as
+`max_output_tokens`. `/v1/messages` still requires `max_tokens` for Anthropic
+wire compatibility. The split follows the transport actually used, not the
+model name. See `docs/providers/codex/README.md`.
+
 ## Phase 1: Extras Contract
 
 Goal: make provider-specific extras behavior explicit and testable.

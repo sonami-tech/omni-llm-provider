@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# Lets the server binary's tests point the ChatGPT host at a local mock.
+# Off unless a dev-dependency enables it, so `cargo run` cannot redirect
+# the ChatGPT OAuth token.
+test-support = []
+
 [dependencies]
 omni-core = { path = "../omni-core" }
 omni-common = { path = "../omni-common" }

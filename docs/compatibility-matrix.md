@@ -21,6 +21,16 @@ Normal tests are hermetic and quota-free. Live provider checks remain opt-in via
 
 Unsupported typed media parts and file variants that a selected backend cannot honor fail loudly with a request error. File IDs belong to the receiving provider; Omni does not upload or transfer files between providers. Grok file support uses its Responses route on agentic-capable models.
 
+Codex caller output caps (`max_tokens` / `max_completion_tokens` on Chat,
+`max_output_tokens` on Responses, `max_tokens` on `/v1/messages`): the REST
+path (API key or custom gateway) forwards the cap as `max_output_tokens`.
+The ChatGPT WebSocket path does not enforce the cap and ignores `max_tokens`.
+That path logs one warning (model, route, requested value) and returns
+`x-omni-dropped: max_output_tokens` on streaming and non-streaming responses,
+including when the upstream request fails after the drop.
+The proxy does not truncate output. The split follows the transport actually
+used, not the model name. `/v1/messages` still requires `max_tokens`.
+
 ## Anthropic inbound (`POST /v1/messages`)
 
 | Feature | Claude (native) | Grok (translated) | Codex (translated) |
@@ -36,6 +46,7 @@ Unsupported typed media parts and file variants that a selected backend cannot h
 | Claude Code fingerprint | Yes | No | No |
 | Official `cache_control` | Native passthrough | Translated | Translated |
 | Body `prompt_cache_key` | 400 | 400 | 400 |
+| `max_tokens` | Client value when set | Required on the translated path | Required. REST forwards it. ChatGPT WebSocket ignores it and does not enforce it |
 
 Details and lossy fields: `docs/anthropic-compat.md`.
 Shipped cache translation: `docs/cache-translation.md`.

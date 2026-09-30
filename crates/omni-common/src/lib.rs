@@ -8,6 +8,7 @@ pub mod auth;
 pub mod cache;
 pub mod canonical_mapping;
 pub mod conversation_log;
+pub mod dropped_output_cap;
 pub mod env;
 pub mod error;
 pub mod http;
@@ -33,6 +34,10 @@ pub use anthropic_native_stats::{
 };
 pub use auth::{ApiKeyId, auth_layer};
 pub use conversation_log::{ConversationLog, DEFAULT_LOG_BACKUPS, DEFAULT_LOG_MAX_BYTES};
+pub use dropped_output_cap::{
+    DROPPED_OUTPUT_CAP_HEADER, DROPPED_OUTPUT_CAP_HEADER_VALUE, DroppedOutputCap,
+    dropped_output_cap, note_dropped_output_cap, with_inbound_route,
+};
 pub use env::{env_nonempty, headers_from_env, parse_custom_headers};
 pub use error::{AppError, classify_upstream};
 pub use http::{
