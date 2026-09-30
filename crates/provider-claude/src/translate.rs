@@ -78,8 +78,8 @@ pub struct MessagesRequest {
     /// Top-level Anthropic *automatic* caching marker. When set, the server
     /// places one cache breakpoint on the last cacheable block and moves it
     /// forward as the conversation grows (the documented analog of OpenAI's
-    /// server-side caching). Serialized LAST so it never lands inside the
-    /// cached prefix. Set when the builder copies client `cache.automatic`,
+    /// server-side caching). It does not change the tools, system, and
+    /// messages prefix. Set when the builder copies client `cache.automatic`,
     /// when Door 2 forwards the client's official top-level `cache_control`,
     /// or when first-party OpenAI inbound injects gateway auto-cache.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1256,8 +1256,8 @@ fn apply_client_effort_to_output_config(
 /// 3. wire defaults (fills only still-unset fields)
 /// 4. identity injection (the billing suffix is derived from the
 ///    post-replacement first user text)
-/// 5. auto-cache marker (LAST: a pure top-level appendage; it does not touch the
-///    system/message prefix identity computed by step 4)
+/// 5. auto-cache marker (a pure top-level field; it does not change the
+///    tools, system, and messages prefix that identity computed in step 4)
 ///
 /// Intentionally does **not** raise `max_tokens` when a thinking budget would
 /// prefer more room (issue #19). Client `max_tokens` is sent as given; if the
@@ -1306,13 +1306,13 @@ pub fn finalize_claude_wire_request(
     // the (post-replacement) first user text.
     prepend_claude_code_identity(req, profile, inject_identity);
 
-    // 5. Auto-cache marker LAST. A single top-level `cache_control` puts Anthropic
+    // 5. Auto-cache marker. A single top-level `cache_control` puts Anthropic
     // in automatic-caching mode: the server anchors one breakpoint on the last
     // cacheable block and advances it as the conversation grows. This is a pure
-    // sibling field (serialized after everything else), so it does NOT alter the
-    // tools->system->messages prefix that identity just finalized; the sha-stable
-    // billing header at system[0] means the cached prefix is byte-stable across
-    // turns as long as the client keeps the first user message identical.
+    // sibling field, so it does not change the tools, system, and messages
+    // prefix that identity just finalized; the sha-stable billing header at
+    // system[0] means the cached prefix is byte-stable across turns as long as
+    // the client keeps the first user message identical.
     // Gated to first-party routes only (Bedrock/Vertex do not support automatic
     // caching); the per-model minimum-token floor makes a sub-floor prefix a
     // silent zero-cost no-op, so no size gate is needed here.
