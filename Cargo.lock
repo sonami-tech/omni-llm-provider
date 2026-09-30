@@ -1016,7 +1016,7 @@ dependencies = [
 
 [[package]]
 name = "omni"
-version = "3.16.6"
+version = "3.16.7"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1045,7 +1045,7 @@ dependencies = [
 
 [[package]]
 name = "omni-common"
-version = "3.16.6"
+version = "3.16.7"
 dependencies = [
  "async-stream",
  "axum",
@@ -1066,7 +1066,7 @@ dependencies = [
 
 [[package]]
 name = "omni-core"
-version = "3.16.6"
+version = "3.16.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1170,7 +1170,7 @@ dependencies = [
 
 [[package]]
 name = "provider-claude"
-version = "3.16.6"
+version = "3.16.7"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1195,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "provider-codex"
-version = "3.16.6"
+version = "3.16.7"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1218,7 +1218,7 @@ dependencies = [
 
 [[package]]
 name = "provider-grok"
-version = "3.16.6"
+version = "3.16.7"
 dependencies = [
  "anyhow",
  "async-stream",
