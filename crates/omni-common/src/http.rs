@@ -19,7 +19,9 @@ use omni_core::{
 };
 
 use crate::cache::{parse_openai_cache_intent, parse_prompt_cache_breakpoint};
-use crate::canonical_mapping::{provider_metadata_json, usage_detail_json};
+use crate::canonical_mapping::{
+    client_visible_total_tokens, provider_metadata_json, usage_detail_json,
+};
 
 /// OpenAI-compatible chat completion request (text messages, tools, and core
 /// sampling). Unknown fields are captured in `extras` so a client request never
@@ -798,7 +800,9 @@ pub fn from_canonical(
         }
     });
 
-    let total = canon.usage.input_tokens + canon.usage.output_tokens;
+    let provider = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.provider.as_deref());
 
     ChatCompletionResponse {
         id: chat_id,
@@ -815,7 +819,7 @@ pub fn from_canonical(
             },
             finish_reason: finish,
         }],
-        usage: chat_usage_from_canonical(&canon.usage, total),
+        usage: chat_usage_from_canonical(provider, &canon.usage),
         system_fingerprint: metadata
             .as_ref()
             .and_then(|metadata| metadata.system_fingerprint.clone()),
@@ -826,7 +830,11 @@ pub fn from_canonical(
     }
 }
 
-fn chat_usage_from_canonical(usage: &omni_core::CanonicalUsage, total: u64) -> ChatUsage {
+fn chat_usage_from_canonical(
+    provider: Option<&str>,
+    usage: &omni_core::CanonicalUsage,
+) -> ChatUsage {
+    let total = client_visible_total_tokens(provider, usage);
     let has_split_audio = usage.input_audio_tokens != 0 || usage.output_audio_tokens != 0;
     let prompt_audio_tokens = if has_split_audio {
         usage.input_audio_tokens

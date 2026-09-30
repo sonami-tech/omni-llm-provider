@@ -29,7 +29,9 @@ use serde::{Deserialize, Serialize};
 use crate::cache::{
     parse_openai_cache_intent, parse_prompt_cache_breakpoint, strip_openai_cache_keys,
 };
-use crate::canonical_mapping::{provider_metadata_json, usage_detail_json};
+use crate::canonical_mapping::{
+    client_visible_total_tokens, provider_metadata_json, usage_detail_json,
+};
 use crate::http::{gateway_only_extra_keys, validate_reasoning_effort_lexical};
 
 use omni_core::{
@@ -698,8 +700,10 @@ pub fn responses_from_canonical(
         });
     }
 
-    let total = canon.usage.input_tokens + canon.usage.output_tokens;
-    let usage = responses_usage_from_canonical(&canon.usage, total);
+    let provider = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.provider.as_deref());
+    let usage = responses_usage_from_canonical(provider, &canon.usage);
 
     ResponsesResponse {
         id: response_id,
@@ -721,7 +725,11 @@ pub fn responses_from_canonical(
     }
 }
 
-fn responses_usage_from_canonical(usage: &omni_core::CanonicalUsage, total: u64) -> ResponsesUsage {
+fn responses_usage_from_canonical(
+    provider: Option<&str>,
+    usage: &omni_core::CanonicalUsage,
+) -> ResponsesUsage {
+    let total = client_visible_total_tokens(provider, usage);
     let has_split_audio = usage.input_audio_tokens != 0 || usage.output_audio_tokens != 0;
     let input_audio_tokens = if has_split_audio {
         usage.input_audio_tokens
@@ -860,6 +868,13 @@ struct ResponsesStreamSnapshot<'a> {
     annotations: &'a [serde_json::Value],
 }
 
+fn stream_snapshot_provider(meta: &StreamMeta) -> Option<&str> {
+    meta.provider_metadata
+        .as_ref()
+        .and_then(|value| value.get("provider"))
+        .and_then(|value| value.as_str())
+}
+
 /// Build the terminal response envelope embedded in `response.completed` /
 /// `response.incomplete` / `response.failed`, carrying the aggregated output
 /// and usage so a streaming client ends with the same shape as non-streaming.
@@ -909,40 +924,11 @@ fn responses_stream_envelope(
             ResponsesStreamOutputItem::Message => {}
         }
     }
-    let total = snapshot.usage.input_tokens + snapshot.usage.output_tokens;
-    let has_split_audio =
-        snapshot.usage.input_audio_tokens != 0 || snapshot.usage.output_audio_tokens != 0;
-    let input_audio_tokens = if has_split_audio {
-        snapshot.usage.input_audio_tokens
-    } else {
-        snapshot.usage.audio_tokens
-    };
-    let mut usage = serde_json::json!({
-        "input_tokens": snapshot.usage.input_tokens,
-        "output_tokens": snapshot.usage.output_tokens,
-        "total_tokens": total,
-    });
-    if let Some(details) = usage_detail_json(&[
-        ("cached_tokens", snapshot.usage.cache_read),
-        ("audio_tokens", input_audio_tokens),
-        ("image_tokens", snapshot.usage.image_tokens),
-    ]) {
-        usage["input_tokens_details"] = details;
-    }
-    if let Some(details) = usage_detail_json(&[
-        ("reasoning_tokens", snapshot.usage.reasoning_tokens),
-        ("audio_tokens", snapshot.usage.output_audio_tokens),
-        (
-            "accepted_prediction_tokens",
-            snapshot.usage.accepted_prediction_tokens,
-        ),
-        (
-            "rejected_prediction_tokens",
-            snapshot.usage.rejected_prediction_tokens,
-        ),
-    ]) {
-        usage["output_tokens_details"] = details;
-    }
+    let usage = serde_json::to_value(responses_usage_from_canonical(
+        stream_snapshot_provider(meta),
+        snapshot.usage,
+    ))
+    .expect("responses usage serializes");
     let mut envelope = serde_json::json!({
         "id": meta.response_id,
         "object": "response",
@@ -1560,7 +1546,7 @@ fn responses_error_reason(finish_reason: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::MAX_REASONING_EFFORT_LEN;
+    use crate::http::{MAX_REASONING_EFFORT_LEN, from_canonical};
     use omni_core::{
         CanonicalContent, CanonicalImageSource, CanonicalResponseMetadata, CanonicalStreamEvent,
         CanonicalToolCall, CanonicalToolChoice, CanonicalUsage, ProviderError,
@@ -2413,6 +2399,118 @@ mod tests {
         assert_eq!(v["system_fingerprint"], "fp_resp");
         assert_eq!(v["provider_metadata"]["provider"], "codex");
         assert_eq!(v["provider_metadata"]["num_sources_used"], 1);
+    }
+
+    fn usage_prompt_20_completion_7_reasoning_3() -> CanonicalUsage {
+        CanonicalUsage {
+            input_tokens: 20,
+            output_tokens: 7,
+            reasoning_tokens: 3,
+            ..Default::default()
+        }
+    }
+
+    fn canon_with_provider(provider: &str, usage: CanonicalUsage) -> CanonicalResponse {
+        CanonicalResponse {
+            model: "m".into(),
+            content: "answer".into(),
+            usage,
+            metadata: Some(CanonicalResponseMetadata {
+                provider: Some(provider.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    async fn completed_stream_usage(provider: &str, usage: CanonicalUsage) -> serde_json::Value {
+        let stream = canonical_stream(vec![
+            Ok(CanonicalStreamEvent::ResponseMetadata(
+                CanonicalResponseMetadata {
+                    provider: Some(provider.into()),
+                    ..Default::default()
+                },
+            )),
+            Ok(CanonicalStreamEvent::TextDelta("answer".into())),
+            Ok(CanonicalStreamEvent::Usage(usage)),
+            Ok(CanonicalStreamEvent::Finish {
+                finish_reason: Some("stop".into()),
+            }),
+        ]);
+        let sse = sse_from_canonical_stream_responses(stream, "m".into(), "resp_usage".into(), 0);
+        let payloads = data_payloads(&sse_body_to_string(sse).await);
+        let last = payloads.last().expect("terminal responses event");
+        assert_eq!(last["type"], "response.completed");
+        last["response"]["usage"].clone()
+    }
+
+    #[tokio::test]
+    async fn client_visible_total_adds_grok_reasoning_once() {
+        // WHY: Grok reasoning is additive and excluded from output. Codex and
+        // Claude reasoning is already inside output, or is zero, so the same
+        // counts must not be added again. Chat replies, Responses replies, and
+        // Responses stream snapshots share one total rule. This fails if a Grok
+        // total drops the reasoning term, if reasoning is folded into output,
+        // or if a Codex or Claude total becomes input plus output plus reasoning.
+        let usage = usage_prompt_20_completion_7_reasoning_3();
+        for (provider, total) in [("grok", 30_u64), ("codex", 27), ("claude", 27)] {
+            let chat = serde_json::to_value(from_canonical(
+                canon_with_provider(provider, usage.clone()),
+                "m".into(),
+                "chatcmpl_usage".into(),
+                1,
+            ))
+            .unwrap();
+            assert_eq!(chat["usage"]["prompt_tokens"], 20, "{provider} chat input");
+            assert_eq!(
+                chat["usage"]["completion_tokens"], 7,
+                "{provider} chat output must stay the visible completion count"
+            );
+            assert_eq!(
+                chat["usage"]["total_tokens"], total,
+                "{provider} chat total"
+            );
+            assert_eq!(
+                chat["usage"]["completion_tokens_details"]["reasoning_tokens"], 3,
+                "{provider} chat reasoning detail"
+            );
+
+            let responses = serde_json::to_value(responses_from_canonical(
+                canon_with_provider(provider, usage.clone()),
+                "m".into(),
+                "resp_usage".into(),
+                1,
+            ))
+            .unwrap();
+            assert_eq!(
+                responses["usage"]["input_tokens"], 20,
+                "{provider} responses input"
+            );
+            assert_eq!(
+                responses["usage"]["output_tokens"], 7,
+                "{provider} responses output must stay the visible completion count"
+            );
+            assert_eq!(
+                responses["usage"]["total_tokens"], total,
+                "{provider} responses total"
+            );
+            assert_eq!(
+                responses["usage"]["output_tokens_details"]["reasoning_tokens"], 3,
+                "{provider} responses reasoning detail"
+            );
+
+            let snapshot = completed_stream_usage(provider, usage.clone()).await;
+            assert_eq!(snapshot["input_tokens"], 20, "{provider} stream input");
+            assert_eq!(
+                snapshot["output_tokens"], 7,
+                "{provider} stream output must stay the visible completion count"
+            );
+            assert_eq!(snapshot["total_tokens"], total, "{provider} stream total");
+            assert_eq!(
+                snapshot["output_tokens_details"]["reasoning_tokens"], 3,
+                "{provider} stream reasoning detail"
+            );
+        }
     }
 
     // ---- SSE streaming framing ----

@@ -5,7 +5,24 @@
 
 use serde_json::{Map, Value};
 
-use omni_core::CanonicalResponse;
+use omni_core::{CanonicalResponse, CanonicalUsage};
+
+/// Client-visible `total_tokens` for Chat replies, Responses replies, and
+/// Responses stream snapshots.
+///
+/// Grok reports reasoning tokens in addition to the visible completion count,
+/// so its total is input plus output plus reasoning. Codex and Claude already
+/// include reasoning inside `output_tokens`, or report reasoning as zero, so
+/// their total stays input plus output. One function so the three surfaces
+/// cannot drift. This does not change `output_tokens`.
+pub(crate) fn client_visible_total_tokens(provider: Option<&str>, usage: &CanonicalUsage) -> u64 {
+    let total = usage.input_tokens + usage.output_tokens;
+    if provider == Some("grok") {
+        total + usage.reasoning_tokens
+    } else {
+        total
+    }
+}
 
 /// Build a `*_tokens_details` object from `(key, count)` pairs, omitting any
 /// zero count and returning `None` when nothing remains. Both wire formats emit

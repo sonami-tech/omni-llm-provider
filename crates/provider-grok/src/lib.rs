@@ -3553,8 +3553,40 @@ mod tests {
         assert_eq!(canon.content, "searched");
         assert_eq!(canon.usage.input_tokens, 20);
         assert_eq!(canon.usage.output_tokens, 7);
+        assert_eq!(canon.usage.reasoning_tokens, 3);
         assert_eq!(canon.usage.cache_read, 5);
         // citations stay provider-specific; usage details are lifted into canonical.
+        // WHY (issues #49 and #50): this xAI fixture reports reasoning beside
+        // completion, not inside it. The client total counts reasoning once
+        // (30) and leaves the visible completion count at 7.
+        let chat = omni_common::from_canonical(
+            canon.clone(),
+            "grok-4.5".into(),
+            "chatcmpl-fixture".into(),
+            1,
+        );
+        assert_eq!(chat.usage.prompt_tokens, 20);
+        assert_eq!(chat.usage.completion_tokens, 7);
+        assert_eq!(chat.usage.total_tokens, 30);
+        let chat_json = serde_json::to_value(&chat).unwrap();
+        assert_eq!(
+            chat_json["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            3
+        );
+        let responses = omni_common::responses_from_canonical(
+            canon,
+            "grok-4.5".into(),
+            "resp_fixture".into(),
+            1,
+        );
+        assert_eq!(responses.usage.input_tokens, 20);
+        assert_eq!(responses.usage.output_tokens, 7);
+        assert_eq!(responses.usage.total_tokens, 30);
+        let responses_json = serde_json::to_value(&responses).unwrap();
+        assert_eq!(
+            responses_json["usage"]["output_tokens_details"]["reasoning_tokens"],
+            3
+        );
     }
 
     #[test]
