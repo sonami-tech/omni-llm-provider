@@ -4332,6 +4332,26 @@ requires_openai_auth = false
         omni_common::test_support::ChildGuard::new(cmd.spawn().expect("spawn omni"))
     }
 
+    /// Env for a subprocess that names providers but must boot with no real login.
+    /// GitHub has no credential files, and Claude and Grok exit when those files
+    /// are missing. The fixture only satisfies that startup check. `child_env`
+    /// clears `OMNI_PROVIDERS` for the auto-detect test, so this puts the list
+    /// under test back and keeps any caller keys.
+    fn hermetic_provider_env(
+        homes: &TempDetectedProviderHomes,
+        providers: &str,
+        extra: &[(&str, &str)],
+    ) -> Vec<(String, Option<String>)> {
+        let mut envs = homes.child_env();
+        envs.retain(|(key, _)| key != "OMNI_PROVIDERS");
+        envs.push(("OMNI_PROVIDERS".to_string(), Some(providers.to_string())));
+        for (key, value) in extra {
+            envs.retain(|(existing, _)| existing != *key);
+            envs.push(((*key).to_string(), Some((*value).to_string())));
+        }
+        envs
+    }
+
     fn get(port: u16, path: &str) -> omni_common::test_support::HttpResponse {
         omni_common::test_support::http_get(format!("http://127.0.0.1:{port}{path}"))
     }
@@ -8532,9 +8552,10 @@ rule = [
     #[test]
     fn test_subprocess_omni_binary_health_and_root() {
         let port = free_port();
-        let _child = spawn_omni(
+        let homes = TempDetectedProviderHomes::install();
+        let _child = spawn_omni_owned(
             &["--no-auth", "--port", &port.to_string()],
-            &[("OMNI_PROVIDERS", "claude")],
+            hermetic_provider_env(&homes, "claude", &[]),
         );
         assert!(
             wait_for_200_health(port, subprocess_health_timeout()),
@@ -8549,9 +8570,10 @@ rule = [
     #[test]
     fn test_subprocess_omni_binary_models() {
         let port = free_port();
-        let _child = spawn_omni(
+        let homes = TempDetectedProviderHomes::install();
+        let _child = spawn_omni_owned(
             &["--no-auth", "--port", &port.to_string()],
-            &[("OMNI_PROVIDERS", "claude,grok")],
+            hermetic_provider_env(&homes, "claude,grok", &[]),
         );
         assert!(wait_for_200_health(port, subprocess_health_timeout()));
         let resp = get(port, "/v1/models");
@@ -8601,7 +8623,8 @@ rule = [
         let port = free_port();
         let stats_path = temp_stats_path();
         let _guard = TempStats(stats_path.clone());
-        let _child = spawn_omni(
+        let homes = TempDetectedProviderHomes::install();
+        let _child = spawn_omni_owned(
             &[
                 "--no-auth",
                 "--port",
@@ -8609,7 +8632,7 @@ rule = [
                 "--stats-db",
                 stats_path.to_str().unwrap(),
             ],
-            &[("OMNI_PROVIDERS", "claude")],
+            hermetic_provider_env(&homes, "claude", &[]),
         );
         assert!(wait_for_200_health(port, subprocess_health_timeout()));
 
@@ -8646,13 +8669,11 @@ rule = [
     fn test_subprocess_omni_binary_auth_mw_401_vs_200() {
         // Auth mw (with/without keys, 401 vs 200) - full layered router via binary
         let port = free_port();
+        let homes = TempDetectedProviderHomes::install();
         // with keys set (no --no-auth): unauthed requests 401, authed 200. Wait must auth.
-        let child = spawn_omni(
+        let child = spawn_omni_owned(
             &["--port", &port.to_string()],
-            &[
-                ("OMNI_API_KEYS", "secret123,other"),
-                ("OMNI_PROVIDERS", "claude"),
-            ],
+            hermetic_provider_env(&homes, "claude", &[("OMNI_API_KEYS", "secret123,other")]),
         );
         // wait using proper header (keys case requires it for any surface incl health)
         let start = Instant::now();
@@ -8715,9 +8736,9 @@ rule = [
 
         // without keys (empty or --no-auth) -> 200 even no header
         let port2 = free_port();
-        let _child2 = spawn_omni(
+        let _child2 = spawn_omni_owned(
             &["--no-auth", "--port", &port2.to_string()],
-            &[("OMNI_PROVIDERS", "claude")],
+            hermetic_provider_env(&homes, "claude", &[]),
         );
         assert!(wait_for_200_health(port2, Duration::from_secs(6)));
         let out4 = get(port2, "/health");
@@ -9152,9 +9173,10 @@ rule = [
     fn test_subprocess_omni_binary_completions_routing_errors() {
         // errors (unknown provider, disabled, bad model) via full http
         let port = free_port();
-        let _child = spawn_omni(
+        let homes = TempDetectedProviderHomes::install();
+        let _child = spawn_omni_owned(
             &["--no-auth", "--port", &port.to_string()],
-            &[("OMNI_PROVIDERS", "claude,grok")],
+            hermetic_provider_env(&homes, "claude,grok", &[]),
         );
         assert!(wait_for_200_health(port, subprocess_health_timeout()));
         // unknown prefix
@@ -9247,9 +9269,10 @@ rule = [
     fn test_subprocess_omni_binary_multi_provider_config() {
         // enable both via OMNI_PROVIDERS, test routing to each (prefix)
         let port = free_port();
-        let _child = spawn_omni(
+        let homes = TempDetectedProviderHomes::install();
+        let _child = spawn_omni_owned(
             &["--no-auth", "--port", &port.to_string()],
-            &[("OMNI_PROVIDERS", "claude,grok")],
+            hermetic_provider_env(&homes, "claude,grok", &[]),
         );
         assert!(wait_for_200_health(port, subprocess_health_timeout()));
         // models should list for both
@@ -10421,9 +10444,10 @@ rule = [
         // level (400) before any upstream call, so this is hermetic; a 404 means
         // /v1/responses is not wired.
         let port = free_port();
-        let _child = spawn_omni(
+        let homes = TempDetectedProviderHomes::install();
+        let _child = spawn_omni_owned(
             &["--no-auth", "--port", &port.to_string()],
-            &[("OMNI_PROVIDERS", "claude")],
+            hermetic_provider_env(&homes, "claude", &[]),
         );
         assert!(wait_for_200_health(port, subprocess_health_timeout()));
         let out = post_json(
