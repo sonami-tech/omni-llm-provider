@@ -3,8 +3,6 @@
 This document tracks go-forward compatibility work across sessions. It covers
 the active compatibility plan only.
 
-Last updated: 2026-09-04.
-
 ## Current Status
 
 | Phase | Status | Owner Notes |

@@ -1,7 +1,5 @@
 # Compatibility Matrix
 
-Last updated: 2026-09-04.
-
 Normal tests are hermetic and quota-free. Live provider checks remain opt-in via
 `OMNI_LIVE_TESTS=1`.
 
