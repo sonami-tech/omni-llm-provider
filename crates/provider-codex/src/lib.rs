@@ -60,28 +60,30 @@ const CONSERVATIVE_ORIGINATOR: &str = "codex_exec";
 const CONSERVATIVE_BETA_FEATURES: &str = "remote_compaction_v2";
 const CONSERVATIVE_CLIENT_REQUEST_ID: &str = "00000000-0000-4000-8000-000000000000";
 const CONSERVATIVE_WINDOW_ID: &str = "00000000-0000-4000-8000-000000000000:0";
-const DEFAULT_CODEX_MODEL: &str = "gpt-6-astra";
+const DEFAULT_CODEX_MODEL: &str = "gpt-6.1-sol";
 const DEFAULT_AUTH_COMMAND_TIMEOUT_MS: u64 = 5_000;
 
-// Codex catalog from `codex debug models --bundled` on CLI 0.156.1 (2026-09-23).
-// Visibility=list slugs only, in dump order: gpt-6-astra (default, priority 1),
-// gpt-6-sol, gpt-6-luna, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5.
-// The dump has no alias field, so short names stay on the previous targets:
-// `gpt` / `astra` map to astra; `sol` maps to gpt-5.6-sol; `luna` / `mini` /
-// `gpt-mini` map to gpt-5.6-luna. Hidden slugs stay out of the caller catalog.
-// If that listing cannot be read, rebaseline must fail; do not keep a previous
-// pin's catalog. Custom Responses base_url does not change this source.
+// Codex catalog from `codex debug models --bundled` on CLI 0.161.0 (2026-10-08).
+// Visibility=list slugs only, in priority order: gpt-6.1-sol (default,
+// priority 1), gpt-6-astra, gpt-6-sol, gpt-6-luna, gpt-5.6-sol, gpt-5.6-terra,
+// gpt-5.6-luna, gpt-5.5. The dump has no alias field. Family aliases point at
+// the newest model in each family: `gpt` / `sol` map to gpt-6.1-sol; `luna` /
+// `mini` / `gpt-mini` map to gpt-6-luna; `terra` stays on gpt-5.6-terra (the
+// only terra); `astra` maps to gpt-6-astra. Hidden slugs stay out of the caller
+// catalog. If that listing cannot be read, rebaseline must fail; do not keep a
+// previous pin's catalog. Custom Responses base_url does not change this source.
 /// Pinned Codex CLI version (UA + header fingerprint). Single live pin.
-pub const CODEX_VERSION: &str = "0.156.1";
+pub const CODEX_VERSION: &str = "0.161.0";
 
 /// Model catalog for the active pin.
 const CODEX_CATALOG: &[CatalogModel] = &[
-    CatalogModel::new("gpt-6-astra", &["gpt", "astra"]),
+    CatalogModel::new("gpt-6.1-sol", &["gpt", "sol"]),
+    CatalogModel::new("gpt-6-astra", &["astra"]),
     CatalogModel::new("gpt-6-sol", &[]),
-    CatalogModel::new("gpt-6-luna", &[]),
-    CatalogModel::new("gpt-5.6-sol", &["sol"]),
+    CatalogModel::new("gpt-6-luna", &["luna", "mini", "gpt-mini"]),
+    CatalogModel::new("gpt-5.6-sol", &[]),
     CatalogModel::new("gpt-5.6-terra", &["terra"]),
-    CatalogModel::new("gpt-5.6-luna", &["luna", "mini", "gpt-mini"]),
+    CatalogModel::new("gpt-5.6-luna", &[]),
     CatalogModel::new("gpt-5.5", &[]),
 ];
 
@@ -365,8 +367,16 @@ impl CodexProvider {
         drop(preflight);
 
         let ws_url = config.conservative_responses_ws_url()?;
-        let ws_request = conservative_ws_request(&ws_url, self.version, &auth)?;
         let body = codex_response_create_body(&req)?;
+        // The routing hint and turn metadata name the model and effort that
+        // the response.create frame actually sends.
+        let ws_request = conservative_ws_request(
+            &ws_url,
+            self.version,
+            &auth,
+            &req.model,
+            body.pointer("/reasoning/effort").and_then(Value::as_str),
+        )?;
         // The HTTP edge reads this after send returns: one warning plus
         // `x-omni-dropped`. The cap is not enforced on this path.
         if let Some(requested) = req.max_tokens {
@@ -1504,28 +1514,62 @@ fn conservative_codex_headers(
         "user-agent",
         &conservative_user_agent(version),
     )?;
+    // Codex 0.161.0 sends this on its REST Responses requests (gateway
+    // capture). This is the CLI-parity REST request builder; the custom
+    // gateway and API-key REST path stays free of CLI headers.
+    insert_header(
+        &mut headers,
+        "x-openai-internal-codex-responses-lite",
+        "true",
+    )?;
     Ok(headers)
 }
 
-fn conservative_turn_metadata() -> String {
+/// `x-codex-turn-metadata` for the WebSocket upgrade. The key set matches the
+/// Codex 0.161.0 capture (a run outside a git repo sends no `workspaces`).
+/// Values are fixed synthetic stand-ins, never real workspace or account data.
+/// Only `model` and `reasoning_effort` come from the request; effort is null
+/// when the request sends none.
+fn conservative_turn_metadata(model: &str, reasoning_effort: Option<&str>) -> String {
     json!({
         "installation_id": "omni-llm-provider",
         "session_id": CONSERVATIVE_CLIENT_REQUEST_ID,
         "thread_id": CONSERVATIVE_CLIENT_REQUEST_ID,
+        "agent_name": "/root",
         "turn_id": "",
         "window_id": CONSERVATIVE_WINDOW_ID,
+        "window_number": 0,
+        "context_window_id": CONSERVATIVE_CLIENT_REQUEST_ID,
         "request_kind": "prewarm",
         "thread_source": "user",
         "sandbox": "none",
-        "workspaces": {},
+        "sandbox_mode": "read-only",
+        "auto_review_enabled": false,
+        "node_repl_auto_review_required": true,
+        "node_repl_disabled": false,
+        "analytics_enabled": true,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
     })
     .to_string()
+}
+
+/// Header value built from client request fields. A value that cannot be a
+/// header is a client error, not an auth failure.
+fn request_header_value(name: &str, value: &str) -> Result<http::HeaderValue, ProviderError> {
+    http::HeaderValue::from_str(value).map_err(|_| {
+        ProviderError::BadRequest(format!(
+            "Codex {name} header cannot carry the requested model or reasoning effort"
+        ))
+    })
 }
 
 fn conservative_ws_request(
     ws_url: &str,
     version: &str,
     auth: &ChatGptAuth,
+    model: &str,
+    reasoning_effort: Option<&str>,
 ) -> Result<http::Request<()>, ProviderError> {
     let mut request = ws_url
         .into_client_request()
@@ -1573,7 +1617,14 @@ fn conservative_ws_request(
     );
     headers.insert(
         "x-codex-turn-metadata",
-        http_header_value("x-codex-turn-metadata", &conservative_turn_metadata())?,
+        request_header_value(
+            "x-codex-turn-metadata",
+            &conservative_turn_metadata(model, reasoning_effort),
+        )?,
+    );
+    headers.insert(
+        "x-codex-routing-hint",
+        request_header_value("x-codex-routing-hint", &format!("model={model}"))?,
     );
     Ok(request)
 }
@@ -2709,9 +2760,9 @@ model = "gpt-native"
 
     #[test]
     fn active_catalog_advertises_verified_models_alongside_configured() {
-        // WHY: /v1/models must surface the verified single-pin catalog (gpt-6
-        // astra/sol/luna, the 5.6 family, and still-listed 5.5) AND the
-        // actually-configured model.
+        // WHY: /v1/models must surface the verified single-pin catalog (gpt-6.1
+        // sol, gpt-6 astra/sol/luna, the 5.6 family, and still-listed 5.5) AND
+        // the actually-configured model.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _home = TempCodexHome::new("", None);
         // Clear any OMNI override from a prior test in the shared process.
@@ -2721,6 +2772,7 @@ model = "gpt-native"
         }
         let provider = CodexProvider::new().unwrap();
         let ids: Vec<String> = provider.models_list().into_iter().map(|m| m.id).collect();
+        assert!(ids.iter().any(|id| id == "gpt-6.1-sol"), "ids: {ids:?}");
         assert!(ids.iter().any(|id| id == "gpt-6-astra"), "ids: {ids:?}");
         assert!(ids.iter().any(|id| id == "gpt-6-sol"), "ids: {ids:?}");
         assert!(ids.iter().any(|id| id == "gpt-6-luna"), "ids: {ids:?}");
@@ -2744,13 +2796,14 @@ model = "gpt-native"
         // tests that mutate env.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _home = TempCodexHome::new("", None);
-        assert_eq!(CodexProvider::pinned_version(), "0.156.1");
+        assert_eq!(CodexProvider::pinned_version(), "0.161.0");
         let provider = CodexProvider::new().unwrap();
-        assert_eq!(provider.version, "0.156.1");
+        assert_eq!(provider.version, "0.161.0");
         let ids: Vec<_> = provider.active_catalog().iter().map(|m| m.id).collect();
         assert_eq!(
             ids,
             [
+                "gpt-6.1-sol",
                 "gpt-6-astra",
                 "gpt-6-sol",
                 "gpt-6-luna",
@@ -2760,6 +2813,37 @@ model = "gpt-native"
                 "gpt-5.5"
             ]
         );
+    }
+
+    #[test]
+    fn family_aliases_point_at_newest_model_in_family() {
+        // WHY (operator decision, #56): each family shorthand names the newest
+        // model in that family, and the default follows the priority-1 slug.
+        // A stale alias would silently route `sol` or `mini` to an older model.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _home = TempCodexHome::new("", None);
+        let provider = CodexProvider::new().unwrap();
+        assert_eq!(provider.current_model().unwrap(), "gpt-6.1-sol");
+        let aliases = provider.model_aliases();
+        for (alias, target) in [
+            ("gpt", "gpt-6.1-sol"),
+            ("sol", "gpt-6.1-sol"),
+            ("astra", "gpt-6-astra"),
+            ("luna", "gpt-6-luna"),
+            ("mini", "gpt-6-luna"),
+            ("gpt-mini", "gpt-6-luna"),
+            ("terra", "gpt-5.6-terra"),
+        ] {
+            assert!(
+                aliases.contains(&(alias.to_string(), target.to_string())),
+                "{alias} must map to {target}: {aliases:?}"
+            );
+            assert_eq!(
+                aliases.iter().filter(|(a, _)| a == alias).count(),
+                1,
+                "{alias} must have one target: {aliases:?}"
+            );
+        }
     }
 
     #[test]
@@ -3161,13 +3245,31 @@ query_params = { api-version = "2026-01-01" }
     }
 
     #[test]
-    fn conservative_headers_match_captured_codex_0142_names_and_values() {
+    fn conservative_headers_match_captured_codex_0161_names_and_values() {
+        // WHY: the ChatGPT path is CLI parity. Header names and values (not
+        // order) must match the Codex 0.161.0 capture, including the new REST
+        // responses-lite header, the WebSocket routing hint, and the turn
+        // metadata key set. The CLI cookie is session state and must not appear.
         let auth = ChatGptAuth {
             access_token: "eyJ-fake-oauth".into(),
             account_id: "11111111-2222-3333-4444-555555555555".into(),
         };
-        let headers = conservative_codex_headers("0.156.1", &auth).unwrap();
-        assert_eq!(headers.get("version").unwrap(), "0.156.1");
+        let headers = conservative_codex_headers("0.161.0", &auth).unwrap();
+        let mut names: Vec<&str> = headers.keys().map(|k| k.as_str()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "accept",
+                "authorization",
+                "chatgpt-account-id",
+                "originator",
+                "user-agent",
+                "version",
+                "x-openai-internal-codex-responses-lite",
+            ]
+        );
+        assert_eq!(headers.get("version").unwrap(), "0.161.0");
         assert_eq!(
             headers.get("authorization").unwrap(),
             "Bearer eyJ-fake-oauth"
@@ -3180,13 +3282,21 @@ query_params = { api-version = "2026-01-01" }
         assert_eq!(headers.get("originator").unwrap(), "codex_exec");
         assert_eq!(
             headers.get("user-agent").unwrap(),
-            "codex_exec/0.156.1 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.156.1)"
+            "codex_exec/0.161.0 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.161.0)"
+        );
+        assert_eq!(
+            headers
+                .get("x-openai-internal-codex-responses-lite")
+                .unwrap(),
+            "true"
         );
 
         let request = conservative_ws_request(
             "ws://127.0.0.1/backend-api/codex/responses",
-            "0.156.1",
+            "0.161.0",
             &auth,
+            "gpt-6.1-sol",
+            Some("high"),
         )
         .unwrap();
         let ws_headers = request.headers();
@@ -3200,7 +3310,7 @@ query_params = { api-version = "2026-01-01" }
             CONSERVATIVE_BETA_FEATURES
         );
         assert_eq!(ws_headers.get("originator").unwrap(), "codex_exec");
-        assert_eq!(ws_headers.get("version").unwrap(), "0.156.1");
+        assert_eq!(ws_headers.get("version").unwrap(), "0.161.0");
         assert_eq!(
             ws_headers.get("x-client-request-id").unwrap(),
             CONSERVATIVE_CLIENT_REQUEST_ID
@@ -3213,6 +3323,17 @@ query_params = { api-version = "2026-01-01" }
             ws_headers.get("thread-id").unwrap(),
             CONSERVATIVE_CLIENT_REQUEST_ID
         );
+        assert_eq!(
+            ws_headers.get("x-codex-routing-hint").unwrap(),
+            "model=gpt-6.1-sol"
+        );
+        assert!(ws_headers.get("cookie").is_none());
+        // The WebSocket upgrade does not carry the REST-only header.
+        assert!(
+            ws_headers
+                .get("x-openai-internal-codex-responses-lite")
+                .is_none()
+        );
         let metadata: Value = serde_json::from_str(
             ws_headers
                 .get("x-codex-turn-metadata")
@@ -3221,9 +3342,92 @@ query_params = { api-version = "2026-01-01" }
                 .unwrap(),
         )
         .unwrap();
+        let mut keys: Vec<&str> = metadata
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "agent_name",
+                "analytics_enabled",
+                "auto_review_enabled",
+                "context_window_id",
+                "installation_id",
+                "model",
+                "node_repl_auto_review_required",
+                "node_repl_disabled",
+                "reasoning_effort",
+                "request_kind",
+                "sandbox",
+                "sandbox_mode",
+                "session_id",
+                "thread_id",
+                "thread_source",
+                "turn_id",
+                "window_id",
+                "window_number",
+            ],
+            "turn metadata key set must match the 0.161.0 capture"
+        );
+        assert_eq!(metadata["model"], "gpt-6.1-sol");
+        assert_eq!(metadata["reasoning_effort"], "high");
         assert_eq!(metadata["request_kind"], "prewarm");
         assert_eq!(metadata["thread_source"], "user");
-        assert_eq!(metadata["workspaces"], json!({}));
+        assert_eq!(metadata["installation_id"], "omni-llm-provider");
+        assert_eq!(metadata["window_id"], CONSERVATIVE_WINDOW_ID);
+        assert_eq!(metadata["window_number"], 0);
+
+        // No requested effort: the key stays, with a null value.
+        let request = conservative_ws_request(
+            "ws://127.0.0.1/backend-api/codex/responses",
+            "0.161.0",
+            &auth,
+            "gpt-6-luna",
+            None,
+        )
+        .unwrap();
+        let metadata: Value = serde_json::from_str(
+            request
+                .headers()
+                .get("x-codex-turn-metadata")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["model"], "gpt-6-luna");
+        assert!(metadata["reasoning_effort"].is_null());
+        assert_eq!(
+            request.headers().get("x-codex-routing-hint").unwrap(),
+            "model=gpt-6-luna"
+        );
+    }
+
+    #[test]
+    fn conservative_ws_request_rejects_model_that_cannot_be_a_header() {
+        // WHY: the routing hint carries the client model id. An id that
+        // cannot be a header value is a client error (400), not an auth
+        // failure that would point the caller at their credentials.
+        let auth = ChatGptAuth {
+            access_token: "eyJ-fake-oauth".into(),
+            account_id: "acct".into(),
+        };
+        let err = conservative_ws_request(
+            "ws://127.0.0.1/backend-api/codex/responses",
+            "0.161.0",
+            &auth,
+            "gpt-6.1-sol\nx-injected: 1",
+            None,
+        )
+        .expect_err("control characters cannot be sent in a header");
+        assert!(
+            matches!(err, ProviderError::BadRequest(_)),
+            "expected BadRequest, got {err:?}"
+        );
     }
 
     #[test]
@@ -3374,18 +3578,34 @@ requires_openai_auth = false
         );
         assert_eq!(
             headers.get("user-agent").unwrap().to_str().unwrap(),
-            "codex_exec/0.156.1 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.156.1)"
+            "codex_exec/0.161.0 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.161.0)"
         );
         assert_eq!(headers.get("originator").unwrap(), "codex_exec");
         assert_eq!(
             headers.get("openai-beta").unwrap(),
             CONSERVATIVE_OPENAI_BETA
         );
-        assert_eq!(headers.get("version").unwrap(), "0.156.1");
+        assert_eq!(headers.get("version").unwrap(), "0.161.0");
         assert_eq!(
             headers.get("x-codex-beta-features").unwrap(),
             CONSERVATIVE_BETA_FEATURES
         );
+        // The routing hint and turn metadata name the model and the mapped
+        // effort that the response.create frame sends (request: gpt-5.5, max).
+        assert_eq!(
+            headers.get("x-codex-routing-hint").unwrap(),
+            "model=gpt-5.5"
+        );
+        let metadata: Value = serde_json::from_str(
+            headers
+                .get("x-codex-turn-metadata")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["model"], "gpt-5.5");
+        assert_eq!(metadata["reasoning_effort"], "high");
         Ok(response)
     }
 
@@ -3487,7 +3707,8 @@ model = "gpt-5.5"
             .and(header("authorization", "Bearer eyJ-test-oauth"))
             .and(header("chatgpt-account-id", "acct-test"))
             .and(header("originator", "codex_exec"))
-            .and(header("version", "0.156.1"))
+            .and(header("version", "0.161.0"))
+            .and(header("x-openai-internal-codex-responses-lite", "true"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "models": [{"slug": "gpt-5.5", "prefer_websockets": true}]
             })))
@@ -3512,6 +3733,10 @@ model = "gpt-5.5"
                     role: "user".into(),
                     content: CanonicalContent::Text("hi".into()),
                 }],
+                reasoning: Some(CanonicalReasoning {
+                    effort: Some("max".into()),
+                    budget_tokens: None,
+                }),
                 ..Default::default()
             })
             .await
@@ -3531,6 +3756,7 @@ model = "gpt-5.5"
         let body = body_rx.await.unwrap();
         assert_eq!(body["type"], "response.create");
         assert_eq!(body["model"], "gpt-5.5");
+        assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"], "hi");
         assert!(body.get("stream").is_none());

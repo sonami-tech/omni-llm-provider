@@ -2,7 +2,7 @@
 
 Codex-specific behavior lives in `crates/provider-codex`.
 
-Single pin: Codex CLI **0.156.1**. `--codex-version` / `OMNI_CODEX_VERSION` and
+Single pin: Codex CLI **0.161.0**. `--codex-version` / `OMNI_CODEX_VERSION` and
 match-system flags are removed (issue #12). Rebaseline overwrites this pin;
 older wire needs an older Omni release.
 
@@ -154,11 +154,28 @@ Unsupported extras fail loudly.
 Rebaseline overwrites the single pin, including the model catalog. The catalog
 source is `codex debug models --bundled` (`visibility=list` slugs). A custom
 Responses `base_url` is not a reason to skip. If that command fails or lists
-no models, stop. Do not keep the previous pin's catalog. The 2026-09-23
-capture returned a successful Responses POST on the configured custom endpoint.
-`visibility=list` includes `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`,
-`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, and `gpt-5.5`. The user-agent
-comes from that successful exec, not the bundled catalog.
+no models, stop. Do not keep the previous pin's catalog. The 2026-10-08
+capture returned a successful Responses POST on the configured custom endpoint
+and a successful ChatGPT WebSocket turn. `visibility=list` includes
+`gpt-6.1-sol` (priority 1, the default), `gpt-6-astra`, `gpt-6-sol`,
+`gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, and `gpt-5.5`.
+The user-agent comes from that successful exec, not the bundled catalog.
+
+The bundled catalog has no alias field. Family aliases point at the newest
+model in each family: `gpt` and `sol` map to `gpt-6.1-sol`, `astra` to
+`gpt-6-astra`, `luna`, `mini`, and `gpt-mini` to `gpt-6-luna`, and `terra` to
+`gpt-5.6-terra`. The `gpt` alias still follows the configured model when the
+config names one. Source of truth: `CODEX_CATALOG` in
+`crates/provider-codex/src/lib.rs`.
+
+Codex 0.161.0 adds `x-openai-internal-codex-responses-lite: true` to its REST
+Responses requests and `x-codex-routing-hint: model=<model>` to the WebSocket
+upgrade. Omni sends the first on its CLI-parity REST request (the ChatGPT
+models preflight) and the second on the WebSocket upgrade. The WebSocket
+`x-codex-turn-metadata` carries the 0.161.0 key set with fixed synthetic
+values; only `model` and `reasoning_effort` come from the request. The custom
+gateway and API-key REST path sends no CLI headers, and Omni never sends the
+CLI `cookie`.
 
 ```sh
 python3 -m tools.capture catalog --provider codex
