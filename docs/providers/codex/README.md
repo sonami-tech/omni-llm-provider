@@ -183,6 +183,10 @@ Refresh validation proves traffic to the selected API `base_url` (from
 `openai_base_url` or `[model_providers.<id>].base_url`). Separate auth-host proof
 awaits a stable observed auth endpoint; do not invent auth hosts.
 
+When the config sets no base URL, the built-in provider host follows the
+staged `auth.json`. ChatGPT sign-in requires `chatgpt.com`. An API key
+requires `api.openai.com`.
+
 Dry-run uses placeholder credential paths only. It does not copy real credentials
 or create a tmpfs workdir.
 

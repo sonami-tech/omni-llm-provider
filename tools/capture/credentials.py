@@ -371,12 +371,50 @@ def stage_credentials(
 
 
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+# Native Codex with ChatGPT sign-in talks to the ChatGPT backend, not the
+# OpenAI API host (REST preflight and the WebSocket upgrade both go here).
+CHATGPT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 DEFAULT_CODEX_PROVIDER_ID = "openai"
 
 
 def _toml_str(value: dict[str, Any], key: str) -> str | None:
     raw = value.get(key)
     return raw if isinstance(raw, str) else None
+
+
+def codex_uses_chatgpt_auth(auth_path: Path) -> bool:
+    """Whether a Codex `auth.json` selects ChatGPT sign-in, not an API key.
+
+    An explicit `auth_mode` wins. Without it, a stored `OPENAI_API_KEY` means
+    API-key auth, and a ChatGPT `tokens.access_token` means ChatGPT sign-in.
+    A missing or unreadable file is not ChatGPT auth.
+    """
+    if not auth_path.is_file():
+        return False
+    try:
+        data = _load_json(auth_path)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    mode = _toml_str(data, "auth_mode")
+    if mode and mode.strip():
+        return mode.strip().lower() == "chatgpt"
+    if _toml_str(data, "OPENAI_API_KEY"):
+        return False
+    tokens = data.get("tokens")
+    return isinstance(tokens, dict) and bool(_toml_str(tokens, "access_token"))
+
+
+def _codex_default_base_url(config_path: Path) -> str:
+    """Base URL of the built-in provider when config sets no `openai_base_url`.
+
+    Codex picks it from the auth mode in the same CODEX_HOME: ChatGPT sign-in
+    uses the ChatGPT backend; an API key uses the OpenAI API.
+    """
+    if codex_uses_chatgpt_auth(config_path.parent / "auth.json"):
+        return CHATGPT_CODEX_BASE_URL
+    return DEFAULT_OPENAI_BASE_URL
 
 
 def _find_model_provider_table(
@@ -393,7 +431,7 @@ def _find_model_provider_table(
     return None
 
 
-def _codex_base_url_from_parsed(value: dict[str, Any]) -> str | None:
+def _codex_base_url_from_parsed(value: dict[str, Any], default_base_url: str) -> str | None:
     provider_id = _toml_str(value, "model_provider") or DEFAULT_CODEX_PROVIDER_ID
     providers_raw = value.get("model_providers")
     providers = providers_raw if isinstance(providers_raw, dict) else None
@@ -402,14 +440,14 @@ def _codex_base_url_from_parsed(value: dict[str, Any]) -> str | None:
         openai_entry = providers.get("openai")
         if isinstance(openai_entry, dict):
             # Mirror provider-codex: reserved [model_providers.openai] uses openai_base_url.
-            return _toml_str(value, "openai_base_url") or DEFAULT_OPENAI_BASE_URL
+            return _toml_str(value, "openai_base_url") or default_base_url
 
     provider = (
         _find_model_provider_table(providers, provider_id) if providers is not None else None
     )
     built_in_openai = provider_id == DEFAULT_CODEX_PROVIDER_ID and provider is None
     if built_in_openai:
-        return _toml_str(value, "openai_base_url") or DEFAULT_OPENAI_BASE_URL
+        return _toml_str(value, "openai_base_url") or default_base_url
 
     if provider is None:
         return None
@@ -426,7 +464,7 @@ def _strip_toml_value(raw: str) -> str:
     return value
 
 
-def _codex_base_url_raw_fallback(text: str) -> str | None:
+def _codex_base_url_raw_fallback(text: str, default_base_url: str) -> str | None:
     provider_id = DEFAULT_CODEX_PROVIDER_ID
     openai_base_url: str | None = None
     active_section: str | None = None
@@ -463,11 +501,11 @@ def _codex_base_url_raw_fallback(text: str) -> str | None:
 
     if provider_id == DEFAULT_CODEX_PROVIDER_ID:
         if "openai" in provider_sections:
-            return openai_base_url or DEFAULT_OPENAI_BASE_URL
+            return openai_base_url or default_base_url
         if provider_id not in provider_sections and not any(
             key.lower() == provider_id.lower() for key in provider_sections
         ):
-            return openai_base_url or DEFAULT_OPENAI_BASE_URL
+            return openai_base_url or default_base_url
 
     for key, base_url in provider_sections.items():
         if key == provider_id or key.lower() == provider_id.lower():
@@ -478,16 +516,17 @@ def _codex_base_url_raw_fallback(text: str) -> str | None:
 def codex_base_url(config_path: Path) -> str | None:
     if not config_path.is_file():
         return None
+    default_base_url = _codex_default_base_url(config_path)
     text = config_path.read_text(encoding="utf-8")
     if not text.strip():
-        return DEFAULT_OPENAI_BASE_URL
+        return default_base_url
     try:
         parsed = tomllib.loads(text)
     except tomllib.TOMLDecodeError:
-        return _codex_base_url_raw_fallback(text)
+        return _codex_base_url_raw_fallback(text, default_base_url)
     if not isinstance(parsed, dict):
-        return _codex_base_url_raw_fallback(text)
-    return _codex_base_url_from_parsed(parsed)
+        return _codex_base_url_raw_fallback(text, default_base_url)
+    return _codex_base_url_from_parsed(parsed, default_base_url)
 
 
 def codex_base_url_host(config_path: Path) -> str | None:
@@ -498,12 +537,18 @@ def codex_base_url_host(config_path: Path) -> str | None:
 
 
 def codex_primary_api_host(config_path: Path) -> str:
-    return codex_base_url_host(config_path) or "api.openai.com"
+    # With no config file, Codex still runs the built-in provider, whose
+    # default host follows the auth mode in the same CODEX_HOME.
+    return (
+        codex_base_url_host(config_path)
+        or urlparse(_codex_default_base_url(config_path)).hostname
+        or "api.openai.com"
+    )
 
 
 def codex_expected_hosts(config_path: Path) -> list[str]:
     hosts = ["api.openai.com"]
-    base_host = codex_base_url_host(config_path)
-    if base_host and base_host not in hosts:
+    base_host = codex_primary_api_host(config_path)
+    if base_host not in hosts:
         hosts.append(base_host)
     return hosts

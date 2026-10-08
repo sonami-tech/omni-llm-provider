@@ -47,6 +47,7 @@ from tools.capture.providers import (  # noqa: E402
     build_provider_commands,
     build_provider_env,
     command_plan,
+    expected_hosts_for_provider,
     provider_command_stdin,
     required_hosts_for_validation,
 )
@@ -523,6 +524,101 @@ class ExtractionTests(unittest.TestCase):
             self.assertEqual(required_custom, ("proxy.example.com",))
             with self.assertRaises(RuntimeError):
                 validate_expected_hosts(["api.openai.com"], required_custom)
+
+    def _staged_codex(self, root: Path, auth: dict[str, object] | None) -> StagedCredentials:
+        clean_codex = root / "clean-codex"
+        clean_codex.mkdir(exist_ok=True)
+        (clean_codex / "config.toml").write_text('model = "gpt-6.1-sol"\n', encoding="utf-8")
+        if auth is not None:
+            (clean_codex / "auth.json").write_text(json.dumps(auth), encoding="utf-8")
+        return StagedCredentials(
+            provider="codex",
+            clean_home=root / "clean-home",
+            clean_codex_home=clean_codex,
+            copied_paths=(),
+            source_paths=(),
+            env_overrides={},
+        )
+
+    def test_codex_chatgpt_auth_expects_chatgpt_host(self) -> None:
+        # WHY: native Codex with ChatGPT sign-in (CODEX_HOME=~/.codex-oauth)
+        # talks to chatgpt.com and never to api.openai.com. Requiring
+        # api.openai.com made a valid 0.161.0 capture fail closed.
+        chatgpt_auth = {
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": None,
+            "tokens": {
+                "access_token": "synthetic-access",
+                "account_id": "synthetic-account",
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            staged = self._staged_codex(Path(tmp), chatgpt_auth)
+            assert staged.clean_codex_home is not None
+            config = staged.clean_codex_home / "config.toml"
+
+            required = required_hosts_for_validation("codex", "general", staged)
+            self.assertEqual(required, ("chatgpt.com",))
+            self.assertIn("chatgpt.com", expected_hosts_for_provider("codex", staged))
+            # The host set that the failing native capture saw now passes.
+            validate_expected_hosts(
+                ["ab.chatgpt.com", "chatgpt.com", "sdmntprcentralus.oaiusercontent.com"],
+                required,
+            )
+            with self.assertRaises(RuntimeError):
+                validate_expected_hosts(["api.openai.com"], required)
+
+            # Without auth_mode, ChatGPT tokens still mean ChatGPT sign-in.
+            (staged.clean_codex_home / "auth.json").write_text(
+                json.dumps({"tokens": {"access_token": "synthetic-access"}}),
+                encoding="utf-8",
+            )
+            self.assertEqual(codex_primary_api_host(config), "chatgpt.com")
+
+            # With no config file, Codex runs the built-in provider, which
+            # still follows the auth mode.
+            config.unlink()
+            self.assertEqual(
+                required_hosts_for_validation("codex", "general", staged),
+                ("chatgpt.com",),
+            )
+
+            # An explicit base URL wins over the ChatGPT default.
+            config.write_text('openai_base_url = "https://alt.example.com/v1"\n', encoding="utf-8")
+            self.assertEqual(codex_primary_api_host(config), "alt.example.com")
+            config.write_text(
+                'model_provider = "proxy"\n'
+                '[model_providers.proxy]\n'
+                'base_url = "https://proxy.example.com/v1"\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(codex_primary_api_host(config), "proxy.example.com")
+
+    def test_codex_api_key_auth_keeps_openai_host(self) -> None:
+        # WHY: an API key on the built-in provider still talks to the OpenAI
+        # API. Leftover ChatGPT tokens must not flip it to chatgpt.com.
+        for auth in (
+            {"auth_mode": "apikey", "OPENAI_API_KEY": "synthetic-key"},
+            {
+                "auth_mode": "apikey",
+                "tokens": {"access_token": "synthetic-access", "account_id": "a"},
+            },
+            {
+                "OPENAI_API_KEY": "synthetic-key",
+                "tokens": {"access_token": "synthetic-access", "account_id": "a"},
+            },
+            {"tokens": {"access_token": ""}},
+            None,
+        ):
+            with self.subTest(auth=auth), tempfile.TemporaryDirectory() as tmp:
+                staged = self._staged_codex(Path(tmp), auth)
+                self.assertEqual(
+                    required_hosts_for_validation("codex", "general", staged),
+                    ("api.openai.com",),
+                )
+                self.assertEqual(
+                    expected_hosts_for_provider("codex", staged), ("api.openai.com",)
+                )
 
     def test_hosts_in_jsonl(self) -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as handle:
