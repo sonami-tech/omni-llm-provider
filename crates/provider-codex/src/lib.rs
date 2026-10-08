@@ -3439,7 +3439,8 @@ query_params = { api-version = "2026-01-01" }
         )
         .unwrap();
         assert_eq!(metadata["model"], "gpt-6-luna");
-        assert!(metadata["reasoning_effort"].is_null());
+        // `get`, not indexing: indexing a missing key also yields Null.
+        assert_eq!(metadata.get("reasoning_effort"), Some(&Value::Null));
         assert_eq!(
             request.headers().get("x-codex-routing-hint").unwrap(),
             "model=gpt-6-luna"

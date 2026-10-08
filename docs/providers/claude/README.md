@@ -38,9 +38,10 @@ the **OpenAI inbound → Claude** path, **effort-capable** models pass free-stri
 effort allowlist; unknown names may 400 from upstream by design. Fail loud only
 when the thinking-budget ladder cannot map the value (e.g. `xhigh` on a model
 without `output_config.effort`; the 2.1.293 pin has none).
-Precedence remains **client effort > pin default > absent**. This does not
-change native Anthropic `/v1/messages` (closed allowlist still drops client
-`output_config`). Operator summary: `docs/README.md`.
+Precedence remains **client effort > pin default > absent**. Native Anthropic
+`/v1/messages` also forwards client `output_config` as given and fills the pin
+default only when the client omits it (issue #22; see Provider Extras below).
+Operator summary: `docs/README.md`.
 
 ## max_tokens and thinking (issue #19)
 

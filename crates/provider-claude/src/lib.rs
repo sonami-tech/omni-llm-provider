@@ -1073,18 +1073,18 @@ mod tests {
         //     exact prefix bytes are a prefix of Turn 2's request. A cache READ on
         //     Turn 2 is therefore only possible if that shared prefix (including our
         //     injected billing + preamble) was byte-identical across the two builds.
-        //   - The shared message is padded far past the model floor. This uses
-        //     Haiku 4.5, whose floor is 4096 tokens (the highest of the family), so
-        //     the padding targets ~9k tokens to clear it with margin. Below the floor
+        //   - The shared message is padded far past the model floor. The `haiku`
+        //     alias resolves to Haiku 5.5. Haiku 4.5's floor was 4096 tokens (the
+        //     highest of the family); Haiku 5.5's floor is not verified offline,
+        //     so the padding targets ~9k tokens to clear 4096 with margin. Below the floor
         //     Anthropic silently declines to cache and cache_creation would be 0 ->
         //     so requiring cache_creation > 0 on Turn 1 simultaneously proves we
         //     cleared the floor (#2) and that the marker is live. Padding is
         //     deterministic (fixed string), so no clock/nonce leaks into the prefix.
-        //   - Model: catalog alias `haiku` (not a dated id). NOT Sonnet: the
-        //     active profile's wire override injects output_config.effort="high"
-        //     for opus/sonnet/fable, and the live Anthropic API rejects `effort`
-        //     on current Sonnet with a 400. Haiku's wire override sets
-        //     output_effort=None, so its request is valid.
+        //   - Model: catalog alias `haiku` (not a dated id), the cheapest catalog
+        //     model. On the 2.1.293 pin it sends output_config.effort="medium"
+        //     like the other catalog models; the capture shows Haiku 5.5 accepts
+        //     it.
         //
         // Guarded exactly like claude_send_exercises_full_fingerprint_path: opt-in
         // via OMNI_LIVE_TESTS=1, real creds required, CLAUDE_CREDENTIALS_PATH
@@ -1121,7 +1121,7 @@ mod tests {
             return;
         }
 
-        // Deterministic padding well past Haiku's 4096-token floor. ~4 chars/token
+        // Deterministic padding well past a 4096-token floor. ~4 chars/token
         // => ~36k chars targets ~9k tokens, comfortably clearing the floor with
         // margin for tokenizer variance. Fixed content: identical bytes every turn.
         let big_context = format!(

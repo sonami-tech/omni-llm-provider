@@ -1230,7 +1230,9 @@ fn apply_client_effort_to_output_config(
         });
         return Ok(());
     }
-    // No output_config surface (e.g. Haiku pin). Thinking budget may still
+    // No output_config surface (a pin model with no `output_effort` and no
+    // effort beta; none on the 2.1.293 pin, see the cfg(test) no-effort
+    // profile in fingerprint.rs). Thinking budget may still
     // express known ladder values; unmappable efforts must not silently vanish.
     // Shared structured shape (issue #25); thinking-budget-only models still
     // fail loud for values with no budget mapping.
