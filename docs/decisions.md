@@ -291,8 +291,8 @@ pseudo-streaming.
   absent**. Client effort sets `output_config.effort` before pin wire defaults.
   Pin defaults apply only when effort is absent. Explicit `none` suppresses pin
   fill. Effort-capable models prefer `output_config` over effort-derived
-  thinking budgets; models without that surface (e.g. Haiku) use thinking
-  budgets and fail loud when unmappable.
+  thinking budgets; models without that surface (Haiku before the 2.1.293
+  pin) use thinking budgets and fail loud when unmappable.
 - Rationale: clients and providers add new effort names faster than a gateway
   allowlist can track. Closing the edge name set either blocks real traffic or
   forces silent drops. Open edge + per-adapter map-or-fail preserves client

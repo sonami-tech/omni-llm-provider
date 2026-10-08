@@ -61,7 +61,7 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
 
    ```sh
    tools/providers/claude/fingerprint/capture_baseline.sh \
-     claude-fable-5 claude-haiku-4-5 claude-sonnet-5 claude-opus-5
+     claude-fable-5-1 claude-haiku-5-5 claude-sonnet-5-5 claude-opus-5-5
    ```
 
    Both helpers start mitmdump as a reverse proxy to `https://api.anthropic.com`,
@@ -144,19 +144,26 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
 - Captured fields are represented in source.
 - Default workspace tests pass without credentials or network.
 
-## Current 2.1.281 Status
+## Current 2.1.293 Status
 
-On 2026-09-23 the clean-HOME general capture returned HTTP 200 for default,
+On 2026-10-08 the clean-HOME general capture returned HTTP 200 for default,
 `opus`, `sonnet`, `haiku`, and `fable`. The observed catalog contains
-`claude-opus-5-5`, `claude-sonnet-5`, `claude-haiku-4-5-20251001`, and
-`claude-fable-5-1`. Fable acceptance is a successful POST, not a rate
-limit. The explicit `claude-fable-5` path was not recaptured; its prior
+`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, and
+`claude-fable-5-1`. `claude-sonnet-5` and `claude-haiku-4-5*` left the
+catalog with their overrides; they now pass through raw like any unknown
+id. The explicit `claude-fable-5` path was not recaptured; its prior
 pass-through and wire override remain unchanged.
 
-Default and explicit Opus use 128000 max tokens and medium effort. Sonnet
-and Fable use 64000 and high effort. Haiku uses 32000 and omits
-`output_config`. SDK package `0.112.1`, runtime `v26.3.0`, and Anthropic
-version `2023-06-01` were observed. Billing is
-`cc_version=2.1.281.3ee; cc_entrypoint=sdk-cli;` for `Say OK`; no `cch=`
-was emitted. The `Sha256Utf16SampleV1` suffix stays in use. Beta lists
-match the previous pin.
+Default, Opus, Sonnet, and Haiku use 128000 max tokens and medium effort.
+Fable uses 64000 and high effort. Haiku now has `output_config.effort`, so
+client effort maps to `output_config.effort` on every catalog model. SDK
+package `0.128.0`, runtime `v26.3.0`, and Anthropic version `2023-06-01`
+were observed. Billing is `cc_version=2.1.293.33e; cc_entrypoint=sdk-cli;`
+for `Say OK`; no `cch=` was emitted. The `Sha256Utf16SampleV1` suffix stays
+in use.
+
+Every beta list drops `fallback-credit-2026-06-01` and adds
+`dangerous-tool-use-2026-09-03` and `afk-mode-2026-01-31`. The default list
+drops `context-1m-2025-08-07` and equals Opus. Sonnet and Fable equal Opus.
+Haiku has the same members with `claude-code-20250219` after
+`mid-conversation-system-2026-04-07`.

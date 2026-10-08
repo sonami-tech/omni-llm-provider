@@ -167,8 +167,9 @@ optional model, optional supported list). Grok and Codex use
   (so pin cannot overwrite). Pin defaults apply only when client effort is
   absent. Explicit `"none"` suppresses pin fill. Models with
   an effort surface prefer `output_config` over effort-derived thinking
-  budgets; models without it (e.g. Haiku) use the thinking-budget ladder and
-  fail loud when the ladder cannot express the value.
+  budgets; models without it (Haiku before the 2.1.293 pin) use the
+  thinking-budget ladder and fail loud when the ladder cannot express the
+  value.
   On the OpenAI chat/Responses path, effort-capable models pass free-string
   **non-`none`** effort through to `output_config.effort` (issue #26); only
   `minimal`→`low` is remapped (`max` and others stay as-is). There is no closed

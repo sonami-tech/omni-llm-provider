@@ -667,7 +667,7 @@ mod tests {
         assert_eq!(provider_id(), "claude");
         let p = ClaudeProvider::new().expect("default profile constructs");
         assert_eq!(p.id(), "claude");
-        assert_eq!(p.profile().name, "cc-2.1.281-sdk-cli");
+        assert_eq!(p.profile().name, "cc-2.1.293-sdk-cli");
     }
 
     #[test]
@@ -757,7 +757,7 @@ mod tests {
     fn resolve_via_profile_still_claude_specific() {
         let p = ClaudeProvider::new().unwrap();
         let m = p.profile().resolve_model("sonnet").unwrap();
-        assert_eq!(m.canonical, "claude-sonnet-5");
+        assert_eq!(m.canonical, "claude-sonnet-5-5");
     }
 
     #[test]
@@ -1240,8 +1240,8 @@ mod tests {
         // WHY: single-pin world (issue #12) — test helpers must still construct
         // a provider on the shipped fingerprint, not a deleted historical profile.
         let p = ClaudeProvider::new_for_test(crate::fingerprint::default_profile());
-        assert_eq!(p.profile().name, "cc-2.1.281-sdk-cli");
-        assert_eq!(p.profile().claude_cli_version, "2.1.281");
+        assert_eq!(p.profile().name, "cc-2.1.293-sdk-cli");
+        assert_eq!(p.profile().claude_cli_version, "2.1.293");
     }
 
     #[test]
@@ -1289,13 +1289,13 @@ mod tests {
         let prof = p.profile();
         // canonical -> resolves
         assert_eq!(
-            prof.resolve_model("claude-sonnet-5").unwrap().canonical,
-            "claude-sonnet-5"
+            prof.resolve_model("claude-sonnet-5-5").unwrap().canonical,
+            "claude-sonnet-5-5"
         );
         // alias -> resolves
         assert_eq!(
             prof.resolve_model("sonnet").unwrap().canonical,
-            "claude-sonnet-5"
+            "claude-sonnet-5-5"
         );
         // substring -> NO LONGER resolves (matcher deleted): passes through raw
         assert!(prof.resolve_model("foo-sonnet-bar").is_none());
@@ -1306,13 +1306,12 @@ mod tests {
         );
         // unknown -> NO LONGER defaults: passes through raw
         assert!(prof.resolve_model("weird").is_none());
-        // exact dated canonical -> resolves
+        // exact canonical -> resolves; the removed dated id passes through raw
         assert_eq!(
-            prof.resolve_model("claude-haiku-4-5-20251001")
-                .unwrap()
-                .canonical,
-            "claude-haiku-4-5-20251001"
+            prof.resolve_model("claude-haiku-5-5").unwrap().canonical,
+            "claude-haiku-5-5"
         );
+        assert!(prof.resolve_model("claude-haiku-4-5-20251001").is_none());
     }
 
     #[test]

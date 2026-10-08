@@ -9,7 +9,7 @@
 //! - --providers claude,grok,codex   or   OMNI_PROVIDERS=... (comma sep, order preserved).
 //!   When omitted, Omni enables all locally detected providers.
 //! - --bind 127.0.0.1 by default, or --public as shorthand for --bind 0.0.0.0
-//! - Canonical model routing: real model ids (e.g. "claude-sonnet-5", "grok-4.7")
+//! - Canonical model routing: real model ids (e.g. "claude-sonnet-5-5", "grok-4.7")
 //!   route directly when they uniquely identify an enabled provider.
 //! - Alias routing: "opus", "sonnet", "haiku", "grok", and "gpt"
 //!   resolve to current provider-owned model ids when unique.
@@ -3221,16 +3221,13 @@ mod tests {
         assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-fable-5-1"));
 
         let (k, m) = resolve_provider_and_model("sonnet", &catalogs).unwrap();
-        assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-sonnet-5"));
+        assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-sonnet-5-5"));
 
         let (k, m) = resolve_provider_and_model("claude-haiku-4-5", &catalogs).unwrap();
         assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-haiku-4-5"));
 
         let (k, m) = resolve_provider_and_model("haiku", &catalogs).unwrap();
-        assert_eq!(
-            (k.as_str(), m.as_str()),
-            ("claude", "claude-haiku-4-5-20251001")
-        );
+        assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-haiku-5-5"));
 
         let (k, m) = resolve_provider_and_model("grok", &catalogs).unwrap();
         assert_eq!((k.as_str(), m.as_str()), ("grok", "grok-4.7"));
@@ -3293,10 +3290,10 @@ mod tests {
 
         let text = format_aliases_for_log(&providers).expect("aliases format");
         for expected in [
-            "sonnet=claude-sonnet-5",
+            "sonnet=claude-sonnet-5-5",
             "opus=claude-opus-5-5",
             "fable=claude-fable-5-1",
-            "haiku=claude-haiku-4-5-20251001",
+            "haiku=claude-haiku-5-5",
             "grok=grok-4.7",
             "gpt=",
         ] {
@@ -3331,7 +3328,7 @@ mod tests {
 
         let text = format_models_for_log(&providers).expect("models format");
         assert!(text.contains("claude=["));
-        assert!(text.contains("claude-sonnet-5"));
+        assert!(text.contains("claude-sonnet-5-5"));
         assert!(text.contains("grok=["));
         assert!(text.contains("grok-4.7"));
         assert!(text.contains("grok-4.7-build-fast"));
@@ -5789,11 +5786,11 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "claude opus catalog entry missing: {ids:?}"
         );
         assert!(
-            ids.iter().any(|id| id == "claude-sonnet-5"),
+            ids.iter().any(|id| id == "claude-sonnet-5-5"),
             "claude sonnet catalog entry missing: {ids:?}"
         );
         assert!(
-            ids.iter().any(|id| id == "claude-haiku-4-5-20251001"),
+            ids.iter().any(|id| id == "claude-haiku-5-5"),
             "claude haiku catalog entry missing: {ids:?}"
         );
         assert!(
@@ -5951,14 +5948,14 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                 format!("Bearer {}", TempClaudeCreds::dummy_token()).as_str(),
             ))
             .and(body_partial_json(serde_json::json!({
-                "model": "claude-sonnet-5",
+                "model": "claude-sonnet-5-5",
                 "stream": false
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "msg_native",
                 "type": "message",
                 "role": "assistant",
-                "model": "claude-sonnet-5",
+                "model": "claude-sonnet-5-5",
                 "content": [{"type":"text","text":"hello"}],
                 "stop_reason": "end_turn",
                 "stop_sequence": null,
@@ -5990,7 +5987,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         assert_eq!(v["id"], "msg_native");
         assert_eq!(v["future_field"]["kept"], true);
         let snap = state.stats.as_ref().unwrap().snapshot();
-        let model = &snap.models["claude:claude-sonnet-5"];
+        let model = &snap.models["claude:claude-sonnet-5-5"];
         assert_eq!(model.requests, 1);
         assert_eq!(model.input_tokens, 11);
         assert_eq!(model.output_tokens, 3);
@@ -6013,7 +6010,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
                 format!("Bearer {}", TempClaudeCreds::dummy_token()).as_str(),
             ))
             .and(body_partial_json(serde_json::json!({
-                "model": "claude-sonnet-5",
+                "model": "claude-sonnet-5-5",
                 "messages": [{"role":"user","content":"hi"}]
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -6046,7 +6043,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
 
         let sse_body = concat!(
             "event: message_start\n",
-            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0,\"cache_read_input_tokens\":1}}}\n\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"model\":\"claude-sonnet-5-5\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0,\"cache_read_input_tokens\":1}}}\n\n",
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
             "event: message_delta\n",
@@ -6086,7 +6083,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             "Anthropic SSE must not use OpenAI sentinels: {text}"
         );
         let snap = state.stats.as_ref().unwrap().snapshot();
-        let model = &snap.models["claude:claude-sonnet-5"];
+        let model = &snap.models["claude:claude-sonnet-5-5"];
         assert_eq!(model.requests, 1);
         assert_eq!(model.input_tokens, 5);
         assert_eq!(model.output_tokens, 2);

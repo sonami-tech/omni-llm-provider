@@ -897,7 +897,9 @@ mod tests {
             // exact canonical -> canonical
             ("claude-opus-5-5", "claude-opus-5-5"),
             // short alias -> canonical
-            ("sonnet", "claude-sonnet-5"),
+            ("sonnet", "claude-sonnet-5-5"),
+            // id that left the catalog: forwards raw, not remapped
+            ("claude-sonnet-5", "claude-sonnet-5"),
             // family long-form: NOT a catalog alias -> forwards raw
             ("claude-sonnet", "claude-sonnet"),
             // non-Claude id: no reject -> forwards raw (Anthropic will 400 it)
@@ -960,7 +962,7 @@ mod tests {
     #[test]
     fn wire_defaults_fill_only_unset_values() {
         let body = serde_json::json!({
-            "model": "claude-haiku-4-5",
+            "model": "claude-haiku-5-5",
             "messages": [{"role": "user", "content": "Say OK"}]
         });
         let req = reconcile_client_request(
@@ -971,12 +973,12 @@ mod tests {
             false,
         )
         .expect("reconcile ok");
-        assert!(req.max_tokens > 0);
-        // 2.1.207 haiku wire omits temperature when the client did not set one.
+        assert_eq!(req.max_tokens, 128_000);
+        // 2.1.293 haiku wire omits temperature when the client did not set one.
         assert_eq!(req.temperature, None);
 
         let body = serde_json::json!({
-            "model": "claude-haiku-4-5",
+            "model": "claude-haiku-5-5",
             "max_tokens": 123,
             "temperature": 0.3,
             "messages": [{"role": "user", "content": "Say OK"}]
@@ -1040,7 +1042,7 @@ mod tests {
         )
         .expect("reconcile ok");
         assert_eq!(
-            req.max_tokens, 64_000,
+            req.max_tokens, 128_000,
             "omitted max_tokens must use wire default, not budget+1024"
         );
         assert_eq!(
@@ -1290,7 +1292,7 @@ mod tests {
         // WHY (issue #22): Door-2 must not strip client output_config for
         // fingerprint fidelity. Client effort wins over the Sonnet pin default.
         let body = serde_json::json!({
-            "model": "claude-sonnet-5",
+            "model": "claude-sonnet-5-5",
             "max_tokens": 100,
             "messages": [{"role": "user", "content": "Say OK"}],
             "output_config": {"effort": "low"}
@@ -1324,7 +1326,7 @@ mod tests {
         assert_eq!(
             req.output_config.as_ref().and_then(|o| o.effort.as_deref()),
             Some("max"),
-            "client max must not be replaced by sonnet pin high"
+            "client max must not be replaced by the sonnet pin default"
         );
     }
 
@@ -1346,12 +1348,12 @@ mod tests {
                 .get("output_config")
                 .and_then(|o| o.get("effort"))
                 .and_then(|e| e.as_str()),
-            Some("high"),
+            Some("medium"),
             "sonnet pin default effort when client omitted output_config"
         );
 
         let body = serde_json::json!({
-            "model": "claude-sonnet-5",
+            "model": "claude-sonnet-5-5",
             "max_tokens": 100,
             "messages": [{"role": "user", "content": "Say OK"}]
         });
@@ -1365,19 +1367,19 @@ mod tests {
         .expect("reconcile ok");
         assert_eq!(
             req.output_config.as_ref().and_then(|o| o.effort.as_deref()),
-            Some("high"),
+            Some("medium"),
             "Sonnet pin default when client omitted output_config"
         );
 
-        // Haiku pin has no output_effort: stay absent (do not invent).
+        // A pin model with no output_effort: stay absent (do not invent).
         let body = serde_json::json!({
-            "model": "claude-haiku-4-5",
+            "model": crate::fingerprint::TEST_NO_EFFORT_MODEL,
             "max_tokens": 100,
             "messages": [{"role": "user", "content": "Say OK"}]
         });
         let req = reconcile_client_request(
             &parse_client(body),
-            default_profile(),
+            &crate::fingerprint::TEST_PROFILE_WITH_NO_EFFORT_MODEL,
             &empty_repl(),
             false,
             false,
@@ -1385,25 +1387,29 @@ mod tests {
         .expect("reconcile ok");
         assert!(
             req.output_config.is_none(),
-            "haiku pin has no output_effort: {:?}",
+            "a pin model with no output_effort must not get one: {:?}",
             req.output_config
         );
     }
 
     #[test]
-    fn door2_client_output_config_on_haiku_is_not_stripped() {
+    fn door2_client_output_config_on_no_effort_model_is_not_stripped() {
         // WHY (issue #22): even when the pin has no effort surface, a client
         // that set output_config is honored (pass-through). Upstream may 400;
         // silent strip of client intent is the bug this issue closes.
         let body = serde_json::json!({
-            "model": "claude-haiku-4-5",
+            "model": crate::fingerprint::TEST_NO_EFFORT_MODEL,
             "max_tokens": 100,
             "messages": [{"role": "user", "content": "Say OK"}],
             "output_config": {"effort": "high"}
         });
-        let prepared =
-            prepare_client_messages_request(body, default_profile(), &empty_repl(), false)
-                .expect("prepare ok");
+        let prepared = prepare_client_messages_request(
+            body,
+            &crate::fingerprint::TEST_PROFILE_WITH_NO_EFFORT_MODEL,
+            &empty_repl(),
+            false,
+        )
+        .expect("prepare ok");
         assert_eq!(
             prepared
                 .body()
@@ -1411,7 +1417,7 @@ mod tests {
                 .and_then(|o| o.get("effort"))
                 .and_then(|e| e.as_str()),
             Some("high"),
-            "client-set output_config on haiku must not be fingerprint-stripped"
+            "client-set output_config on a no-effort model must not be fingerprint-stripped"
         );
     }
 
@@ -1467,7 +1473,7 @@ mod tests {
         // Client set output_config (format-only): pin must not inject effort.
         assert_ne!(
             oc.get("effort").and_then(|e| e.as_str()),
-            Some("high"),
+            Some("medium"),
             "pin must not merge effort onto client-set format-only output_config"
         );
     }

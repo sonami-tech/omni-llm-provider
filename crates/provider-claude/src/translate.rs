@@ -1373,7 +1373,7 @@ mod tests {
         let profile = crate::fingerprint::default_profile();
         let model_def = profile.resolve_model("haiku");
         let anth = build_messages_request_from_canonical(&req, model_def, &empty_repl()).unwrap();
-        assert_eq!(anth.model, "claude-haiku-4-5-20251001");
+        assert_eq!(anth.model, "claude-haiku-5-5");
         assert!(
             matches!(anth.messages[0].content, MessageContent::Text(ref s) if s == "hello world")
         );
@@ -2024,11 +2024,24 @@ mod tests {
                 Some("high"),
             ),
             ("opus", "claude-opus-5-5", 128_000, None, Some("medium")),
-            ("sonnet", "claude-sonnet-5", 64_000, None, Some("high")),
-            // The "haiku" alias resolves to the dated canonical; 2.1.220 omits
-            // temperature on the wire (no temp=1) and has no output_config.
-            ("haiku", "claude-haiku-4-5-20251001", 32_000, None, None),
-            ("claude-haiku-4-5", "claude-haiku-4-5", 32_000, None, None),
+            ("sonnet", "claude-sonnet-5-5", 128_000, None, Some("medium")),
+            ("haiku", "claude-haiku-5-5", 128_000, None, Some("medium")),
+            (
+                "claude-haiku-5-5",
+                "claude-haiku-5-5",
+                128_000,
+                None,
+                Some("medium"),
+            ),
+            // An id that left the catalog with 2.1.293 is forwarded raw (not
+            // remapped to haiku 5.5) and gets the non-override fallback.
+            (
+                "claude-haiku-4-5",
+                "claude-haiku-4-5",
+                32_000,
+                None,
+                Some("high"),
+            ),
         ];
 
         for (alias, exp_model, exp_max, exp_temp, exp_effort) in cases {
@@ -2088,7 +2101,7 @@ mod tests {
             anth.output_config
                 .as_ref()
                 .and_then(|o| o.effort.as_deref()),
-            Some("high")
+            Some("medium")
         );
     }
 
@@ -2148,7 +2161,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_effort_keeps_sonnet_pin_default_high() {
+    fn absent_effort_keeps_sonnet_pin_default() {
         // WHY (issue #20): pin default applies only when client effort is absent.
         let profile = crate::fingerprint::default_profile();
         let repl = empty_repl();
@@ -2165,7 +2178,7 @@ mod tests {
             anth.output_config
                 .as_ref()
                 .and_then(|o| o.effort.as_deref()),
-            Some("high"),
+            Some("medium"),
             "Sonnet capture-backed pin default when effort absent"
         );
     }
@@ -2197,14 +2210,52 @@ mod tests {
     }
 
     #[test]
-    fn haiku_client_effort_does_not_inject_output_config() {
-        // WHY (issue #20 review): Haiku pin has no output_effort and no effort
-        // beta. Client high/medium must not force output_config (upstream 400 /
-        // fingerprint break); thinking budget still expresses known efforts.
+    fn haiku_client_effort_sets_output_config() {
+        // WHY: Haiku 5.5 has the effort surface (pin output_effort and the
+        // effort beta), so client effort, xhigh included, must land on
+        // output_config.effort and must not also send an effort-derived
+        // thinking budget (Haiku 4.5 used that path; it can 400 here).
         let profile = crate::fingerprint::default_profile();
         let repl = empty_repl();
+        for effort in ["high", "xhigh"] {
+            let canon = CanonicalRequest {
+                model: "haiku".into(),
+                messages: vec![CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Text("hi".into()),
+                }],
+                reasoning: Some(CanonicalReasoning {
+                    effort: Some(effort.into()),
+                    budget_tokens: None,
+                }),
+                ..Default::default()
+            };
+            let anth = prepare_anthropic_request(&canon, profile, &repl, false, false).unwrap();
+            assert_eq!(anth.model, "claude-haiku-5-5");
+            assert_eq!(
+                anth.output_config
+                    .as_ref()
+                    .and_then(|o| o.effort.as_deref()),
+                Some(effort),
+                "haiku effort={effort} on output_config"
+            );
+            assert!(
+                anth.thinking.is_none(),
+                "haiku effort={effort} must not also set thinking: {:?}",
+                anth.thinking
+            );
+        }
+    }
+
+    #[test]
+    fn no_effort_model_keeps_thinking_budget_path() {
+        // WHY (issue #20 review): a pin model with no output_effort and no
+        // effort beta must not get output_config (upstream 400 / fingerprint
+        // break); the thinking budget still expresses known efforts.
+        let profile = &crate::fingerprint::TEST_PROFILE_WITH_NO_EFFORT_MODEL;
+        let repl = empty_repl();
         let canon = CanonicalRequest {
-            model: "haiku".into(),
+            model: crate::fingerprint::TEST_NO_EFFORT_MODEL.into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("hi".into()),
@@ -2218,25 +2269,26 @@ mod tests {
         let anth = prepare_anthropic_request(&canon, profile, &repl, false, false).unwrap();
         assert!(
             anth.output_config.is_none(),
-            "haiku must not get output_config.effort: {:?}",
+            "no-effort model must not get output_config.effort: {:?}",
             anth.output_config
         );
-        assert!(
-            anth.thinking.is_some(),
-            "haiku high effort still uses thinking budget"
+        assert_eq!(
+            anth.thinking.as_ref().and_then(|t| t.budget_tokens),
+            Some(16384),
+            "no-effort model high effort still uses the thinking budget"
         );
     }
 
     #[test]
-    fn haiku_unmappable_effort_fails_loud() {
-        // WHY (issues #20/#25): xhigh has no thinking budget and haiku has no
-        // output_config surface; must fail loud with the shared structured
+    fn no_effort_model_unmappable_effort_fails_loud() {
+        // WHY (issues #20/#25): xhigh has no thinking budget and this model has
+        // no output_config surface; must fail loud with the shared structured
         // unsupported-effort shape (same fields as Grok/Codex), not silent omit
         // or a hand-built string.
-        let profile = crate::fingerprint::default_profile();
+        let profile = &crate::fingerprint::TEST_PROFILE_WITH_NO_EFFORT_MODEL;
         let repl = empty_repl();
         let canon = CanonicalRequest {
-            model: "haiku".into(),
+            model: crate::fingerprint::TEST_NO_EFFORT_MODEL.into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("hi".into()),
@@ -2248,7 +2300,7 @@ mod tests {
             ..Default::default()
         };
         let err = prepare_anthropic_request(&canon, profile, &repl, false, false)
-            .expect_err("haiku xhigh must fail loud");
+            .expect_err("no-effort model xhigh must fail loud");
         // End-to-end ProviderError::BadRequest (issue #30); no String unwrap.
         // Real fail path (prepare_anthropic_request → apply_client_effort):
         // shared helper includes model= for the resolved outbound pin id (#28).
@@ -2312,9 +2364,9 @@ mod tests {
     fn door1_effort_on_output_config_model_skips_thinking_budget() {
         // WHY (issue #20): sonnet supports output_config.effort; client effort
         // drives that knob and must not also emit legacy thinking budgets (can
-        // 400 on modern Anthropic). max_tokens comes from the pin (64000).
-        // Haiku (no effort surface) still uses the thinking path
-        // — see haiku_client_effort_does_not_inject_output_config.
+        // 400 on modern Anthropic). max_tokens comes from the pin (128000).
+        // A model with no effort surface still uses the thinking path; see
+        // no_effort_model_keeps_thinking_budget_path.
         let profile = crate::fingerprint::default_profile();
         let repl = empty_repl();
         for effort in ["high", "max"] {
@@ -2344,7 +2396,7 @@ mod tests {
                 anth.thinking
             );
             assert_eq!(
-                anth.max_tokens, 64_000,
+                anth.max_tokens, 128_000,
                 "sonnet effort={effort}: pin max_tokens (no thinking path)"
             );
         }
@@ -2354,8 +2406,8 @@ mod tests {
     fn door1_thinking_budget_does_not_raise_client_max_tokens() {
         // WHY (issue #19): when the client sets max_tokens below a thinking
         // budget, omni must NOT auto-bump max_tokens. Cover both explicit
-        // budget_tokens and effort-mapped budget (haiku has no output_config
-        // effort surface, so effort maps to thinking).
+        // budget_tokens and effort-mapped budget (a model with no output_config
+        // effort surface maps effort to thinking).
         let profile = crate::fingerprint::default_profile();
         let repl = empty_repl();
 
@@ -2383,9 +2435,9 @@ mod tests {
             "client max_tokens must not be raised for explicit thinking budget"
         );
 
-        // effort high -> budget_for_effort = 16384 on haiku thinking path
+        // effort high -> budget_for_effort = 16384 on the thinking path
         let effort_mapped = CanonicalRequest {
-            model: "haiku".into(),
+            model: crate::fingerprint::TEST_NO_EFFORT_MODEL.into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("hi".into()),
@@ -2397,7 +2449,14 @@ mod tests {
             }),
             ..Default::default()
         };
-        let anth = prepare_anthropic_request(&effort_mapped, profile, &repl, false, false).unwrap();
+        let anth = prepare_anthropic_request(
+            &effort_mapped,
+            &crate::fingerprint::TEST_PROFILE_WITH_NO_EFFORT_MODEL,
+            &repl,
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             anth.thinking.as_ref().and_then(|t| t.budget_tokens),
             Some(16384),

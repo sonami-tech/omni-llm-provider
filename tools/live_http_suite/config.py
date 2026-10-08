@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:18321"
-DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+DEFAULT_CLAUDE_MODEL = "claude-haiku-5-5"
 DEFAULT_DUAL_MODE_MODEL = "grok-4.5"
 DEFAULT_TIMEOUT_S = 60.0
 DEFAULT_CONNECT_TIMEOUT_S = 5.0

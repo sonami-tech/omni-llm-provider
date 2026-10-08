@@ -36,7 +36,8 @@ the **OpenAI inbound → Claude** path, **effort-capable** models pass free-stri
 **non-`none`** effort through to `output_config.effort` (issue #26). Only
 `minimal`→`low` is remapped (`max` kept as-is). There is no closed local Claude
 effort allowlist; unknown names may 400 from upstream by design. Fail loud only
-when the thinking-budget ladder cannot map the value (e.g. Haiku + `xhigh`).
+when the thinking-budget ladder cannot map the value (e.g. `xhigh` on a model
+without `output_config.effort`; the 2.1.293 pin has none).
 Precedence remains **client effort > pin default > absent**. This does not
 change native Anthropic `/v1/messages` (closed allowlist still drops client
 `output_config`). Operator summary: `docs/README.md`.
@@ -48,8 +49,8 @@ Client `max_tokens` is sent as given. When the client omits `max_tokens`, only
 fingerprint wire defaults apply. If the pair is invalid for Anthropic
 (`max_tokens <= thinking.budget_tokens`), upstream rejects it; the gateway does
 not auto-fix. That can also occur when a wire default is below a client (or
-effort-mapped) thinking budget, for example Haiku's 32k default with effort
-`max` (budget 32768). See `docs/decisions.md`.
+effort-mapped) thinking budget, for example Fable's 64000 default with a client
+budget of 64000 or more. See `docs/decisions.md`.
 
 ## Provider Extras
 

@@ -1,6 +1,6 @@
 # Claude CLI Baseline Wire Fingerprint
 
-Active baseline: Claude Code 2.1.281, captured 2026-09-23 (single pin; issue #12).
+Active baseline: Claude Code 2.1.293, captured 2026-10-08 (single pin; issue #12).
 
 Raw mitmproxy `.flow` files are not committed because they contain live bearer
 tokens and account identifiers. Keep raw captures on tmpfs and inspect them with
@@ -10,7 +10,7 @@ tokens and account identifiers. Keep raw captures on tmpfs and inspect them with
 
 | Profile | Claude Code | SDK package | Runtime | Entrypoint | Source |
 |---|---|---|---|---|---|
-| `cc-2.1.281-sdk-cli` | `2.1.281` | `0.112.1` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/Fable/default, 2026-09-23 |
+| `cc-2.1.293-sdk-cli` | `2.1.293` | `0.128.0` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/Fable/default, 2026-10-08 |
 
 Only one pin is compiled. Rebaseline overwrites this row; do not append a
 historical ladder. Older Omni releases retain older wire.
@@ -44,28 +44,31 @@ Header names and dynamic values are pinned in
 - `anthropic-version: 2023-06-01`
 - `x-app: cli`
 
-## 2.1.281 Model Surface (active)
+## 2.1.293 Model Surface (active)
 
 | Input | Wire model | Beta list | max_tokens | temperature | output_config.effort |
 |---|---|---|---:|---:|---|
-| no `--model` | `claude-opus-5-5` | default (+context-1m + per-turn-control) | 128000 | omitted | `medium` |
-| `opus` | `claude-opus-5-5` | opus (+per-turn-control) | 128000 | omitted | `medium` |
-| `sonnet` | `claude-sonnet-5` | sonnet | 64000 | omitted | `high` |
-| `fable` | `claude-fable-5-1` | fable (+per-turn-control) | 64000 | omitted | `high` |
-| `haiku` | `claude-haiku-4-5-20251001` | haiku | 32000 | omitted | omitted |
+| no `--model` | `claude-opus-5-5` | default (same bytes as opus) | 128000 | omitted | `medium` |
+| `opus` | `claude-opus-5-5` | opus | 128000 | omitted | `medium` |
+| `sonnet` | `claude-sonnet-5-5` | sonnet (same bytes as opus) | 128000 | omitted | `medium` |
+| `haiku` | `claude-haiku-5-5` | haiku (opus members, reordered) | 128000 | omitted | `medium` |
+| `fable` | `claude-fable-5-1` | fable (same bytes as opus) | 64000 | omitted | `high` |
 
 All five captured requests returned HTTP 200. Explicit `claude-fable-5` was
 not captured in this run and remains pass-through with its existing override.
-The default and explicit Opus beta lists now include
-`per-turn-control-2026-07-01`. Sonnet, Fable, and Haiku beta bytes match the
-prior pin; exact lists are in `crates/provider-claude/src/fingerprint.rs`.
+Every beta list drops `fallback-credit-2026-06-01` and adds
+`dangerous-tool-use-2026-09-03` and `afk-mode-2026-01-31`. The default list
+drops `context-1m-2025-08-07`. The Haiku list puts `claude-code-20250219`
+after `mid-conversation-system-2026-04-07`. Exact lists are in
+`crates/provider-claude/src/fingerprint.rs`. `claude-sonnet-5` and
+`claude-haiku-4-5*` left the catalog with their overrides.
 
-Billing (no cch): `cc_version=2.1.281.3ee; cc_entrypoint=sdk-cli;` for
-prompt `Say OK`. Stainless package is `0.112.1`, runtime `v26.3.0`, and
+Billing (no cch): `cc_version=2.1.293.33e; cc_entrypoint=sdk-cli;` for
+prompt `Say OK`. Stainless package is `0.128.0`, runtime `v26.3.0`, and
 `x-client-request-id` is absent. The system identity remains
 `You are a Claude agent, built on Anthropic's Claude Agent SDK.`
-The CLI sends adaptive thinking on effort models, and enabled thinking with
-budget 31999 on Haiku. Omni does not clone those CLI-only bodies.
+The CLI sends adaptive thinking on every captured model, Haiku included.
+Omni does not clone those CLI-only bodies.
 
 ## 2.1.175 Model Surface
 
