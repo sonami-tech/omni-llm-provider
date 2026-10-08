@@ -151,7 +151,7 @@ Current shorthand aliases are resolved from provider-owned catalogs at startup:
 - `opus` -> `claude-opus-5-5`
 - `haiku` -> `claude-haiku-5-5`
 - `fable` -> `claude-fable-5-1`
-- `grok` -> `grok-4.6`
+- `grok` -> `grok-4.7`
 - `gpt` -> the current Codex model from `$CODEX_HOME/config.toml` or
   `~/.codex/config.toml`, falling back to the provider default
 
@@ -235,7 +235,7 @@ Adapter mapping (summary):
 
 | Backend | Maps / keeps | `"none"` | Fails loud (examples) |
 |---|---|---|---|
-| **Grok** | `low`/`medium`/`high`; `xhigh` on `grok-4.6`; `minimal`→`low`, `max`→`high` | omits field | `xhigh` on `grok-4.5`, `ultra`, other unknowns |
+| **Grok** | `low`/`medium`/`high`; `xhigh` on `grok-4.7`, `grok-4.7-build-fast`, and `grok-4.6`; `minimal`→`low`, `max`→`high` | omits field | `xhigh` on `grok-4.5`, `ultra`, other unknowns |
 | **Codex** | `none`/`minimal`/`low`/`medium`/`high`/`xhigh`; `max`→`high` | emits `none` | `ultra`, other unknowns |
 | **Claude** | client effort wins; pin default only when absent | suppresses pin | unmappable on a model without `output_config.effort` (none on the 2.1.293 pin) |
 

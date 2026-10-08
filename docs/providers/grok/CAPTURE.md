@@ -123,27 +123,34 @@ wrapper around `tools.capture extract jsonl` for sanitized JSONL exports.
 
 ## Current Wire + Model Findings
 
-Re-baselined against grok-shell **1.0.41** on **2026-09-22**. A 2026-09-23
-general capture returned the same catalog, user-agent, and client version.
+Re-baselined against grok-shell **1.0.46** on **2026-10-08** (one clean-HOME
+general capture on a Free-tier account, no retries).
 
 ### Default path (cli-chat-proxy.grok.com)
 
-The clean-HOME `GET /v1/models` returned HTTP 200 with `grok-4.7`,
-`grok-4.7-build-fast`, `grok-4.6`, and `grok-4.5`. The no-`--model`
-`POST /v1/responses` selected `grok-4.7` and returned HTTP 200.
-The catalog advertises low, medium, high, and xhigh effort for the
-4.7/4.7-build-fast/4.6 models, and low, medium, high for 4.5.
+The clean-HOME `GET /v1/models` returned HTTP 200 with only `grok-4.7`, which
+it lists with low, medium, high, and xhigh effort. The account is on the Free
+tier with a "Grok 4.7 free for a limited time" promo, so the listing shows the
+account tier, not the CLI. `grok-4.6` still returned HTTP 200 in this capture.
+The pin keeps the four models from the 1.0.41 listing (`grok-4.7`,
+`grok-4.7-build-fast`, `grok-4.6`, `grok-4.5`); see the catalog exception in
+`docs/providers/grok/README.md`. The 1.0.41 listing advertised xhigh for the
+4.7/4.7-build-fast/4.6 models and low, medium, high for 4.5. The
+no-`--model` `POST /v1/responses` selected `grok-4.7` and returned HTTP 200.
 Do not use operator `grok models` or `~/.grok/config.toml` overrides as
 catalog evidence.
 
-The captured UA is `grok-shell/1.0.41 (linux; x86_64)` and
-`x-grok-client-version` is `1.0.41`. Token-auth, authenticate-response,
+The captured UA is `grok-shell/1.0.46 (linux; x86_64)` and
+`x-grok-client-version` is `1.0.46`. Token-auth, authenticate-response,
 client identifier, headless mode, model override, and SSE accept headers
-remain present. Default chat sends high/concise reasoning, encrypted-content
-and no-inline-citations includes, `store: false`, and `stream: true`.
-Omni still omits CLI-only session metadata and request preferences unless
-client intent requires them. `/v1/models` exposes canonical ids; `grok`
-remains an inbound alias for `grok-4.7`.
+remain present. The chat body keeps the same top-level keys (`include`,
+`input`, `model`, `prompt_cache_key`, `reasoning`, `store`, `stream`,
+`tools`). The CLI also sends session headers: `x-compactions-remaining`,
+`x-compaction-at`, `x-grok-conv-group-id`, `x-grok-doom-loop-check`,
+`x-grok-exact-repetition-check`, `traceparent`, and the conversation,
+request, session, agent, and turn ids. Omni omits that CLI session metadata
+and request preferences unless client intent requires them. `/v1/models`
+exposes canonical ids; `grok` remains an inbound alias for `grok-4.7`.
 
 ### Custom endpoint override
 

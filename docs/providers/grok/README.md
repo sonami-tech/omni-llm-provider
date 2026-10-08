@@ -20,9 +20,10 @@ identity preambles. The maintained contract is:
 - fresh credential resolution per request (prefers `~/.grok/auth.json` OIDC),
 - grok-shell fingerprint headers for the pinned CLI version,
 - correct non-stream and stream decoding via the shared Responses parser,
-- model catalog kept current (single pin: grok-shell 1.0.41, confirmed 2026-09-23; `grok-4.7` default,
+- model catalog kept current (single pin: grok-shell 1.0.46, captured 2026-10-08; `grok-4.7` default,
   plus `grok-4.7-build-fast`, `grok-4.6`, and `grok-4.5`). Catalog source is clean-HOME `GET /v1/models` on
-  `cli-chat-proxy.grok.com`, not the operator `grok models` UI.
+  `cli-chat-proxy.grok.com`, not the operator `grok models` UI. See
+  [Catalog exception for 1.0.46](#catalog-exception-for-1046).
 
 `--grok-version` / `OMNI_GROK_VERSION` and match-system flags are removed
 (issue #12). Rebaseline overwrites this pin; older wire needs an older Omni
@@ -40,6 +41,18 @@ Default tests use wiremock. Live calls require `OMNI_LIVE_TESTS=1`.
 
 Capture and refresh-capture work uses `python3 -m tools.capture`; see
 `docs/providers/grok/CAPTURE.md`.
+
+## Catalog exception for 1.0.46
+
+The rebaseline rule in `docs/providers/README.md` says to replace the catalog
+with the fresh listing from this pin. The 1.0.46 pin is an exception
+(operator decision, issue #56). Its clean-HOME `GET /v1/models` listed only
+`grok-4.7`. The capture account is on the Free tier, with a "Grok 4.7 free for
+a limited time" promo, so that listing shows the account tier, not the CLI.
+`grok-4.6` still returned HTTP 200 in the same capture. The pin keeps the four
+models from the 1.0.41 listing: `grok-4.7`, `grok-4.7-build-fast`, `grok-4.6`,
+and `grok-4.5`. At the next rebaseline, take the listing from a paid-tier
+account, or keep this exception only with a new operator decision.
 
 ## Reasoning effort
 
