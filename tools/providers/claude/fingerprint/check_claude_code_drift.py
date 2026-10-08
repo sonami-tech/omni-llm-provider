@@ -85,7 +85,7 @@ def stream_events() -> list[tuple[str, dict[str, object]]]:
 					"id": "msg_drift_check",
 					"type": "message",
 					"role": "assistant",
-					"model": "claude-haiku-4-5-20251001",
+					"model": "claude-haiku-5-5",
 					"content": [],
 					"stop_reason": None,
 					"stop_sequence": None,
@@ -146,7 +146,7 @@ def run_claude_probe(
 	base_url: str,
 	prompt: str,
 	timeout: int,
-	model: str = "claude-haiku-4-5",
+	model: str = "claude-haiku-5-5",
 ) -> subprocess.CompletedProcess[str]:
 	env = os.environ.copy()
 	env["ANTHROPIC_BASE_URL"] = base_url

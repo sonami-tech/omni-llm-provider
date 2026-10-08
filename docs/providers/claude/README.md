@@ -49,8 +49,7 @@ Client `max_tokens` is sent as given. When the client omits `max_tokens`, only
 fingerprint wire defaults apply. If the pair is invalid for Anthropic
 (`max_tokens <= thinking.budget_tokens`), upstream rejects it; the gateway does
 not auto-fix. That can also occur when a wire default is below a client (or
-effort-mapped) thinking budget, for example Fable's 64000 default with a client
-budget of 64000 or more. See `docs/decisions.md`.
+effort-mapped) thinking budget. See `docs/decisions.md`.
 
 ## Provider Extras
 

@@ -3163,8 +3163,9 @@ mod tests {
         // so an unknown id's leading token IS its routing key. In a multi-provider
         // catalog an unmatched id must route to the provider its token names and
         // forward RAW (pass-through), not error and not get rewritten. This is what
-        // lets a NEW pinned id (e.g. claude-sonnet-5, a future grok) work before we
-        // add a catalog entry, and is the fix for the silent-remap bug's sibling:
+        // lets an id outside the catalog (a retired one such as claude-sonnet-5, or
+        // a future grok) route by its leading token, and is the fix for the
+        // silent-remap bug's sibling:
         // OpenAI-door requests for unknown ids now have a defined destination.
         let catalogs = catalogs_claude_grok_codex();
         for (input, provider) in [

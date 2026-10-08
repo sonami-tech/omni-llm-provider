@@ -168,12 +168,15 @@ model in each family: `gpt` and `sol` map to `gpt-6.1-sol`, `astra` to
 config names one. Source of truth: `CODEX_CATALOG` in
 `crates/provider-codex/src/lib.rs`.
 
-Codex 0.161.0 adds `x-openai-internal-codex-responses-lite: true` to its REST
-Responses requests and `x-codex-routing-hint: model=<model>` to the WebSocket
-upgrade. Omni sends the first on its CLI-parity REST request (the ChatGPT
-models preflight) and the second on the WebSocket upgrade. The WebSocket
-`x-codex-turn-metadata` carries the 0.161.0 key set with fixed synthetic
-values; only `model` and `reasoning_effort` come from the request. The custom
+Codex 0.161.0 adds `x-codex-routing-hint: model=<model>` to the WebSocket
+upgrade, and Omni sends it there. The WebSocket `x-codex-turn-metadata`
+carries the 0.161.0 key set with fixed synthetic values; only `model` and
+`reasoning_effort` come from the request. Codex also sends
+`x-openai-internal-codex-responses-lite: true`, but only on Responses
+requests and per model (`use_responses_lite` in the bundled catalog): as a
+header on REST, and as a `response.create` field on WebSocket. Omni does not
+send it. Its CLI-parity Responses path is the WebSocket, whose frame is
+shape-only, and its models preflight carries no Responses headers. The custom
 gateway and API-key REST path sends no CLI headers, and Omni never sends the
 CLI `cookie`.
 

@@ -1514,14 +1514,10 @@ fn conservative_codex_headers(
         "user-agent",
         &conservative_user_agent(version),
     )?;
-    // Codex 0.161.0 sends this on its REST Responses requests (gateway
-    // capture). This is the CLI-parity REST request builder; the custom
-    // gateway and API-key REST path stays free of CLI headers.
-    insert_header(
-        &mut headers,
-        "x-openai-internal-codex-responses-lite",
-        "true",
-    )?;
+    // No `x-openai-internal-codex-responses-lite` here. Codex 0.161.0 sends it
+    // only on Responses requests, per model (`use_responses_lite`): as a header
+    // on REST, and as a response.create field on WebSocket. This builder is the
+    // models preflight, which carries no Responses headers.
     Ok(headers)
 }
 
@@ -3035,6 +3031,48 @@ model = "gpt-5.5"
     }
 
     #[test]
+    fn rest_path_sends_no_cli_parity_headers() {
+        // WHY: the custom gateway and API-key REST path is not CLI parity. It
+        // sends configured headers and auth only. The Codex 0.161.0 CLI
+        // headers (responses-lite, routing hint, turn metadata) belong to the
+        // ChatGPT path and must not leak onto REST requests to any gateway.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for (config, auth) in [
+            (
+                r#"
+model = "gpt-6.1-sol"
+model_provider = "proxy"
+[model_providers.proxy]
+base_url = "https://proxy.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = false
+"#,
+                Some(r#"{"OPENAI_API_KEY":"sk-gateway"}"#),
+            ),
+            (
+                r#"model = "gpt-6.1-sol""#,
+                Some(r#"{"OPENAI_API_KEY":"sk-from-auth-json"}"#),
+            ),
+        ] {
+            let _home = TempCodexHome::new(config, auth);
+            let cfg = CodexRequestConfig::load().unwrap();
+            assert!(!cfg.should_use_chatgpt_ws(), "REST case: {config}");
+            let headers = rt.block_on(cfg.headers()).unwrap();
+            for name in [
+                "x-openai-internal-codex-responses-lite",
+                "x-codex-routing-hint",
+                "x-codex-turn-metadata",
+            ] {
+                assert!(
+                    headers.get(name).is_none(),
+                    "{name} must not be on the REST path: {config}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn url_join_does_not_duplicate_v1() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _home = TempCodexHome::new(
@@ -3247,9 +3285,12 @@ query_params = { api-version = "2026-01-01" }
     #[test]
     fn conservative_headers_match_captured_codex_0161_names_and_values() {
         // WHY: the ChatGPT path is CLI parity. Header names and values (not
-        // order) must match the Codex 0.161.0 capture, including the new REST
-        // responses-lite header, the WebSocket routing hint, and the turn
-        // metadata key set. The CLI cookie is session state and must not appear.
+        // order) must match the Codex 0.161.0 capture, including the new
+        // WebSocket routing hint and the turn metadata key set. The CLI cookie
+        // is session state and must not appear. Codex sends
+        // x-openai-internal-codex-responses-lite only on Responses requests (a
+        // REST header, or a response.create field on WebSocket), so neither the
+        // models preflight nor the WebSocket upgrade may carry it.
         let auth = ChatGptAuth {
             access_token: "eyJ-fake-oauth".into(),
             account_id: "11111111-2222-3333-4444-555555555555".into(),
@@ -3266,7 +3307,6 @@ query_params = { api-version = "2026-01-01" }
                 "originator",
                 "user-agent",
                 "version",
-                "x-openai-internal-codex-responses-lite",
             ]
         );
         assert_eq!(headers.get("version").unwrap(), "0.161.0");
@@ -3284,11 +3324,10 @@ query_params = { api-version = "2026-01-01" }
             headers.get("user-agent").unwrap(),
             "codex_exec/0.161.0 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.161.0)"
         );
-        assert_eq!(
+        assert!(
             headers
                 .get("x-openai-internal-codex-responses-lite")
-                .unwrap(),
-            "true"
+                .is_none()
         );
 
         let request = conservative_ws_request(
@@ -3328,7 +3367,7 @@ query_params = { api-version = "2026-01-01" }
             "model=gpt-6.1-sol"
         );
         assert!(ws_headers.get("cookie").is_none());
-        // The WebSocket upgrade does not carry the REST-only header.
+        // The 0.161.0 upgrade capture has no responses-lite header.
         assert!(
             ws_headers
                 .get("x-openai-internal-codex-responses-lite")
@@ -3708,7 +3747,6 @@ model = "gpt-5.5"
             .and(header("chatgpt-account-id", "acct-test"))
             .and(header("originator", "codex_exec"))
             .and(header("version", "0.161.0"))
-            .and(header("x-openai-internal-codex-responses-lite", "true"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "models": [{"slug": "gpt-5.5", "prefer_websockets": true}]
             })))
@@ -3751,6 +3789,16 @@ model = "gpt-5.5"
                 .as_ref()
                 .and_then(|meta| meta.provider.as_deref()),
             Some("codex")
+        );
+
+        // The preflight is a models GET; it carries no Responses headers.
+        let preflights = models_server.received_requests().await.unwrap();
+        assert_eq!(preflights.len(), 1);
+        assert!(
+            preflights[0]
+                .headers
+                .get("x-openai-internal-codex-responses-lite")
+                .is_none()
         );
 
         let body = body_rx.await.unwrap();

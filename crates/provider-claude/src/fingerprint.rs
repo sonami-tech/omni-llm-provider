@@ -770,6 +770,16 @@ mod tests {
                 "{beta}"
             );
         }
+        // The header bytes, order included, are the fingerprint. These literals
+        // are the captured 2.1.293 `anthropic-beta` values for opus and haiku.
+        assert_eq!(
+            BETA_OPUS,
+            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24,dangerous-tool-use-2026-09-03,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11"
+        );
+        assert_eq!(
+            BETA_HAIKU,
+            "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24,dangerous-tool-use-2026-09-03,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11"
+        );
         assert_eq!(profile.beta_reply, BETA_OPUS);
         assert_eq!(BETA_SONNET, BETA_OPUS);
         assert_eq!(BETA_FABLE, BETA_OPUS);
