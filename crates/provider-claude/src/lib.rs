@@ -1083,8 +1083,8 @@ mod tests {
         //     deterministic (fixed string), so no clock/nonce leaks into the prefix.
         //   - Model: catalog alias `haiku` (not a dated id), the cheapest catalog
         //     model. On the 2.1.293 pin it sends output_config.effort="medium"
-        //     like the other catalog models; the capture shows Haiku 5.5 accepts
-        //     it.
+        //     like Opus and Sonnet (Fable sends "high"); the capture shows Haiku
+        //     5.5 accepts it.
         //
         // Guarded exactly like claude_send_exercises_full_fingerprint_path: opt-in
         // via OMNI_LIVE_TESTS=1, real creds required, CLAUDE_CREDENTIALS_PATH
