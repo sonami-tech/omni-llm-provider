@@ -3414,17 +3414,33 @@ query_params = { api-version = "2026-01-01" }
             ],
             "turn metadata key set must match the 0.161.0 capture"
         );
-        assert_eq!(metadata["model"], "gpt-6.1-sol");
-        assert_eq!(metadata["reasoning_effort"], "high");
-        assert_eq!(metadata["request_kind"], "prewarm");
-        assert_eq!(metadata["thread_source"], "user");
-        assert_eq!(metadata["installation_id"], "omni-llm-provider");
+        // Every value and JSON type is pinned. The flag values and the root
+        // agent path ("/root", a CLI constant, not a directory) come from the
+        // 0.161.0 gateway capture; the ids are synthetic; model and effort come
+        // from the request.
         assert_eq!(
-            metadata["agent_name"], "/root",
-            "Codex root agent path constant from the 0.161.0 capture, not a directory"
+            metadata,
+            json!({
+                "installation_id": "omni-llm-provider",
+                "session_id": CONSERVATIVE_CLIENT_REQUEST_ID,
+                "thread_id": CONSERVATIVE_CLIENT_REQUEST_ID,
+                "agent_name": "/root",
+                "turn_id": "",
+                "window_id": CONSERVATIVE_WINDOW_ID,
+                "window_number": 0,
+                "context_window_id": CONSERVATIVE_CLIENT_REQUEST_ID,
+                "request_kind": "prewarm",
+                "thread_source": "user",
+                "sandbox": "none",
+                "sandbox_mode": "read-only",
+                "auto_review_enabled": false,
+                "node_repl_auto_review_required": true,
+                "node_repl_disabled": false,
+                "analytics_enabled": true,
+                "model": "gpt-6.1-sol",
+                "reasoning_effort": "high",
+            })
         );
-        assert_eq!(metadata["window_id"], CONSERVATIVE_WINDOW_ID);
-        assert_eq!(metadata["window_number"], 0);
 
         // No requested effort: the key stays, with a null value.
         let request = conservative_ws_request(
