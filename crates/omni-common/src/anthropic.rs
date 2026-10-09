@@ -70,6 +70,75 @@ pub fn encode_tool_result_content(content: &str, is_error: bool) -> String {
     }
 }
 
+/// One part of a tool result that holds an image, after `is_error` encoding.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolResultPart<'a> {
+    Text(String),
+    Image(&'a CanonicalImageSource),
+}
+
+/// Encode the blocks of a tool result that holds an image, for the
+/// OpenAI-style Grok and Codex writers. The order stays the same. With
+/// `is_error`, the first text part gets the [`encode_tool_result_content`]
+/// prefix; when there is no text part, a leading `"error"` part is added.
+/// Text-only results do not use this: they keep the plain string from
+/// [`encode_tool_result_content`].
+pub fn encode_tool_result_parts(
+    blocks: &[CanonicalBlock],
+    is_error: bool,
+) -> Result<Vec<ToolResultPart<'_>>, String> {
+    let mut parts = Vec::with_capacity(blocks.len() + 1);
+    let mut prefix_pending = is_error;
+    for block in blocks {
+        match block {
+            CanonicalBlock::Text { text, .. } => {
+                parts.push(ToolResultPart::Text(encode_tool_result_content(
+                    text,
+                    prefix_pending,
+                )));
+                prefix_pending = false;
+            }
+            CanonicalBlock::Image { source, .. } => parts.push(ToolResultPart::Image(source)),
+            _ => return Err("tool results can hold only text and image content".into()),
+        }
+    }
+    if prefix_pending {
+        parts.insert(
+            0,
+            ToolResultPart::Text(encode_tool_result_content("", true)),
+        );
+    }
+    Ok(parts)
+}
+
+/// `function_call_output.output` for the OpenAI Responses writers (Codex, and
+/// Grok on cli-chat-proxy). A text-only result is the same string as before.
+/// A result with an image is an array of `input_text` and `input_image` parts
+/// in order, the shape that both backends accepted in live spikes (#57).
+pub fn responses_tool_result_output(
+    content: &CanonicalContent,
+    is_error: bool,
+) -> Result<Value, String> {
+    match content {
+        CanonicalContent::Text(text) => Ok(Value::String(encode_tool_result_content(
+            text, is_error,
+        ))),
+        CanonicalContent::Blocks(blocks) => Ok(Value::Array(
+            encode_tool_result_parts(blocks, is_error)?
+                .into_iter()
+                .map(|part| match part {
+                    ToolResultPart::Text(text) => {
+                        serde_json::json!({ "type": "input_text", "text": text })
+                    }
+                    ToolResultPart::Image(source) => {
+                        serde_json::json!({ "type": "input_image", "image_url": source.as_image_url() })
+                    }
+                })
+                .collect(),
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Parse helpers
 // ---------------------------------------------------------------------------
@@ -356,7 +425,7 @@ enum RawBlock {
     },
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: CanonicalContent,
         is_error: bool,
         cache: Option<CanonicalCacheMark>,
     },
@@ -465,66 +534,9 @@ fn parse_message_blocks(
                                 "messages[{msg_idx}]: image blocks only allowed on user messages"
                             )));
                         }
-                        let source = b.get("source").ok_or_else(|| {
-                            AnthropicMapError::new(format!(
-                                "messages[{msg_idx}].content[{bi}]: image missing source"
-                            ))
-                        })?;
-                        let src_ty =
-                            source.get("type").and_then(|t| t.as_str()).ok_or_else(|| {
-                                AnthropicMapError::new(format!(
-                                    "messages[{msg_idx}].content[{bi}]: image source.type required"
-                                ))
-                            })?;
-                        let img = match src_ty {
-                            "base64" => {
-                                let media_type = source
-                                    .get("media_type")
-                                    .and_then(|m| m.as_str())
-                                    .filter(|s| !s.is_empty())
-                                    .ok_or_else(|| {
-                                        AnthropicMapError::new(format!(
-                                            "messages[{msg_idx}].content[{bi}]: image base64 missing media_type"
-                                        ))
-                                    })?;
-                                let data = source
-                                    .get("data")
-                                    .and_then(|d| d.as_str())
-                                    .filter(|s| !s.is_empty())
-                                    .ok_or_else(|| {
-                                        AnthropicMapError::new(format!(
-                                            "messages[{msg_idx}].content[{bi}]: image base64 missing data"
-                                        ))
-                                    })?;
-                                CanonicalImageSource::Base64 {
-                                    media_type: media_type.to_string(),
-                                    data: data.to_string(),
-                                }
-                            }
-                            "url" => {
-                                let url = source
-                                    .get("url")
-                                    .and_then(|u| u.as_str())
-                                    .filter(|s| !s.trim().is_empty())
-                                    .ok_or_else(|| {
-                                        AnthropicMapError::new(format!(
-                                            "messages[{msg_idx}].content[{bi}]: image url missing url"
-                                        ))
-                                    })?;
-                                CanonicalImageSource::Url {
-                                    url: url.to_string(),
-                                }
-                            }
-                            other => {
-                                return Err(AnthropicMapError::new(format!(
-                                    "messages[{msg_idx}].content[{bi}]: unsupported image source.type \"{other}\""
-                                )));
-                            }
-                        };
-                        let cache = parse_block_cache_control(
-                            b,
-                            &format!("messages[{msg_idx}].content[{bi}]"),
-                        )?;
+                        let loc = format!("messages[{msg_idx}].content[{bi}]");
+                        let img = anthropic_image_source(b, &loc)?;
+                        let cache = parse_block_cache_control(b, &loc)?;
                         blocks.push(RawBlock::Image { source: img, cache });
                     }
                     "tool_use" => {
@@ -594,7 +606,8 @@ fn parse_message_blocks(
                                 ))
                             })?
                             .to_string();
-                        let content_str = tool_result_content(b.get("content"), msg_idx, bi)?;
+                        let (content, inner_cache) =
+                            tool_result_content(b.get("content"), msg_idx, bi)?;
                         let is_error = b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
                         let cache = parse_block_cache_control(
                             b,
@@ -602,9 +615,10 @@ fn parse_message_blocks(
                         )?;
                         blocks.push(RawBlock::ToolResult {
                             tool_use_id,
-                            content: content_str,
+                            content,
                             is_error,
-                            cache,
+                            // The block's own mark comes after its inner ones.
+                            cache: cache.or(inner_cache),
                         });
                     }
                     "thinking" => blocks.push(RawBlock::Thinking),
@@ -629,43 +643,96 @@ fn parse_message_blocks(
     }
 }
 
+/// Parse an Anthropic `image` block's `source` (base64 or url).
+fn anthropic_image_source(b: &Value, loc: &str) -> Result<CanonicalImageSource, AnthropicMapError> {
+    let source = b
+        .get("source")
+        .ok_or_else(|| AnthropicMapError::new(format!("{loc}: image missing source")))?;
+    let src_ty = source
+        .get("type")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| AnthropicMapError::new(format!("{loc}: image source.type required")))?;
+    match src_ty {
+        "base64" => {
+            let media_type = source
+                .get("media_type")
+                .and_then(|m| m.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AnthropicMapError::new(format!("{loc}: image base64 missing media_type"))
+                })?;
+            let data = source
+                .get("data")
+                .and_then(|d| d.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AnthropicMapError::new(format!("{loc}: image base64 missing data"))
+                })?;
+            Ok(CanonicalImageSource::Base64 {
+                media_type: media_type.to_string(),
+                data: data.to_string(),
+            })
+        }
+        "url" => {
+            let url = source
+                .get("url")
+                .and_then(|u| u.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| AnthropicMapError::new(format!("{loc}: image url missing url")))?;
+            Ok(CanonicalImageSource::Url {
+                url: url.to_string(),
+            })
+        }
+        other => Err(AnthropicMapError::new(format!(
+            "{loc}: unsupported image source.type \"{other}\""
+        ))),
+    }
+}
+
+/// Parse `tool_result.content` (a string, or text and image blocks). Returns
+/// the content and the last inner `cache_control` mark, which the caller
+/// moves to the outer tool result. `document` and other blocks are a 400.
 fn tool_result_content(
     content: Option<&Value>,
     msg_idx: usize,
     bi: usize,
-) -> Result<String, AnthropicMapError> {
+) -> Result<(CanonicalContent, Option<CanonicalCacheMark>), AnthropicMapError> {
     match content {
-        None | Some(Value::Null) => Ok(String::new()),
-        Some(Value::String(s)) => Ok(s.clone()),
+        None | Some(Value::Null) => Ok((CanonicalContent::Text(String::new()), None)),
+        Some(Value::String(s)) => Ok((CanonicalContent::Text(s.clone()), None)),
         Some(Value::Array(arr)) => {
-            let mut parts = Vec::new();
+            let mut blocks = Vec::with_capacity(arr.len());
             for (ci, c) in arr.iter().enumerate() {
+                let loc = format!("messages[{msg_idx}].content[{bi}].content[{ci}]");
                 let ty = c.get("type").and_then(|t| t.as_str()).unwrap_or("text");
                 match ty {
-                    "text" => {
-                        parts.push(
-                            c.get("text")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                        );
-                    }
-                    "image" => {
-                        return Err(AnthropicMapError::new(format!(
-                            "messages[{msg_idx}].content[{bi}]: tool_result image content is not supported"
-                        )));
-                    }
+                    "text" => blocks.push(CanonicalBlock::Text {
+                        text: c
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        cache: parse_block_cache_control(c, &loc)?,
+                    }),
+                    "image" => blocks.push(CanonicalBlock::Image {
+                        source: anthropic_image_source(c, &loc)?,
+                        cache: parse_block_cache_control(c, &loc)?,
+                    }),
                     other => {
                         return Err(AnthropicMapError::new(format!(
-                            "messages[{msg_idx}].content[{bi}].content[{ci}]: unsupported type \"{other}\""
+                            "{loc}: unsupported type \"{other}\""
                         )));
                     }
                 }
             }
-            Ok(parts.join("\n"))
+            CanonicalContent::Blocks(blocks)
+                .into_tool_result()
+                .map_err(|e| {
+                    AnthropicMapError::new(format!("messages[{msg_idx}].content[{bi}]: {e}"))
+                })
         }
         Some(_) => Err(AnthropicMapError::new(format!(
-            "messages[{msg_idx}].content[{bi}]: tool_result.content must be string or text array"
+            "messages[{msg_idx}].content[{bi}]: tool_result.content must be a string or an array of text and image blocks"
         ))),
     }
 }
@@ -1839,7 +1906,7 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(tool_use_id, "t1");
-                    assert_eq!(content, "ok1");
+                    assert_eq!(content, &CanonicalContent::Text("ok1".into()));
                     assert!(!is_error);
                 }
                 other => panic!("{other:?}"),
@@ -1855,17 +1922,108 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(tool_use_id, "t2");
-                    assert_eq!(content, "fail");
+                    assert_eq!(content, &CanonicalContent::Text("fail".into()));
                     assert!(*is_error);
                     assert_eq!(
-                        encode_tool_result_content(content, *is_error),
-                        "ERROR: fail"
+                        responses_tool_result_output(content, *is_error).unwrap(),
+                        json!("ERROR: fail")
                     );
                 }
                 other => panic!("{other:?}"),
             },
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_result_image_maps_for_translated_backends() {
+        // WHY (issue #57): Anthropic clients send a screenshot as an image block
+        // inside tool_result.content. On the Grok/Codex path this was a 400, so
+        // the session broke on every turn that resent the image.
+        let tool_turn = |results: Value| {
+            json!({
+                "model": "m",
+                "max_tokens": 10,
+                "messages": [
+                    {"role": "user", "content": "take screenshots"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "t1", "name": "shot", "input": {}},
+                        {"type": "tool_use", "id": "t2", "name": "shot", "input": {}}
+                    ]},
+                    {"role": "user", "content": results}
+                ]
+            })
+        };
+        let body = tool_turn(json!([
+            // t1: image only, with an inner mark and no outer mark.
+            {"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="
+                }, "cache_control": {"type": "ephemeral"}}
+            ]},
+            // t2: text and a URL image; the outer 1h mark beats the inner one.
+            {"type": "tool_result", "tool_use_id": "t2", "is_error": true,
+             "cache_control": {"type": "ephemeral", "ttl": "1h"}, "content": [
+                {"type": "text", "text": "page", "cache_control": {"type": "ephemeral"}},
+                {"type": "image", "source": {"type": "url", "url": "https://example.com/p.png"}}
+            ]}
+        ]));
+        let canon = anthropic_to_canonical(&body, "codex").expect("tool_result image must map");
+        let result = |i: usize| match &canon.messages[i].content {
+            CanonicalContent::Blocks(b) => match &b[0] {
+                CanonicalBlock::ToolResult {
+                    content,
+                    is_error,
+                    cache,
+                    ..
+                } => (content.clone(), *is_error, cache.clone()),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        };
+        let png = CanonicalBlock::Image {
+            source: CanonicalImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "iVBORw0KGgo=".into(),
+            },
+            cache: None,
+        };
+        assert_eq!(
+            result(2),
+            (
+                CanonicalContent::Blocks(vec![png]),
+                false,
+                Some(CanonicalCacheMark::breakpoint())
+            )
+        );
+        assert_eq!(
+            result(3),
+            (
+                CanonicalContent::Blocks(vec![
+                    CanonicalBlock::text("page"),
+                    CanonicalBlock::Image {
+                        source: CanonicalImageSource::Url {
+                            url: "https://example.com/p.png".into()
+                        },
+                        cache: None,
+                    },
+                ]),
+                true,
+                Some(CanonicalCacheMark {
+                    ttl: Some(omni_core::CanonicalCacheTtl::OneHour)
+                })
+            )
+        );
+
+        // Documents stay out of scope: still a 400.
+        let body = tool_turn(json!([
+            {"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "document", "source": {"type": "url", "url": "https://example.com/a.pdf"}}
+            ]},
+            {"type": "tool_result", "tool_use_id": "t2", "content": "ok"}
+        ]));
+        let err = anthropic_to_canonical(&body, "codex").unwrap_err();
+        assert!(err.0.contains("document"), "{err}");
     }
 
     #[test]
@@ -2076,6 +2234,67 @@ mod tests {
         assert_eq!(encode_tool_result_content("ok", false), "ok");
         assert_eq!(encode_tool_result_content("", true), "error");
         assert_eq!(encode_tool_result_content("boom", true), "ERROR: boom");
+    }
+
+    #[test]
+    fn responses_tool_result_output_matrix() {
+        // WHY (issue #57): Codex and Grok Responses share this output. A
+        // text-only result must stay the exact string sent before images were
+        // allowed. An image result is the input_text/input_image array that
+        // both backends accepted in live spikes. is_error must reach the model
+        // even when the result has no text.
+        let image = || CanonicalBlock::Image {
+            source: CanonicalImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            },
+            cache: None,
+        };
+        let image_part = json!({"type": "input_image", "image_url": "data:image/png;base64,AAAA"});
+        let text_part = |t: &str| json!({"type": "input_text", "text": t});
+        let cases = [
+            (CanonicalContent::Text("72F".into()), false, json!("72F")),
+            (
+                CanonicalContent::Text("boom".into()),
+                true,
+                json!("ERROR: boom"),
+            ),
+            (
+                CanonicalContent::Blocks(vec![
+                    CanonicalBlock::text("Screenshot captured."),
+                    image(),
+                ]),
+                false,
+                json!([text_part("Screenshot captured."), image_part]),
+            ),
+            (
+                CanonicalContent::Blocks(vec![
+                    image(),
+                    CanonicalBlock::text("a"),
+                    image(),
+                    CanonicalBlock::text("b"),
+                ]),
+                true,
+                json!([
+                    image_part,
+                    text_part("ERROR: a"),
+                    image_part,
+                    text_part("b")
+                ]),
+            ),
+            (
+                CanonicalContent::Blocks(vec![image()]),
+                true,
+                json!([text_part("error"), image_part]),
+            ),
+        ];
+        for (content, is_error, want) in cases {
+            assert_eq!(
+                responses_tool_result_output(&content, is_error).unwrap(),
+                want,
+                "{content:?} is_error={is_error}"
+            );
+        }
     }
 
     #[test]

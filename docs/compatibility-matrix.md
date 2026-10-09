@@ -14,10 +14,22 @@ Normal tests are hermetic and quota-free. Live provider checks remain opt-in via
 | Tool result loops | Yes | Yes | Yes | Yes | Yes |
 | Image URL input | Yes | Yes | Yes | Yes | Yes |
 | Base64 image input | Yes | Yes | Yes | Yes | Yes |
+| Images in tool results | Yes (`image_url` parts on `role:"tool"`) | Yes (`function_call_output.output` parts) | Yes (native blocks) | Yes (Responses parts; Chat: see below) | Yes (Responses parts) |
 | Audio input | No | No | No | No | No |
 | File input | PDF `file_id` / `file_data` | `input_file` URL / ID / data | PDF URL / data; no OpenAI ID or detail | Responses URL / ID only; Chat rejects files | Responses URL / ID / data |
 
 Unsupported typed media parts and file variants that a selected backend cannot honor fail loudly with a request error. File IDs belong to the receiving provider; Omni does not upload or transfer files between providers. Grok file support uses its Responses route on agentic-capable models.
+
+Tool results hold text and images only; files in tool results fail with a
+request error. A text-only tool result reaches each backend as the same string
+as before. The Chat spec allows only text in tool messages, so the Grok Chat
+path (custom OpenAI-compatible endpoints) puts a placeholder such as
+`[image 1 from tool call <id>: see next user message]` in the tool message, and
+adds one user message with the labeled images after the run of tool messages.
+That path has offline tests only.
+
+Chat, Responses, and Anthropic routes share one request body limit,
+`MAX_REQUEST_BODY_BYTES` in `crates/bin/omni/src/main.rs`.
 
 Codex caller output caps (`max_tokens` / `max_completion_tokens` on Chat,
 `max_output_tokens` on Responses, `max_tokens` on `/v1/messages`): the REST
@@ -37,6 +49,7 @@ used, not the model name. `/v1/messages` still requires `max_tokens`.
 | Function tools + tool loops | Yes | Yes | Yes |
 | `tool_choice` (`auto` / `any` / `tool` / `none`) | Yes | Yes | Yes |
 | Images (url/base64) | Yes | Yes | Yes |
+| Images in `tool_result` | Yes | Yes | Yes |
 | Streaming SSE | Yes (raw) | Yes (framed) | Yes (framed) |
 | Thinking wire emit | Yes | No | No |
 | Hosted/computer tools | Passthrough | No (400) | No (400) |

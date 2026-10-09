@@ -138,7 +138,8 @@ Gateway auth on `/v1/messages` unchanged. Upstream credentials per provider.
 | Message `content` array | Walk blocks |
 | `tool_result.content` string | Pass as tool result text |
 | `tool_result.content` array of text | Join with `\n` |
-| `tool_result.content` with image/other | **400** |
+| `tool_result.content` with images | Keep the text and image blocks in order (issue #57). A `cache_control` mark on an inner block moves to the tool result. |
+| `tool_result.content` with `document` or other blocks | **400** |
 | Block-by-role matrix | user: text, image, tool_result only; assistant: **text, tool_use only** (no images; thinking dropped before matrix); illegal role+type → **400** |
 | Unpaired `tool_result` (no prior outstanding tool_use id) | **400** |
 | Assistant `tool_use` in history | non-empty unique `id`, non-empty `name`, `input` object (or empty object) — else **400** |
@@ -184,13 +185,14 @@ Anthropic embeds `tool_result` **inside user messages**. Canonical/OpenAI expect
    - Unpaired tool_result anywhere → **400**
 4. For that resolving user message (lossy reorder, documented):
    - Emit **all** tool-result turns **first**, then **one** user message for non-tool text/image.  
-   - Each `tool_result`: exact id; string or text-array content; image → **400**.  
+   - Each `tool_result`: exact id; string content, or text and image blocks; `document` → **400**.  
    - **`is_error` encoding (normative, end-to-end):**  
      1. Anthropic → `CanonicalBlock::ToolResult { is_error }`  
      2. Grok/Codex request wire: OpenAI `role:tool` message content string =  
         - `is_error && content.empty` → `"error"`  
         - `is_error && !content.empty` → `"ERROR: " + content`  
         - `!is_error` → content as-is  
+        - Content with an image: the prefix goes on the first text part. When there is no text part, a leading `"error"` part is added.  
      3. Hermetic tests assert the **provider-bound JSON** contains that content string (not merely that the canonical struct has the bit).
 
 ### 5.3 Tool ID round-trip invariant (critical)

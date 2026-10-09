@@ -46,6 +46,11 @@ Canonical `ToolResult.is_error` maps to OpenAI-style tool content:
 | true | empty | `"error"` |
 | true | non-empty | `"ERROR: " + content` |
 
+A `tool_result` with images keeps its text and image blocks in order. Grok
+and Codex Responses send `function_call_output.output` as `input_text` and
+`input_image` parts; the `ERROR: ` prefix goes on the first text part, or a
+leading `"error"` part is added. A `document` block in `tool_result` is a 400.
+
 ## No thinking on translated wire
 
 Historical `thinking` / `redacted_thinking` blocks are dropped. Response

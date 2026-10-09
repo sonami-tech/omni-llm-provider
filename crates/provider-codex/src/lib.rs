@@ -1753,13 +1753,13 @@ fn codex_responses_body(req: &CanonicalRequest, stream: bool) -> Result<Value, P
                 // field. Emit a developer input item so breakpoints survive.
                 let mut marked = message.clone();
                 marked.role = "developer".into();
-                append_message_items(&marked, &mut input);
+                append_message_items(&marked, &mut input)?;
             } else {
                 instructions.push(message.content.as_text());
             }
             continue;
         }
-        append_message_items(message, &mut input);
+        append_message_items(message, &mut input)?;
     }
 
     let mut body = json!({
@@ -2068,7 +2068,10 @@ fn openai_breakpoint_part(mut part: Value, cache: Option<&CanonicalCacheMark>) -
     part
 }
 
-fn append_message_items(message: &CanonicalMessage, input: &mut Vec<Value>) {
+fn append_message_items(
+    message: &CanonicalMessage,
+    input: &mut Vec<Value>,
+) -> Result<(), ProviderError> {
     match &message.content {
         CanonicalContent::Text(text) => {
             input.push(json!({
@@ -2166,11 +2169,15 @@ fn append_message_items(message: &CanonicalMessage, input: &mut Vec<Value>) {
                             &mut has_image,
                             &mut has_breakpoint,
                         );
-                        let wire = omni_common::encode_tool_result_content(content, *is_error);
+                        // A string, or [input_text, input_image] when the
+                        // result holds an image (accepted by the ChatGPT
+                        // Codex backend in a live spike, #57).
+                        let output = omni_common::responses_tool_result_output(content, *is_error)
+                            .map_err(ProviderError::BadRequest)?;
                         input.push(json!({
                             "type": "function_call_output",
                             "call_id": tool_use_id,
-                            "output": wire,
+                            "output": output,
                         }));
                     }
                 }
@@ -2185,6 +2192,7 @@ fn append_message_items(message: &CanonicalMessage, input: &mut Vec<Value>) {
             );
         }
     }
+    Ok(())
 }
 
 fn flush_codex_message(
@@ -3225,6 +3233,51 @@ query_params = { api-version = "2026-01-01" }
         let parts = rest["input"][0]["content"].as_array().unwrap();
         assert_eq!(parts[0]["prompt_cache_breakpoint"]["mode"], "explicit");
         assert!(parts[1].get("prompt_cache_breakpoint").is_none());
+        let ws = codex_response_create_body(&canon).unwrap();
+        assert_eq!(rest["input"], ws["input"]);
+    }
+
+    #[test]
+    fn tool_result_images_reach_codex_as_input_parts() {
+        // WHY (issue #57): a direct POST to the ChatGPT Codex backend with
+        // function_call_output.output = [input_text, input_image{image_url}]
+        // returned 200 and the model read the image (live spike). REST and
+        // WebSocket share the body. A text-only result must stay the string
+        // it was before.
+        let chat: omni_common::ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-6.1-sol",
+            "messages": [
+                {"role": "user", "content": "read both"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+                    {"id": "c2", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": [
+                    {"type": "text", "text": "Read image file: /tmp/red.png"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+                ]},
+                {"role": "tool", "tool_call_id": "c2", "content": "72F"}
+            ]
+        }))
+        .unwrap();
+        let canon = omni_common::to_canonical(&chat).unwrap();
+        let rest = codex_responses_body(&canon, false).unwrap();
+        let outputs: Vec<&Value> = rest["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .collect();
+        assert_eq!(
+            outputs,
+            [
+                &json!({"type": "function_call_output", "call_id": "c1", "output": [
+                    {"type": "input_text", "text": "Read image file: /tmp/red.png"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+                ]}),
+                &json!({"type": "function_call_output", "call_id": "c2", "output": "72F"}),
+            ]
+        );
         let ws = codex_response_create_body(&canon).unwrap();
         assert_eq!(rest["input"], ws["input"]);
     }

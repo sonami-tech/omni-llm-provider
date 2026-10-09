@@ -68,7 +68,7 @@ use anyhow::Context;
 use axum::{
     Router,
     body::Body,
-    extract::{Extension, Json, Query, State},
+    extract::{DefaultBodyLimit, Extension, Json, Query, State},
     http::{HeaderMap, Request, StatusCode, header},
     middleware,
     response::{
@@ -565,6 +565,11 @@ fn log_startup_banner() {
     );
 }
 
+/// Largest request body that the Chat, Responses, and Anthropic routes accept.
+/// Clients resend the whole history on each turn, and user turns and tool
+/// results can carry base64 screenshots, so axum's 2 MB default is too small.
+const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 fn build_router(state: Arc<AppState>, auth_keys: Arc<HashSet<String>>) -> Router {
     let auth = AuthConfig {
         valid_keys: auth_keys,
@@ -586,6 +591,9 @@ fn build_router(state: Arc<AppState>, auth_keys: Arc<HashSet<String>>) -> Router
         .route("/stats", get(stats_handler))
         .route("/stats/json", get(stats_json_handler))
         .with_state(state)
+        // Raises the `Json` extractor limit (Chat and Responses). The
+        // Anthropic routes read the raw body with the same constant.
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         // Always layer; empty keys still run dual-credential / strict checks on
         // Anthropic paths, then allow-all when no membership set is configured.
         .layer(middleware::from_fn({
@@ -2429,7 +2437,7 @@ async fn anthropic_count_tokens_inner(
 }
 
 async fn read_anthropic_body_bytes(request: Request<Body>) -> Result<Vec<u8>, AppError> {
-    let body = axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024)
+    let body = axum::body::to_bytes(request.into_body(), MAX_REQUEST_BODY_BYTES)
         .await
         .map_err(|error| AppError::BadRequest(format!("failed to read body: {error}")))?;
     Ok(body.to_vec())
@@ -5932,6 +5940,144 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
         assert_eq!(v["content"][0]["type"], "text");
         assert_eq!(v["content"][0]["text"], "pong");
         assert!(v["stop_sequence"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_inference_routes_share_the_32_mb_body_limit() {
+        // WHY (issue #57): clients resend the whole history on each turn, so a
+        // few screenshots pass axum's 2 MB `Json` default (413 on Chat and
+        // Responses) and the old 10 MB Anthropic read. All three routes share
+        // one 32 MB limit, and a larger body is still refused.
+        use tower::ServiceExt;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl_test",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "red"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}
+            })))
+            .mount(&server)
+            .await;
+        let post = |path: &'static str, body: String| {
+            let app = mk_app_with(
+                HashMap::from([("grok".to_string(), grok_entry(&server.uri()))]),
+                Arc::new(HashSet::new()),
+            );
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .expect("router responds")
+                .status()
+            }
+        };
+        let data = "A".repeat(11 * 1024 * 1024);
+        let url = format!("data:image/png;base64,{data}");
+        let bodies = [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "grok:grok-4.6", "messages": [{"role": "user",
+                    "content": [{"type": "image_url", "image_url": {"url": url}}]}]}),
+            ),
+            (
+                "/v1/responses",
+                serde_json::json!({"model": "grok:grok-4.6", "input": [{"role": "user",
+                    "content": [{"type": "input_image", "image_url": url}]}]}),
+            ),
+            (
+                "/v1/messages",
+                serde_json::json!({"model": "grok:grok-4.6", "max_tokens": 16, "messages": [
+                    {"role": "user", "content": [{"type": "image", "source":
+                        {"type": "base64", "media_type": "image/png", "data": data}}]}]}),
+            ),
+        ];
+        for (path, body) in bodies {
+            assert_eq!(post(path, body.to_string()).await, StatusCode::OK, "{path}");
+        }
+
+        let too_big = serde_json::json!({"model": "grok:grok-4.6", "messages": [{"role": "user",
+            "content": "A".repeat(MAX_REQUEST_BODY_BYTES)}]});
+        assert_eq!(
+            post("/v1/chat/completions", too_big.to_string()).await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_anthropic_tool_result_image_reaches_codex() {
+        // WHY (issue #57): an Anthropic client sends a screenshot inside
+        // tool_result.content. Routed to Codex, it was a 400 before any
+        // upstream call. It must now reach the Responses wire as the
+        // function_call_output input-part array.
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let server = MockServer::start().await;
+        let _codex_home = TempCodexHome::install_for_mock(&server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "gpt-5.5",
+                "status": "completed",
+                "output": [{"type":"message","content":[{"type":"output_text","text":"red"}]}],
+                "usage": {"input_tokens": 2, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut map = HashMap::new();
+        map.insert("codex".into(), codex_entry());
+        let resp = call_anthropic_messages_handler(
+            state_with(map),
+            &serde_json::json!({
+                "model": "codex:gpt-5.5",
+                "max_tokens": 64,
+                "tools": [{"name": "screenshot", "input_schema": {"type": "object"}}],
+                "messages": [
+                    {"role": "user", "content": "What color is the screen?"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "toolu_1", "name": "screenshot", "input": {}}
+                    ]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                        "content": [
+                            {"type": "text", "text": "Screenshot captured."},
+                            {"type": "image", "source": {
+                                "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="
+                            }}
+                        ]}]}
+                ]
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let requests = server.received_requests().await.unwrap();
+        let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let output = sent["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .expect("tool result must reach Codex");
+        assert_eq!(
+            output,
+            &serde_json::json!({"type": "function_call_output", "call_id": "toolu_1", "output": [
+                {"type": "input_text", "text": "Screenshot captured."},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+            ]})
+        );
     }
 
     #[tokio::test]

@@ -102,9 +102,10 @@ pub struct ResponsesInputItem {
     /// `function_call`: the raw JSON arguments string.
     #[serde(default)]
     pub arguments: Option<String>,
-    /// `function_call_output`: the tool's result text.
+    /// `function_call_output`: the tool's result, a string or typed parts
+    /// (text and images).
     #[serde(default)]
-    pub output: Option<String>,
+    pub output: Option<ResponsesInputContent>,
 }
 
 /// Message content: a bare string or typed parts.
@@ -289,7 +290,8 @@ pub struct ResponsesUsage {
 ///   content used verbatim; multiple text parts joined with "\n"
 /// - `function_call` item -> an assistant message with a ToolUse block;
 ///   `function_call_output` item -> a "tool" message with a ToolResult block
-///   (both keyed by `call_id`), so multi-turn tool loops round-trip
+///   (both keyed by `call_id`), so multi-turn tool loops round-trip. Its
+///   `output` is a string or `input_text` / `input_image` parts
 /// - `max_output_tokens`/`temperature`/`top_p` -> canonical sampling
 /// - `reasoning.effort` -> canonical reasoning effort
 /// - unknown top-level Responses fields -> canonical provider_extras, where
@@ -341,18 +343,22 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
                             }]),
                         });
                     }
-                    // A tool result fed back -> a ToolResult block.
+                    // A tool result fed back -> a ToolResult block. A part
+                    // breakpoint moves to the outer ToolResult.
                     Some("function_call_output") => {
                         let call_id = item.call_id.clone().ok_or_else(|| {
                             "function_call_output item missing call_id".to_string()
                         })?;
+                        let (content, cache) =
+                            responses_content_to_canonical(item.output.as_ref())?
+                                .into_tool_result()?;
                         messages.push(CanonicalMessage {
                             role: "tool".into(),
                             content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
                                 tool_use_id: call_id,
-                                content: item.output.clone().unwrap_or_default(),
+                                content,
                                 is_error: false,
-                                cache: None,
+                                cache,
                             }]),
                         });
                     }
@@ -2091,12 +2097,55 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(tool_use_id, "c1");
-                    assert_eq!(content, "72F");
+                    assert_eq!(content, &CanonicalContent::Text("72F".into()));
                 }
                 other => panic!("expected ToolResult block, got {other:?}"),
             },
             other => panic!("function_call_output must become Blocks, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn to_canonical_accepts_array_function_call_output() {
+        // WHY (issue #57): the Responses spec lets function_call_output.output
+        // be a string or an array of input parts. A tool that returns a
+        // screenshot sends the array form; it must not fail to deserialize.
+        let req: ResponsesRequest = serde_json::from_str(
+            r#"{"model":"m","input":[
+                {"type":"function_call","call_id":"c1","name":"shot","arguments":"{}"},
+                {"type":"function_call_output","call_id":"c1","output":[
+                    {"type":"input_text","text":"Screenshot captured."},
+                    {"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo=","detail":"auto"}
+                ]}
+            ]}"#,
+        )
+        .expect("an array output must deserialize");
+        let canon = responses_to_canonical(&req).expect("an array output must convert");
+        let CanonicalContent::Blocks(blocks) = &canon.messages[1].content else {
+            panic!("function_call_output must become Blocks")
+        };
+        let CanonicalBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } = &blocks[0]
+        else {
+            panic!("expected ToolResult, got {:?}", blocks[0])
+        };
+        assert_eq!(tool_use_id, "c1");
+        assert_eq!(
+            content,
+            &CanonicalContent::Blocks(vec![
+                CanonicalBlock::text("Screenshot captured."),
+                CanonicalBlock::Image {
+                    source: CanonicalImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "iVBORw0KGgo=".into(),
+                    },
+                    cache: None,
+                },
+            ])
+        );
     }
 
     #[test]

@@ -24,8 +24,9 @@ pub mod test_support;
 pub mod timeouts;
 
 pub use anthropic::{
-    AnthropicMapError, AnthropicProtocolError, anthropic_to_canonical, canonical_to_anthropic,
-    encode_tool_result_content, parse_anthropic_object_no_dup_keys, peek_model_string,
+    AnthropicMapError, AnthropicProtocolError, ToolResultPart, anthropic_to_canonical,
+    canonical_to_anthropic, encode_tool_result_content, encode_tool_result_parts,
+    parse_anthropic_object_no_dup_keys, peek_model_string, responses_tool_result_output,
     sse_from_canonical_stream_anthropic,
 };
 pub use anthropic_native_stats::{

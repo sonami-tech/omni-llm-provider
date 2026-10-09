@@ -30,15 +30,15 @@ use omni_common::responses_upstream::{
     self, ErrorRedactor, ResponsesSseBuffer, ResponsesStreamParser,
 };
 use omni_common::{
-    UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_ERROR_BODY_PREFIX, UPSTREAM_ERROR_BODY_READ_TIMEOUT,
-    UPSTREAM_REQUEST_TIMEOUT, env_nonempty, headers_from_env, is_sse_content_type,
-    map_upstream_headers_wait, timeout_upstream_headers,
+    ToolResultPart, UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_ERROR_BODY_PREFIX,
+    UPSTREAM_ERROR_BODY_READ_TIMEOUT, UPSTREAM_REQUEST_TIMEOUT, env_nonempty, headers_from_env,
+    is_sse_content_type, map_upstream_headers_wait, timeout_upstream_headers,
 };
 use omni_core::{
-    CanonicalBlock, CanonicalContent, CanonicalMessage, CanonicalReasoning, CanonicalRequest,
-    CanonicalResponse, CanonicalResponseMetadata, CanonicalStream, CanonicalStreamEvent,
-    CanonicalToolCall, CanonicalToolChoice, CanonicalUsage, CatalogModel, LlmProvider,
-    ProviderError,
+    CanonicalBlock, CanonicalContent, CanonicalImageSource, CanonicalMessage, CanonicalReasoning,
+    CanonicalRequest, CanonicalResponse, CanonicalResponseMetadata, CanonicalStream,
+    CanonicalStreamEvent, CanonicalToolCall, CanonicalToolChoice, CanonicalUsage, CatalogModel,
+    LlmProvider, ProviderError,
 };
 use reqwest::Client;
 use reqwest::header;
@@ -1081,9 +1081,11 @@ fn to_xai_chat_request(
     catalog: &[CatalogModel],
 ) -> Result<Value, ProviderError> {
     let mut messages: Vec<Value> = Vec::new();
+    let mut tool_images = HoistedToolImages::default();
     for m in &req.messages {
         match &m.content {
             CanonicalContent::Text(t) => {
+                tool_images.flush(&mut messages);
                 messages.push(json!({ "role": m.role, "content": repl.apply_prompt(t) }));
             }
             CanonicalContent::Blocks(blocks) => {
@@ -1095,7 +1097,7 @@ fn to_xai_chat_request(
                 let mut text = String::new();
                 let mut content_parts: Vec<Value> = Vec::new();
                 let mut tool_calls: Vec<Value> = Vec::new();
-                let mut tool_result_msgs: Vec<Value> = Vec::new();
+                let mut tool_results = Vec::new();
                 for b in blocks {
                     match b {
                         CanonicalBlock::Text { text: t, .. } => {
@@ -1134,14 +1136,7 @@ fn to_xai_chat_request(
                             content,
                             is_error,
                             ..
-                        } => {
-                            let wire = omni_common::encode_tool_result_content(content, *is_error);
-                            tool_result_msgs.push(json!({
-                                "role": "tool",
-                                "tool_call_id": tool_use_id,
-                                "content": repl.apply_prompt(&wire)
-                            }));
-                        }
+                        } => tool_results.push((tool_use_id, content, *is_error)),
                     }
                 }
                 // Emit the role's own message FIRST (when it carries text or tool
@@ -1151,6 +1146,7 @@ fn to_xai_chat_request(
                 // but no text, content is null per the OpenAI contract; an empty
                 // tool_calls array is omitted.
                 if !text.is_empty() || !content_parts.is_empty() || !tool_calls.is_empty() {
+                    tool_images.flush(&mut messages);
                     let mut msg = serde_json::Map::new();
                     msg.insert("role".into(), json!(m.role));
                     let content = if content_parts.iter().any(is_image_part) {
@@ -1166,10 +1162,24 @@ fn to_xai_chat_request(
                     }
                     messages.push(Value::Object(msg));
                 }
-                messages.extend(tool_result_msgs);
+                for (tool_use_id, content, is_error) in tool_results {
+                    let content = xai_tool_message_content(
+                        tool_use_id,
+                        content,
+                        is_error,
+                        repl,
+                        &mut tool_images,
+                    )?;
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": content
+                    }));
+                }
             }
         }
     }
+    tool_images.flush(&mut messages);
 
     let tools: Option<Vec<Value>> = req
         .tools
@@ -1258,6 +1268,75 @@ fn to_xai_chat_request(
     // (Real rules for tool names etc. are typically applied by the frontend before producing CanonicalRequest,
     // or the provider ctor would be given a live Replacements instance instead of always empty().)
     Ok(body)
+}
+
+/// Content of one `role:"tool"` message on the Grok Chat wire.
+///
+/// Chat tool messages carry only text. A text-only result stays the string it
+/// was before. In a result with an image, each image becomes a placeholder
+/// line and moves to the user message after the run of tool messages (see
+/// [`HoistedToolImages`]). Replacements apply to text parts only.
+fn xai_tool_message_content(
+    tool_use_id: &str,
+    content: &CanonicalContent,
+    is_error: bool,
+    repl: &Replacements,
+    images: &mut HoistedToolImages,
+) -> Result<String, ProviderError> {
+    let blocks = match content {
+        CanonicalContent::Text(text) => {
+            let wire = omni_common::encode_tool_result_content(text, is_error);
+            return Ok(repl.apply_prompt(&wire));
+        }
+        CanonicalContent::Blocks(blocks) => blocks,
+    };
+    let parts = omni_common::encode_tool_result_parts(blocks, is_error)
+        .map_err(ProviderError::BadRequest)?;
+    Ok(parts
+        .into_iter()
+        .map(|part| match part {
+            ToolResultPart::Text(text) => repl.apply_prompt(&text),
+            ToolResultPart::Image(source) => images.push(tool_use_id, source),
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// Images moved out of a run of `role:"tool"` messages on the Grok Chat wire.
+///
+/// The Chat spec allows only text in tool messages, and this path serves
+/// arbitrary custom OpenAI-compatible endpoints. So each image becomes a
+/// numbered placeholder in its tool message, and after the run of tool
+/// messages ONE user message holds a matching label before each image.
+/// Nothing is inserted between tool messages.
+#[derive(Default)]
+struct HoistedToolImages {
+    parts: Vec<Value>,
+    count: usize,
+}
+
+impl HoistedToolImages {
+    /// Queue one image and return the placeholder for its tool message.
+    fn push(&mut self, tool_use_id: &str, source: &CanonicalImageSource) -> String {
+        self.count += 1;
+        let label = format!("image {} from tool call {tool_use_id}", self.count);
+        self.parts
+            .push(json!({ "type": "text", "text": format!("[{label}]") }));
+        self.parts.push(json!({
+            "type": "image_url",
+            "image_url": { "url": source.as_image_url() },
+        }));
+        format!("[{label}: see next user message]")
+    }
+
+    /// End the run: add the user message that holds the queued images.
+    fn flush(&mut self, messages: &mut Vec<Value>) {
+        if self.parts.is_empty() {
+            return;
+        }
+        messages.push(json!({ "role": "user", "content": std::mem::take(&mut self.parts) }));
+        self.count = 0;
+    }
 }
 
 fn apply_grok_prompt_cache_key(body: &mut Value, req: &CanonicalRequest) {
@@ -1561,11 +1640,15 @@ fn append_grok_responses_items(
                             &mut content_parts,
                             &mut has_image,
                         );
-                        let wire = omni_common::encode_tool_result_content(content, *is_error);
+                        // A string, or [input_text, input_image] when the
+                        // result holds an image (accepted by cli-chat-proxy
+                        // in a live spike, #57).
+                        let output = omni_common::responses_tool_result_output(content, *is_error)
+                            .map_err(ProviderError::BadRequest)?;
                         input.push(json!({
                             "type": "function_call_output",
                             "call_id": tool_use_id,
-                            "output": wire,
+                            "output": output,
                         }));
                     }
                 }
@@ -2498,7 +2581,7 @@ mod tests {
                     role: "tool".into(),
                     content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
                         tool_use_id: "c1".into(),
-                        content: "R".into(),
+                        content: CanonicalContent::Text("R".into()),
                         is_error: false,
                         cache: None,
                     }]),
@@ -2558,7 +2641,7 @@ mod tests {
                     },
                     CanonicalBlock::ToolResult {
                         tool_use_id: "c1".into(),
-                        content: "R".into(),
+                        content: CanonicalContent::Text("R".into()),
                         is_error: false,
                         cache: None,
                     },
@@ -2577,6 +2660,121 @@ mod tests {
         assert!(
             asst_idx < tool_idx,
             "assistant message must precede the tool result: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn chat_tool_images_move_to_one_user_message_after_each_tool_run() {
+        // WHY (issue #57): the Chat spec allows only text in tool messages, and
+        // Grok Chat serves arbitrary custom endpoints. Each image becomes a
+        // placeholder, and ONE user message after the run of tool messages
+        // holds the labeled images. Nothing may land between tool messages
+        // (parallel calls), the run can end at a role message, a text message,
+        // or the end of the request, and replacements touch text parts only.
+        let repl = Replacements::parse(
+            r#"rule = [ { scope = "prompt", search = "image", replace = "IMG" } ]"#,
+        )
+        .unwrap();
+        let png = |data: &str| CanonicalBlock::Image {
+            source: omni_core::CanonicalImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: data.into(),
+            },
+            cache: None,
+        };
+        let calls = |ids: &[&str], text: Option<&str>| CanonicalMessage {
+            role: "assistant".into(),
+            content: CanonicalContent::Blocks(
+                text.map(CanonicalBlock::text)
+                    .into_iter()
+                    .chain(ids.iter().map(|id| CanonicalBlock::ToolUse {
+                        id: (*id).into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                        cache: None,
+                    }))
+                    .collect(),
+            ),
+        };
+        let result = |id: &str, content: CanonicalContent, is_error| CanonicalMessage {
+            role: "tool".into(),
+            content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
+                tool_use_id: id.into(),
+                content,
+                is_error,
+                cache: None,
+            }]),
+        };
+        let text = |role: &str, t: &str| CanonicalMessage {
+            role: role.into(),
+            content: CanonicalContent::Text(t.into()),
+        };
+        let req = CanonicalRequest {
+            model: "grok-4.6".into(),
+            messages: vec![
+                text("user", "look"),
+                calls(&["c1", "c2", "c3"], None),
+                result(
+                    "c1",
+                    CanonicalContent::Blocks(vec![
+                        CanonicalBlock::text("Read image file: a.png"),
+                        png("AAAA"),
+                    ]),
+                    false,
+                ),
+                result("c2", CanonicalContent::Text("72F".into()), false),
+                result(
+                    "c3",
+                    CanonicalContent::Blocks(vec![CanonicalBlock::Image {
+                        source: omni_core::CanonicalImageSource::Url {
+                            url: "https://example.com/b.png".into(),
+                        },
+                        cache: None,
+                    }]),
+                    true,
+                ),
+                calls(&["c4"], Some("checking")),
+                result("c4", CanonicalContent::Blocks(vec![png("BBBB")]), false),
+                text("assistant", "Both are red."),
+                text("user", "and this one?"),
+                calls(&["c5"], None),
+                result("c5", CanonicalContent::Blocks(vec![png("CCCC")]), false),
+            ],
+            ..Default::default()
+        };
+        let body = to_xai_chat_request(&req, &repl, GROK_CATALOG).unwrap();
+        let tool_calls = |ids: &[&str]| {
+            ids.iter()
+                .map(|id| json!({"id": id, "type": "function", "function": {"name": "read", "arguments": "{}"}}))
+                .collect::<Vec<_>>()
+        };
+        let label = |n: u32, id: &str| json!({"type": "text", "text": format!("[image {n} from tool call {id}]")});
+        let url = |u: &str| json!({"type": "image_url", "image_url": {"url": u}});
+        let png_url = |data: &str| url(&format!("data:image/png;base64,{data}"));
+        assert_eq!(
+            body["messages"],
+            json!([
+                {"role": "user", "content": "look"},
+                {"role": "assistant", "content": null, "tool_calls": tool_calls(&["c1", "c2", "c3"])},
+                {"role": "tool", "tool_call_id": "c1",
+                 "content": "Read IMG file: a.png\n[image 1 from tool call c1: see next user message]"},
+                {"role": "tool", "tool_call_id": "c2", "content": "72F"},
+                {"role": "tool", "tool_call_id": "c3",
+                 "content": "error\n[image 2 from tool call c3: see next user message]"},
+                {"role": "user", "content": [
+                    label(1, "c1"), png_url("AAAA"), label(2, "c3"), url("https://example.com/b.png")
+                ]},
+                {"role": "assistant", "content": "checking", "tool_calls": tool_calls(&["c4"])},
+                {"role": "tool", "tool_call_id": "c4",
+                 "content": "[image 1 from tool call c4: see next user message]"},
+                {"role": "user", "content": [label(1, "c4"), png_url("BBBB")]},
+                {"role": "assistant", "content": "Both are red."},
+                {"role": "user", "content": "and this one?"},
+                {"role": "assistant", "content": null, "tool_calls": tool_calls(&["c5"])},
+                {"role": "tool", "tool_call_id": "c5",
+                 "content": "[image 1 from tool call c5: see next user message]"},
+                {"role": "user", "content": [label(1, "c5"), png_url("CCCC")]}
+            ])
         );
     }
 
@@ -5514,7 +5712,27 @@ mod tests {
                     role: "tool".into(),
                     content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
                         tool_use_id: "call_1".into(),
-                        content: "sunny".into(),
+                        content: CanonicalContent::Text("sunny".into()),
+                        is_error: false,
+                        cache: None,
+                    }]),
+                },
+                // Issue #57: an image result uses the input-part array that
+                // grok-shell sends to cli-chat-proxy (live spike).
+                CanonicalMessage {
+                    role: "tool".into(),
+                    content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
+                        tool_use_id: "call_2".into(),
+                        content: CanonicalContent::Blocks(vec![
+                            CanonicalBlock::text("Read image file: red.png"),
+                            CanonicalBlock::Image {
+                                source: omni_core::CanonicalImageSource::Base64 {
+                                    media_type: "image/png".into(),
+                                    data: "iVBORw0KGgo=".into(),
+                                },
+                                cache: None,
+                            },
+                        ]),
                         is_error: false,
                         cache: None,
                     }]),
@@ -5530,6 +5748,13 @@ mod tests {
         assert_eq!(input[1]["type"], "function_call_output");
         assert_eq!(input[1]["call_id"], "call_1");
         assert_eq!(input[1]["output"], "sunny");
+        assert_eq!(
+            input[2],
+            json!({"type": "function_call_output", "call_id": "call_2", "output": [
+                {"type": "input_text", "text": "Read image file: red.png"},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+            ]})
+        );
     }
 
     #[test]

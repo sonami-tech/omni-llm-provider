@@ -60,7 +60,7 @@ pub struct CanonicalMessage {
 /// sequence of content blocks, used when a turn mixes text with tool-call,
 /// tool-result, image, or file data. Keeping `Text` as its own variant means every
 /// plain-text producer stays valid; only mixed-content turns need `Blocks`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum CanonicalContent {
     Text(String),
     Blocks(Vec<CanonicalBlock>),
@@ -104,9 +104,11 @@ pub enum CanonicalBlock {
         cache: Option<CanonicalCacheMark>,
     },
     /// A tool's result fed back by the caller, keyed to the `ToolUse` it answers.
+    /// `content` holds only text and images; build it with
+    /// [`CanonicalContent::into_tool_result`].
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: CanonicalContent,
         #[serde(default)]
         is_error: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -252,6 +254,63 @@ impl CanonicalContent {
             CanonicalContent::Text(_) => false,
             CanonicalContent::Blocks(blocks) => blocks.iter().any(|b| b.cache_mark().is_some()),
         }
+    }
+
+    /// Shape parsed content for a [`CanonicalBlock::ToolResult`].
+    ///
+    /// A tool result holds only text and images. Any other block is an error.
+    /// - With no image, the result becomes `Text`, with its text parts joined
+    ///   by `"\n"`. Each writer then sends the same plain string that it sent
+    ///   before tool results could hold images.
+    /// - With an image, the blocks keep their order and empty text parts are
+    ///   dropped (Anthropic rejects empty text blocks).
+    /// - Inner blocks keep no cache mark. The last inner mark is returned, so
+    ///   that the parser can put it on the outer `ToolResult`. The cache-slot
+    ///   counts thus do not change.
+    pub fn into_tool_result(self) -> Result<(Self, Option<CanonicalCacheMark>), String> {
+        let blocks = match self {
+            CanonicalContent::Text(text) => return Ok((CanonicalContent::Text(text), None)),
+            CanonicalContent::Blocks(blocks) => blocks,
+        };
+        let mut mark = None;
+        let mut has_image = false;
+        let mut parts = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            match block {
+                CanonicalBlock::Text { text, cache } => {
+                    mark = cache.or(mark);
+                    parts.push(CanonicalBlock::Text { text, cache: None });
+                }
+                CanonicalBlock::Image { source, cache } => {
+                    mark = cache.or(mark);
+                    has_image = true;
+                    parts.push(CanonicalBlock::Image {
+                        source,
+                        cache: None,
+                    });
+                }
+                CanonicalBlock::File { .. } => {
+                    return Err("file content is not supported in tool results".into());
+                }
+                CanonicalBlock::ToolUse { .. } | CanonicalBlock::ToolResult { .. } => {
+                    return Err("tool results can hold only text and image content".into());
+                }
+            }
+        }
+        if !has_image {
+            let text = parts
+                .into_iter()
+                .filter_map(|block| match block {
+                    CanonicalBlock::Text { text, .. } => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Ok((CanonicalContent::Text(text), mark));
+        }
+        parts
+            .retain(|block| !matches!(block, CanonicalBlock::Text { text, .. } if text.is_empty()));
+        Ok((CanonicalContent::Blocks(parts), mark))
     }
 }
 
@@ -1028,6 +1087,74 @@ mod tests {
             }
             CanonicalContent::Text(_) => panic!("image content must stay block content"),
         }
+    }
+
+    #[test]
+    fn into_tool_result_keeps_text_strings_and_moves_marks_out() {
+        // WHY (issue #57): a text-only tool result must stay the exact string
+        // that every writer sent before tool results could hold images. An
+        // image result keeps its order. Inner cache marks must move to the
+        // outer block, or Claude would count more cache slots than the client
+        // asked for.
+        let text = |t: &str, cache: Option<CanonicalCacheMark>| CanonicalBlock::Text {
+            text: t.into(),
+            cache,
+        };
+        let one_hour = CanonicalCacheMark {
+            ttl: Some(crate::CanonicalCacheTtl::OneHour),
+        };
+        let image = CanonicalImageSource::Url {
+            url: "https://example.com/a.png".into(),
+        };
+
+        // No image: the parts join with "\n" (empty parts too) and the mark
+        // moves out.
+        let (content, mark) = CanonicalContent::Blocks(vec![
+            text("a", None),
+            text("", Some(CanonicalCacheMark::breakpoint())),
+            text("b", None),
+        ])
+        .into_tool_result()
+        .unwrap();
+        assert_eq!(content, CanonicalContent::Text("a\n\nb".into()));
+        assert_eq!(mark, Some(CanonicalCacheMark::breakpoint()));
+
+        // With an image: order kept, empty text dropped, no inner mark, and
+        // the last inner mark wins.
+        let (content, mark) = CanonicalContent::Blocks(vec![
+            text("", None),
+            CanonicalBlock::Image {
+                source: image.clone(),
+                cache: Some(CanonicalCacheMark::breakpoint()),
+            },
+            text("after", Some(one_hour.clone())),
+        ])
+        .into_tool_result()
+        .unwrap();
+        assert_eq!(
+            content,
+            CanonicalContent::Blocks(vec![
+                CanonicalBlock::Image {
+                    source: image,
+                    cache: None
+                },
+                text("after", None),
+            ])
+        );
+        assert_eq!(mark, Some(one_hour));
+
+        // Files are out of scope: fail loudly, never drop them.
+        let err = CanonicalContent::Blocks(vec![CanonicalBlock::File {
+            source: CanonicalFileSource::Id {
+                file_id: "file-1".into(),
+            },
+            filename: None,
+            detail: None,
+            cache: None,
+        }])
+        .into_tool_result()
+        .unwrap_err();
+        assert!(err.contains("file"), "{err}");
     }
 
     #[test]

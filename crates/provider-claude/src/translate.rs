@@ -171,7 +171,6 @@ pub enum ContentBlock {
 #[serde(untagged)]
 pub enum ToolResultContent {
     Text(String),
-    #[allow(dead_code)]
     Blocks(Vec<ContentBlock>),
 }
 
@@ -767,7 +766,7 @@ fn canonical_block_to_anthropic(
             cache,
         } => ContentBlock::ToolResult {
             tool_use_id: tool_use_id.clone(),
-            content: Some(ToolResultContent::Text(repl.apply_prompt(content))),
+            content: Some(claude_tool_result_content(content, repl)?),
             is_error: if *is_error { Some(true) } else { None },
             cache_control: claude_cache_control(cache.as_ref(), request_ttl),
         },
@@ -832,6 +831,37 @@ fn canonical_block_to_anthropic(
             }
         }
     })
+}
+
+/// Native `tool_result.content`. A text-only result stays one string. A result
+/// with an image becomes text and image blocks in order, as Claude Code sends
+/// it. Inner blocks get no `cache_control`: the mark stays on the outer
+/// tool_result, so the four-slot cap counts it once.
+fn claude_tool_result_content(
+    content: &CanonicalContent,
+    repl: &Replacements,
+) -> Result<ToolResultContent, String> {
+    let blocks = match content {
+        CanonicalContent::Text(text) => {
+            return Ok(ToolResultContent::Text(repl.apply_prompt(text)));
+        }
+        CanonicalContent::Blocks(blocks) => blocks,
+    };
+    blocks
+        .iter()
+        .map(|block| match block {
+            CanonicalBlock::Text { text, .. } => Ok(ContentBlock::Text {
+                text: repl.apply_prompt(text),
+                cache_control: None,
+            }),
+            CanonicalBlock::Image { source, .. } => Ok(ContentBlock::Image {
+                source: canonical_image_to_anthropic(source)?,
+                cache_control: None,
+            }),
+            _ => Err("tool results can hold only text and image content".to_string()),
+        })
+        .collect::<Result<_, _>>()
+        .map(ToolResultContent::Blocks)
 }
 
 fn canonical_image_to_anthropic(source: &CanonicalImageSource) -> Result<ImageSource, String> {
@@ -1406,7 +1436,7 @@ mod tests {
                     role: "tool".into(),
                     content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
                         tool_use_id: "toolu_1".into(),
-                        content: "72F".into(),
+                        content: CanonicalContent::Text("72F".into()),
                         is_error: false,
                         cache: None,
                     }]),
@@ -2784,7 +2814,7 @@ mod tests {
                     role: "tool".into(),
                     content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
                         tool_use_id: "t1".into(),
-                        content: "A".into(),
+                        content: CanonicalContent::Text("A".into()),
                         is_error: false,
                         cache: None,
                     }]),
@@ -2793,7 +2823,7 @@ mod tests {
                     role: "tool".into(),
                     content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
                         tool_use_id: "t2".into(),
-                        content: "B".into(),
+                        content: CanonicalContent::Text("B".into()),
                         is_error: false,
                         cache: None,
                     }]),
@@ -2844,6 +2874,99 @@ mod tests {
         };
         assert!(ids.contains(&"t1"), "merged message must keep t1");
         assert!(ids.contains(&"t2"), "merged message must keep t2");
+    }
+
+    #[test]
+    fn tool_result_images_map_to_native_blocks_like_claude_code() {
+        // WHY (issue #57): Claude Code 2.1.293 sends a tool image as
+        // tool_result.content = [{type:"image", source:{type:"base64", ...}}]
+        // with cache_control on the tool_result, and Claude answered from it
+        // in a live spike. Inner blocks must carry no cache_control (the
+        // four-slot cap counts only top-level marks), is_error stays the
+        // native flag, and replacements still reach the inner text.
+        use omni_core::{CanonicalBlock, CanonicalCacheMark};
+        let repl = Replacements::parse(
+            r#"rule = [ { scope = "prompt", search = "secret", replace = "REDACTED" } ]"#,
+        )
+        .unwrap();
+        let tool_message =
+            |id: &str, content: CanonicalContent, is_error, cache| CanonicalMessage {
+                role: "tool".into(),
+                content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
+                    tool_use_id: id.into(),
+                    content,
+                    is_error,
+                    cache,
+                }]),
+            };
+        let req = CanonicalRequest {
+            model: "haiku".into(),
+            messages: vec![
+                CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Text("look".into()),
+                },
+                CanonicalMessage {
+                    role: "assistant".into(),
+                    content: CanonicalContent::Blocks(
+                        ["t1", "t2"]
+                            .map(|id| CanonicalBlock::ToolUse {
+                                id: id.into(),
+                                name: "shot".into(),
+                                arguments: "{}".into(),
+                                cache: None,
+                            })
+                            .to_vec(),
+                    ),
+                },
+                tool_message(
+                    "t1",
+                    CanonicalContent::Blocks(vec![CanonicalBlock::Image {
+                        source: CanonicalImageSource::Base64 {
+                            media_type: "image/png".into(),
+                            data: "iVBORw0KGgo=".into(),
+                        },
+                        cache: None,
+                    }]),
+                    true,
+                    Some(CanonicalCacheMark::breakpoint()),
+                ),
+                tool_message(
+                    "t2",
+                    CanonicalContent::Blocks(vec![
+                        CanonicalBlock::text("secret page"),
+                        CanonicalBlock::Image {
+                            source: CanonicalImageSource::Url {
+                                url: "https://example.com/p.png".into(),
+                            },
+                            cache: None,
+                        },
+                    ]),
+                    false,
+                    None,
+                ),
+            ],
+            ..Default::default()
+        };
+        let profile = crate::fingerprint::default_profile();
+        let anth =
+            build_messages_request_from_canonical(&req, profile.resolve_model("haiku"), &repl)
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(&anth.messages[2]).unwrap(),
+            serde_json::json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "is_error": true,
+                 "cache_control": {"type": "ephemeral"}, "content": [
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="
+                    }}
+                ]},
+                {"type": "tool_result", "tool_use_id": "t2", "content": [
+                    {"type": "text", "text": "REDACTED page"},
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/p.png"}}
+                ]}
+            ]})
+        );
     }
 
     #[test]

@@ -596,18 +596,20 @@ fn chat_message_to_canonical(m: &ChatMessage) -> Result<CanonicalMessage, String
         ));
     }
 
-    // A `role:"tool"` message carries a tool result keyed by tool_call_id.
+    // A `role:"tool"` message carries a tool result keyed by tool_call_id. Its
+    // parts may mix text and images (a read_file PNG, a screenshot). A part
+    // breakpoint moves to the outer ToolResult.
     if m.role == "tool" {
         let id = m
             .tool_call_id
             .clone()
             .ok_or_else(|| "tool message missing tool_call_id".to_string())?;
-        let cache = chat_content_cache_mark(&m.content)?;
+        let (content, cache) = chat_content_to_canonical(&m.content)?.into_tool_result()?;
         return Ok(CanonicalMessage {
             role: "tool".into(),
             content: CanonicalContent::Blocks(vec![CanonicalBlock::ToolResult {
                 tool_use_id: id,
-                content: chat_content_text(&m.content)?,
+                content,
                 is_error: false,
                 cache,
             }]),
@@ -645,44 +647,6 @@ fn chat_message_to_canonical(m: &ChatMessage) -> Result<CanonicalMessage, String
         role: m.role.clone(),
         content: chat_content_to_canonical(&m.content)?,
     })
-}
-
-fn chat_content_text(content: &Option<ChatMessageContent>) -> Result<String, String> {
-    match content {
-        Some(ChatMessageContent::Text(text)) => Ok(text.clone()),
-        Some(ChatMessageContent::Parts(parts)) => {
-            let mut fragments = Vec::new();
-            for part in parts {
-                match part.kind.as_str() {
-                    "text" => fragments.push(part.text.clone().unwrap_or_default()),
-                    "image_url" | "file" => {
-                        return Err(format!(
-                            "{} content is not supported on tool messages",
-                            part.kind
-                        ));
-                    }
-                    other => return Err(format!("unsupported content part type: {other}")),
-                }
-            }
-            Ok(fragments.join("\n"))
-        }
-        None => Ok(String::new()),
-    }
-}
-
-fn chat_content_cache_mark(
-    content: &Option<ChatMessageContent>,
-) -> Result<Option<omni_core::CanonicalCacheMark>, String> {
-    let Some(ChatMessageContent::Parts(parts)) = content else {
-        return Ok(None);
-    };
-    let mut found = None;
-    for part in parts {
-        if let Some(mark) = parse_prompt_cache_breakpoint(part.prompt_cache_breakpoint.as_ref())? {
-            found = Some(mark);
-        }
-    }
-    Ok(found)
 }
 
 fn chat_content_to_canonical(
@@ -1648,7 +1612,7 @@ mod tests {
         assert!(
             to_canonical(&req)
                 .unwrap_err()
-                .contains("file content is not supported on tool")
+                .contains("file content is not supported in tool results")
         );
     }
 
@@ -1851,13 +1815,65 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(tool_use_id, "call_1");
-                    assert_eq!(content, "72F");
+                    assert_eq!(content, &CanonicalContent::Text("72F".into()));
                     assert!(!is_error);
                 }
                 other => panic!("expected ToolResult, got {other:?}"),
             },
             other => panic!("tool role must become Blocks, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn to_canonical_accepts_image_url_on_tool_message() {
+        // WHY (issue #57): Grok Build sends a read_file PNG or an MCP screenshot
+        // as an image_url part in a role:"tool" message and resends the history
+        // every turn. A 400 here broke the session until compaction removed the
+        // image.
+        let req = req_from_json(
+            r#"{"model":"m","messages":[{"role":"tool","tool_call_id":"call_1","content":[
+                {"type":"text","text":"Read image file: /tmp/red.png"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo=","detail":"high"}},
+                {"type":"image_url","image_url":{"url":"https://example.com/b.png"},
+                 "prompt_cache_breakpoint":{"mode":"explicit"}}
+            ]}]}"#,
+        );
+        let canon = to_canonical(&req).expect("a tool message with an image must parse");
+        let CanonicalContent::Blocks(blocks) = &canon.messages[0].content else {
+            panic!("tool role must become Blocks")
+        };
+        let CanonicalBlock::ToolResult {
+            tool_use_id,
+            content,
+            cache,
+            ..
+        } = &blocks[0]
+        else {
+            panic!("expected ToolResult, got {:?}", blocks[0])
+        };
+        assert_eq!(tool_use_id, "call_1");
+        // Order and both image sources survive; the part breakpoint moves to
+        // the outer ToolResult.
+        assert_eq!(
+            content,
+            &CanonicalContent::Blocks(vec![
+                CanonicalBlock::text("Read image file: /tmp/red.png"),
+                CanonicalBlock::Image {
+                    source: CanonicalImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "iVBORw0KGgo=".into(),
+                    },
+                    cache: None,
+                },
+                CanonicalBlock::Image {
+                    source: CanonicalImageSource::Url {
+                        url: "https://example.com/b.png".into(),
+                    },
+                    cache: None,
+                },
+            ])
+        );
+        assert!(cache.is_some(), "the part breakpoint must not be lost");
     }
 
     #[test]

@@ -43,6 +43,8 @@ Request-level object (`CanonicalCacheIntent`):
 
 Block- and tool-level marks stay on content and `CanonicalTool`. Unmarked text
 may stay `CanonicalContent::Text`. Marked blocks must not collapse to a string.
+A mark inside a tool result's content moves to the tool result block, so the
+Claude slot count does not change.
 
 Do not map `user`, `safety_identifier`, or Anthropic `metadata.user_id` to
 routing identity.

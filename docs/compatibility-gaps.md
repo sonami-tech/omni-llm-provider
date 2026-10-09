@@ -74,6 +74,13 @@ Implemented support now covers:
 6. Compatibility matrix.
    - Resolved: `docs/compatibility-matrix.md` tracks current support status.
 
+7. Images in tool results (issue #57).
+   - Resolved: Chat `role:"tool"` messages, Responses `function_call_output`
+     parts, and Anthropic `tool_result` blocks accept images, which reach
+     Claude, Grok, and Codex. Before, these requests failed with a 400, and
+     bodies over 2 MB failed on the Chat and Responses routes.
+   - Files and documents in tool results still fail with a request error.
+
 ## Notes
 
 Claude native `/v1/messages` intentionally has a closed allowlist to preserve
