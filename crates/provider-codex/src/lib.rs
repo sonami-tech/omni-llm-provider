@@ -1531,6 +1531,8 @@ fn conservative_turn_metadata(model: &str, reasoning_effort: Option<&str>) -> St
         "installation_id": "omni-llm-provider",
         "session_id": CONSERVATIVE_CLIENT_REQUEST_ID,
         "thread_id": CONSERVATIVE_CLIENT_REQUEST_ID,
+        // Codex's root agent path (a CLI constant, not a directory), as sent
+        // in the 0.161.0 capture.
         "agent_name": "/root",
         "turn_id": "",
         "window_id": CONSERVATIVE_WINDOW_ID,
@@ -3417,6 +3419,10 @@ query_params = { api-version = "2026-01-01" }
         assert_eq!(metadata["request_kind"], "prewarm");
         assert_eq!(metadata["thread_source"], "user");
         assert_eq!(metadata["installation_id"], "omni-llm-provider");
+        assert_eq!(
+            metadata["agent_name"], "/root",
+            "Codex root agent path constant from the 0.161.0 capture, not a directory"
+        );
         assert_eq!(metadata["window_id"], CONSERVATIVE_WINDOW_ID);
         assert_eq!(metadata["window_number"], 0);
 
