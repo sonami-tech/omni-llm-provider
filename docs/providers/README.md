@@ -13,7 +13,7 @@ Each provider ships **one live pin**. Multi-version selection is gone:
 
 A rebaseline must obtain a **fresh catalog listing** from this pin's source.
 If that listing cannot be read, stop and surface the error. Do not keep the
-previous pin's model list. One operator-approved exception exists: Grok 1.0.46
+previous pin's model list. One operator-approved exception exists: the active Grok pin
 keeps the 1.0.41 list (see `docs/providers/grok/README.md`).
 
 Catalog sources:

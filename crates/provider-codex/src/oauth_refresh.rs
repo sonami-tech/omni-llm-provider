@@ -8,7 +8,7 @@
 //! `omni_common::oauth_refresh`). Static `OPENAI_API_KEY` entries are never
 //! refreshed.
 //!
-//! The 0.161.0 general exec captured the version, not the OAuth refresh UA
+//! The 0.162.1 general exec did not capture the OAuth refresh UA
 //! shape. Keep the prior refresh shape until a refresh capture proves a change.
 
 use std::path::Path;

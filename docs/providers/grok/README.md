@@ -20,10 +20,10 @@ identity preambles. The maintained contract is:
 - fresh credential resolution per request (prefers `~/.grok/auth.json` OIDC),
 - grok-shell fingerprint headers for the pinned CLI version,
 - correct non-stream and stream decoding via the shared Responses parser,
-- model catalog kept current (single pin: grok-shell 1.0.46, captured 2026-10-08; `grok-4.7` default,
-  plus `grok-4.7-build-fast`, `grok-4.6`, and `grok-4.5`). Catalog source is clean-HOME `GET /v1/models` on
-  `cli-chat-proxy.grok.com`, not the operator `grok models` UI. See
-  [Catalog exception for 1.0.46](#catalog-exception-for-1046).
+- model catalog kept current; the active version and catalog are defined in
+  `crates/provider-grok/src/lib.rs`. Catalog source is clean-HOME
+  `GET /v1/models` on `cli-chat-proxy.grok.com`. See
+  [Catalog exception](#catalog-exception).
 
 `--grok-version` / `OMNI_GROK_VERSION` and match-system flags are removed
 (issue #12). Rebaseline overwrites this pin; older wire needs an older Omni
@@ -42,17 +42,20 @@ Default tests use wiremock. Live calls require `OMNI_LIVE_TESTS=1`.
 Capture and refresh-capture work uses `python3 -m tools.capture`; see
 `docs/providers/grok/CAPTURE.md`.
 
-## Catalog exception for 1.0.46
+## Catalog exception
 
-The rebaseline rule in `docs/providers/README.md` says to replace the catalog
-with the fresh listing from this pin. The 1.0.46 pin is an exception
-(operator decision, issue #56). Its clean-HOME `GET /v1/models` listed only
-`grok-4.7`. The capture account is on the Free tier, with a "Grok 4.7 free for
-a limited time" promo, so that listing shows the account tier, not the CLI.
-`grok-4.6` still returned HTTP 200 in the same capture. The pin keeps the four
-models from the 1.0.41 listing: `grok-4.7`, `grok-4.7-build-fast`, `grok-4.6`,
-and `grok-4.5`. At the next rebaseline, take the listing from a paid-tier
-account, or keep this exception only with a new operator decision.
+The 2026-10-14 grok-shell 1.0.52 clean-HOME capture listed only `grok-4.7`.
+The capture account is on the Free tier with a temporary Grok 4.7 promo.
+The default inference request completed with HTTP 200 after one CLI-managed
+429 retry; a background session-title request to `grok-4.6` also returned
+HTTP 200. Request headers and body shape match the previous pin apart from
+the CLI version.
+
+The operator renewed the issue #56 exception for this pin: keep the four
+models from the 1.0.41 listing. Source of truth is `GROK_CATALOG` in
+`crates/provider-grok/src/lib.rs`. At the next rebaseline, take the listing
+from a paid-tier account, or obtain a new operator decision to keep the
+exception.
 
 ## Reasoning effort
 

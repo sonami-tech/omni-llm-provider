@@ -123,34 +123,28 @@ wrapper around `tools.capture extract jsonl` for sanitized JSONL exports.
 
 ## Current Wire + Model Findings
 
-Re-baselined against grok-shell **1.0.46** on **2026-10-08** (one clean-HOME
-general capture on a Free-tier account, no retries).
+The 2026-10-14 clean-HOME capture used grok-shell 1.0.52. The active version,
+header values, and catalog are defined in `crates/provider-grok/src/lib.rs`.
 
 ### Default path (cli-chat-proxy.grok.com)
 
-The clean-HOME `GET /v1/models` returned HTTP 200 with only `grok-4.7`, which
-it lists with low, medium, high, and xhigh effort. The account is on the Free
-tier with a "Grok 4.7 free for a limited time" promo, so the listing shows the
-account tier, not the CLI. `grok-4.6` still returned HTTP 200 in this capture.
-The pin keeps the four models from the 1.0.41 listing (`grok-4.7`,
-`grok-4.7-build-fast`, `grok-4.6`, `grok-4.5`); see the catalog exception in
-`docs/providers/grok/README.md`. The 1.0.41 listing advertised xhigh for the
-4.7/4.7-build-fast/4.6 models and low, medium, high for 4.5. The
-no-`--model` `POST /v1/responses` selected `grok-4.7` and returned HTTP 200.
-Do not use operator `grok models` or `~/.grok/config.toml` overrides as
-catalog evidence.
+The fresh `GET /v1/models` returned HTTP 200 with only `grok-4.7`, with
+low, medium, high, and xhigh effort. The Free-tier account has a temporary
+Grok 4.7 promo. The operator renewed the four-model catalog exception;
+see `docs/providers/grok/README.md`.
 
-The captured UA is `grok-shell/1.0.46 (linux; x86_64)` and
-`x-grok-client-version` is `1.0.46`. Token-auth, authenticate-response,
-client identifier, headless mode, model override, and SSE accept headers
-remain present. The chat body keeps the same top-level keys (`include`,
-`input`, `model`, `prompt_cache_key`, `reasoning`, `store`, `stream`,
-`tools`). The CLI also sends session headers: `x-compactions-remaining`,
-`x-compaction-at`, `x-grok-conv-group-id`, `x-grok-doom-loop-check`,
-`x-grok-exact-repetition-check`, `traceparent`, and the conversation,
-request, session, agent, and turn ids. Omni omits that CLI session metadata
-and request preferences unless client intent requires them. `/v1/models`
-exposes canonical ids; `grok` remains an inbound alias for `grok-4.7`.
+The no-model inference request selected `grok-4.7` and completed with
+HTTP 200 after one CLI-managed 429 retry. A background session-title
+request to `grok-4.6` also returned HTTP 200. Tokenization calls to
+`api.x.ai` returned 429 and are outside Omni's inference path.
+
+UA and `x-grok-client-version` use the installed CLI version. Token-auth,
+authenticate-response, client identifier, headless mode, model override,
+and SSE accept headers remain present. The chat body keeps the same
+top-level keys (`include`, `input`, `model`, `prompt_cache_key`, `reasoning`,
+`store`, `stream`, `tools`). CLI-only session metadata stays omitted by Omni.
+The main completed response contained usage and cache-read counts; this
+capture does not establish cache-miss behavior.
 
 ### Custom endpoint override
 

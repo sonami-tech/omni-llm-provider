@@ -2,9 +2,10 @@
 
 Codex-specific behavior lives in `crates/provider-codex`.
 
-Single pin: Codex CLI **0.161.0**. `--codex-version` / `OMNI_CODEX_VERSION` and
-match-system flags are removed (issue #12). Rebaseline overwrites this pin;
-older wire needs an older Omni release.
+The active CLI version is `CODEX_VERSION` in `crates/provider-codex/src/lib.rs`.
+`--codex-version` / `OMNI_CODEX_VERSION` and match-system flags are removed
+(issue #12). Rebaseline overwrites this pin; older wire needs an older Omni
+release.
 
 ## Source Of Truth
 
@@ -154,31 +155,33 @@ Unsupported extras fail loudly.
 Rebaseline overwrites the single pin, including the model catalog. The catalog
 source is `codex debug models --bundled` (`visibility=list` slugs). A custom
 Responses `base_url` is not a reason to skip. If that command fails or lists
-no models, stop. Do not keep the previous pin's catalog. The 2026-10-08
-capture returned a successful Responses POST on the configured custom endpoint
-and a successful ChatGPT WebSocket turn. `visibility=list` includes
-`gpt-6.1-sol` (priority 1, the default), `gpt-6-astra`, `gpt-6-sol`,
-`gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, and `gpt-5.5`.
-The user-agent comes from that successful exec, not the bundled catalog.
+no models, stop. Do not keep the previous pin's catalog.
 
-The bundled catalog has no alias field. Family aliases point at the newest
-model in each family: `gpt` and `sol` map to `gpt-6.1-sol`, `astra` to
-`gpt-6-astra`, `luna`, `mini`, and `gpt-mini` to `gpt-6-luna`, and `terra` to
-`gpt-5.6-terra`. The `gpt` alias still follows the configured model when the
-config names one. Source of truth: `CODEX_CATALOG` in
-`crates/provider-codex/src/lib.rs`.
+The 2026-10-14 capture used Codex CLI 0.162.1 and returned a successful
+Responses POST on the configured custom endpoint. The fresh bundled catalog
+has the same eight visible models and priorities as the previous pin;
+`gpt-6.1-sol` remains priority 1. Catalog ids and aliases are defined by
+`CODEX_CATALOG` in `crates/provider-codex/src/lib.rs`. The `gpt` alias follows
+the configured model when the config names one. The user-agent was captured
+from the successful exec.
 
-Codex 0.161.0 adds `x-codex-routing-hint: model=<model>` to the WebSocket
-upgrade, and Omni sends it there. The WebSocket `x-codex-turn-metadata`
-carries the 0.161.0 key set with fixed synthetic values; only `model` and
-`reasoning_effort` come from the request. Codex also sends
-`x-openai-internal-codex-responses-lite: true`, but only on Responses
-requests and per model (`use_responses_lite` in the bundled catalog): as a
-header on REST, and as a `response.create` field on WebSocket. Omni does not
-send it. Its CLI-parity Responses path is the WebSocket, whose frame is
-shape-only, and its models preflight carries no Responses headers. The custom
-gateway and API-key REST path sends no CLI headers, and Omni never sends the
-CLI `cookie`.
+A separate local WebSocket probe used fake ChatGPT auth and an isolated
+custom provider. The upgrade/prewarm metadata has the same 18 keys as the
+previous pin, with the same static flags. Actual-turn metadata adds
+`root_turn_id`, `turn_trigger`, and `turn_started_at_unix_ms`; Omni retains
+its synthetic prewarm metadata. Request bodies keep the existing shape-only
+contract and omit CLI session data and preferences. The Responses-lite
+signal appears inside the CLI frame's `client_metadata`, with no matching
+upgrade header; Omni omits it.
+
+**Verification limit:** the machine has no ChatGPT OAuth login. The local
+built-in-route probe failed during workspace-routing discovery. The local
+custom-provider probe confirms WebSocket shape, but does not establish
+current built-in ChatGPT routing requirements or live acceptance. The
+`version` and `x-codex-routing-hint` upgrade headers retain their 0.161.0 live
+evidence. OAuth refresh traffic was not captured; its existing UA stays
+unchanged. Custom/API-key REST continues to send configured headers and
+auth only, with no CLI headers or cookie.
 
 ```sh
 python3 -m tools.capture catalog --provider codex

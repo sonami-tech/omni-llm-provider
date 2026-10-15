@@ -37,7 +37,7 @@ the **OpenAI inbound → Claude** path, **effort-capable** models pass free-stri
 `minimal`→`low` is remapped (`max` kept as-is). There is no closed local Claude
 effort allowlist; unknown names may 400 from upstream by design. Fail loud only
 when the thinking-budget ladder cannot map the value (e.g. `xhigh` on a model
-without `output_config.effort`; the 2.1.293 pin has none).
+without `output_config.effort`; the active pin has none).
 Precedence remains **client effort > pin default > absent**. Native Anthropic
 `/v1/messages` also forwards client `output_config` as given and fills the pin
 default only when the client omits it (issue #22; see Provider Extras below).
