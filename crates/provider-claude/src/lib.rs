@@ -667,7 +667,7 @@ mod tests {
         assert_eq!(provider_id(), "claude");
         let p = ClaudeProvider::new().expect("default profile constructs");
         assert_eq!(p.id(), "claude");
-        assert_eq!(p.profile().name, "cc-2.1.299-sdk-cli");
+        assert_eq!(p.profile().name, "cc-2.1.309-sdk-cli");
     }
 
     #[test]
@@ -1082,7 +1082,7 @@ mod tests {
         //     cleared the floor (#2) and that the marker is live. Padding is
         //     deterministic (fixed string), so no clock/nonce leaks into the prefix.
         //   - Model: catalog alias `haiku` (not a dated id), the cheapest catalog
-        //     model. On the 2.1.299 pin it sends output_config.effort="medium"
+        //     model. On the 2.1.309 pin it sends output_config.effort="medium"
         //     like Opus and Sonnet (Fable sends "high"); the capture shows Haiku
         //     5.5 accepts it.
         //
@@ -1240,8 +1240,8 @@ mod tests {
         // WHY: single-pin world (issue #12) — test helpers must still construct
         // a provider on the shipped fingerprint, not a deleted historical profile.
         let p = ClaudeProvider::new_for_test(crate::fingerprint::default_profile());
-        assert_eq!(p.profile().name, "cc-2.1.299-sdk-cli");
-        assert_eq!(p.profile().claude_cli_version, "2.1.299");
+        assert_eq!(p.profile().name, "cc-2.1.309-sdk-cli");
+        assert_eq!(p.profile().claude_cli_version, "2.1.309");
     }
 
     #[test]

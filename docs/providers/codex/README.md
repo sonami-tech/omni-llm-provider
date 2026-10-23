@@ -157,7 +157,7 @@ source is `codex debug models --bundled` (`visibility=list` slugs). A custom
 Responses `base_url` is not a reason to skip. If that command fails or lists
 no models, stop. Do not keep the previous pin's catalog.
 
-The 2026-10-14 capture used Codex CLI 0.162.1 and returned a successful
+The 2026-10-15 capture used Codex CLI 0.164.0 and returned a successful
 Responses POST on the configured custom endpoint. The fresh bundled catalog
 has the same eight visible models and priorities as the previous pin;
 `gpt-6.1-sol` remains priority 1. Catalog ids and aliases are defined by
@@ -165,14 +165,18 @@ has the same eight visible models and priorities as the previous pin;
 the configured model when the config names one. The user-agent was captured
 from the successful exec.
 
-A separate local WebSocket probe used fake ChatGPT auth and an isolated
-custom provider. The upgrade/prewarm metadata has the same 18 keys as the
-previous pin, with the same static flags. Actual-turn metadata adds
-`root_turn_id`, `turn_trigger`, and `turn_started_at_unix_ms`; Omni retains
-its synthetic prewarm metadata. Request bodies keep the existing shape-only
-contract and omit CLI session data and preferences. The Responses-lite
-signal appears inside the CLI frame's `client_metadata`, with no matching
-upgrade header; Omni omits it.
+A separate isolated local WebSocket probe used fake ChatGPT auth and a
+custom provider. Upgrade/prewarm metadata now has 19 keys, adding
+`history_initialization: "new"`; the live REST capture has the same field.
+Omni adds that field to its synthetic prewarm metadata. Actual-turn metadata
+has three additional keys: `root_turn_id`, `turn_trigger`, and
+`turn_started_at_unix_ms`. These stay outside Omni's prewarm metadata.
+
+The local clean configuration reported `node_repl_auto_review_required: false`;
+the live configured REST capture reported `true`. Omni preserves its existing
+`true` stand-in. Other metadata flags remain unchanged. Request bodies keep
+the existing shape-only contract and omit CLI session data and preferences.
+The Responses-lite signal stays omitted by Omni.
 
 **Verification limit:** the machine has no ChatGPT OAuth login. The local
 built-in-route probe failed during workspace-routing discovery. The local

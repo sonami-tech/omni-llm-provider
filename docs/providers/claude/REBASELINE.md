@@ -146,16 +146,17 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
 
 ## Current Capture
 
-The 2026-10-14 clean-HOME capture used Claude Code 2.1.299. Default,
+The 2026-10-15 clean-HOME capture used Claude Code 2.1.309. Default,
 Opus, Sonnet, Haiku, and Fable each returned HTTP 200 with an `OK` reply.
 The fresh catalog has the same four canonical ids as the previous pin.
 Catalog and defaults are defined in `crates/provider-claude/src/models.rs`
 and `crates/provider-claude/src/fingerprint.rs`.
 
-Every beta list removes `mid-conversation-system-2026-04-07`. The SDK,
-runtime, Anthropic version, identity, output defaults, and no-cch billing
-shape remain unchanged. For `Say OK`, billing is
-`cc_version=2.1.299.51e; cc_entrypoint=sdk-cli;`.
+Every beta list adds `advanced-tool-use-2025-11-20` and removes
+`prompt-caching-scope-2026-01-05`, `dangerous-tool-use-2026-09-03`, and
+`afk-mode-2026-01-31`. The SDK, runtime, Anthropic version, identity,
+output defaults, and no-cch billing shape remain unchanged. For `Say OK`,
+billing is `cc_version=2.1.309.742; cc_entrypoint=sdk-cli;`.
 The explicit `claude-fable-5` path was not recaptured; its pass-through
 and wire override remain unchanged.
 

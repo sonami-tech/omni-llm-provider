@@ -63,7 +63,7 @@ const CONSERVATIVE_WINDOW_ID: &str = "00000000-0000-4000-8000-000000000000:0";
 const DEFAULT_CODEX_MODEL: &str = "gpt-6.1-sol";
 const DEFAULT_AUTH_COMMAND_TIMEOUT_MS: u64 = 5_000;
 
-// Codex catalog from `codex debug models --bundled` on CLI 0.162.1 (2026-10-14).
+// Codex catalog from `codex debug models --bundled` on CLI 0.164.0 (2026-10-15).
 // Visibility=list slugs only, in priority order: gpt-6.1-sol (default,
 // priority 1), gpt-6-astra, gpt-6-sol, gpt-6-luna, gpt-5.6-sol, gpt-5.6-terra,
 // gpt-5.6-luna, gpt-5.5. The dump has no alias field. Family aliases point at
@@ -73,7 +73,7 @@ const DEFAULT_AUTH_COMMAND_TIMEOUT_MS: u64 = 5_000;
 // catalog. If that listing cannot be read, rebaseline must fail; do not keep a
 // previous pin's catalog. Custom Responses base_url does not change this source.
 /// Pinned Codex CLI version (UA + header fingerprint). Single live pin.
-pub const CODEX_VERSION: &str = "0.162.1";
+pub const CODEX_VERSION: &str = "0.164.0";
 
 /// Model catalog for the active pin.
 const CODEX_CATALOG: &[CatalogModel] = &[
@@ -1514,7 +1514,7 @@ fn conservative_codex_headers(
         "user-agent",
         &conservative_user_agent(version),
     )?;
-    // No `x-openai-internal-codex-responses-lite` here. Codex 0.162.1 sends it
+    // No `x-openai-internal-codex-responses-lite` here. Codex 0.164.0 sends it
     // only on Responses requests, per model (`use_responses_lite`): as a header
     // on REST, and as a response.create field on WebSocket. This builder is the
     // models preflight, which carries no Responses headers.
@@ -1522,7 +1522,7 @@ fn conservative_codex_headers(
 }
 
 /// `x-codex-turn-metadata` for the WebSocket upgrade. The key set matches the
-/// Codex 0.162.1 local WebSocket probe (outside a git repo: no `workspaces`).
+/// Codex 0.164.0 local WebSocket probe (outside a git repo: no `workspaces`).
 /// Values are fixed synthetic stand-ins, never real workspace or account data.
 /// Only `model` and `reasoning_effort` come from the request; effort is null
 /// when the request sends none.
@@ -1532,12 +1532,13 @@ fn conservative_turn_metadata(model: &str, reasoning_effort: Option<&str>) -> St
         "session_id": CONSERVATIVE_CLIENT_REQUEST_ID,
         "thread_id": CONSERVATIVE_CLIENT_REQUEST_ID,
         // Codex's root agent path (a CLI constant, not a directory), as sent
-        // in the 0.162.1 capture.
+        // in the 0.164.0 capture.
         "agent_name": "/root",
         "turn_id": "",
         "window_id": CONSERVATIVE_WINDOW_ID,
         "window_number": 0,
         "context_window_id": CONSERVATIVE_CLIENT_REQUEST_ID,
+        "history_initialization": "new",
         "request_kind": "prewarm",
         "thread_source": "user",
         "sandbox": "none",
@@ -2802,9 +2803,9 @@ model = "gpt-native"
         // tests that mutate env.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _home = TempCodexHome::new("", None);
-        assert_eq!(CodexProvider::pinned_version(), "0.162.1");
+        assert_eq!(CodexProvider::pinned_version(), "0.164.0");
         let provider = CodexProvider::new().unwrap();
-        assert_eq!(provider.version, "0.162.1");
+        assert_eq!(provider.version, "0.164.0");
         let ids: Vec<_> = provider.active_catalog().iter().map(|m| m.id).collect();
         assert_eq!(
             ids,
@@ -3043,7 +3044,7 @@ model = "gpt-5.5"
     #[test]
     fn rest_path_sends_no_cli_parity_headers() {
         // WHY: the custom gateway and API-key REST path is not CLI parity. It
-        // sends configured headers and auth only. The Codex 0.162.1 CLI
+        // sends configured headers and auth only. The Codex 0.164.0 CLI
         // headers (responses-lite, routing hint, turn metadata) belong to the
         // ChatGPT path and must not leak onto REST requests to any gateway.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -3338,7 +3339,7 @@ query_params = { api-version = "2026-01-01" }
     }
 
     #[test]
-    fn conservative_headers_match_captured_codex_0162_names_and_values() {
+    fn conservative_headers_match_captured_codex_0164_names_and_values() {
         // WHY: the ChatGPT path is CLI parity. Header names and values (not
         // order) pin the captured UA and local WebSocket metadata. The built-in
         // version and routing hint retain the 0.161.0 live evidence. The CLI cookie
@@ -3350,7 +3351,7 @@ query_params = { api-version = "2026-01-01" }
             access_token: "eyJ-fake-oauth".into(),
             account_id: "11111111-2222-3333-4444-555555555555".into(),
         };
-        let headers = conservative_codex_headers("0.162.1", &auth).unwrap();
+        let headers = conservative_codex_headers("0.164.0", &auth).unwrap();
         let mut names: Vec<&str> = headers.keys().map(|k| k.as_str()).collect();
         names.sort();
         assert_eq!(
@@ -3364,7 +3365,7 @@ query_params = { api-version = "2026-01-01" }
                 "version",
             ]
         );
-        assert_eq!(headers.get("version").unwrap(), "0.162.1");
+        assert_eq!(headers.get("version").unwrap(), "0.164.0");
         assert_eq!(
             headers.get("authorization").unwrap(),
             "Bearer eyJ-fake-oauth"
@@ -3377,7 +3378,7 @@ query_params = { api-version = "2026-01-01" }
         assert_eq!(headers.get("originator").unwrap(), "codex_exec");
         assert_eq!(
             headers.get("user-agent").unwrap(),
-            "codex_exec/0.162.1 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.162.1)"
+            "codex_exec/0.164.0 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.164.0)"
         );
         assert!(
             headers
@@ -3387,7 +3388,7 @@ query_params = { api-version = "2026-01-01" }
 
         let request = conservative_ws_request(
             "ws://127.0.0.1/backend-api/codex/responses",
-            "0.162.1",
+            "0.164.0",
             &auth,
             "gpt-6.1-sol",
             Some("high"),
@@ -3404,7 +3405,7 @@ query_params = { api-version = "2026-01-01" }
             CONSERVATIVE_BETA_FEATURES
         );
         assert_eq!(ws_headers.get("originator").unwrap(), "codex_exec");
-        assert_eq!(ws_headers.get("version").unwrap(), "0.162.1");
+        assert_eq!(ws_headers.get("version").unwrap(), "0.164.0");
         assert_eq!(
             ws_headers.get("x-client-request-id").unwrap(),
             CONSERVATIVE_CLIENT_REQUEST_ID
@@ -3422,7 +3423,7 @@ query_params = { api-version = "2026-01-01" }
             "model=gpt-6.1-sol"
         );
         assert!(ws_headers.get("cookie").is_none());
-        // The 0.162.1 local upgrade probe has no responses-lite header.
+        // The 0.164.0 local upgrade probe has no responses-lite header.
         assert!(
             ws_headers
                 .get("x-openai-internal-codex-responses-lite")
@@ -3450,6 +3451,7 @@ query_params = { api-version = "2026-01-01" }
                 "analytics_enabled",
                 "auto_review_enabled",
                 "context_window_id",
+                "history_initialization",
                 "installation_id",
                 "model",
                 "node_repl_auto_review_required",
@@ -3465,11 +3467,11 @@ query_params = { api-version = "2026-01-01" }
                 "window_id",
                 "window_number",
             ],
-            "turn metadata key set must match the 0.162.1 local upgrade probe"
+            "turn metadata key set must match the 0.164.0 local upgrade probe"
         );
         // Every value and JSON type is pinned. The flag values and the root
         // agent path ("/root", a CLI constant, not a directory) come from the
-        // 0.162.1 gateway capture; the ids are synthetic; model and effort come
+        // 0.164.0 gateway capture; the ids are synthetic; model and effort come
         // from the request.
         assert_eq!(
             metadata,
@@ -3482,6 +3484,7 @@ query_params = { api-version = "2026-01-01" }
                 "window_id": CONSERVATIVE_WINDOW_ID,
                 "window_number": 0,
                 "context_window_id": CONSERVATIVE_CLIENT_REQUEST_ID,
+                "history_initialization": "new",
                 "request_kind": "prewarm",
                 "thread_source": "user",
                 "sandbox": "none",
@@ -3498,7 +3501,7 @@ query_params = { api-version = "2026-01-01" }
         // No requested effort: the key stays, with a null value.
         let request = conservative_ws_request(
             "ws://127.0.0.1/backend-api/codex/responses",
-            "0.162.1",
+            "0.164.0",
             &auth,
             "gpt-6-luna",
             None,
@@ -3533,7 +3536,7 @@ query_params = { api-version = "2026-01-01" }
         };
         let err = conservative_ws_request(
             "ws://127.0.0.1/backend-api/codex/responses",
-            "0.162.1",
+            "0.164.0",
             &auth,
             "gpt-6.1-sol\nx-injected: 1",
             None,
@@ -3693,14 +3696,14 @@ requires_openai_auth = false
         );
         assert_eq!(
             headers.get("user-agent").unwrap().to_str().unwrap(),
-            "codex_exec/0.162.1 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.162.1)"
+            "codex_exec/0.164.0 (Ubuntu 24.4.0; x86_64) unknown (codex_exec; 0.164.0)"
         );
         assert_eq!(headers.get("originator").unwrap(), "codex_exec");
         assert_eq!(
             headers.get("openai-beta").unwrap(),
             CONSERVATIVE_OPENAI_BETA
         );
-        assert_eq!(headers.get("version").unwrap(), "0.162.1");
+        assert_eq!(headers.get("version").unwrap(), "0.164.0");
         assert_eq!(
             headers.get("x-codex-beta-features").unwrap(),
             CONSERVATIVE_BETA_FEATURES
@@ -3822,7 +3825,7 @@ model = "gpt-5.5"
             .and(header("authorization", "Bearer eyJ-test-oauth"))
             .and(header("chatgpt-account-id", "acct-test"))
             .and(header("originator", "codex_exec"))
-            .and(header("version", "0.162.1"))
+            .and(header("version", "0.164.0"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "models": [{"slug": "gpt-5.5", "prefer_websockets": true}]
             })))

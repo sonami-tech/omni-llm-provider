@@ -15,7 +15,7 @@
 //! wire types + identity prepend). It never leaks into omni-common or
 //! omni-core.
 //!
-//! Active baseline: Claude Code 2.1.299 (captured 2026-10-14). Single pin only
+//! Active baseline: Claude Code 2.1.309 (captured 2026-10-15). Single pin only
 //! (issue #12). Billing ends at `cc_entrypoint=sdk-cli;` with no `cch=` field.
 //! Historical checksum rewrite lives in `docs/providers/claude/CCH_ALGORITHM.md`.
 //!
@@ -185,8 +185,8 @@ impl FingerprintProfile {
 const BILLING_SUFFIX_SEED_V1: &str = "59cf53e54c78";
 const BILLING_SUFFIX_INDICES_V1: [usize; 3] = [4, 7, 20];
 // Live pin: the version suffix is still computed, but the billing header
-// carries no cch field and the body is serialized as-is. Captured 2026-10-14
-// against Claude Code 2.1.299: the header ends at `cc_entrypoint=sdk-cli;`.
+// carries no cch field and the body is serialized as-is. Captured 2026-10-15
+// against Claude Code 2.1.309: the header ends at `cc_entrypoint=sdk-cli;`.
 const BILLING_SCHEME_V1_NO_CCH: BillingScheme = BillingScheme {
     suffix_algorithm: BillingSuffixAlgorithm::Sha256Utf16SampleV1,
     seed: BILLING_SUFFIX_SEED_V1,
@@ -204,18 +204,18 @@ pub const CLAUDE_CODE_SYSTEM_PREAMBLE: &str =
     "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
 /// Active-pin default beta list (default-model resolution to opus). The
-/// 2.1.299 default has no `context-1m` beta and equals the explicit opus list.
-pub const BETA_DEFAULT: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24,dangerous-tool-use-2026-09-03,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11";
+/// 2.1.309 default has no `context-1m` beta and equals the explicit opus list.
+pub const BETA_DEFAULT: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11";
 /// Active-pin explicit opus beta list.
-pub const BETA_OPUS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24,dangerous-tool-use-2026-09-03,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11";
-/// Active-pin sonnet beta list (same bytes as opus on 2.1.299).
-pub const BETA_SONNET: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24,dangerous-tool-use-2026-09-03,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11";
+pub const BETA_OPUS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11";
+/// Active-pin sonnet beta list (same bytes as opus on 2.1.309).
+pub const BETA_SONNET: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11";
 /// Active-pin haiku beta list. Same members as opus, but
-/// `claude-code-20250219` comes after `prompt-caching-scope-2026-01-05`.
-pub const BETA_HAIKU: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24,dangerous-tool-use-2026-09-03,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11";
+/// `claude-code-20250219` comes after `context-management-2025-06-27`.
+pub const BETA_HAIKU: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11";
 /// Active-pin fable beta list (Fable 5.1 and explicit Fable 5). Same bytes as
-/// opus on 2.1.299.
-pub const BETA_FABLE: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24,dangerous-tool-use-2026-09-03,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11";
+/// opus on 2.1.309.
+pub const BETA_FABLE: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11";
 
 const MODEL_BETA_OVERRIDES: &[ModelBetaOverride] = &[
     ModelBetaOverride {
@@ -290,13 +290,13 @@ pub const WIRE_DEFAULTS: WireDefaults = WireDefaults {
     output_effort: Some("high"),
 };
 
-pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.299-sdk-cli";
+pub const DEFAULT_PROFILE_NAME: &str = "cc-2.1.309-sdk-cli";
 
-// Captured 2026-10-14 from five successful Claude Code 2.1.299 requests.
-// No cch; cc_version=2.1.299.51e for prompt "Say OK".
-pub const PROFILE_CLAUDE_2_1_299_SDK_CLI: FingerprintProfile = FingerprintProfile {
+// Captured 2026-10-15 from five successful Claude Code 2.1.309 requests.
+// No cch; cc_version=2.1.309.742 for prompt "Say OK".
+pub const PROFILE_CLAUDE_2_1_309_SDK_CLI: FingerprintProfile = FingerprintProfile {
     name: DEFAULT_PROFILE_NAME,
-    claude_cli_version: "2.1.299",
+    claude_cli_version: "2.1.309",
     stainless_package_version: "0.128.0",
     stainless_runtime_version: "v26.3.0",
     entrypoint: "sdk-cli",
@@ -311,7 +311,7 @@ pub const PROFILE_CLAUDE_2_1_299_SDK_CLI: FingerprintProfile = FingerprintProfil
 };
 
 pub fn default_profile() -> &'static FingerprintProfile {
-    &PROFILE_CLAUDE_2_1_299_SDK_CLI
+    &PROFILE_CLAUDE_2_1_309_SDK_CLI
 }
 
 /// Synthetic model id for [`TEST_PROFILE_WITH_NO_EFFORT_MODEL`]. Test only.
@@ -320,7 +320,7 @@ pub(crate) const TEST_NO_EFFORT_MODEL: &str = "claude-test-no-effort";
 
 /// Test-only pin with one model that has no effort surface: no
 /// `output_effort` and no `effort-2025-11-24` beta. Haiku 4.5 was such a model
-/// until 2.1.293. Every 2.1.299 model has the effort surface, so this fixture
+/// until 2.1.293. Every 2.1.309 model has the effort surface, so this fixture
 /// keeps the thinking-budget fallback and its fail-loud error under test for a
 /// later pin that brings such a model back.
 #[cfg(test)]
@@ -335,7 +335,7 @@ pub(crate) static TEST_PROFILE_WITH_NO_EFFORT_MODEL: FingerprintProfile = Finger
         temperature: None,
         output_effort: None,
     }],
-    ..PROFILE_CLAUDE_2_1_299_SDK_CLI
+    ..PROFILE_CLAUDE_2_1_309_SDK_CLI
 };
 
 pub fn is_claude_code_billing_header(text: &str) -> bool {
@@ -457,7 +457,7 @@ fn build_headers_with_profile(
     insert(&mut h, "anthropic-dangerous-direct-browser-access", "true");
     insert(&mut h, "anthropic-version", ANTHROPIC_VERSION);
     insert(&mut h, "x-app", "cli");
-    // 2.1.299 capture does not send x-client-request-id.
+    // 2.1.309 capture does not send x-client-request-id.
 
     h
 }
@@ -731,13 +731,13 @@ mod tests {
         // WHY: issue #12 ships exactly one pin. These bytes are the gate: UA,
         // stainless, catalog ids, and per-model beta lists must match capture.
         let profile = default_profile();
-        assert_eq!(profile.name, "cc-2.1.299-sdk-cli");
-        assert_eq!(profile.claude_cli_version, "2.1.299");
+        assert_eq!(profile.name, "cc-2.1.309-sdk-cli");
+        assert_eq!(profile.claude_cli_version, "2.1.309");
         assert_eq!(profile.stainless_package_version, "0.128.0");
         assert_eq!(profile.stainless_runtime_version, "v26.3.0");
         assert_eq!(
             profile.user_agent(),
-            "claude-cli/2.1.299 (external, sdk-cli)"
+            "claude-cli/2.1.309 (external, sdk-cli)"
         );
         assert_eq!(
             profile.resolve_model("fable").unwrap().canonical,
@@ -755,7 +755,8 @@ mod tests {
             profile.resolve_model("haiku").unwrap().canonical,
             "claude-haiku-5-5"
         );
-        // 2.1.299 removes mid-conversation-system from every beta list.
+        // 2.1.309 adds advanced-tool-use and removes prompt-caching-scope,
+        // dangerous-tool-use, and afk-mode from every beta list.
         // Default, sonnet, and fable still equal opus.
         for beta in [BETA_DEFAULT, BETA_OPUS, BETA_SONNET, BETA_HAIKU, BETA_FABLE] {
             assert!(!beta.contains("fallback-credit-2026-06-01"), "{beta}");
@@ -764,8 +765,10 @@ mod tests {
                 "{beta}"
             );
             assert!(!beta.contains("context-1m"), "{beta}");
-            assert!(beta.contains("dangerous-tool-use-2026-09-03"), "{beta}");
-            assert!(beta.contains("afk-mode-2026-01-31"), "{beta}");
+            assert!(!beta.contains("dangerous-tool-use-2026-09-03"), "{beta}");
+            assert!(!beta.contains("prompt-caching-scope-2026-01-05"), "{beta}");
+            assert!(beta.contains("advanced-tool-use-2025-11-20"), "{beta}");
+            assert!(!beta.contains("afk-mode-2026-01-31"), "{beta}");
             assert!(beta.contains("effort-2025-11-24"), "{beta}");
             assert!(beta.contains("per-turn-control-2026-07-01"), "{beta}");
             assert!(
@@ -774,14 +777,14 @@ mod tests {
             );
         }
         // The header bytes, order included, are the fingerprint. These literals
-        // are the captured 2.1.299 `anthropic-beta` values for opus and haiku.
+        // are the captured 2.1.309 `anthropic-beta` values for opus and haiku.
         assert_eq!(
             BETA_OPUS,
-            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24,dangerous-tool-use-2026-09-03,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11"
+            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11"
         );
         assert_eq!(
             BETA_HAIKU,
-            "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24,dangerous-tool-use-2026-09-03,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11"
+            "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11"
         );
         assert_eq!(profile.beta_reply, BETA_OPUS);
         assert_eq!(BETA_SONNET, BETA_OPUS);
@@ -792,7 +795,7 @@ mod tests {
             BETA_SONNET
         );
         // Haiku has the opus members in a different order: claude-code comes
-        // after prompt-caching-scope.
+        // after context-management.
         let members = |beta: &str| {
             let mut m: Vec<String> = beta.split(',').map(str::to_string).collect();
             m.sort();
@@ -802,7 +805,7 @@ mod tests {
         assert_ne!(BETA_HAIKU, BETA_OPUS);
         assert!(
             BETA_HAIKU.find("claude-code-20250219").unwrap()
-                > BETA_HAIKU.find("prompt-caching-scope-2026-01-05").unwrap()
+                > BETA_HAIKU.find("context-management-2025-06-27").unwrap()
         );
         // Wire golden: opus, sonnet, and haiku 128k/medium; fable 64k/high.
         let fable_w = profile.wire_defaults_for_model("claude-fable-5-1");
@@ -833,7 +836,7 @@ mod tests {
     #[test]
     fn billing_suffix_matches_claude_code_probe() {
         // Historical suffix vectors lock the algorithm across past versions.
-        // Active pin: 2.1.299 / "Say OK" -> 51e; header has no cch field.
+        // Active pin: 2.1.309 / "Say OK" -> 742; header has no cch field.
         // 2.1.281 stays as a historical vector for the same algorithm.
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.142"), "73b");
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.150"), "5bd");
@@ -857,9 +860,10 @@ mod tests {
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.281"), "3ee");
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.293"), "33e");
         assert_eq!(claude_code_version_suffix("Say OK", "2.1.299"), "51e");
+        assert_eq!(claude_code_version_suffix("Say OK", "2.1.309"), "742");
         assert_eq!(
             default_profile().billing_header_text("Say OK"),
-            "x-anthropic-billing-header: cc_version=2.1.299.51e; cc_entrypoint=sdk-cli;"
+            "x-anthropic-billing-header: cc_version=2.1.309.742; cc_entrypoint=sdk-cli;"
         );
     }
 

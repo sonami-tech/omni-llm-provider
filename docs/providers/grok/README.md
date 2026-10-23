@@ -44,12 +44,12 @@ Capture and refresh-capture work uses `python3 -m tools.capture`; see
 
 ## Catalog exception
 
-The 2026-10-14 grok-shell 1.0.52 clean-HOME capture listed only `grok-4.7`.
+The 2026-10-15 grok-shell 1.0.67 clean-HOME capture listed only `grok-4.7`.
 The capture account is on the Free tier with a temporary Grok 4.7 promo.
 The default inference request completed with HTTP 200 after one CLI-managed
-429 retry; a background session-title request to `grok-4.6` also returned
-HTTP 200. Request headers and body shape match the previous pin apart from
-the CLI version.
+429 retry. Background session-title requests to `grok-4.6` returned 429;
+this run does not prove that model's current acceptance. Request header
+names and body shape match the previous pin apart from the CLI version.
 
 The operator renewed the issue #56 exception for this pin: keep the four
 models from the 1.0.41 listing. Source of truth is `GROK_CATALOG` in

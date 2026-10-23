@@ -123,7 +123,7 @@ wrapper around `tools.capture extract jsonl` for sanitized JSONL exports.
 
 ## Current Wire + Model Findings
 
-The 2026-10-14 clean-HOME capture used grok-shell 1.0.52. The active version,
+The 2026-10-15 clean-HOME capture used grok-shell 1.0.67. The active version,
 header values, and catalog are defined in `crates/provider-grok/src/lib.rs`.
 
 ### Default path (cli-chat-proxy.grok.com)
@@ -134,8 +134,8 @@ Grok 4.7 promo. The operator renewed the four-model catalog exception;
 see `docs/providers/grok/README.md`.
 
 The no-model inference request selected `grok-4.7` and completed with
-HTTP 200 after one CLI-managed 429 retry. A background session-title
-request to `grok-4.6` also returned HTTP 200. Tokenization calls to
+HTTP 200 after one CLI-managed 429 retry. Background session-title
+requests to `grok-4.6` returned HTTP 429. Tokenization calls to
 `api.x.ai` returned 429 and are outside Omni's inference path.
 
 UA and `x-grok-client-version` use the installed CLI version. Token-auth,
@@ -145,6 +145,10 @@ top-level keys (`include`, `input`, `model`, `prompt_cache_key`, `reasoning`,
 `store`, `stream`, `tools`). CLI-only session metadata stays omitted by Omni.
 The main completed response contained usage and cache-read counts; this
 capture does not establish cache-miss behavior.
+
+The updated Omni binary's live streaming and non-streaming smoke requests
+to `grok-4.7` both returned HTTP 429. Those acceptance checks remain blocked
+by account rate limits; the successful CLI capture is separate evidence.
 
 ### Custom endpoint override
 

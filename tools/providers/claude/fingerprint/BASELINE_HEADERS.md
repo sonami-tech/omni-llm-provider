@@ -1,6 +1,6 @@
 # Claude CLI Baseline Wire Fingerprint
 
-Active baseline: Claude Code 2.1.299, captured 2026-10-14 (single pin; issue #12).
+Active baseline: Claude Code 2.1.309, captured 2026-10-15 (single pin; issue #12).
 
 Raw mitmproxy `.flow` files are not committed because they contain live bearer
 tokens and account identifiers. Keep raw captures on tmpfs and inspect them with
@@ -10,7 +10,7 @@ tokens and account identifiers. Keep raw captures on tmpfs and inspect them with
 
 | Profile | Claude Code | SDK package | Runtime | Entrypoint | Source |
 |---|---|---|---|---|---|
-| `cc-2.1.299-sdk-cli` | `2.1.299` | `0.128.0` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/Fable/default, 2026-10-14 |
+| `cc-2.1.309-sdk-cli` | `2.1.309` | `0.128.0` | `v26.3.0` | `sdk-cli` | live shared-capture mitmproxy, Opus/Sonnet/Haiku/Fable/default, 2026-10-15 |
 
 Only one pin is compiled. Rebaseline overwrites this row; do not append a
 historical ladder. Older Omni releases retain older wire.
@@ -44,7 +44,7 @@ Header names and dynamic values are pinned in
 - `anthropic-version: 2023-06-01`
 - `x-app: cli`
 
-## 2.1.299 Model Surface (active)
+## 2.1.309 Model Surface (active)
 
 | Input | Wire model | Beta list | max_tokens | temperature | output_config.effort |
 |---|---|---|---:|---:|---|
@@ -56,14 +56,15 @@ Header names and dynamic values are pinned in
 
 All five captured requests returned HTTP 200. Explicit `claude-fable-5` was
 not captured in this run and remains pass-through with its existing override.
-Every beta list removes `mid-conversation-system-2026-04-07`.
-Default, Sonnet, and Fable still equal Opus. Haiku puts
-`claude-code-20250219` after `prompt-caching-scope-2026-01-05`.
+Every beta list adds `advanced-tool-use-2025-11-20` and removes
+`prompt-caching-scope-2026-01-05`, `dangerous-tool-use-2026-09-03`, and
+`afk-mode-2026-01-31`. Default, Sonnet, and Fable still equal Opus.
+Haiku puts `claude-code-20250219` after `context-management-2025-06-27`.
 Exact lists and model defaults are in
 `crates/provider-claude/src/fingerprint.rs`; the catalog is in
 `crates/provider-claude/src/models.rs`.
 
-Billing (no cch): `cc_version=2.1.299.51e; cc_entrypoint=sdk-cli;` for
+Billing (no cch): `cc_version=2.1.309.742; cc_entrypoint=sdk-cli;` for
 prompt `Say OK`. Stainless package is `0.128.0`, runtime `v26.3.0`, and
 `x-client-request-id` is absent. The system identity remains
 `You are a Claude agent, built on Anthropic's Claude Agent SDK.`
