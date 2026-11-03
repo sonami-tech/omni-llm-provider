@@ -10,6 +10,8 @@ Normal tests are hermetic and quota-free. Live provider checks remain opt-in via
 | Text messages | Yes | Yes | Yes | Yes | Yes |
 | Official cache fields | Yes (`prompt_cache_key`, `x-grok-conv-id`, options, breakpoints) | Yes (`prompt_cache_key`, options, breakpoints) | Consume routing identity; emit `cache_control` | Yes (body `prompt_cache_key`; never `x-grok-conv-id`) | Yes (REST and ChatGPT WS share one cache payload) |
 | Function tools | Yes | Yes | Yes | Yes | Yes |
+| Tool choice `auto` / `none` | Yes | Yes | Yes | Yes | Yes |
+| Forced tool choice (`required` / named) | Yes | Yes | Upstream 400 on current models | Yes | Yes |
 | OpenAI `allowed_tools` function subset | Yes (filtered) | Yes (filtered) | Translated | Translated | Translated |
 | Tool result loops | Yes | Yes | Yes | Yes | Yes |
 | Image URL input | Yes | Yes | Yes | Yes | Yes |
@@ -47,7 +49,8 @@ used, not the model name. `/v1/messages` still requires `max_tokens`.
 |---|---:|---:|---:|
 | Text + multi-block | Yes | Yes | Yes |
 | Function tools + tool loops | Yes | Yes | Yes |
-| `tool_choice` (`auto` / `any` / `tool` / `none`) | Yes | Yes | Yes |
+| `tool_choice` `auto` / `none` | Yes | Yes | Yes |
+| `tool_choice` `any` / `tool` | Upstream 400 on current models | Yes | Yes |
 | Images (url/base64) | Yes | Yes | Yes |
 | Images in `tool_result` | Yes | Yes | Yes |
 | Streaming SSE | Yes (raw) | Yes (framed) | Yes (framed) |
@@ -81,11 +84,43 @@ but choice is omitted and a flag needs a carrier. Claude `none` stays `none`;
 with no tools no choice is sent, and forced choices still fail validation.
 Grok and Codex preserve explicit booleans, including no-tools requests, and
 omit absent controls in streaming and non-streaming builders. These are tested
-serialization contracts, not proof of real CLI/model acceptance. Live explicit
-true/false acceptance and the incident target Claude model's forced-choice and
-final thinking compatibility remain unverified.
+serialization contracts, not proof of real CLI/model acceptance. A live
+`auto` request with `parallel_tool_calls: false` was accepted by every model
+in the tool choice check below; that shows acceptance, not enforcement.
 
 Gateway metadata such as `user` is not provider passthrough.
+
+## Tool choice
+
+The tool choice protocol is unchanged: OpenAI has `auto`, `required`, `none`,
+and a named function; Anthropic has `auto`, `any`, `tool`, and `none`. Omni
+maps `required` to `any` and a named function to `tool`.
+
+Current Claude models reject the two forced choices, `any` and `tool`, with an
+upstream 400: `tool_choice: type "tool" and "any" are not supported for this
+model.` The restriction also applies to token counting. Anthropic's list of
+affected models is the source of truth:
+<https://platform.claude.com/docs/en/api/errors#forced-tool-use-not-supported>.
+
+Omni currently forwards the forced choice unchanged, so the client receives
+that 400. The forward-facing baseline for every provider is `auto` or `none`.
+Forced choices work on the current Grok and Codex models.
+
+Live check through Omni on 2026-11-03, non-streaming, one request per cell:
+
+| Model | `auto` | `none` | `required` | Named tool | `auto` + parallel off |
+|---|---:|---:|---:|---:|---:|
+| `claude-opus-5-5` | 200 | 200 | 400 | 400 | 200 |
+| `claude-sonnet-5-5` | 200 | 200 | 400 | 400 | 200 |
+| `claude-fable-5-1` | 200 | 200 | 400 | 400 | 200 |
+| `gpt-6-astra` | 200 | 200 | 200 | 200 | 200 |
+| `gpt-6.1-sol` | 200 | 200 | 200 | 200 | 200 |
+| `gpt-6-luna` | 200 | 200 | 200 | 200 | 200 |
+| `grok-4.7` | 200 | 200 | 200 | 200 | 200 |
+
+`claude-opus-5-5` also returned 400 for a named tool on `/v1/responses` and
+native `/v1/messages`, so the rejection does not come from Omni's translation.
+Streaming and tool-result turns were not part of this check.
 
 ## Rich Outputs
 

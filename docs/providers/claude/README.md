@@ -62,9 +62,18 @@ flag. Without tools the choice is omitted; forced choices still fail.
 Native Messages keeps its existing nested control and validation.
 
 Disabling parallel calls permits at most one call with auto, or exactly one
-with a supported forced choice. Model-specific forced-choice restrictions are
-unchanged. Mock serialization does not establish live model acceptance or the
-incident model's final thinking/forced-choice compatibility.
+with a supported forced choice. Mock serialization does not establish live
+model acceptance.
+
+## Forced tool choice
+
+Current Claude models reject `tool_choice` `any` and `tool` with an upstream
+400, including on token counting. Omni maps OpenAI `required` to `any` and a
+named function to `tool`, and currently forwards both unchanged, so the client
+receives that 400. `auto` and `none` work. Anthropic's list of affected models
+is the source of truth:
+<https://platform.claude.com/docs/en/api/errors#forced-tool-use-not-supported>.
+See the live check in `docs/compatibility-matrix.md`.
 
 ## Provider Extras
 
