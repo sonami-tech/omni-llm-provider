@@ -815,28 +815,25 @@ mod tests {
 
     #[test]
     fn native_ingress_preserves_all_anthropic_tool_choice_modes() {
-        for choice in [
-            serde_json::json!({"type": "auto", "disable_parallel_tool_use": true}),
-            serde_json::json!({"type": "any", "disable_parallel_tool_use": true}),
-            serde_json::json!({"type": "tool", "name": "read", "disable_parallel_tool_use": true}),
-            serde_json::json!({"type": "none"}),
-        ] {
-            let expected_type = choice["type"].as_str().unwrap();
-            let body = serde_json::json!({
-                "model": "claude-sonnet-5",
-                "max_tokens": 100,
-                "messages": [{"role": "user", "content": "use tools"}],
-                "tools": [{"name": "read", "input_schema": {"type": "object"}}],
-                "tool_choice": choice
-            });
-            let wire = serde_json::to_value(parse_client(body).to_messages_request())
-                .expect("request serializes");
-            assert_eq!(wire["tool_choice"]["type"], expected_type);
-            if expected_type == "tool" {
-                assert_eq!(wire["tool_choice"]["name"], "read");
-            }
-            if expected_type != "none" {
-                assert_eq!(wire["tool_choice"]["disable_parallel_tool_use"], true);
+        for mode in ["auto", "any", "tool", "none"] {
+            for disabled in [None, Some(true), Some(false)] {
+                let mut choice = serde_json::json!({"type":mode});
+                if mode == "tool" {
+                    choice["name"] = serde_json::json!("read");
+                }
+                if mode != "none"
+                    && let Some(disabled) = disabled
+                {
+                    choice["disable_parallel_tool_use"] = serde_json::json!(disabled);
+                }
+                let body = serde_json::json!({
+                    "model":"claude-sonnet-5", "max_tokens":100,
+                    "messages":[{"role":"user","content":"use tools"}],
+                    "tools":[{"name":"read","input_schema":{"type":"object"}}],
+                    "tool_choice":choice
+                });
+                let wire = serde_json::to_value(parse_client(body).to_messages_request()).unwrap();
+                assert_eq!(wire["tool_choice"], choice);
             }
         }
     }

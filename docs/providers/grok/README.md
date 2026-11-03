@@ -68,6 +68,17 @@ does not send one. The provider/model default applies (often `high` on
 grok-4.5). No force-floor and no invented disable. Capture notes:
 `docs/providers/grok/CAPTURE.md`. Operator summary: `docs/README.md`.
 
+## Parallel tool control
+
+`parallel_tool_calls` is a typed canonical boolean, not a provider extra.
+Chat and Responses treat missing/null as absent and reject other types.
+Translated Messages inverts both explicit disabling booleans. Explicit values
+are emitted unchanged and absent controls stay absent, including named
+single-call requests and no-tools requests. Both custom-auth Chat and default
+CLI Responses builders carry the control.
+Streaming and non-streaming paths share these mappings. Offline tests prove
+serialization only; actual CLI acceptance of explicit true/false is unverified.
+
 ## Provider Extras
 
 Grok accepts these provider extras on OpenAI-compatible inbound surfaces:
@@ -75,7 +86,6 @@ Grok accepts these provider extras on OpenAI-compatible inbound surfaces:
 - `service_tier`
 - `search_parameters`
 - `response_format`
-- `parallel_tool_calls`
 - `seed`
 - `stop`
 - `n`

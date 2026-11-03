@@ -407,6 +407,7 @@ fn chat_reasoning_and_extras(
     for (key, value) in obj {
         let k = key.as_str();
         if gateway_only_extra_keys().contains(&k)
+            || k == "parallel_tool_calls"
             || k == "reasoning_effort"
             || k == "reasoning"
             || crate::cache::OPENAI_CACHE_EXTRA_KEYS.contains(&k)
@@ -535,6 +536,10 @@ pub fn to_canonical_with_headers(
         messages,
         tools,
         tool_choice,
+        parallel_tool_calls: optional_bool(
+            req.extras.get("parallel_tool_calls"),
+            "parallel_tool_calls",
+        )?,
         // OpenAI's max_completion_tokens supersedes the legacy max_tokens.
         max_tokens: req.max_completion_tokens.or(req.max_tokens),
         temperature: req.temperature,
@@ -544,6 +549,14 @@ pub fn to_canonical_with_headers(
         cache,
         provider_extras,
     })
+}
+
+pub(crate) fn optional_bool(value: Option<&Value>, field: &str) -> Result<Option<bool>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(format!("{field} must be a boolean or null")),
+    }
 }
 
 fn restrict_tools_to_allowed(
@@ -2316,5 +2329,65 @@ mod issue_51_tool_tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod parallel_tool_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn openai_parallel_control_is_typed_not_an_extra() {
+        for responses in [false, true] {
+            for value in [
+                None,
+                Some(Value::Null),
+                Some(json!(true)),
+                Some(json!(false)),
+                Some(json!("false")),
+                Some(json!(0)),
+                Some(json!([])),
+                Some(json!({})),
+            ] {
+                let mut body = if responses {
+                    json!({"model":"m","input":"hi","service_tier":"priority"})
+                } else {
+                    json!({"model":"m","messages":[{"role":"user","content":"hi"}],"service_tier":"priority"})
+                };
+                if let Some(value) = &value {
+                    body["parallel_tool_calls"] = value.clone();
+                }
+                let result = if responses {
+                    let req = serde_json::from_value(body).unwrap();
+                    crate::responses::responses_to_canonical(&req)
+                } else {
+                    let req = serde_json::from_value(body).unwrap();
+                    to_canonical(&req)
+                };
+                if value
+                    .as_ref()
+                    .is_some_and(|v| !v.is_null() && !v.is_boolean())
+                {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .contains("parallel_tool_calls must be a boolean")
+                    );
+                } else {
+                    let canon = result.unwrap();
+                    let expected = value.as_ref().and_then(Value::as_bool);
+                    assert_eq!(canon.parallel_tool_calls, expected);
+                    let extras = canon.provider_extras.as_ref().unwrap();
+                    assert_eq!(extras["service_tier"], "priority");
+                    assert!(extras.get("parallel_tool_calls").is_none());
+                    let wire = serde_json::to_value(&canon).unwrap();
+                    assert_eq!(
+                        wire.get("parallel_tool_calls"),
+                        expected.map(Value::Bool).as_ref()
+                    );
+                }
+            }
+        }
     }
 }

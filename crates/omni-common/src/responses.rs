@@ -468,7 +468,10 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
     let provider_extras = req.extras.as_object().and_then(|extras| {
         let filtered = extras
             .iter()
-            .filter(|(key, _)| !gateway_only_extra_keys().contains(&key.as_str()))
+            .filter(|(key, _)| {
+                key.as_str() != "parallel_tool_calls"
+                    && !gateway_only_extra_keys().contains(&key.as_str())
+            })
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<serde_json::Map<_, _>>();
         let filtered = strip_openai_cache_keys(&filtered);
@@ -484,6 +487,10 @@ pub fn responses_to_canonical(req: &ResponsesRequest) -> Result<CanonicalRequest
         messages,
         tools,
         tool_choice,
+        parallel_tool_calls: crate::http::optional_bool(
+            req.extras.get("parallel_tool_calls"),
+            "parallel_tool_calls",
+        )?,
         max_tokens: req.max_output_tokens,
         temperature: req.temperature,
         top_p: req.top_p,
@@ -1851,7 +1858,8 @@ mod tests {
         assert_eq!(extras["previous_response_id"], "resp_prev");
         assert_eq!(extras["store"], false);
         assert_eq!(extras["metadata"]["trace"], "abc");
-        assert_eq!(extras["parallel_tool_calls"], true);
+        assert_eq!(canon.parallel_tool_calls, Some(true));
+        assert!(extras.get("parallel_tool_calls").is_none());
         assert_eq!(extras["service_tier"], "priority");
         assert!(extras.get("user").is_none());
     }

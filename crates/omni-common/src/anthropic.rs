@@ -208,7 +208,7 @@ where
 /// Translate an Anthropic Messages request body into a [`CanonicalRequest`].
 ///
 /// `provider_id` selects provider-specific extras allowlist behavior
-/// (`stop_sequences`, `parallel_tool_calls`). Only `"grok"` and `"codex"` are
+/// (`stop_sequences`). Only `"grok"` and `"codex"` are
 /// intended call sites.
 pub fn anthropic_to_canonical(
     body: &Value,
@@ -350,7 +350,7 @@ pub fn anthropic_to_canonical(
     // thinking request config → CanonicalReasoning
     let reasoning = map_thinking_config(body.get("thinking"))?;
 
-    // provider extras: stop_sequences, parallel_tool_calls
+    // provider extras: stop_sequences
     let provider_extras = build_provider_extras(body, provider_id);
 
     reject_anthropic_prompt_cache_key(body).map_err(AnthropicMapError::new)?;
@@ -393,6 +393,13 @@ pub fn anthropic_to_canonical(
         messages,
         tools,
         tool_choice,
+        parallel_tool_calls: crate::http::optional_bool(
+            body.get("tool_choice")
+                .and_then(|choice| choice.get("disable_parallel_tool_use")),
+            "tool_choice.disable_parallel_tool_use",
+        )
+        .map_err(AnthropicMapError::new)?
+        .map(|disabled| !disabled),
         max_tokens: Some(max_tokens),
         temperature,
         top_p,
@@ -1072,7 +1079,6 @@ fn map_tool_choice(
             )));
         }
     };
-    // disable_parallel_tool_use is handled in build_provider_extras
     let _ = provider_id;
     Ok(Some(mapped))
 }
@@ -1125,20 +1131,6 @@ fn build_provider_extras(body: &Value, provider_id: &str) -> Option<Value> {
                     count = stops.len(),
                     "dropping stop_sequences for codex (not mapped on translated Anthropic path)"
                 );
-            }
-        }
-    }
-
-    // tool_choice.disable_parallel_tool_use → parallel_tool_calls: false
-    if let Some(tc) = body.get("tool_choice") {
-        if let Some(true) = tc
-            .get("disable_parallel_tool_use")
-            .and_then(|v| v.as_bool())
-        {
-            if provider_id == "grok" || provider_id == "codex" {
-                extras.insert("parallel_tool_calls".into(), Value::Bool(false));
-            } else {
-                debug!("dropping disable_parallel_tool_use for provider {provider_id}");
             }
         }
     }
@@ -2156,15 +2148,73 @@ mod tests {
     }
 
     #[test]
-    fn parallel_disable_maps_extra() {
-        let body = json!({
-            "model": "m",
-            "max_tokens": 10,
-            "tool_choice": {"type": "auto", "disable_parallel_tool_use": true},
-            "messages": [{"role": "user", "content": "u"}]
-        });
-        let c = anthropic_to_canonical(&body, "grok").unwrap();
-        assert_eq!(c.provider_extras.unwrap()["parallel_tool_calls"], false);
+    fn parallel_disable_maps_canonical_control() {
+        for provider in ["grok", "codex"] {
+            for mode in ["auto", "any", "tool", "none"] {
+                for value in [
+                    None,
+                    Some(Value::Null),
+                    Some(json!(true)),
+                    Some(json!(false)),
+                    Some(json!("false")),
+                    Some(json!(1)),
+                    Some(json!([])),
+                    Some(json!({})),
+                ] {
+                    let mut body = json!({
+                        "model":"m", "max_tokens":10,
+                        "tools":[{"name":"lookup","input_schema":{"type":"object"}}],
+                        "tool_choice":{"type":mode,"name":"lookup"},
+                        "messages":[{"role":"user","content":"hi"}]
+                    });
+                    if let Some(value) = &value {
+                        body["tool_choice"]["disable_parallel_tool_use"] = value.clone();
+                    }
+                    let result = anthropic_to_canonical(&body, provider);
+                    if value
+                        .as_ref()
+                        .is_some_and(|v| !v.is_null() && !v.is_boolean())
+                    {
+                        assert!(
+                            result.unwrap_err().to_string().contains(
+                                "tool_choice.disable_parallel_tool_use must be a boolean"
+                            )
+                        );
+                    } else {
+                        let canon = result.unwrap();
+                        assert_eq!(
+                            canon.parallel_tool_calls,
+                            value.as_ref().and_then(Value::as_bool).map(|v| !v)
+                        );
+                        assert!(canon.provider_extras.is_none());
+                        match mode {
+                            "auto" => assert!(matches!(
+                                canon.tool_choice,
+                                Some(CanonicalToolChoice::Auto)
+                            )),
+                            "any" => assert!(matches!(
+                                canon.tool_choice,
+                                Some(CanonicalToolChoice::Required)
+                            )),
+                            "none" => assert!(matches!(
+                                canon.tool_choice,
+                                Some(CanonicalToolChoice::None)
+                            )),
+                            _ => assert!(
+                                matches!(canon.tool_choice, Some(CanonicalToolChoice::Specific { name }) if name == "lookup")
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        let body = json!({"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]});
+        assert_eq!(
+            anthropic_to_canonical(&body, "grok")
+                .unwrap()
+                .parallel_tool_calls,
+            None
+        );
     }
 
     #[test]

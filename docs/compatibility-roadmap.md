@@ -124,9 +124,10 @@ and adds `format`, or accepts an equal existing `format`. A conflicting
 invalid non-null `response_format` is also a 400. Without non-null
 `response_format`, `text` is forwarded unchanged. Unsupported extras fail loudly.
 Grok continues to forward its chat-compatible extras such as
-`service_tier`, `response_format`, and `parallel_tool_calls`; Responses-native
+`service_tier` and `response_format`; Responses-native
 state fields remain unsupported for Grok. Claude OpenAI-compatible provider
-extras remain unsupported.
+extras remain unsupported. `parallel_tool_calls` is now canonical intent, not
+an extra; see `compatibility-matrix.md` for all transport mappings and limits.
 
 Deferred: non-function hosted tools and additional provider-specific output item
 types.

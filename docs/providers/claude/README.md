@@ -52,6 +52,20 @@ fingerprint wire defaults apply. If the pair is invalid for Anthropic
 not auto-fix. That can also occur when a wire default is below a client (or
 effort-mapped) thinking budget. See `docs/decisions.md`.
 
+## Parallel tool control
+
+Chat and Responses `parallel_tool_calls` is canonical intent, not an extra.
+Both booleans invert into `tool_choice.disable_parallel_tool_use` for `auto`,
+`any`, and named `tool`, without changing the choice or name. With tools and no
+choice, an explicit flag uses `auto`. `none` stays `none` without a disabling
+flag. Without tools the choice is omitted; forced choices still fail.
+Native Messages keeps its existing nested control and validation.
+
+Disabling parallel calls permits at most one call with auto, or exactly one
+with a supported forced choice. Model-specific forced-choice restrictions are
+unchanged. Mock serialization does not establish live model acceptance or the
+incident model's final thinking/forced-choice compatibility.
+
 ## Provider Extras
 
 Claude's OpenAI-compatible path has no provider extras passthrough today.

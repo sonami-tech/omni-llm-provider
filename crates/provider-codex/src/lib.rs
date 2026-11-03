@@ -1812,6 +1812,9 @@ fn codex_responses_body(req: &CanonicalRequest, stream: bool) -> Result<Value, P
             CanonicalToolChoice::Specific { name } => json!({"type": "function", "name": name}),
         };
     }
+    if let Some(parallel) = req.parallel_tool_calls {
+        body["parallel_tool_calls"] = json!(parallel);
+    }
     apply_codex_cache(&mut body, req);
     if let Some(extras) = &req.provider_extras
         && let Some(obj) = extras.as_object()
@@ -2233,13 +2236,7 @@ fn flush_codex_message(
 pub fn codex_extra_allowed(key: &str) -> bool {
     matches!(
         key,
-        "store"
-            | "previous_response_id"
-            | "metadata"
-            | "parallel_tool_calls"
-            | "service_tier"
-            | "response_format"
-            | "text"
+        "store" | "previous_response_id" | "metadata" | "service_tier" | "response_format" | "text"
     )
 }
 
@@ -3137,6 +3134,7 @@ query_params = { api-version = "2026-01-01" }
             tool_choice: Some(CanonicalToolChoice::Specific {
                 name: "lookup".into(),
             }),
+            parallel_tool_calls: None,
             max_tokens: Some(50),
             temperature: Some(0.2),
             top_p: None,
@@ -6365,6 +6363,71 @@ mod issue_51_tool_tests {
             let wire = codex_responses_body(&canon, false).unwrap();
             assert_eq!(wire["tools"][0]["parameters"], schema);
             assert_eq!(wire["tools"][0]["strict"], expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod parallel_tool_tests {
+    use super::*;
+
+    #[test]
+    fn parallel_control_reaches_all_transport_builders() {
+        for parallel in [None, Some(true), Some(false)] {
+            for choice in [
+                None,
+                Some(CanonicalToolChoice::Auto),
+                Some(CanonicalToolChoice::Required),
+                Some(CanonicalToolChoice::Specific {
+                    name: "lookup".into(),
+                }),
+                Some(CanonicalToolChoice::None),
+            ] {
+                for has_tools in [false, true] {
+                    let req = CanonicalRequest {
+                        model: "gpt-5.5".into(),
+                        parallel_tool_calls: parallel,
+                        tool_choice: choice.clone(),
+                        tools: has_tools.then(|| {
+                            vec![omni_core::CanonicalTool {
+                                name: "lookup".into(),
+                                description: None,
+                                parameters: json!({"type":"object"}),
+                                strict: false,
+                                cache: None,
+                            }]
+                        }),
+                        ..Default::default()
+                    };
+                    let bodies = [
+                        (codex_responses_body(&req, false).unwrap(), false, false),
+                        (codex_responses_body(&req, true).unwrap(), false, false),
+                        (codex_response_create_body(&req).unwrap(), false, false),
+                    ];
+                    for (body, chat, omit_choice) in bodies {
+                        assert_eq!(
+                            body.get("parallel_tool_calls"),
+                            parallel.map(Value::Bool).as_ref()
+                        );
+                        let expected = if omit_choice {
+                            None
+                        } else {
+                            choice.as_ref().map(|choice| match choice {
+                                CanonicalToolChoice::Auto => json!("auto"),
+                                CanonicalToolChoice::Required => json!("required"),
+                                CanonicalToolChoice::None => json!("none"),
+                                CanonicalToolChoice::Specific { name } if chat => {
+                                    json!({"type":"function","function":{"name":name}})
+                                }
+                                CanonicalToolChoice::Specific { name } => {
+                                    json!({"type":"function","name":name})
+                                }
+                            })
+                        };
+                        assert_eq!(body.get("tool_choice"), expected.as_ref());
+                    }
+                }
+            }
         }
     }
 }

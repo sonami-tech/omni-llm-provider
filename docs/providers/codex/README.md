@@ -73,6 +73,17 @@ the built-in OpenAI provider at another base URL, or use a non-reserved
 Default tests are hermetic and use wiremock. Live Codex calls should remain
 explicitly opt-in because they may spend quota and depend on account state.
 
+## Parallel tool control
+
+`parallel_tool_calls` is a typed canonical boolean, not a provider extra.
+Chat and Responses treat missing/null as absent and reject other types.
+Translated Messages inverts both explicit disabling booleans. Explicit values
+are emitted unchanged and absent controls stay absent, including named
+single-call requests and no-tools requests. REST and ChatGPT WebSocket use the
+same body builder.
+Streaming and non-streaming paths share these mappings. Offline tests prove
+serialization only; actual CLI acceptance of explicit true/false is unverified.
+
 ## Provider Extras
 
 Codex accepts these provider extras on OpenAI-compatible inbound surfaces and
@@ -81,7 +92,6 @@ forwards them to the upstream Responses-compatible body:
 - `store`
 - `previous_response_id`
 - `metadata`
-- `parallel_tool_calls`
 - `service_tier`
 - `text`
 

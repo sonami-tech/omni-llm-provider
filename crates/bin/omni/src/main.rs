@@ -10877,4 +10877,237 @@ rule = [
             "responses tool loop output must mention the fed-back temperature (proves the tool result round-tripped): {v}"
         );
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_subprocess_parallel_control_routes_repeated_launches() {
+        use serde_json::{Value, json};
+        let homes = TempDetectedProviderHomes::install();
+        let mut previous_port = None;
+        for launch in 0..2 {
+            let server = MockServer::start().await;
+            let claude_json = json!({
+                "id":"msg_parallel", "type":"message", "role":"assistant", "model":"claude-sonnet-5-5",
+                "content":[{"type":"text","text":"parallel route ok"}], "stop_reason":"end_turn", "stop_sequence":null,
+                "usage":{"input_tokens":1,"output_tokens":2}
+            });
+            let claude_sse = concat!(
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_parallel\",\"model\":\"claude-sonnet-5-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+                "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"parallel route ok\"}}\n\n",
+                "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+            );
+            let chat_json = json!({"model":"grok-4.7","choices":[{"message":{"content":"parallel route ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}});
+            let chat_sse = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"parallel route ok\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let responses_json = json!({"id":"resp_parallel","model":"gpt-5.5","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"parallel route ok"}]}],"usage":{"input_tokens":1,"output_tokens":2}});
+            let responses_sse = concat!(
+                "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_parallel\"}}\n\n",
+                "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"parallel route ok\"}\n\n",
+                "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n"
+            );
+            for (route, nonstream, stream) in [
+                ("/v1/messages", claude_json, claude_sse),
+                ("/chat/completions", chat_json, chat_sse),
+                ("/v1/responses", responses_json, responses_sse),
+            ] {
+                Mock::given(method("POST"))
+                    .and(path(route))
+                    .respond_with(move |request: &wiremock::Request| {
+                        let body: Value = serde_json::from_slice(&request.body).unwrap();
+                        if body["stream"] == true {
+                            ResponseTemplate::new(200).set_body_raw(stream, "text/event-stream")
+                        } else {
+                            ResponseTemplate::new(200).set_body_json(&nonstream)
+                        }
+                    })
+                    .mount(&server)
+                    .await;
+            }
+            let mut port = free_port();
+            while previous_port == Some(port) {
+                port = free_port();
+            }
+            previous_port = Some(port);
+            let stats = homes.root.join(format!("parallel-{launch}.redb"));
+            let log = homes.root.join(format!("parallel-{launch}.log"));
+            let base = server.uri();
+            let child = spawn_omni_owned(
+                &[
+                    "--no-auth",
+                    "--bind",
+                    "127.0.0.1",
+                    "--port",
+                    &port.to_string(),
+                    "--no-oauth-refresh",
+                    "--stats-db",
+                    stats.to_str().unwrap(),
+                    "--log-file",
+                    log.to_str().unwrap(),
+                ],
+                hermetic_provider_env(
+                    &homes,
+                    "claude,grok,codex",
+                    &[
+                        ("OMNI_CLAUDE_BASE_URL", &base),
+                        ("OMNI_CLAUDE_API_KEY", "fixture-claude"),
+                        ("OMNI_GROK_BASE_URL", &base),
+                        ("OMNI_GROK_API_KEY", "fixture-grok"),
+                        ("OMNI_CODEX_BASE_URL", &format!("{base}/v1")),
+                        ("OMNI_CODEX_API_KEY", "fixture-codex"),
+                    ],
+                ),
+            );
+            assert!(
+                wait_for_200_health(port, subprocess_health_timeout()),
+                "launch {launch}"
+            );
+            eprintln!("PARALLEL_LAUNCH launch={launch} port={port} upstream={base}");
+            for (route, model, stream, parallel, native) in [
+                ("/v1/chat/completions", "claude:sonnet", false, false, false),
+                ("/v1/responses", "claude:sonnet", true, true, false),
+                ("/v1/messages", "claude:sonnet", false, false, true),
+                ("/v1/messages", "grok:grok-4.7", false, true, false),
+                ("/v1/chat/completions", "grok:grok-4.7", true, false, false),
+                ("/v1/responses", "codex:gpt-5.5", false, false, false),
+                ("/v1/messages", "codex:gpt-5.5", true, false, false),
+            ] {
+                let mut body = json!({"model":model,"stream":stream});
+                if route == "/v1/responses" {
+                    body["input"] = json!("hi");
+                    body["tools"] =
+                        json!([{"type":"function","name":"lookup","parameters":{"type":"object"}}]);
+                    body["tool_choice"] = json!({"type":"function","name":"lookup"});
+                } else {
+                    body["messages"] = json!([{"role":"user","content":"hi"}]);
+                    if route == "/v1/messages" {
+                        body["max_tokens"] = json!(100);
+                        body["tools"] = json!([{"name":"lookup","input_schema":{"type":"object"}}]);
+                        body["tool_choice"] = json!({"type":"tool","name":"lookup","disable_parallel_tool_use":!parallel});
+                    } else {
+                        body["tools"] = json!([{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]);
+                        body["tool_choice"] =
+                            json!({"type":"function","function":{"name":"lookup"}});
+                    }
+                }
+                if route != "/v1/messages" {
+                    body["parallel_tool_calls"] = json!(parallel);
+                }
+                let response = post_json(port, route, &body.to_string());
+                assert_eq!(response.status, 200, "{model} {route}: {}", response.body);
+                if !stream {
+                    let value: Value = serde_json::from_str(&response.body).unwrap();
+                    let text = match route {
+                        "/v1/chat/completions" => &value["choices"][0]["message"]["content"],
+                        "/v1/responses" => &value["output"][0]["content"][0]["text"],
+                        _ => &value["content"][0]["text"],
+                    };
+                    assert_eq!(text, "parallel route ok");
+                } else {
+                    assert!(
+                        response.body.contains("parallel route ok"),
+                        "{}",
+                        response.body
+                    );
+                    assert!(!response.body.contains("event: error"), "{}", response.body);
+                }
+                let requests = server.received_requests().await.unwrap();
+                let request = requests.last().unwrap();
+                let captured: Value = serde_json::from_slice(&request.body).unwrap();
+                if model.starts_with("claude:") {
+                    assert_eq!(
+                        captured["tool_choice"],
+                        json!({"type":"tool","name":"lookup","disable_parallel_tool_use":!parallel})
+                    );
+                    assert!(captured.get("parallel_tool_calls").is_none());
+                    assert_eq!(request.headers["x-api-key"], "fixture-claude");
+                } else {
+                    assert_eq!(captured["parallel_tool_calls"], parallel);
+                    if model.starts_with("grok:") {
+                        assert_eq!(captured["tool_choice"]["function"]["name"], "lookup");
+                    } else {
+                        assert_eq!(captured["tool_choice"]["name"], "lookup");
+                    }
+                }
+                eprintln!(
+                    "PARALLEL_CAPTURE model={model} route={route} native={native} input={body} upstream={captured} status={} response={}",
+                    response.status, response.body
+                );
+            }
+            drop(child);
+            eprintln!(
+                "PARALLEL_TEARDOWN launch={launch} log={}",
+                std::fs::read_to_string(log).unwrap_or_default()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parallel_control_grok_cli_route_capture() {
+        use serde_json::json;
+        for stream in [false, true] {
+            let server = MockServer::start().await;
+            let response = if stream {
+                ResponseTemplate::new(200).set_body_raw(concat!(
+                    "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cli\"}}\n\n",
+                    "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"CLI parallel ok\"}\n\n",
+                    "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+                ), "text/event-stream")
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({"id":"resp_cli","model":"grok-4.7","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"CLI parallel ok"}]}]}))
+            };
+            Mock::given(method("POST"))
+                .and(path("/v1/responses"))
+                .respond_with(response)
+                .expect(3)
+                .mount(&server)
+                .await;
+            let provider = provider_grok::GrokProvider::new_for_test("fixture-cli", server.uri());
+            let mut map = HashMap::new();
+            map.insert(
+                "grok".into(),
+                entry_from_bootstrap("grok", provider_grok::from_provider(provider).unwrap())
+                    .unwrap(),
+            );
+            let state = state_with(map);
+            for parallel in [None, Some(true), Some(false)] {
+                let mut body = json!({"model":"grok:grok-4.7","input":"hi","stream":stream,
+                    "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
+                    "tool_choice":{"type":"function","name":"lookup"}});
+                if let Some(parallel) = parallel {
+                    body["parallel_tool_calls"] = json!(parallel);
+                }
+                let request = serde_json::from_value(body).unwrap();
+                let response = call_responses_handler(state.clone(), request)
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                let response = String::from_utf8(bytes.to_vec()).unwrap();
+                assert!(response.contains("CLI parallel ok"), "{response}");
+                assert!(!response.contains("response.failed"), "{response}");
+                let requests = server.received_requests().await.unwrap();
+                let captured: Value =
+                    serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+                assert_eq!(
+                    captured.get("parallel_tool_calls"),
+                    parallel.map(Value::Bool).as_ref()
+                );
+                assert_eq!(
+                    captured["tool_choice"],
+                    json!({"type":"function","name":"lookup"})
+                );
+                assert_eq!(captured["stream"], stream);
+                eprintln!(
+                    "PARALLEL_CLI_CAPTURE stream={stream} control={parallel:?} upstream={captured} response={response}"
+                );
+            }
+        }
+    }
 }

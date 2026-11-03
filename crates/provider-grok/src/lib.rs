@@ -1226,6 +1226,9 @@ fn to_xai_chat_request(
         body["tool_choice"] = v;
     }
 
+    if let Some(parallel) = req.parallel_tool_calls {
+        body["parallel_tool_calls"] = json!(parallel);
+    }
     if let Some(mt) = req.max_tokens {
         // xAI prefers max_completion_tokens (does not count internal reasoning/function tokens)
         body["max_completion_tokens"] = json!(mt);
@@ -1356,14 +1359,7 @@ fn is_image_part(value: &Value) -> bool {
 pub fn grok_extra_allowed(key: &str) -> bool {
     matches!(
         key,
-        "service_tier"
-            | "search_parameters"
-            | "response_format"
-            | "parallel_tool_calls"
-            | "seed"
-            | "stop"
-            | "n"
-            | "tools"
+        "service_tier" | "search_parameters" | "response_format" | "seed" | "stop" | "n" | "tools"
     )
 }
 
@@ -1455,6 +1451,10 @@ fn to_grok_responses_request(
         "input": input,
         "stream": stream,
     });
+
+    if let Some(parallel) = req.parallel_tool_calls {
+        body["parallel_tool_calls"] = json!(parallel);
+    }
 
     let has_tools = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
     if let Some(tools) = &req.tools
@@ -2187,6 +2187,7 @@ mod tests {
             ],
             tools: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             max_tokens: Some(128),
             temperature: Some(0.5),
             top_p: None,
@@ -2535,6 +2536,7 @@ mod tests {
             tool_choice: Some(CanonicalToolChoice::Specific {
                 name: "get_weather".into(),
             }),
+            parallel_tool_calls: None,
             max_tokens: None,
             temperature: None,
             top_p: None,
@@ -3052,6 +3054,7 @@ mod tests {
                 cache: None,
             }]),
             tool_choice: Some(CanonicalToolChoice::Auto),
+            parallel_tool_calls: None,
             max_tokens: Some(256),
             temperature: None,
             top_p: Some(0.9),
@@ -3565,8 +3568,8 @@ mod tests {
                 role: "user".into(),
                 content: CanonicalContent::Text("x".into()),
             }],
+            parallel_tool_calls: Some(true),
             provider_extras: Some(json!({
-                "parallel_tool_calls": true,
                 "response_format": {"type": "json_object"},
                 "seed": 42,
                 "stop": ["END"],
@@ -6367,5 +6370,89 @@ mod issue_51_tool_tests {
             to_grok_responses_request(&req, GROK_CATALOG, false),
             Err(ProviderError::BadRequest(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod parallel_tool_tests {
+    use super::*;
+
+    #[test]
+    fn parallel_control_reaches_all_transport_builders() {
+        for parallel in [None, Some(true), Some(false)] {
+            for choice in [
+                None,
+                Some(CanonicalToolChoice::Auto),
+                Some(CanonicalToolChoice::Required),
+                Some(CanonicalToolChoice::Specific {
+                    name: "lookup".into(),
+                }),
+                Some(CanonicalToolChoice::None),
+            ] {
+                for has_tools in [false, true] {
+                    let req = CanonicalRequest {
+                        model: "grok-4.7".into(),
+                        parallel_tool_calls: parallel,
+                        tool_choice: choice.clone(),
+                        tools: has_tools.then(|| {
+                            vec![omni_core::CanonicalTool {
+                                name: "lookup".into(),
+                                description: None,
+                                parameters: json!({"type":"object"}),
+                                strict: false,
+                                cache: None,
+                            }]
+                        }),
+                        ..Default::default()
+                    };
+                    let bodies = [
+                        (
+                            to_xai_chat_request(&req, &Replacements::empty(), GROK_CATALOG)
+                                .unwrap(),
+                            true,
+                            false,
+                        ),
+                        (
+                            to_xai_chat_stream_request(&req, &Replacements::empty(), GROK_CATALOG)
+                                .unwrap(),
+                            true,
+                            false,
+                        ),
+                        (
+                            to_grok_responses_request(&req, GROK_CATALOG, false).unwrap(),
+                            false,
+                            !has_tools,
+                        ),
+                        (
+                            to_grok_responses_request(&req, GROK_CATALOG, true).unwrap(),
+                            false,
+                            !has_tools,
+                        ),
+                    ];
+                    for (body, chat, omit_choice) in bodies {
+                        assert_eq!(
+                            body.get("parallel_tool_calls"),
+                            parallel.map(Value::Bool).as_ref()
+                        );
+                        let expected = if omit_choice {
+                            None
+                        } else {
+                            choice.as_ref().map(|choice| match choice {
+                                CanonicalToolChoice::Auto => json!("auto"),
+                                CanonicalToolChoice::Required => json!("required"),
+                                CanonicalToolChoice::None => json!("none"),
+                                CanonicalToolChoice::Specific { name } if chat => {
+                                    json!({"type":"function","function":{"name":name}})
+                                }
+                                CanonicalToolChoice::Specific { name } => {
+                                    json!({"type":"function","name":name})
+                                }
+                            })
+                        };
+                        assert_eq!(body.get("tool_choice"), expected.as_ref());
+                    }
+                }
+            }
+        }
     }
 }

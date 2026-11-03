@@ -103,7 +103,7 @@ auth (gateway)
 
 | Piece | Crate |
 |---|---|
-| `anthropic_to_canonical(body, provider_id)` | `omni-common` (provider_id selects extras allowlist: stop_sequences, parallel_tool_calls) |
+| `anthropic_to_canonical(body, provider_id)` | `omni-common` (provider_id selects provider-specific stop handling; parallel control is canonical intent) |
 | `canonical_to_anthropic` + SSE framer | `omni-common` |
 | Dual-mode dispatch | `crates/bin/omni` |
 | Providers | unchanged; canonical-only |
@@ -169,7 +169,7 @@ Gateway auth on `/v1/messages` unchanged. Upstream credentials per provider.
 | `model`, `messages` | **Required** (missing/empty messages → 400) |
 | `thinking` request config | Map to `CanonicalReasoning` |
 | Tools without plain `name` + `input_schema` (hosted/server tools, computer use, etc.) | **400** unsupported tool kind |
-| `tool_choice.disable_parallel_tool_use` | Map to provider extras if allowlisted (`parallel_tool_calls: false` style for Grok/Codex when supported); else drop + log |
+| `tool_choice.disable_parallel_tool_use` | Canonical control, not a provider extra. See [Parallel tool control](anthropic-compat.md#parallel-tool-control) for boolean inversion, validation, and native-path preservation. |
 | Response thinking blocks | **Do not emit** on translated path (v1) |
 
 ### 5.2 Tool history rewrite (critical)

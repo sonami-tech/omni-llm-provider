@@ -88,15 +88,21 @@ never `x-grok-conv-id`; Claude consumes routing identity and emits
 inbound `prompt_cache_key` is 400. See
 [`docs/cache-translation.md`](../cache-translation.md).
 
+`parallel_tool_calls` is also canonical intent, not an extra. Both OpenAI
+inputs accept booleans (missing/null is absent); translated Messages inverts
+both disabling booleans. Claude emits the inverse nested flag; Codex REST/WS
+and Grok Chat/CLI Responses emit the original boolean. See the provider notes
+and compatibility matrix for choice/no-tools behavior and live-acceptance limits.
+
 The selected provider validates remaining extras against its allowlist before
 dispatch. Unsupported extras fail loudly with a request error.
 
 Current allowlists:
 
 - Grok: `service_tier`, `search_parameters`, `response_format`,
-  `parallel_tool_calls`, `seed`, `stop`, `n`, `tools`
+  `seed`, `stop`, `n`, `tools`
 - Codex: `store`, `previous_response_id`, `metadata`,
-  `parallel_tool_calls`, `service_tier`, `text`; chat `response_format: null`
+  `service_tier`, `text`; chat `response_format: null`
   acts as absent. Non-null chat `response_format` is validated and translated
   into Responses `text.format`, not forwarded as `response_format`. It creates
   `text` when absent, or merges into object `text` while keeping siblings;

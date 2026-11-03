@@ -12,6 +12,8 @@ pub struct CanonicalRequest {
     pub messages: Vec<CanonicalMessage>,
     pub tools: Option<Vec<CanonicalTool>>,
     pub tool_choice: Option<CanonicalToolChoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
@@ -520,6 +522,7 @@ mod tests {
             }],
             tools: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             max_tokens: Some(10),
             temperature: Some(0.7),
             top_p: None,
@@ -686,6 +689,7 @@ mod tests {
             tool_choice: Some(CanonicalToolChoice::Specific {
                 name: "get_info".into(),
             }),
+            parallel_tool_calls: None,
             max_tokens: Some(1024),
             temperature: Some(0.2),
             top_p: Some(0.9),
@@ -896,6 +900,7 @@ mod tests {
             }],
             tools: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             max_tokens: None,
             temperature: None,
             top_p: None,

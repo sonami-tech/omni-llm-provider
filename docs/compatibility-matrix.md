@@ -72,7 +72,18 @@ Shipped cache translation: `docs/cache-translation.md`.
 | `service_tier` passthrough | No | Yes | Yes |
 | `response_format` passthrough | No | Yes | Translated |
 | `text.format` passthrough | No | No | Yes |
-| `parallel_tool_calls` passthrough | No | Yes | Yes |
+| `parallel_tool_calls` canonical control | Inverse nested disabling flag | Yes (Chat and CLI Responses) | Yes (REST and WebSocket) |
+
+Chat and Responses accept boolean `parallel_tool_calls`; missing or null means
+absent, and other types are a 400. It is canonical intent, not a provider extra.
+Claude preserves auto/required/named choices and uses `auto` when tools exist
+but choice is omitted and a flag needs a carrier. Claude `none` stays `none`;
+with no tools no choice is sent, and forced choices still fail validation.
+Grok and Codex preserve explicit booleans, including no-tools requests, and
+omit absent controls in streaming and non-streaming builders. These are tested
+serialization contracts, not proof of real CLI/model acceptance. Live explicit
+true/false acceptance and the incident target Claude model's forced-choice and
+final thinking compatibility remain unverified.
 
 Gateway metadata such as `user` is not provider passthrough.
 

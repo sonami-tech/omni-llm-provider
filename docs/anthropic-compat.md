@@ -30,6 +30,14 @@ Full contracts: `docs/anthropic-frontend-multi-backend-plan.md`.
 | claude | Native `/v1/messages/count_tokens` |
 | grok / codex | **400** — token counting unsupported for this backend |
 
+## Parallel tool control
+
+Translated Messages inverts both explicit booleans of
+`tool_choice.disable_parallel_tool_use` into canonical `parallel_tool_calls`.
+Missing or null means absent; other types are a 400. Tool choice, including a
+named tool, is kept. Native Claude Messages keeps its existing nested flag and
+validation without canonical conversion.
+
 ## Tool ID invariant
 
 On the translated path, Anthropic `tool_use.id` is the **exact** backend

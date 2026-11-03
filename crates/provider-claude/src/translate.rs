@@ -438,7 +438,10 @@ pub fn build_messages_request_from_canonical(
     }
 
     let tool_choice = if tools.is_some() {
-        translate_tool_choice(&req.tool_choice, None) // parallel handled elsewhere for now
+        translate_tool_choice(
+            &req.tool_choice,
+            req.parallel_tool_calls.map(|parallel| !parallel),
+        )
     } else {
         None
     };
@@ -959,19 +962,21 @@ fn translate_tools(
 
 fn translate_tool_choice(
     choice: &Option<CanonicalToolChoice>,
-    _disable_parallel: Option<bool>,
+    disable_parallel: Option<bool>,
 ) -> Option<ToolChoice> {
     match choice {
-        None => None,
+        None => disable_parallel.map(|disabled| ToolChoice::Auto {
+            disable_parallel_tool_use: Some(disabled),
+        }),
         Some(CanonicalToolChoice::Auto) => Some(ToolChoice::Auto {
-            disable_parallel_tool_use: None,
+            disable_parallel_tool_use: disable_parallel,
         }),
         Some(CanonicalToolChoice::Required) => Some(ToolChoice::Any {
-            disable_parallel_tool_use: None,
+            disable_parallel_tool_use: disable_parallel,
         }),
         Some(CanonicalToolChoice::Specific { name }) => Some(ToolChoice::Tool {
             name: name.clone(),
-            disable_parallel_tool_use: None,
+            disable_parallel_tool_use: disable_parallel,
         }),
         Some(CanonicalToolChoice::None) => Some(ToolChoice::None {}),
     }
@@ -3307,5 +3312,122 @@ mod issue_51_tool_tests {
         let wire = chat(loose.clone(), true).unwrap();
         assert!(wire["tools"][0].get("strict").is_none());
         assert_eq!(wire["tools"][0]["input_schema"], loose);
+    }
+}
+
+#[cfg(test)]
+mod parallel_tool_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parallel_control_preserves_choices_and_no_tools_validation() {
+        for parallel in [None, Some(true), Some(false)] {
+            for choice in [
+                None,
+                Some(CanonicalToolChoice::Auto),
+                Some(CanonicalToolChoice::Required),
+                Some(CanonicalToolChoice::Specific {
+                    name: "lookup".into(),
+                }),
+                Some(CanonicalToolChoice::None),
+            ] {
+                for tools in [
+                    None,
+                    Some(vec![]),
+                    Some(vec![CanonicalTool {
+                        name: "lookup".into(),
+                        description: None,
+                        parameters: json!({"type":"object"}),
+                        strict: false,
+                        cache: None,
+                    }]),
+                ] {
+                    let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
+                    let canon = CanonicalRequest {
+                        model: "sonnet".into(),
+                        tools,
+                        tool_choice: choice.clone(),
+                        parallel_tool_calls: parallel,
+                        ..Default::default()
+                    };
+                    let result = prepare_anthropic_request(
+                        &canon,
+                        crate::fingerprint::default_profile(),
+                        &Replacements::empty(),
+                        false,
+                        false,
+                    );
+                    if !has_tools
+                        && matches!(
+                            choice,
+                            Some(
+                                CanonicalToolChoice::Required
+                                    | CanonicalToolChoice::Specific { .. }
+                            )
+                        )
+                    {
+                        assert!(
+                            result
+                                .unwrap_err()
+                                .to_string()
+                                .contains("no tools were provided")
+                        );
+                        continue;
+                    }
+                    let body = serde_json::to_value(result.unwrap()).unwrap();
+                    let expected = if !has_tools {
+                        None
+                    } else {
+                        match &choice {
+                            Some(CanonicalToolChoice::None) => Some(json!({"type":"none"})),
+                            None if parallel.is_none() => None,
+                            choice => {
+                                let mut value = match choice {
+                                    Some(CanonicalToolChoice::Required) => json!({"type":"any"}),
+                                    Some(CanonicalToolChoice::Specific { name }) => {
+                                        json!({"type":"tool","name":name})
+                                    }
+                                    _ => json!({"type":"auto"}),
+                                };
+                                if let Some(parallel) = parallel {
+                                    value["disable_parallel_tool_use"] = json!(!parallel);
+                                }
+                                Some(value)
+                            }
+                        }
+                    };
+                    assert_eq!(
+                        body.get("tool_choice"),
+                        expected.as_ref(),
+                        "parallel={parallel:?}, choice={choice:?}, tools={has_tools}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn named_single_call_survives_request_preparation() {
+        let req: omni_common::ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"sonnet", "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}],
+            "tool_choice":{"type":"function","function":{"name":"lookup"}},
+            "parallel_tool_calls":false
+        })).unwrap();
+        let canon = omni_common::to_canonical(&req).unwrap();
+        let wire = prepare_anthropic_request(
+            &canon,
+            crate::fingerprint::default_profile(),
+            &Replacements::empty(),
+            false,
+            false,
+        )
+        .expect("a named single-call request must not be rejected as an extra");
+        let body = serde_json::to_value(wire).unwrap();
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type":"tool","name":"lookup","disable_parallel_tool_use":true})
+        );
     }
 }
