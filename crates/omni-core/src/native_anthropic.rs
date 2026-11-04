@@ -26,6 +26,9 @@ pub struct PreparedAnthropicNative {
     pub outbound_model: String,
     pub stream: bool,
     pub dropped_fields: Vec<String>,
+    /// Client tool choice kind that preparation relaxed, for the send to
+    /// report. Opaque to the edge.
+    pub relaxed_tool_choice: Option<&'static str>,
     body: Value,
 }
 
@@ -44,8 +47,14 @@ impl PreparedAnthropicNative {
             outbound_model,
             stream,
             dropped_fields,
+            relaxed_tool_choice: None,
             body,
         }
+    }
+
+    pub fn with_relaxed_tool_choice(mut self, kind: Option<&'static str>) -> Self {
+        self.relaxed_tool_choice = kind;
+        self
     }
 
     pub fn body(&self) -> &Value {
@@ -89,24 +98,21 @@ pub trait AnthropicNativeSurface: Send + Sync {
     /// (gateway session id); the implementor maps it to its own request context.
     async fn send_messages_json(
         &self,
-        body: &Value,
+        prepared: &PreparedAnthropicNative,
         session_key: &str,
-        outbound_model: &str,
     ) -> Result<Value, ProviderError>;
 
     /// Streaming Messages send (raw Anthropic SSE frames).
     async fn send_messages_stream(
         &self,
-        body: &Value,
+        prepared: &PreparedAnthropicNative,
         session_key: &str,
-        outbound_model: &str,
     ) -> Result<NativeAnthropicSseStream, ProviderError>;
 
     /// count_tokens send.
     async fn send_count_tokens(
         &self,
-        body: &Value,
+        prepared: &PreparedAnthropicNative,
         session_key: &str,
-        outbound_model: &str,
     ) -> Result<Value, ProviderError>;
 }

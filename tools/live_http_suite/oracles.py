@@ -55,6 +55,17 @@ def is_event_stream_content_type(headers: Mapping[str, str]) -> bool:
     return content_type_main(headers) == "text/event-stream"
 
 
+def oracle_dropped_tool_choice(headers: Mapping[str, str]) -> OracleResult:
+    """Claude sends forced tool choice as `auto` and reports it in `x-omni-dropped`."""
+    for key, value in headers.items():
+        if key.lower() == "x-omni-dropped":
+            tokens = [token.strip() for token in value.split(",")]
+            if "tool_choice" in tokens:
+                return OracleResult.pass_("x-omni-dropped contains tool_choice")
+            return OracleResult.fail(f"x-omni-dropped {value!r} lacks tool_choice")
+    return OracleResult.fail("missing x-omni-dropped header")
+
+
 # ---------------------------------------------------------------------------
 # OpenAI error object
 # ---------------------------------------------------------------------------

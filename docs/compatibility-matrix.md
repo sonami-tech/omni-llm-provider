@@ -11,7 +11,7 @@ Normal tests are hermetic and quota-free. Live provider checks remain opt-in via
 | Official cache fields | Yes (`prompt_cache_key`, `x-grok-conv-id`, options, breakpoints) | Yes (`prompt_cache_key`, options, breakpoints) | Consume routing identity; emit `cache_control` | Yes (body `prompt_cache_key`; never `x-grok-conv-id`) | Yes (REST and ChatGPT WS share one cache payload) |
 | Function tools | Yes | Yes | Yes | Yes | Yes |
 | Tool choice `auto` / `none` | Yes | Yes | Yes | Yes | Yes |
-| Forced tool choice (`required` / named) | Yes | Yes | Upstream 400 on current models | Yes | Yes |
+| Forced tool choice (`required` / named) | Yes | Yes | Sent as `auto` ([Tool choice](#tool-choice)) | Yes | Yes |
 | OpenAI `allowed_tools` function subset | Yes (filtered) | Yes (filtered) | Translated | Translated | Translated |
 | Tool result loops | Yes | Yes | Yes | Yes | Yes |
 | Image URL input | Yes | Yes | Yes | Yes | Yes |
@@ -50,7 +50,7 @@ used, not the model name. `/v1/messages` still requires `max_tokens`.
 | Text + multi-block | Yes | Yes | Yes |
 | Function tools + tool loops | Yes | Yes | Yes |
 | `tool_choice` `auto` / `none` | Yes | Yes | Yes |
-| `tool_choice` `any` / `tool` | Upstream 400 on current models | Yes | Yes |
+| `tool_choice` `any` / `tool` | Sent as `auto` ([Tool choice](#tool-choice)) | Yes | Yes |
 | Images (url/base64) | Yes | Yes | Yes |
 | Images in `tool_result` | Yes | Yes | Yes |
 | Streaming SSE | Yes (raw) | Yes (framed) | Yes (framed) |
@@ -79,8 +79,9 @@ Shipped cache translation: `docs/cache-translation.md`.
 
 Chat and Responses accept boolean `parallel_tool_calls`; missing or null means
 absent, and other types are a 400. It is canonical intent, not a provider extra.
-Claude preserves auto/required/named choices and uses `auto` when tools exist
-but choice is omitted and a flag needs a carrier. Claude `none` stays `none`;
+Claude keeps `auto`, sends required and named choices as `auto` with the
+same flag (see Tool choice), and uses `auto` when tools exist but choice is
+omitted and a flag needs a carrier. Claude `none` stays `none`;
 with no tools no choice is sent, and forced choices still fail validation.
 Grok and Codex preserve explicit booleans, including no-tools requests, and
 omit absent controls in streaming and non-streaming builders. These are tested
@@ -102,11 +103,36 @@ model.` The restriction also applies to token counting. Anthropic's list of
 affected models is the source of truth:
 <https://platform.claude.com/docs/en/api/errors#forced-tool-use-not-supported>.
 
-Omni currently forwards the forced choice unchanged, so the client receives
-that 400. The forward-facing baseline for every provider is `auto` or `none`.
-Forced choices work on the current Grok and Codex models.
+The forward-facing baseline for every provider is `auto` or `none`. On every
+Claude request, Omni sends a forced choice (`any`, or `tool` with a name) as
+`{"type":"auto"}`. This applies to Chat Completions, Responses, and native
+`/v1/messages`, streaming or not, and to `/v1/messages/count_tokens`. The rule
+is fixed: it does not depend on the model ID or the endpoint.
 
-Live check through Omni on 2026-11-03, non-streaming, one request per cell:
+- `disable_parallel_tool_use` keeps its value on the `auto` choice, or stays
+  absent when absent.
+- Tools, schemas, system, messages, cache markers, and all other fields stay
+  unchanged. Omni adds no text.
+- `auto`, `none`, and an omitted choice stay unchanged. A forced choice with
+  no tools keeps its existing error.
+- The response carries `x-omni-dropped: tool_choice`, merged with any other
+  `x-omni-dropped` value. This includes upstream and transport errors after
+  Omni tried to send the request, and streaming responses (the header comes
+  before the body). Requests that fail before Omni sends them (validation,
+  preparation, credentials, request build) do not get it. Omni logs one warning
+  with route, model, and choice kind. The log has no tool names or prompts.
+- Omni adds no compatibility retry or probe and does not remember model
+  support.
+
+A required tool call becomes optional on Claude: the model may answer without
+a tool or pick another tool. Changing `tool_choice` can still affect message
+caching under Anthropic's normal cache rules.
+
+Grok and Codex forward forced choices unchanged; the current models accept
+them.
+
+Live check through Omni on 2026-11-03, before the Claude change, non-streaming,
+one request per cell:
 
 | Model | `auto` | `none` | `required` | Named tool | `auto` + parallel off |
 |---|---:|---:|---:|---:|---:|

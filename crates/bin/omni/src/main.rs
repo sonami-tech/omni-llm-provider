@@ -1258,26 +1258,59 @@ fn stats_json_response(state: &AppState) -> Response {
         .into_response()
 }
 
-/// One warning and `x-omni-dropped` when this request's Codex WebSocket path
-/// removed a caller output cap. No-op when the cap was forwarded or absent.
-/// Success and upstream-error responses both get the header.
+/// One warning per dropped or relaxed field, and its token merged into
+/// `x-omni-dropped`. Sources: the Codex WebSocket path removed a caller output
+/// cap; the Claude provider sent a forced tool choice as `auto`. No-op when
+/// neither happened. Success and upstream-error responses both get the header.
 fn observe_dropped_output_cap(response: Option<&mut Response>) {
-    let Some(dropped) = omni_common::dropped_output_cap() else {
+    let mut tokens: Vec<&'static str> = Vec::new();
+    if let Some(dropped) = omni_common::dropped_output_cap() {
+        warn!(
+            model = %dropped.model,
+            route = %dropped.route,
+            requested = dropped.requested,
+            "chatgpt websocket dropped caller output cap"
+        );
+        tokens.push(omni_common::DROPPED_OUTPUT_CAP_HEADER_VALUE);
+    }
+    if let Some(relaxed) = omni_common::relaxed_tool_choice() {
+        warn!(
+            model = %relaxed.model,
+            route = %relaxed.route,
+            kind = %relaxed.kind,
+            "claude forced tool_choice sent as auto"
+        );
+        tokens.push(omni_common::DROPPED_TOOL_CHOICE_HEADER_VALUE);
+    }
+    if tokens.is_empty() {
         return;
-    };
-    warn!(
-        model = %dropped.model,
-        route = %dropped.route,
-        requested = dropped.requested,
-        "chatgpt websocket dropped caller output cap"
-    );
+    }
     let Some(response) = response else {
         return;
     };
-    response.headers_mut().insert(
-        header::HeaderName::from_static(omni_common::DROPPED_OUTPUT_CAP_HEADER),
-        header::HeaderValue::from_static(omni_common::DROPPED_OUTPUT_CAP_HEADER_VALUE),
-    );
+    let name = header::HeaderName::from_static(omni_common::DROPPED_OUTPUT_CAP_HEADER);
+    let mut merged: Vec<String> = response
+        .headers()
+        .get_all(&name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect();
+    for token in tokens {
+        if !merged.iter().any(|existing| existing == token) {
+            merged.push(token.to_string());
+        }
+    }
+    if let Ok(value) = header::HeaderValue::from_str(&merged.join(", ")) {
+        response.headers_mut().insert(name, value);
+    }
+}
+
+fn has_dropped_field_note() -> bool {
+    omni_common::dropped_output_cap().is_some() || omni_common::relaxed_tool_choice().is_some()
 }
 
 async fn finish_with_dropped_output_cap<F>(
@@ -1294,10 +1327,11 @@ where
                 Ok(response)
             }
             Err(error) => {
-                // The cap is already gone. Put the header on the error
-                // response before it leaves this scope. Requests that did
-                // not drop a cap stay `Err` so existing callers still match.
-                if omni_common::dropped_output_cap().is_some() {
+                // The request already went upstream without the field. Put
+                // the header on the error response before it leaves this
+                // scope. Requests with no note stay `Err` so existing
+                // callers still match.
+                if has_dropped_field_note() {
                     let mut response = error.into_response();
                     observe_dropped_output_cap(Some(&mut response));
                     Ok(response)
@@ -1310,11 +1344,11 @@ where
     .await
 }
 
-async fn finish_anthropic_response<F>(fut: F) -> Response
+async fn finish_anthropic_response<F>(route: &'static str, fut: F) -> Response
 where
     F: Future<Output = Response>,
 {
-    omni_common::with_inbound_route("/v1/messages", async move {
+    omni_common::with_inbound_route(route, async move {
         let mut response = fut.await;
         observe_dropped_output_cap(Some(&mut response));
         response
@@ -1927,7 +1961,7 @@ async fn anthropic_messages_handler(
     api_key: Option<Extension<ApiKeyId>>,
     request: Request<Body>,
 ) -> Response {
-    finish_anthropic_response(async move {
+    finish_anthropic_response("/v1/messages", async move {
         match anthropic_messages_inner(state.0, headers, api_key, request).await {
             Ok(response) => response,
             Err(error) => anthropic_error_response(error),
@@ -2085,7 +2119,7 @@ async fn anthropic_messages_via_native(
     if prepared.stream {
         let open_started = Instant::now();
         let stream = native
-            .send_messages_stream(prepared.body(), &session_id, &prepared.outbound_model)
+            .send_messages_stream(&prepared, &session_id)
             .await
             .map_err(|error| {
                 let err_msg = error.to_string();
@@ -2126,7 +2160,7 @@ async fn anthropic_messages_via_native(
     let _active = state.stats.as_deref().map(ActiveRequestGuard::new);
     let started = Instant::now();
     let value = native
-        .send_messages_json(prepared.body(), &session_id, &prepared.outbound_model)
+        .send_messages_json(&prepared, &session_id)
         .await
         .map_err(|error| {
             let err_msg = error.to_string();
@@ -2328,10 +2362,13 @@ async fn anthropic_count_tokens_handler(
     api_key: Option<Extension<ApiKeyId>>,
     request: Request<Body>,
 ) -> Response {
-    match anthropic_count_tokens_inner(state, headers, api_key, request).await {
-        Ok(response) => response,
-        Err(error) => anthropic_error_response(error),
-    }
+    finish_anthropic_response("/v1/messages/count_tokens", async move {
+        match anthropic_count_tokens_inner(state, headers, api_key, request).await {
+            Ok(response) => response,
+            Err(error) => anthropic_error_response(error),
+        }
+    })
+    .await
 }
 
 async fn anthropic_count_tokens_inner(
@@ -2414,7 +2451,7 @@ async fn anthropic_count_tokens_inner(
 
     let started = Instant::now();
     let value = native
-        .send_count_tokens(prepared.body(), &session_id, &prepared.outbound_model)
+        .send_count_tokens(&prepared, &session_id)
         .await
         .map_err(|error| {
             let err_msg = error.to_string();
@@ -5098,6 +5135,777 @@ requires_openai_auth = false
             !requests[0].headers.contains_key("authorization"),
             "codex no-auth custom provider must not receive default Authorization"
         );
+    }
+
+    fn tool_choice_warning_lines<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+        lines
+            .iter()
+            .copied()
+            .filter(|line| line.contains("claude forced tool_choice sent as auto"))
+            .collect()
+    }
+
+    async fn mount_claude_tool_choice_upstream(server: &MockServer) {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_tc\",\"model\":\"claude-sonnet-5-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        // A body whose text holds "fail" gets a non-retried 400 after send.
+        let fails = |req: &wiremock::Request| String::from_utf8_lossy(&req.body).contains("fail");
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(move |req: &wiremock::Request| {
+                if fails(req) {
+                    return ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "type":"error",
+                        "error":{"type":"invalid_request_error","message":"stub rejection"}
+                    }));
+                }
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                if body["stream"] == true {
+                    ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id":"msg_tc", "type":"message", "role":"assistant",
+                        "model":"claude-sonnet-5-5",
+                        "content":[{"type":"text","text":"ok"}],
+                        "stop_reason":"end_turn", "stop_sequence":null,
+                        "usage":{"input_tokens":1,"output_tokens":1}
+                    }))
+                }
+            })
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(move |req: &wiremock::Request| {
+                if fails(req) {
+                    ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "type":"error",
+                        "error":{"type":"invalid_request_error","message":"stub rejection"}
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens":7}))
+                }
+            })
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[traced_test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_claude_relaxed_tool_choice_warns_and_sets_header() {
+        // WHY: issue #63. Current Claude models 400 on forced tool choice. Every
+        // Claude input must send it as auto, keep the parallel flag, tell the
+        // client with `x-omni-dropped: tool_choice` (success, upstream error
+        // after send, and streaming before the body), and log exactly one
+        // warning without tool names or prompt text. Requests that never reach
+        // upstream and requests with nothing relaxed get neither signal.
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _creds = TempClaudeCreds::install("tool-choice");
+        let server = MockServer::start().await;
+        mount_claude_tool_choice_upstream(&server).await;
+        let mut providers = HashMap::new();
+        providers.insert("claude".into(), claude_entry_with_base(&server.uri()));
+        let state = state_with(providers);
+
+        const TOOL: &str = "lookup_secret_tool";
+        const PROMPT: &str = "SECRET-PROMPT-TEXT";
+        let chat_tools = serde_json::json!([{"type":"function","function":{"name":TOOL,"parameters":{"type":"object"}}}]);
+        let flat_tools =
+            serde_json::json!([{"type":"function","name":TOOL,"parameters":{"type":"object"}}]);
+        let native_tools = serde_json::json!([{"name":TOOL,"input_schema":{"type":"object"}}]);
+        let chat = |choice: Value, text: &str, stream: bool, parallel: Option<bool>| {
+            let mut body = serde_json::json!({
+                "model":"claude-sonnet-5-5", "stream":stream,
+                "messages":[{"role":"user","content":format!("{PROMPT} {text}")}],
+                "tools":chat_tools, "tool_choice":choice
+            });
+            if let Some(parallel) = parallel {
+                body["parallel_tool_calls"] = serde_json::json!(parallel);
+            }
+            serde_json::from_value::<ChatCompletionRequest>(body).unwrap()
+        };
+        let responses = |choice: Value, text: &str, stream: bool| {
+            serde_json::from_value::<omni_common::ResponsesRequest>(serde_json::json!({
+                "model":"claude-sonnet-5-5", "stream":stream,
+                "input":format!("{PROMPT} {text}"),
+                "tools":flat_tools, "tool_choice":choice
+            }))
+            .unwrap()
+        };
+        let native = |choice: Value, text: &str, stream: bool| {
+            serde_json::json!({
+                "model":"claude-sonnet-5-5", "max_tokens":16, "stream":stream,
+                "messages":[{"role":"user","content":format!("{PROMPT} {text}")}],
+                "tools":native_tools, "tool_choice":choice
+            })
+            .to_string()
+        };
+        let required = || serde_json::json!("required");
+        let named_chat = || serde_json::json!({"type":"function","function":{"name":TOOL}});
+        let named_flat = || serde_json::json!({"type":"function","name":TOOL});
+        let any = || serde_json::json!({"type":"any","disable_parallel_tool_use":true});
+        let tool = || serde_json::json!({"type":"tool","name":TOOL});
+
+        let mut warnings = 0usize;
+        let mut sent = 0usize;
+        let expect = async |label: &str,
+                            route: &str,
+                            kind: &str,
+                            ok: bool,
+                            resp: Response,
+                            warnings: &mut usize,
+                            sent: &mut usize| {
+            assert_eq!(resp.status() == StatusCode::OK, ok, "{label} status");
+            // Header is set before the (possibly streaming) body is read.
+            assert_eq!(output_cap_header(&resp), "tool_choice", "{label} header");
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .expect("drain body");
+            *warnings += 1;
+            *sent += 1;
+            let expected = *warnings;
+            logs_assert(|lines| {
+                let all = tool_choice_warning_lines(lines);
+                let last = all.last().copied().unwrap_or("");
+                if all.len() != expected {
+                    return Err(format!(
+                        "{label}: expected {expected} warnings, got {}",
+                        all.len()
+                    ));
+                }
+                if !(last.contains(&format!("route={route} "))
+                    && last.contains("claude-sonnet-5-5")
+                    && last.contains(&format!("kind={kind}")))
+                {
+                    return Err(format!("{label}: bad warning {last}"));
+                }
+                Ok(())
+            });
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), *sent, "{label} upstream count");
+            let body: Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(
+                body["tool_choice"]["type"], "auto",
+                "{label} upstream choice"
+            );
+            assert!(body["tool_choice"].get("name").is_none(), "{label}");
+            assert_eq!(body["tools"][0]["name"], TOOL, "{label} tools kept");
+            body
+        };
+
+        // Success on every input, non-stream, stream, and count_tokens.
+        let body = expect(
+            "chat",
+            "/v1/chat/completions",
+            "any",
+            true,
+            call_chat_handler(state.clone(), chat(required(), "ok", false, Some(false)))
+                .await
+                .expect("chat"),
+            &mut warnings,
+            &mut sent,
+        )
+        .await;
+        assert_eq!(
+            body["tool_choice"],
+            serde_json::json!({"type":"auto","disable_parallel_tool_use":true})
+        );
+        expect(
+            "chat stream",
+            "/v1/chat/completions",
+            "tool",
+            true,
+            call_chat_handler(state.clone(), chat(named_chat(), "ok", true, None))
+                .await
+                .expect("chat stream"),
+            &mut warnings,
+            &mut sent,
+        )
+        .await;
+        expect(
+            "responses",
+            "/v1/responses",
+            "any",
+            true,
+            call_responses_handler(state.clone(), responses(required(), "ok", false))
+                .await
+                .expect("responses"),
+            &mut warnings,
+            &mut sent,
+        )
+        .await;
+        expect(
+            "responses stream",
+            "/v1/responses",
+            "tool",
+            true,
+            call_responses_handler(state.clone(), responses(named_flat(), "ok", true))
+                .await
+                .expect("responses stream"),
+            &mut warnings,
+            &mut sent,
+        )
+        .await;
+        let body = expect(
+            "messages",
+            "/v1/messages",
+            "any",
+            true,
+            call_anthropic_messages_handler(state.clone(), &native(any(), "ok", false)).await,
+            &mut warnings,
+            &mut sent,
+        )
+        .await;
+        assert_eq!(
+            body["tool_choice"],
+            serde_json::json!({"type":"auto","disable_parallel_tool_use":true})
+        );
+        let body = expect(
+            "messages stream",
+            "/v1/messages",
+            "tool",
+            true,
+            call_anthropic_messages_handler(state.clone(), &native(tool(), "ok", true)).await,
+            &mut warnings,
+            &mut sent,
+        )
+        .await;
+        assert_eq!(body["tool_choice"], serde_json::json!({"type":"auto"}));
+        expect(
+            "count_tokens",
+            "/v1/messages/count_tokens",
+            "tool",
+            true,
+            call_anthropic_count_tokens_handler(state.clone(), &native(tool(), "ok", false)).await,
+            &mut warnings,
+            &mut sent,
+        )
+        .await;
+
+        // Upstream error after send still reports.
+        let chat_err =
+            match call_chat_handler(state.clone(), chat(required(), "fail", false, None)).await {
+                Ok(resp) => resp,
+                Err(error) => panic!("relaxed chat error must become a response: {error}"),
+            };
+        expect(
+            "chat error",
+            "/v1/chat/completions",
+            "any",
+            false,
+            chat_err,
+            &mut warnings,
+            &mut sent,
+        )
+        .await;
+        let responses_err = match call_responses_handler(
+            state.clone(),
+            responses(named_flat(), "fail", true),
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err(error) => panic!("relaxed responses error must become a response: {error}"),
+        };
+        expect(
+            "responses stream error",
+            "/v1/responses",
+            "tool",
+            false,
+            responses_err,
+            &mut warnings,
+            &mut sent,
+        )
+        .await;
+        expect(
+            "messages stream error",
+            "/v1/messages",
+            "any",
+            false,
+            call_anthropic_messages_handler(state.clone(), &native(any(), "fail", true)).await,
+            &mut warnings,
+            &mut sent,
+        )
+        .await;
+        expect(
+            "messages error",
+            "/v1/messages",
+            "tool",
+            false,
+            call_anthropic_messages_handler(state.clone(), &native(tool(), "fail", false)).await,
+            &mut warnings,
+            &mut sent,
+        )
+        .await;
+        let chat_stream_err =
+            match call_chat_handler(state.clone(), chat(named_chat(), "fail", true, None)).await {
+                Ok(resp) => resp,
+                Err(error) => panic!("relaxed chat stream error must become a response: {error}"),
+            };
+        expect(
+            "chat stream error",
+            "/v1/chat/completions",
+            "tool",
+            false,
+            chat_stream_err,
+            &mut warnings,
+            &mut sent,
+        )
+        .await;
+        let responses_nonstream_err =
+            match call_responses_handler(state.clone(), responses(required(), "fail", false)).await
+            {
+                Ok(resp) => resp,
+                Err(error) => panic!("relaxed responses error must become a response: {error}"),
+            };
+        expect(
+            "responses error",
+            "/v1/responses",
+            "any",
+            false,
+            responses_nonstream_err,
+            &mut warnings,
+            &mut sent,
+        )
+        .await;
+        expect(
+            "count_tokens error",
+            "/v1/messages/count_tokens",
+            "tool",
+            false,
+            call_anthropic_count_tokens_handler(state.clone(), &native(tool(), "fail", false))
+                .await,
+            &mut warnings,
+            &mut sent,
+        )
+        .await;
+
+        // Nothing relaxed: no header, no warning, choice forwarded as given.
+        let quiet = call_chat_handler(
+            state.clone(),
+            chat(serde_json::json!("auto"), "ok", false, None),
+        )
+        .await
+        .expect("auto chat");
+        assert_eq!(quiet.status(), StatusCode::OK);
+        assert_no_output_cap_header(&quiet);
+        let quiet = call_anthropic_messages_handler(
+            state.clone(),
+            &native(serde_json::json!({"type":"none"}), "ok", false),
+        )
+        .await;
+        assert_eq!(quiet.status(), StatusCode::OK);
+        assert_no_output_cap_header(&quiet);
+        sent += 2;
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), sent);
+        let auto: Value = serde_json::from_slice(&requests[sent - 2].body).unwrap();
+        assert_eq!(auto["tool_choice"], serde_json::json!({"type":"auto"}));
+        let none: Value = serde_json::from_slice(&requests[sent - 1].body).unwrap();
+        assert_eq!(none["tool_choice"], serde_json::json!({"type":"none"}));
+
+        // Never submitted: local validation and credential failures.
+        let no_tools: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-sonnet-5-5", "tool_choice":"required",
+            "messages":[{"role":"user","content":"hi"}]
+        }))
+        .unwrap();
+        match call_chat_handler(state.clone(), no_tools).await {
+            Err(AppError::BadRequest(message)) => {
+                assert!(message.contains("no tools were provided"), "{message}")
+            }
+            other => panic!("forced choice without tools must stay a 400: {other:?}"),
+        }
+        let bad_schema = serde_json::json!({
+            "model":"claude-sonnet-5-5", "max_tokens":16,
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"name":TOOL,"input_schema":{"type":"object","properties":{"x":{"anyOf":[]}}}}],
+            "tool_choice":{"type":"tool","name":TOOL}
+        })
+        .to_string();
+        let resp = call_anthropic_messages_handler(state.clone(), &bad_schema).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_no_output_cap_header(&resp);
+        {
+            let missing =
+                std::env::temp_dir().join(format!("omni-missing-{}.json", Uuid::new_v4()));
+            let _env = TempEnvVars::set(&[("CLAUDE_CREDENTIALS_PATH", missing.to_str())]);
+            match call_chat_handler(state.clone(), chat(required(), "ok", false, None)).await {
+                Err(_) => {}
+                Ok(resp) => panic!("missing creds must fail before send: {resp:?}"),
+            }
+            let resp =
+                call_anthropic_messages_handler(state.clone(), &native(tool(), "ok", true)).await;
+            assert_ne!(resp.status(), StatusCode::OK);
+            assert_no_output_cap_header(&resp);
+            let resp =
+                call_anthropic_count_tokens_handler(state.clone(), &native(any(), "ok", false))
+                    .await;
+            assert_ne!(resp.status(), StatusCode::OK);
+            assert_no_output_cap_header(&resp);
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), sent);
+
+        logs_assert(|lines| {
+            let all = tool_choice_warning_lines(lines);
+            if all.len() != warnings {
+                return Err(format!("expected {warnings} warnings, got {}", all.len()));
+            }
+            if let Some(leak) = all
+                .iter()
+                .find(|line| line.contains(TOOL) || line.contains(PROMPT))
+            {
+                return Err(format!("warning leaked a tool name or prompt: {leak}"));
+            }
+            Ok(())
+        });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[traced_test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_claude_relaxed_tool_choice_not_reported_when_request_is_never_built() {
+        // WHY: the relaxed choice is reported only when the request is about to
+        // leave the process. An unusable base URL fails while the request is
+        // built, so no input may get the header or the warning.
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _creds = TempClaudeCreds::install("tool-choice-unbuilt");
+        let mut providers = HashMap::new();
+        providers.insert("claude".into(), claude_entry_with_base("not a url"));
+        let state = state_with(providers);
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-sonnet-5-5", "tool_choice":"required",
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]
+        }))
+        .unwrap();
+        match call_chat_handler(state.clone(), chat).await {
+            Err(_) => {}
+            Ok(resp) => panic!("unbuildable request must fail without a header: {resp:?}"),
+        }
+        let native = |stream: bool| {
+            serde_json::json!({
+                "model":"claude-sonnet-5-5", "max_tokens":16, "stream":stream,
+                "messages":[{"role":"user","content":"hi"}],
+                "tools":[{"name":"lookup","input_schema":{"type":"object"}}],
+                "tool_choice":{"type":"tool","name":"lookup"}
+            })
+            .to_string()
+        };
+        for resp in [
+            call_anthropic_messages_handler(state.clone(), &native(false)).await,
+            call_anthropic_messages_handler(state.clone(), &native(true)).await,
+            call_anthropic_count_tokens_handler(state.clone(), &native(false)).await,
+        ] {
+            assert_ne!(resp.status(), StatusCode::OK);
+            assert_no_output_cap_header(&resp);
+        }
+        logs_assert(|lines| match tool_choice_warning_lines(lines).len() {
+            0 => Ok(()),
+            n => Err(format!("expected no relaxation warning, got {n}")),
+        });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[traced_test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_claude_relaxed_tool_choice_reports_once_across_retries() {
+        // WHY: the upstream client records the relaxed choice on every send
+        // attempt. A retried 5xx must still give one warning and one header
+        // token for the client request.
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _creds = TempClaudeCreds::install("tool-choice-retry");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("try again"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":"msg_retry", "type":"message", "role":"assistant",
+                "model":"claude-sonnet-5-5",
+                "content":[{"type":"text","text":"ok"}],
+                "stop_reason":"end_turn", "stop_sequence":null,
+                "usage":{"input_tokens":1,"output_tokens":1}
+            })))
+            .mount(&server)
+            .await;
+        let mut providers = HashMap::new();
+        providers.insert("claude".into(), claude_entry_with_base(&server.uri()));
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-sonnet-5-5", "tool_choice":"required",
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]
+        }))
+        .unwrap();
+        let resp = call_chat_handler(state_with(providers), chat)
+            .await
+            .expect("retried chat");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(output_cap_header(&resp), "tool_choice");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "one 500 then one retry");
+        for request in &requests {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["tool_choice"], serde_json::json!({"type":"auto"}));
+        }
+        logs_assert(|lines| match tool_choice_warning_lines(lines).len() {
+            1 => Ok(()),
+            n => Err(format!("expected one relaxation warning, got {n}")),
+        });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[traced_test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_claude_relaxed_tool_choice_stream_retry_and_transport_error() {
+        // WHY: the stream-open path also records the relaxed choice on every
+        // attempt, and a transport failure after the send attempt must still
+        // carry the header. Each client request gets one warning.
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _creds = TempClaudeCreds::install("tool-choice-stream-retry");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("busy"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                concat!(
+                    "event: message_start\n",
+                    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_r\",\"model\":\"claude-sonnet-5-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+                    "event: message_delta\n",
+                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+                    "event: message_stop\n",
+                    "data: {\"type\":\"message_stop\"}\n\n",
+                ),
+                "text/event-stream",
+            ))
+            .mount(&server)
+            .await;
+        let body = serde_json::json!({
+            "model":"claude-sonnet-5-5", "max_tokens":16, "stream":true,
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"name":"lookup","input_schema":{"type":"object"}}],
+            "tool_choice":{"type":"any"}
+        })
+        .to_string();
+        let mut providers = HashMap::new();
+        providers.insert("claude".into(), claude_entry_with_base(&server.uri()));
+        let resp = call_anthropic_messages_handler(state_with(providers), &body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(output_cap_header(&resp), "tool_choice");
+        let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("drain stream");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        logs_assert(|lines| match tool_choice_warning_lines(lines).len() {
+            1 => Ok(()),
+            n => Err(format!("expected one warning after stream retry, got {n}")),
+        });
+
+        // Nothing listens on the port: connect fails after the send attempt.
+        let closed = format!("http://127.0.0.1:{}", free_port());
+        let mut providers = HashMap::new();
+        providers.insert("claude".into(), claude_entry_with_base(&closed));
+        let resp = call_anthropic_count_tokens_handler(state_with(providers), &body).await;
+        assert_ne!(resp.status(), StatusCode::OK);
+        assert_eq!(output_cap_header(&resp), "tool_choice");
+        logs_assert(|lines| match tool_choice_warning_lines(lines).len() {
+            2 => Ok(()),
+            n => Err(format!(
+                "expected one more warning after transport error, got {n}"
+            )),
+        });
+    }
+
+    #[tokio::test]
+    async fn test_dropped_header_merges_tool_choice_with_existing_value() {
+        // WHY: one request can hit two notes, and a response may already carry
+        // the header. Each token must appear once, merged into one value.
+        let merged = omni_common::with_inbound_route("/v1/chat/completions", async {
+            omni_common::note_dropped_output_cap("m", 5);
+            omni_common::note_relaxed_tool_choice("m", "any");
+            let mut response = StatusCode::OK.into_response();
+            observe_dropped_output_cap(Some(&mut response));
+            output_cap_header(&response)
+        })
+        .await;
+        assert_eq!(merged, "max_output_tokens, tool_choice");
+
+        let existing = omni_common::with_inbound_route("/v1/messages", async {
+            omni_common::note_relaxed_tool_choice("m", "tool");
+            let mut response = StatusCode::OK.into_response();
+            response.headers_mut().insert(
+                "x-omni-dropped",
+                header::HeaderValue::from_static("max_output_tokens"),
+            );
+            observe_dropped_output_cap(Some(&mut response));
+            let once = output_cap_header(&response);
+            observe_dropped_output_cap(Some(&mut response));
+            (once, output_cap_header(&response))
+        })
+        .await;
+        assert_eq!(existing.0, "max_output_tokens, tool_choice");
+        assert_eq!(existing.1, "max_output_tokens, tool_choice");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_grok_and_codex_forward_forced_tool_choice_unchanged() {
+        // WHY: issue #63 relaxes forced choice on Claude only. Grok and Codex
+        // accept it, so their upstream bodies keep `required` and the named
+        // function, streaming or not, with no x-omni-dropped header.
+        let _guard = PROVIDER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(|req: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                if body["stream"] == true {
+                    ResponseTemplate::new(200).set_body_raw(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n\
+data: [DONE]\n\n",
+                        "text/event-stream",
+                    )
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "model":"grok-4.7",
+                        "choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":1,"completion_tokens":1}
+                    }))
+                }
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(|req: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                if body["stream"] == true {
+                    ResponseTemplate::new(200).set_body_raw(
+                        "event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n\
+event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tc\",\"status\":\"completed\",\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+                        "text/event-stream",
+                    )
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "model":"gpt-5.5", "status":"completed",
+                        "output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],
+                        "usage":{"input_tokens":1,"output_tokens":1}
+                    }))
+                }
+            })
+            .mount(&server)
+            .await;
+        let _codex_home = TempCodexHome::install_for_mock(&format!("{}/v1", server.uri()));
+        let mut map = HashMap::new();
+        map.insert("grok".into(), grok_entry(&server.uri()));
+        map.insert("codex".into(), codex_entry());
+        let state = state_with(map);
+        let mut seen = 0;
+        for model in ["grok:grok-4.7", "codex:gpt-5.5"] {
+            let named_upstream = if model.starts_with("grok:") {
+                serde_json::json!({"type":"function","function":{"name":"lookup"}})
+            } else {
+                serde_json::json!({"type":"function","name":"lookup"})
+            };
+            for (route, required, stream) in [
+                ("chat", true, false),
+                ("chat", false, true),
+                ("responses", true, true),
+                ("responses", false, false),
+                ("messages", true, false),
+                ("messages", false, true),
+            ] {
+                let expected = if required {
+                    serde_json::json!("required")
+                } else {
+                    named_upstream.clone()
+                };
+                let resp = match route {
+                    "chat" => {
+                        let choice = if required {
+                            serde_json::json!("required")
+                        } else {
+                            serde_json::json!({"type":"function","function":{"name":"lookup"}})
+                        };
+                        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                            "model":model, "stream":stream,
+                            "messages":[{"role":"user","content":"hi"}],
+                            "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+                            "tool_choice":choice
+                        }))
+                        .unwrap();
+                        call_chat_handler(state.clone(), req).await.expect(model)
+                    }
+                    "responses" => {
+                        let choice = if required {
+                            serde_json::json!("required")
+                        } else {
+                            serde_json::json!({"type":"function","name":"lookup"})
+                        };
+                        let req: omni_common::ResponsesRequest =
+                            serde_json::from_value(serde_json::json!({
+                                "model":model, "input":"hi", "stream":stream,
+                                "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
+                                "tool_choice":choice
+                            }))
+                            .unwrap();
+                        call_responses_handler(state.clone(), req)
+                            .await
+                            .expect(model)
+                    }
+                    _ => {
+                        let choice = if required {
+                            serde_json::json!({"type":"any"})
+                        } else {
+                            serde_json::json!({"type":"tool","name":"lookup"})
+                        };
+                        let body = serde_json::json!({
+                            "model":model, "max_tokens":16, "stream":stream,
+                            "messages":[{"role":"user","content":"hi"}],
+                            "tools":[{"name":"lookup","input_schema":{"type":"object"}}],
+                            "tool_choice":choice
+                        });
+                        call_anthropic_messages_handler(state.clone(), &body.to_string()).await
+                    }
+                };
+                assert_eq!(resp.status(), StatusCode::OK, "{model} {route}");
+                assert_no_output_cap_header(&resp);
+                let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .expect("drain body");
+                seen += 1;
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(requests.len(), seen, "{model} {route}");
+                let body: Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+                assert_eq!(body["tool_choice"], expected, "{model} {route}");
+                assert_eq!(body["stream"], stream, "{model} {route} stream");
+            }
+        }
     }
 
     fn assert_no_output_cap_header(resp: &Response) {
@@ -11019,9 +11827,11 @@ rule = [
                 let request = requests.last().unwrap();
                 let captured: Value = serde_json::from_slice(&request.body).unwrap();
                 if model.starts_with("claude:") {
+                    // Issue #63: Claude sends the forced choice as auto and
+                    // keeps the parallel flag.
                     assert_eq!(
                         captured["tool_choice"],
-                        json!({"type":"tool","name":"lookup","disable_parallel_tool_use":!parallel})
+                        json!({"type":"auto","disable_parallel_tool_use":!parallel})
                     );
                     assert!(captured.get("parallel_tool_calls").is_none());
                     assert_eq!(request.headers["x-api-key"], "fixture-claude");

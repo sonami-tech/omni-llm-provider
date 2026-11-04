@@ -212,7 +212,8 @@ Anthropic embeds `tool_result` **inside user messages**. Canonical/OpenAI expect
 | tool_choice auto/any/tool/none | Auto / Required / Specific{name} / None |
 | Specific name | Must survive to Grok/Codex forced-function fields — **e2e hermetic test required** |
 
-Current Claude models reject `any` and `tool` upstream. See
+Current Claude models reject `any` and `tool` upstream, so the Claude provider
+sends them as `auto` and reports `x-omni-dropped: tool_choice`. See
 [Tool choice](compatibility-matrix.md#tool-choice).
 
 ### 5.5 Images

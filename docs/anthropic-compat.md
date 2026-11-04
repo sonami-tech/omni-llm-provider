@@ -36,7 +36,10 @@ Translated Messages inverts both explicit booleans of
 `tool_choice.disable_parallel_tool_use` into canonical `parallel_tool_calls`.
 Missing or null means absent; other types are a 400. Tool choice, including a
 named tool, is kept. Native Claude Messages keeps its existing nested flag and
-validation without canonical conversion.
+validation without canonical conversion. On the Claude backend, forced `any`
+and `tool` go upstream as `auto` with the same flag, and the response carries
+`x-omni-dropped: tool_choice`. See
+[Tool choice](compatibility-matrix.md#tool-choice).
 
 ## Tool ID invariant
 

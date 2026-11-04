@@ -1057,14 +1057,10 @@ impl UpstreamClient {
         body: Vec<u8>,
     ) -> Result<Value, UpstreamError> {
         let headers = self.build_headers(creds, ctx)?;
+        let request = self.http.post(url).headers(headers).body(body).build()?;
+        note_relaxed_tool_choice(ctx);
 
-        let resp = self
-            .http
-            .post(url)
-            .headers(headers)
-            .body(body)
-            .send()
-            .await?;
+        let resp = self.http.execute(request).await?;
 
         let status = resp.status();
         let bytes = resp.bytes().await?;
@@ -1235,12 +1231,14 @@ impl UpstreamClient {
         body: Vec<u8>,
     ) -> Result<BoxByteStream, UpstreamError> {
         let headers = self.build_headers(creds, ctx)?;
-        let send = self
+        let request = self
             .http
             .post(self.messages_url())
             .headers(headers)
             .body(body)
-            .send();
+            .build()?;
+        note_relaxed_tool_choice(ctx);
+        let send = self.http.execute(request);
         let resp = map_claude_headers_wait(timeout_upstream_headers(send).await)?;
 
         let status = resp.status();
@@ -1382,6 +1380,15 @@ fn map_claude_headers_wait<T>(
         Ok(Ok(value)) => Ok(value),
         Ok(Err(err)) => Err(UpstreamError::Transport(err)),
         Err(_) => Err(UpstreamError::HeadersTimeout),
+    }
+}
+
+/// Report a forced tool choice sent as `auto` (one warning plus
+/// `x-omni-dropped` at the HTTP edge). Called after the request is fully
+/// built, just before it is sent, so local failures never report it.
+fn note_relaxed_tool_choice(ctx: &RequestContext) {
+    if let Some(kind) = ctx.relaxed_tool_choice {
+        omni_common::note_relaxed_tool_choice(ctx.model.as_deref().unwrap_or_default(), kind);
     }
 }
 

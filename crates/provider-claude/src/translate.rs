@@ -982,6 +982,32 @@ fn translate_tool_choice(
     }
 }
 
+/// Send a forced tool choice (`any` or `tool`) as `auto`, because current
+/// Claude models reject forced choices with HTTP 400, also on token counting.
+/// This is a fixed rule for every Claude request, with no model or endpoint
+/// check. `disable_parallel_tool_use` keeps its value. No other field changes.
+/// Without tools nothing changes, so the existing no-tools errors stay.
+/// Returns the forced kind when the choice changed.
+pub fn relax_forced_tool_choice(req: &mut MessagesRequest) -> Option<&'static str> {
+    if req.tools.as_ref().is_none_or(|tools| tools.is_empty()) {
+        return None;
+    }
+    let (kind, disable_parallel_tool_use) = match req.tool_choice.as_ref()? {
+        ToolChoice::Any {
+            disable_parallel_tool_use,
+        } => ("any", *disable_parallel_tool_use),
+        ToolChoice::Tool {
+            disable_parallel_tool_use,
+            ..
+        } => ("tool", *disable_parallel_tool_use),
+        ToolChoice::Auto { .. } | ToolChoice::None {} => return None,
+    };
+    req.tool_choice = Some(ToolChoice::Auto {
+        disable_parallel_tool_use,
+    });
+    Some(kind)
+}
+
 // ── Identity injection (the preamble + dynamic billing marker) ──
 
 /// Prepend the Claude Code billing marker (dynamic `cc_version` suffix) + system
@@ -1152,6 +1178,10 @@ fn map_stop_reason(reason: Option<&str>, has_tool_calls: bool) -> &'static str {
 /// Given a canonical request, produce the *final* body JSON (post-replacements,
 /// post-identity, ready for finalize_body_json).
 /// Returns the MessagesRequest and the first-user text (for context if needed).
+///
+/// This drops the relaxed tool choice kind. Send paths must use
+/// [`prepare_anthropic_request_reporting`] and pass the kind to
+/// `RequestContext::with_relaxed_tool_choice` so the client is told.
 pub fn prepare_anthropic_request(
     canon: &CanonicalRequest,
     profile: &FingerprintProfile,
@@ -1159,6 +1189,19 @@ pub fn prepare_anthropic_request(
     inject_identity: bool,
     supports_auto_cache: bool,
 ) -> Result<MessagesRequest, ProviderError> {
+    prepare_anthropic_request_reporting(canon, profile, repl, inject_identity, supports_auto_cache)
+        .map(|(anth, _)| anth)
+}
+
+/// [`prepare_anthropic_request`] plus the forced tool choice kind that
+/// [`relax_forced_tool_choice`] sent as `auto`, for the send path to report.
+pub fn prepare_anthropic_request_reporting(
+    canon: &CanonicalRequest,
+    profile: &FingerprintProfile,
+    repl: &Replacements,
+    inject_identity: bool,
+    supports_auto_cache: bool,
+) -> Result<(MessagesRequest, Option<&'static str>), ProviderError> {
     let resolved = profile.resolve_model(&canon.model);
     // Door 1 applies prompt replacements during the canonical build (repl is
     // threaded into build_messages_request_from_canonical), so the shared tail
@@ -1220,7 +1263,8 @@ pub fn prepare_anthropic_request(
     {
         anth.output_config = None;
     }
-    Ok(anth)
+    let relaxed_tool_choice = relax_forced_tool_choice(&mut anth);
+    Ok((anth, relaxed_tool_choice))
 }
 
 /// Whether this model’s fingerprint pin exposes `output_config.effort`.
@@ -3293,7 +3337,8 @@ mod issue_51_tool_tests {
             assert!(tool["input_schema"]["properties"].get(key).is_some());
         }
         assert_eq!(tool["input_schema"]["required"], json!(["b"]));
-        assert_eq!(wire["tool_choice"]["type"], "any");
+        // Issue #63: `required` reaches Claude as auto.
+        assert_eq!(wire["tool_choice"], json!({"type":"auto"}));
         assert!(
             chat(json!({"anyOf":[{"type":"object"},7]}), false)
                 .unwrap_err()
@@ -3382,14 +3427,10 @@ mod parallel_tool_tests {
                         match &choice {
                             Some(CanonicalToolChoice::None) => Some(json!({"type":"none"})),
                             None if parallel.is_none() => None,
-                            choice => {
-                                let mut value = match choice {
-                                    Some(CanonicalToolChoice::Required) => json!({"type":"any"}),
-                                    Some(CanonicalToolChoice::Specific { name }) => {
-                                        json!({"type":"tool","name":name})
-                                    }
-                                    _ => json!({"type":"auto"}),
-                                };
+                            _ => {
+                                // Issue #63: forced choices reach Claude as auto
+                                // and keep the parallel flag.
+                                let mut value = json!({"type":"auto"});
                                 if let Some(parallel) = parallel {
                                     value["disable_parallel_tool_use"] = json!(!parallel);
                                 }
@@ -3425,9 +3466,206 @@ mod parallel_tool_tests {
         )
         .expect("a named single-call request must not be rejected as an extra");
         let body = serde_json::to_value(wire).unwrap();
+        // Issue #63: the named choice is sent as auto; single-call stays.
         assert_eq!(
             body["tool_choice"],
-            json!({"type":"tool","name":"lookup","disable_parallel_tool_use":true})
+            json!({"type":"auto","disable_parallel_tool_use":true})
         );
+    }
+}
+
+#[cfg(test)]
+mod issue_63_tool_choice_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn canon(choice: Option<CanonicalToolChoice>, parallel: Option<bool>) -> CanonicalRequest {
+        CanonicalRequest {
+            model: "sonnet".into(),
+            messages: vec![
+                CanonicalMessage {
+                    role: "system".into(),
+                    content: CanonicalContent::Blocks(vec![CanonicalBlock::Text {
+                        text: "be brief".into(),
+                        cache: Some(CanonicalCacheMark::breakpoint()),
+                    }]),
+                },
+                CanonicalMessage {
+                    role: "user".into(),
+                    content: CanonicalContent::Blocks(vec![CanonicalBlock::Text {
+                        text: "look it up".into(),
+                        cache: Some(CanonicalCacheMark::breakpoint()),
+                    }]),
+                },
+            ],
+            tools: Some(vec![
+                CanonicalTool {
+                    name: "lookup".into(),
+                    description: Some("find".into()),
+                    parameters: json!({"type":"object","properties":{"q":{"type":"string"}}}),
+                    strict: false,
+                    cache: Some(CanonicalCacheMark::breakpoint()),
+                },
+                CanonicalTool {
+                    name: "other".into(),
+                    description: None,
+                    parameters: json!({"type":"object"}),
+                    strict: false,
+                    cache: None,
+                },
+            ]),
+            tool_choice: choice,
+            parallel_tool_calls: parallel,
+            ..Default::default()
+        }
+    }
+
+    fn wire(req: &CanonicalRequest) -> (Value, Option<&'static str>) {
+        let (anth, relaxed) = prepare_anthropic_request_reporting(
+            req,
+            crate::fingerprint::default_profile(),
+            &Replacements::empty(),
+            true,
+            true,
+        )
+        .expect("prepare");
+        (serde_json::to_value(anth).unwrap(), relaxed)
+    }
+
+    #[test]
+    fn canonical_forced_choice_is_sent_as_auto_and_nothing_else_changes() {
+        // WHY: current Claude models 400 on `any` / `tool`. The forced choice
+        // must reach Claude as auto with the parallel flag kept, and the rest
+        // of the body (tools, system, messages, cache markers, identity) must
+        // be byte-identical to the same request sent with `auto`, so no text
+        // is added and the cache prefix is not disturbed.
+        for parallel in [None, Some(true), Some(false)] {
+            let (auto_body, auto_relaxed) = wire(&canon(Some(CanonicalToolChoice::Auto), parallel));
+            assert_eq!(auto_relaxed, None);
+            for (choice, kind) in [
+                (CanonicalToolChoice::Required, "any"),
+                (
+                    CanonicalToolChoice::Specific {
+                        name: "lookup".into(),
+                    },
+                    "tool",
+                ),
+            ] {
+                // The translation itself still maps to the forced protocol value.
+                let built = build_messages_request_from_canonical(
+                    &canon(Some(choice.clone()), parallel),
+                    None,
+                    &Replacements::empty(),
+                )
+                .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&built.tool_choice).unwrap()["type"],
+                    kind
+                );
+
+                let (body, relaxed) = wire(&canon(Some(choice.clone()), parallel));
+                assert_eq!(relaxed, Some(kind), "{choice:?}");
+                let mut expected_choice = json!({"type":"auto"});
+                if let Some(parallel) = parallel {
+                    expected_choice["disable_parallel_tool_use"] = json!(!parallel);
+                }
+                assert_eq!(
+                    body["tool_choice"], expected_choice,
+                    "{choice:?} {parallel:?}"
+                );
+                assert_eq!(body, auto_body, "{choice:?} {parallel:?}");
+                assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+                assert!(!body.to_string().contains("call at least one"), "{body}");
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_auto_none_and_omitted_are_unchanged() {
+        for parallel in [None, Some(false)] {
+            for choice in [
+                None,
+                Some(CanonicalToolChoice::Auto),
+                Some(CanonicalToolChoice::None),
+            ] {
+                let req = canon(choice.clone(), parallel);
+                let (body, relaxed) = wire(&req);
+                assert_eq!(relaxed, None, "{choice:?}");
+                let expected = translate_tool_choice(&choice, parallel.map(|p| !p));
+                assert_eq!(
+                    body.get("tool_choice"),
+                    expected.map(|c| serde_json::to_value(c).unwrap()).as_ref(),
+                    "{choice:?} {parallel:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chat_and_responses_inputs_reach_claude_as_auto() {
+        let tool_chat = json!([{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]);
+        let tool_resp = json!([{"type":"function","name":"lookup","parameters":{"type":"object"}}]);
+        for (choice_chat, choice_resp, kind) in [
+            (json!("required"), json!("required"), "any"),
+            (
+                json!({"type":"function","function":{"name":"lookup"}}),
+                json!({"type":"function","name":"lookup"}),
+                "tool",
+            ),
+        ] {
+            for parallel in [None, Some(false)] {
+                let mut chat = json!({"model":"sonnet","messages":[{"role":"user","content":"hi"}],"tools":tool_chat,"tool_choice":choice_chat});
+                let mut resp = json!({"model":"sonnet","input":"hi","tools":tool_resp,"tool_choice":choice_resp});
+                if let Some(parallel) = parallel {
+                    chat["parallel_tool_calls"] = json!(parallel);
+                    resp["parallel_tool_calls"] = json!(parallel);
+                }
+                let chat: omni_common::ChatCompletionRequest =
+                    serde_json::from_value(chat).unwrap();
+                let resp: omni_common::ResponsesRequest = serde_json::from_value(resp).unwrap();
+                let mut expected = json!({"type":"auto"});
+                if parallel.is_some() {
+                    expected["disable_parallel_tool_use"] = json!(true);
+                }
+                for canon in [
+                    omni_common::to_canonical(&chat).unwrap(),
+                    omni_common::responses_to_canonical(&resp).unwrap(),
+                ] {
+                    let (body, relaxed) = wire(&canon);
+                    assert_eq!(relaxed, Some(kind));
+                    assert_eq!(body["tool_choice"], expected, "{kind} {parallel:?}");
+                    assert_eq!(body["tools"][0]["name"], "lookup");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn relax_without_tools_is_a_no_op() {
+        // Native requests with a forced choice and no tools keep the existing
+        // upstream validation; nothing is relaxed or reported.
+        for tools in [None, Some(vec![])] {
+            let mut req = MessagesRequest {
+                model: "m".into(),
+                max_tokens: 1,
+                messages: vec![],
+                system: None,
+                tools,
+                tool_choice: Some(ToolChoice::Any {
+                    disable_parallel_tool_use: None,
+                }),
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                stop_sequences: None,
+                stream: None,
+                metadata: None,
+                thinking: None,
+                output_config: None,
+                cache_control: None,
+            };
+            assert_eq!(relax_forced_tool_choice(&mut req), None);
+            assert!(matches!(req.tool_choice, Some(ToolChoice::Any { .. })));
+        }
     }
 }

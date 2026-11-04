@@ -361,6 +361,9 @@ pub struct RequestContext {
     pub retry_count: u32,
     pub kind: RequestKind,
     pub model: Option<String>,
+    /// Forced tool choice kind that preparation sent as `auto`. The upstream
+    /// client reports it once the request is built and about to be sent.
+    pub relaxed_tool_choice: Option<&'static str>,
 }
 
 impl RequestContext {
@@ -371,7 +374,13 @@ impl RequestContext {
             retry_count: 0,
             kind: RequestKind::Reply,
             model: None,
+            relaxed_tool_choice: None,
         }
+    }
+
+    pub fn with_relaxed_tool_choice(mut self, kind: Option<&'static str>) -> Self {
+        self.relaxed_tool_choice = kind;
+        self
     }
 
     pub fn with_session(mut self, session_id: Uuid) -> Self {

@@ -227,6 +227,21 @@ class StreamXErrorOracleTests(unittest.TestCase):
         self.assertFalse(r.ok)
 
 
+class DroppedToolChoiceOracleTests(unittest.TestCase):
+    def test_token_in_merged_value_passes(self) -> None:
+        r = O.oracle_dropped_tool_choice({"X-Omni-Dropped": "max_tokens, tool_choice"})
+        self.assertTrue(r.ok, r.reason)
+
+    def test_missing_header_fails(self) -> None:
+        r = O.oracle_dropped_tool_choice({"Content-Type": "application/json"})
+        self.assertFalse(r.ok)
+
+    def test_other_token_only_fails(self) -> None:
+        r = O.oracle_dropped_tool_choice({"x-omni-dropped": "max_tokens"})
+        self.assertFalse(r.ok)
+        self.assertIn("tool_choice", r.reason)
+
+
 class StreamForcedToolOracleTests(unittest.TestCase):
     def test_assembles_name_args_and_terminal(self) -> None:
         raw = (

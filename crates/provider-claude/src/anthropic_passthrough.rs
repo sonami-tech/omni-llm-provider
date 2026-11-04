@@ -16,7 +16,7 @@ use serde_json::Value;
 use crate::fingerprint::{FingerprintProfile, RequestContext};
 use crate::translate::{
     CacheControl, Message, MessagesRequest, OutputConfig, SystemField, Thinking, Tool, ToolChoice,
-    finalize_claude_wire_request,
+    finalize_claude_wire_request, relax_forced_tool_choice,
 };
 use crate::upstream::RawFrame;
 use crate::{ClaudeProvider, ProviderError};
@@ -97,6 +97,8 @@ pub struct PreparedAnthropicRequest {
     pub outbound_model: String,
     pub stream: bool,
     pub dropped_fields: Vec<String>,
+    /// Forced tool choice kind sent as `auto`, if any. The send path reports it.
+    pub relaxed_tool_choice: Option<&'static str>,
     body: Value,
 }
 
@@ -168,6 +170,7 @@ pub fn prepare_client_messages_request(
     let dropped = dropped_fields(&raw_body);
     let mut req =
         reconcile_client_request(&client, profile, replacements, inject_identity, stream)?;
+    let relaxed_tool_choice = relax_forced_tool_choice(&mut req);
     let outbound_model = req.model.clone();
     let model_canonical = profile
         .resolve_model(&client.model)
@@ -182,6 +185,7 @@ pub fn prepare_client_messages_request(
         outbound_model,
         stream,
         dropped_fields: dropped,
+        relaxed_tool_choice,
         body,
     })
 }
@@ -203,6 +207,7 @@ pub fn prepare_count_tokens_request(
     let dropped = dropped_fields(&raw_body);
     let mut req = reconcile_client_request(&client, profile, replacements, false, false)?;
     req.stream = None;
+    let relaxed_tool_choice = relax_forced_tool_choice(&mut req);
     let outbound_model = req.model.clone();
     let model_canonical = profile
         .resolve_model(&client.model)
@@ -231,6 +236,7 @@ pub fn prepare_count_tokens_request(
         outbound_model,
         stream: false,
         dropped_fields: dropped,
+        relaxed_tool_choice,
         body,
     })
 }
@@ -677,7 +683,10 @@ impl ClaudeProvider {
             .map_err(super::map_upstream_err)
     }
 
-    fn request_context_for_session(session_key: &str, outbound_model: &str) -> RequestContext {
+    fn request_context_for_session(
+        session_key: &str,
+        prepared: &omni_core::PreparedAnthropicNative,
+    ) -> RequestContext {
         let session = if let Ok(uuid) = uuid::Uuid::parse_str(session_key) {
             uuid
         } else {
@@ -685,7 +694,8 @@ impl ClaudeProvider {
         };
         RequestContext::new_reply()
             .with_session(session)
-            .with_model(outbound_model.to_string())
+            .with_model(prepared.outbound_model.clone())
+            .with_relaxed_tool_choice(prepared.relaxed_tool_choice)
     }
 }
 
@@ -708,7 +718,8 @@ impl omni_core::AnthropicNativeSurface for ClaudeProvider {
             prepared.stream,
             prepared.dropped_fields,
             body,
-        ))
+        )
+        .with_relaxed_tool_choice(prepared.relaxed_tool_choice))
     }
 
     fn prepare_count_tokens(
@@ -724,27 +735,29 @@ impl omni_core::AnthropicNativeSurface for ClaudeProvider {
             prepared.stream,
             prepared.dropped_fields,
             body,
-        ))
+        )
+        .with_relaxed_tool_choice(prepared.relaxed_tool_choice))
     }
 
     async fn send_messages_json(
         &self,
-        body: &Value,
+        prepared: &omni_core::PreparedAnthropicNative,
         session_key: &str,
-        outbound_model: &str,
     ) -> Result<Value, ProviderError> {
-        let ctx = Self::request_context_for_session(session_key, outbound_model);
-        self.send_anthropic_messages_json(body, &ctx).await
+        let ctx = Self::request_context_for_session(session_key, prepared);
+        self.send_anthropic_messages_json(prepared.body(), &ctx)
+            .await
     }
 
     async fn send_messages_stream(
         &self,
-        body: &Value,
+        prepared: &omni_core::PreparedAnthropicNative,
         session_key: &str,
-        outbound_model: &str,
     ) -> Result<omni_core::NativeAnthropicSseStream, ProviderError> {
-        let ctx = Self::request_context_for_session(session_key, outbound_model);
-        let stream = self.send_anthropic_messages_stream(body, &ctx).await?;
+        let ctx = Self::request_context_for_session(session_key, prepared);
+        let stream = self
+            .send_anthropic_messages_stream(prepared.body(), &ctx)
+            .await?;
         Ok(Box::pin(stream.map(|item| {
             item.map(|frame| omni_core::NativeAnthropicSseFrame {
                 event: frame.event,
@@ -755,12 +768,12 @@ impl omni_core::AnthropicNativeSurface for ClaudeProvider {
 
     async fn send_count_tokens(
         &self,
-        body: &Value,
+        prepared: &omni_core::PreparedAnthropicNative,
         session_key: &str,
-        outbound_model: &str,
     ) -> Result<Value, ProviderError> {
-        let ctx = Self::request_context_for_session(session_key, outbound_model);
-        self.send_anthropic_count_tokens(body, &ctx).await
+        let ctx = Self::request_context_for_session(session_key, prepared);
+        self.send_anthropic_count_tokens(prepared.body(), &ctx)
+            .await
     }
 }
 
@@ -815,6 +828,8 @@ mod tests {
 
     #[test]
     fn native_ingress_preserves_all_anthropic_tool_choice_modes() {
+        // WHY: the allowlist parse keeps every client tool_choice mode intact;
+        // issue #63 relaxes forced modes only at the end of preparation.
         for mode in ["auto", "any", "tool", "none"] {
             for disabled in [None, Some(true), Some(false)] {
                 let mut choice = serde_json::json!({"type":mode});
@@ -832,9 +847,142 @@ mod tests {
                     "tools":[{"name":"read","input_schema":{"type":"object"}}],
                     "tool_choice":choice
                 });
-                let wire = serde_json::to_value(parse_client(body).to_messages_request()).unwrap();
+                let wire =
+                    serde_json::to_value(parse_client(body.clone()).to_messages_request()).unwrap();
                 assert_eq!(wire["tool_choice"], choice);
+
+                // Issue #63: forced `any` / `tool` reach Claude as auto with the
+                // parallel flag kept; auto and none pass through unchanged. Same
+                // on Messages (non-stream and stream) and count_tokens.
+                let forced = mode == "any" || mode == "tool";
+                let mut expected = choice.clone();
+                if forced {
+                    expected = serde_json::json!({"type":"auto"});
+                    if let Some(disabled) = disabled {
+                        expected["disable_parallel_tool_use"] = serde_json::json!(disabled);
+                    }
+                }
+                for stream in [false, true] {
+                    let mut body = body.clone();
+                    body["stream"] = serde_json::json!(stream);
+                    let prepared = prepare_client_messages_request(
+                        body,
+                        default_profile(),
+                        &empty_repl(),
+                        true,
+                    )
+                    .unwrap();
+                    assert_eq!(prepared.body()["tool_choice"], expected, "{mode} {stream}");
+                    assert_eq!(prepared.relaxed_tool_choice, forced.then_some(mode));
+                }
+                let counted =
+                    prepare_count_tokens_request(body, default_profile(), &empty_repl()).unwrap();
+                assert_eq!(counted.body()["tool_choice"], expected, "{mode} count");
+                assert_eq!(counted.relaxed_tool_choice, forced.then_some(mode));
             }
+        }
+    }
+
+    #[test]
+    fn native_relaxed_tool_choice_changes_nothing_else() {
+        // WHY: issue #63 must not add guidance text or move cache markers. The
+        // relaxed body must equal the same request sent with auto, field for
+        // field, on Messages and count_tokens.
+        let with_choice = |choice: Value| {
+            serde_json::json!({
+                "model":"claude-sonnet-5-5", "max_tokens":100,
+                "system":[{"type":"text","text":"be brief","cache_control":{"type":"ephemeral"}}],
+                "messages":[{"role":"user","content":[{"type":"text","text":"look it up","cache_control":{"type":"ephemeral","ttl":"1h"}}]}],
+                "tools":[
+                    {"name":"read","input_schema":{"type":"object","properties":{"q":{"type":"string"}}},"cache_control":{"type":"ephemeral"}},
+                    {"name":"write","input_schema":{"type":"object"}}
+                ],
+                "cache_control":{"type":"ephemeral"},
+                "tool_choice":choice
+            })
+        };
+        for disabled in [None, Some(true)] {
+            let mut auto = serde_json::json!({"type":"auto"});
+            if let Some(disabled) = disabled {
+                auto["disable_parallel_tool_use"] = serde_json::json!(disabled);
+            }
+            let baseline = prepare_client_messages_request(
+                with_choice(auto.clone()),
+                default_profile(),
+                &empty_repl(),
+                true,
+            )
+            .unwrap();
+            let baseline_count = prepare_count_tokens_request(
+                with_choice(auto.clone()),
+                default_profile(),
+                &empty_repl(),
+            )
+            .unwrap();
+            assert_eq!(baseline.relaxed_tool_choice, None);
+            for forced in [
+                serde_json::json!({"type":"any"}),
+                serde_json::json!({"type":"tool","name":"write"}),
+            ] {
+                let mut forced = forced;
+                if let Some(disabled) = disabled {
+                    forced["disable_parallel_tool_use"] = serde_json::json!(disabled);
+                }
+                let prepared = prepare_client_messages_request(
+                    with_choice(forced.clone()),
+                    default_profile(),
+                    &empty_repl(),
+                    true,
+                )
+                .unwrap();
+                assert_eq!(prepared.body(), baseline.body(), "{forced}");
+                let counted = prepare_count_tokens_request(
+                    with_choice(forced.clone()),
+                    default_profile(),
+                    &empty_repl(),
+                )
+                .unwrap();
+                assert_eq!(counted.body(), baseline_count.body(), "{forced}");
+                assert_eq!(
+                    counted.body()["tools"][0]["cache_control"],
+                    serde_json::json!({"type":"ephemeral"})
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_forced_choice_without_tools_is_not_relaxed() {
+        // Existing behavior for a forced choice with no tools stays: the body
+        // forwards it unchanged and upstream validates it; nothing is reported.
+        for tools in [None, Some(serde_json::json!([]))] {
+            let mut body = serde_json::json!({
+                "model":"claude-sonnet-5-5", "max_tokens":100,
+                "messages":[{"role":"user","content":"hi"}],
+                "tool_choice":{"type":"any"}
+            });
+            if let Some(tools) = tools {
+                body["tools"] = tools;
+            }
+            let prepared = prepare_client_messages_request(
+                body.clone(),
+                default_profile(),
+                &empty_repl(),
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                prepared.body()["tool_choice"],
+                serde_json::json!({"type":"any"})
+            );
+            assert_eq!(prepared.relaxed_tool_choice, None);
+            let counted =
+                prepare_count_tokens_request(body, default_profile(), &empty_repl()).unwrap();
+            assert_eq!(
+                counted.body()["tool_choice"],
+                serde_json::json!({"type":"any"})
+            );
+            assert_eq!(counted.relaxed_tool_choice, None);
         }
     }
 

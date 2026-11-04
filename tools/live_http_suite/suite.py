@@ -104,7 +104,11 @@ class LiveHttpSuite:
             raise SuiteFailure(result.reason)
 
     def test_claude_tool_loop_nonstream(self) -> None:
-        """3. Claude tool loop non-stream with digit nonce."""
+        """3. Claude tool loop non-stream with digit nonce.
+
+        Claude receives the named choice as `auto` (issue #63), so the tool call
+        relies on the prompt wording and the reply must report `tool_choice`.
+        """
         self.require_pin(self.cfg.claude_model)
         nonce = _nonce_digits(8)
         tool_name = "report_nonce"
@@ -123,7 +127,7 @@ class LiveHttpSuite:
                 },
             }
         ]
-        # Turn 1: force the tool.
+        # Turn 1: name the tool; Omni sends it to Claude as `auto`.
         body1 = {
             "model": self.cfg.claude_model,
             "messages": [
@@ -144,6 +148,9 @@ class LiveHttpSuite:
         resp1 = self._post("/v1/chat/completions", body1, retry=False)
         if resp1.status != 200:
             raise SuiteFailure(f"turn1 status {resp1.status}: {resp1.body[:400]}")
+        dropped1 = O.oracle_dropped_tool_choice(resp1.headers)
+        if not dropped1.ok:
+            raise SuiteFailure(f"turn1: {dropped1.reason}")
         parsed1 = O.parse_json_body(resp1.body)
         r1 = O.oracle_chat_tool_calls_nonstream(parsed1, expected_name=tool_name)
         if not r1.ok:
@@ -195,7 +202,11 @@ class LiveHttpSuite:
             raise SuiteFailure(f"turn2: {r2.reason}; body={resp2.body[:500]}")
 
     def test_stream_forced_tool(self) -> None:
-        """4. Stream + forced tool on haiku."""
+        """4. Stream + named tool on haiku.
+
+        Claude receives the named choice as `auto` (issue #63), so the tool call
+        relies on the prompt wording and the reply must report `tool_choice`.
+        """
         self.require_pin(self.cfg.claude_model)
         tool_name = "get_weather"
         body = {
@@ -230,6 +241,9 @@ class LiveHttpSuite:
             "max_tokens": 256,
         }
         resp = self._post("/v1/chat/completions", body, retry=False)
+        dropped = O.oracle_dropped_tool_choice(resp.headers)
+        if resp.status == 200 and not dropped.ok:
+            raise SuiteFailure(dropped.reason)
         result = O.oracle_stream_forced_tool(
             resp.status, resp.headers, resp.body, expected_name=tool_name
         )

@@ -55,25 +55,40 @@ effort-mapped) thinking budget. See `docs/decisions.md`.
 ## Parallel tool control
 
 Chat and Responses `parallel_tool_calls` is canonical intent, not an extra.
-Both booleans invert into `tool_choice.disable_parallel_tool_use` for `auto`,
-`any`, and named `tool`, without changing the choice or name. With tools and no
-choice, an explicit flag uses `auto`. `none` stays `none` without a disabling
-flag. Without tools the choice is omitted; forced choices still fail.
-Native Messages keeps its existing nested control and validation.
+Both booleans invert into `tool_choice.disable_parallel_tool_use`. A forced
+`any` or named `tool` is then sent as `auto` with that flag (see Forced tool
+choice). With tools and no choice, an explicit flag uses `auto`. `none` stays
+`none` without a disabling flag. Without tools the choice is omitted; forced
+choices still fail. Native Messages keeps its existing nested control and
+validation, and its forced choices are sent as `auto` the same way.
 
-Disabling parallel calls permits at most one call with auto, or exactly one
-with a supported forced choice. Mock serialization does not establish live
-model acceptance.
+Disabling parallel calls permits at most one call. Forced choices are sent as
+`auto`, so a call is not guaranteed. Mock serialization does not establish
+live model acceptance.
 
 ## Forced tool choice
 
 Current Claude models reject `tool_choice` `any` and `tool` with an upstream
-400, including on token counting. Omni maps OpenAI `required` to `any` and a
-named function to `tool`, and currently forwards both unchanged, so the client
-receives that 400. `auto` and `none` work. Anthropic's list of affected models
-is the source of truth:
+400, including on token counting. Anthropic's list of affected models is the
+source of truth:
 <https://platform.claude.com/docs/en/api/errors#forced-tool-use-not-supported>.
-See the live check in `docs/compatibility-matrix.md`.
+
+Omni maps OpenAI `required` to `any` and a named function to `tool`. At the
+end of request preparation, `relax_forced_tool_choice` in `translate.rs` sends
+every forced choice as `{"type":"auto"}`. The same rule runs on Chat
+Completions, Responses, native `/v1/messages`, and
+`/v1/messages/count_tokens`, streaming or not, for every model and endpoint.
+`disable_parallel_tool_use` keeps its value. No other field changes and no
+text is added. `auto`, `none`, an omitted choice, and a forced choice with no
+tools are unchanged.
+
+When the upstream request is fully built, just before it is sent, the
+provider records the relaxed choice. The edge then sets
+`x-omni-dropped: tool_choice` (merged with any other value) and logs one
+warning with route, model, and choice kind, on success and on upstream or
+transport errors after the send attempt.
+A required call becomes optional: the model may answer without a tool. See
+the Tool choice section in `docs/compatibility-matrix.md`.
 
 ## Provider Extras
 

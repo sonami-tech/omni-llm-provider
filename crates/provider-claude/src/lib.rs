@@ -500,7 +500,7 @@ impl LlmProvider for ClaudeProvider {
         // Request-shaping failures (unrepresentable content, malformed tool args,
         // bad image URL, unsupported role, unsupported effort) are the client's
         // fault -> ProviderError::BadRequest (400), not 500.
-        let anth_req = translate::prepare_anthropic_request(
+        let (anth_req, relaxed_tool_choice) = translate::prepare_anthropic_request_reporting(
             &req,
             self.profile,
             &repl,
@@ -513,7 +513,9 @@ impl LlmProvider for ClaudeProvider {
             ProviderError::Other(anyhow::Error::msg(format!("anth serialize: {e}")))
         })?;
 
-        let ctx = RequestContext::new_reply().with_model(anth_req.model.clone());
+        let ctx = RequestContext::new_reply()
+            .with_model(anth_req.model.clone())
+            .with_relaxed_tool_choice(relaxed_tool_choice);
 
         // Fresh creds read for the default Claude Code path. Custom gateways
         // own auth and must not require or leak the local OAuth file.
@@ -565,7 +567,7 @@ impl LlmProvider for ClaudeProvider {
         // JSON value (the typed builder set Some(false)).
         let repl = Replacements::empty();
         // Request-shaping failures are client faults -> ProviderError::BadRequest.
-        let anth_req = translate::prepare_anthropic_request(
+        let (anth_req, relaxed_tool_choice) = translate::prepare_anthropic_request_reporting(
             &req,
             self.profile,
             &repl,
@@ -577,7 +579,9 @@ impl LlmProvider for ClaudeProvider {
         })?;
         body_val["stream"] = serde_json::Value::Bool(true);
 
-        let ctx = RequestContext::new_reply().with_model(anth_req.model.clone());
+        let ctx = RequestContext::new_reply()
+            .with_model(anth_req.model.clone())
+            .with_relaxed_tool_choice(relaxed_tool_choice);
         // Owned copy for the (potentially long-lived) stream closure to tag the
         // trailing cache-usage log; `anth_req` is consumed by serialization above.
         let log_model = anth_req.model.clone();

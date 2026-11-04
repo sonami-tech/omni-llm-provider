@@ -36,8 +36,9 @@ pub use anthropic_native_stats::{
 pub use auth::{ApiKeyId, auth_layer};
 pub use conversation_log::{ConversationLog, DEFAULT_LOG_BACKUPS, DEFAULT_LOG_MAX_BYTES};
 pub use dropped_output_cap::{
-    DROPPED_OUTPUT_CAP_HEADER, DROPPED_OUTPUT_CAP_HEADER_VALUE, DroppedOutputCap,
-    dropped_output_cap, note_dropped_output_cap, with_inbound_route,
+    DROPPED_OUTPUT_CAP_HEADER, DROPPED_OUTPUT_CAP_HEADER_VALUE, DROPPED_TOOL_CHOICE_HEADER_VALUE,
+    DroppedOutputCap, RelaxedToolChoice, dropped_output_cap, note_dropped_output_cap,
+    note_relaxed_tool_choice, relaxed_tool_choice, with_inbound_route,
 };
 pub use env::{env_nonempty, headers_from_env, parse_custom_headers};
 pub use error::{AppError, classify_upstream};
