@@ -167,35 +167,40 @@ source is `codex debug models --bundled` (`visibility=list` slugs). A custom
 Responses `base_url` is not a reason to skip. If that command fails or lists
 no models, stop. Do not keep the previous pin's catalog.
 
-The 2026-10-15 capture used Codex CLI 0.164.0 and returned a successful
-Responses POST on the configured custom endpoint. The fresh bundled catalog
-has the same eight visible models and priorities as the previous pin;
-`gpt-6.1-sol` remains priority 1. Catalog ids and aliases are defined by
-`CODEX_CATALOG` in `crates/provider-codex/src/lib.rs`. The `gpt` alias follows
-the configured model when the config names one. The user-agent was captured
-from the successful exec.
+The 2026-11-07 general capture used the installed Codex CLI and completed a
+Responses POST on the configured custom endpoint with HTTP 200 and a
+`response.completed` event. The fresh bundled catalog adds a visible model
+and updates the newest `terra` family alias. The default still follows the
+priority-1 slug. The active version, catalog ids, and aliases are defined by
+`CODEX_VERSION` and `CODEX_CATALOG` in `crates/provider-codex/src/lib.rs`.
+The `gpt` alias follows the configured model when the config names one.
+The captured user-agent now reports Ubuntu 26.4.0.
 
-A separate isolated local WebSocket probe used fake ChatGPT auth and a
-custom provider. Upgrade/prewarm metadata now has 19 keys, adding
-`history_initialization: "new"`; the live REST capture has the same field.
-Omni adds that field to its synthetic prewarm metadata. Actual-turn metadata
-has three additional keys: `root_turn_id`, `turn_trigger`, and
-`turn_started_at_unix_ms`. These stay outside Omni's prewarm metadata.
+A separate isolated local probe used fake ChatGPT auth, a loopback custom
+provider, and blocked external proxy traffic. It recorded WebSocket upgrade
+requests, but deliberately returned HTTP 503 and did not complete inference.
+Upgrade/prewarm metadata still has 19 keys. Actual-turn metadata adds
+`root_turn_id`, `turn_trigger`, and `turn_started_at_unix_ms`; these stay
+outside Omni's synthetic prewarm metadata.
 
-The local clean configuration reported `node_repl_auto_review_required: false`;
-the live configured REST capture reported `true`. Omni preserves its existing
-`true` stand-in. Other metadata flags remain unchanged. Request bodies keep
-the existing shape-only contract and omit CLI session data and preferences.
-The Responses-lite signal stays omitted by Omni.
+Both the local probe and live REST capture reported `sandbox: "seccomp"`
+and `node_repl_auto_review_required: true`. Omni updates the synthetic sandbox
+stand-in and keeps the other flags. The local probe used
+`sandbox_mode: "read-only"`; the configured live REST capture used `"workspace-write"`.
+Omni keeps its read-only stand-in. Request bodies keep the existing shape-only
+contract and omit CLI session data and preferences. The Responses-lite signal
+stays omitted by Omni.
 
 **Verification limit:** the machine has no ChatGPT OAuth login. The local
-built-in-route probe failed during workspace-routing discovery. The local
-custom-provider probe confirms WebSocket shape, but does not establish
-current built-in ChatGPT routing requirements or live acceptance. The
-`version` and `x-codex-routing-hint` upgrade headers retain their 0.161.0 live
-evidence. OAuth refresh traffic was not captured; its existing UA stays
-unchanged. Custom/API-key REST continues to send configured headers and
-auth only, with no CLI headers or cookie.
+custom-provider probe confirms emitted upgrade shape, not current built-in
+ChatGPT routing requirements or live acceptance. The `version` and
+`x-codex-routing-hint` upgrade headers were absent on the local custom route;
+Omni retains them from the 0.161.0 built-in live evidence rather than inferring
+a built-in change from that route. OAuth refresh traffic was not captured;
+its existing UA stays unchanged. The configured stored API key was staged
+in tmpfs; no ambient env key was forwarded and no host approval override was
+set. Custom/API-key REST continues to send configured headers and auth only,
+with no CLI headers or cookie.
 
 ```sh
 python3 -m tools.capture catalog --provider codex

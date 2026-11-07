@@ -54,7 +54,7 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
    ```sh
    uv run --with mitmproxy python -m tools.capture capture run \
      --provider claude --mode general --live-capture \
-     --models opus sonnet haiku
+     --models claude-mythos-5-1 opus sonnet haiku fable
    ```
 
    The legacy wrapper remains for compatibility:
@@ -146,19 +146,24 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
 
 ## Current Capture
 
-The 2026-10-15 clean-HOME capture used Claude Code 2.1.309. Default,
-Opus, Sonnet, Haiku, and Fable each returned HTTP 200 with an `OK` reply.
-The fresh catalog has the same four canonical ids as the previous pin.
+The 2026-11-07 clean-HOME capture used Claude Code 2.1.318. Default,
+Mythos 5.1, Opus, Sonnet, Haiku, and Fable each returned HTTP 200 with an
+`OK` reply. Mythos 5.1 is now included in the fresh five-model catalog.
 Catalog and defaults are defined in `crates/provider-claude/src/models.rs`
 and `crates/provider-claude/src/fingerprint.rs`.
 
-Every beta list adds `advanced-tool-use-2025-11-20` and removes
-`prompt-caching-scope-2026-01-05`, `dangerous-tool-use-2026-09-03`, and
-`afk-mode-2026-01-31`. The SDK, runtime, Anthropic version, identity,
-output defaults, and no-cch billing shape remain unchanged. For `Say OK`,
-billing is `cc_version=2.1.309.742; cc_entrypoint=sdk-cli;`.
-The explicit `claude-fable-5` path was not recaptured; its pass-through
-and wire override remain unchanged.
+The runtime and beta ordering changed. Mythos has its own beta list, which
+omits `per-turn-control-2026-07-01`; its captured default is 64000 output
+tokens with high effort. The SDK, Anthropic version, identity, other model
+output defaults, and no-cch billing shape remain unchanged. The explicit
+`claude-fable-5` path was not recaptured; its pass-through and wire override
+remain unchanged.
+
+The rebuilt Omni server also accepted Mythos through Chat Completions,
+Responses, and Anthropic Messages, with streaming and non-streaming requests.
+Every response completed with `OK`. Chat Completions also passed with
+`reasoning_effort: "minimal"`; the native counting endpoint returned a positive
+input token count. Both the canonical id and the `mythos` alias were exercised.
 
 Exact captured header bytes are recorded in
 `tools/providers/claude/fingerprint/BASELINE_HEADERS.md` and the existing

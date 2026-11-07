@@ -123,10 +123,11 @@ wrapper around `tools.capture extract jsonl` for sanitized JSONL exports.
 
 ## Current Wire + Model Findings
 
-The 2026-10-15 clean-HOME capture used grok-shell 1.0.67. The active version,
-header values, and catalog are defined in `crates/provider-grok/src/lib.rs`.
+The active version, header values, and catalog are defined in
+`crates/provider-grok/src/lib.rs`. The latest clean-HOME general capture and
+renewed catalog exception are described below.
 
-### Default path (cli-chat-proxy.grok.com)
+### Previous capture (2026-10-15, grok-shell 1.0.67)
 
 The fresh `GET /v1/models` returned HTTP 200 with only `grok-4.7`, with
 low, medium, high, and xhigh effort. The Free-tier account has a temporary
@@ -149,6 +150,27 @@ capture does not establish cache-miss behavior.
 The updated Omni binary's live streaming and non-streaming smoke requests
 to `grok-4.7` both returned HTTP 429. Those acceptance checks remain blocked
 by account rate limits; the successful CLI capture is separate evidence.
+
+### 2026-11-07 rebaseline
+
+The clean-HOME general capture used grok-shell 1.0.77. Fresh `GET /v1/models`
+returned HTTP 200 with only `grok-4.7`, matching both proxy `default_model`
+and the no-model inference request. Main inference returned HTTP 200 with a
+completed SSE event and usage, including cache-read counts. Tokenization
+requests returned HTTP 429. A background `grok-4.6` request had HTTP 200 but
+no captured response body, so its completion is unproven.
+
+The main request retains the existing top-level body keys and fixed header
+shape; UA and client-version identify the installed CLI. This is CLI evidence,
+not an Omni live smoke test. Raw flows and staged credentials were RAM-only
+and removed after inspection. Refresh capture was not run.
+
+The operator explicitly renewed the four-model catalog exception for this
+pin. The active pin and exact header goldens now follow the inspected CLI
+capture while retaining the 1.0.41 catalog. This approval does not establish
+current acceptance for all four models. At the next rebaseline, obtain a
+paid-tier listing or renew the exception again; see
+`docs/providers/grok/README.md`.
 
 ### Custom endpoint override
 

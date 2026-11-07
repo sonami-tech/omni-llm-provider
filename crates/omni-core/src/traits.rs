@@ -8,6 +8,7 @@ pub trait LlmProvider: Send + Sync {
     fn id(&self) -> &'static str;
 
     /// Non-streaming send: returns the full response once the upstream completes.
+    #[must_use = "provider requests do nothing unless polled or awaited"]
     async fn send(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError>;
     /// Streaming send: returns a stream of [`CanonicalStreamEvent`]s.
     ///
@@ -22,6 +23,7 @@ pub trait LlmProvider: Send + Sync {
     /// support (Claude, Grok) override this to pass deltas through incrementally.
     /// This keeps the trait object-safe and lets any provider participate in the
     /// streaming HTTP path even before it has a native implementation.
+    #[must_use = "provider streams are not opened unless polled or awaited"]
     async fn send_stream(&self, req: CanonicalRequest) -> Result<CanonicalStream, ProviderError> {
         let resp = self.send(req).await?;
         let mut events: Vec<Result<CanonicalStreamEvent, ProviderError>> = Vec::new();

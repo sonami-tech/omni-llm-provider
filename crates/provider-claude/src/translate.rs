@@ -2089,6 +2089,14 @@ mod tests {
             Option<&'static str>,
         );
         let cases: &[WireCase] = &[
+            ("mythos", "claude-mythos-5-1", 64_000, None, Some("high")),
+            (
+                "claude-mythos-5-1",
+                "claude-mythos-5-1",
+                64_000,
+                None,
+                Some("high"),
+            ),
             ("fable", "claude-fable-5-1", 64_000, None, Some("high")),
             (
                 "claude-fable-5-1",

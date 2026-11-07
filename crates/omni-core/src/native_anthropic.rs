@@ -96,6 +96,7 @@ pub trait AnthropicNativeSurface: Send + Sync {
 
     /// Non-streaming Messages send. `session_key` is an opaque correlation string
     /// (gateway session id); the implementor maps it to its own request context.
+    #[must_use = "message requests do nothing unless polled or awaited"]
     async fn send_messages_json(
         &self,
         prepared: &PreparedAnthropicNative,
@@ -103,6 +104,7 @@ pub trait AnthropicNativeSurface: Send + Sync {
     ) -> Result<Value, ProviderError>;
 
     /// Streaming Messages send (raw Anthropic SSE frames).
+    #[must_use = "message streams are not opened unless polled or awaited"]
     async fn send_messages_stream(
         &self,
         prepared: &PreparedAnthropicNative,
@@ -110,6 +112,7 @@ pub trait AnthropicNativeSurface: Send + Sync {
     ) -> Result<NativeAnthropicSseStream, ProviderError>;
 
     /// count_tokens send.
+    #[must_use = "token count requests do nothing unless polled or awaited"]
     async fn send_count_tokens(
         &self,
         prepared: &PreparedAnthropicNative,

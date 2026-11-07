@@ -44,18 +44,19 @@ Capture and refresh-capture work uses `python3 -m tools.capture`; see
 
 ## Catalog exception
 
-The 2026-10-15 grok-shell 1.0.67 clean-HOME capture listed only `grok-4.7`.
-The capture account is on the Free tier with a temporary Grok 4.7 promo.
-The default inference request completed with HTTP 200 after one CLI-managed
-429 retry. Background session-title requests to `grok-4.6` returned 429;
-this run does not prove that model's current acceptance. Request header
+The 2026-11-07 grok-shell 1.0.77 clean-HOME general capture listed only
+`grok-4.7`, as did the previous Free-tier capture. The no-model request and
+proxy `default_model` agreed, and the main inference completed with HTTP 200
+and `response.completed`. A background `grok-4.6` request had HTTP 200 but no
+captured response body, so its completion remains unproven. Fixed header
 names and body shape match the previous pin apart from the CLI version.
 
-The operator renewed the issue #56 exception for this pin: keep the four
-models from the 1.0.41 listing. Source of truth is `GROK_CATALOG` in
-`crates/provider-grok/src/lib.rs`. At the next rebaseline, take the listing
-from a paid-tier account, or obtain a new operator decision to keep the
-exception.
+The operator explicitly renewed the issue #56 exception for this pin:
+keep the four models from the 1.0.41 listing. This is catalog retention
+approval, not proof of current acceptance for all four models. Source of
+truth is `GROK_CATALOG` in `crates/provider-grok/src/lib.rs`. At the next
+rebaseline, take the listing from a paid-tier account, or obtain a new
+operator decision to keep the exception.
 
 ## Reasoning effort
 
