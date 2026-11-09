@@ -17,8 +17,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-PINNED_VERSION = "2.1.318"
-PINNED_PROFILE = "cc-2.1.318-sdk-cli"
+PINNED_VERSION = "2.1.321"
+PINNED_PROFILE = "cc-2.1.321-sdk-cli"
 CCH_RE = re.compile(r"cc_entrypoint=sdk-cli; cch=")
 # Live pin emits the billing header with NO trailing cch field; it ends at the
 # entrypoint terminator. This regex matches that no-cch shape.

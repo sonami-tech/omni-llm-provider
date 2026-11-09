@@ -8,7 +8,7 @@
 //! - host `https://cli-chat-proxy.grok.com`
 //! - `POST /v1/responses` (OpenAI Responses shape)
 //! - CLI fingerprint headers + OIDC bearer (`~/.grok/auth.json` preferred)
-//! - model catalog: `grok-4.7` (alias `grok`), `grok-4.7-build-fast`, `grok-4.6`, `grok-4.5` on grok-shell 1.0.77
+//! - model catalog: `grok-4.7` (alias `grok`) on grok-shell 1.0.77
 //!
 //! Custom endpoint mode (`OMNI_GROK_BASE_URL` / `with_custom_auth*`) is a separate operator
 //! override that speaks OpenAI-compatible `/chat/completions` against an arbitrary base URL
@@ -65,27 +65,18 @@ const DEFAULT_BASE_URL: &str = "https://cli-chat-proxy.grok.com";
 /// User-Agent template for CLI-parity requests. `{version}` is filled from the
 /// pinned catalog version (`self.version`, e.g. "1.0.77") so the UA and
 /// `x-grok-client-version` cannot drift from the catalog the request claims.
-/// Verified live against grok-shell 1.0.77 (2026-11-07; first captured 0.2.60 on
+/// Verified live against grok-shell 1.0.77 (2026-11-09; first captured 0.2.60 on
 /// 2026-06-23, UA template unchanged across bumps including the 1.0.x line).
 const CLI_USER_AGENT_TEMPLATE: &str = "grok-shell/{version} (linux; x86_64)";
 
-// Grok catalog: the four ids from the clean-HOME GET /v1/models on 2026-09-22.
-// The 2026-11-07 capture (grok-shell 1.0.77) again listed only grok-4.7.
-// The operator renewed the four-model exception for this pin. No-model
-// POST /v1/responses selected grok-4.7 and completed; the background grok-4.6
-// request had no captured response body, so its completion remains unproven.
-// Fingerprint headers retain token-auth, authenticate-response, identifier,
-// version, model-override, and headless mode. CLI-only session fields stay omitted.
+// Clean-HOME GET /v1/models on 2026-11-09 listed only grok-4.7, matching
+// proxy default_model and the completed no-model POST /v1/responses.
+// The catalog now follows that listing; the prior retention exception is retired.
 /// Pinned grok-shell CLI version (UA + header fingerprint). Single live pin.
 pub const GROK_VERSION: &str = "1.0.77";
 
 /// Model catalog for the active pin.
-const GROK_CATALOG: &[CatalogModel] = &[
-    CatalogModel::new("grok-4.7", &["grok"]),
-    CatalogModel::new("grok-4.7-build-fast", &[]),
-    CatalogModel::new("grok-4.6", &[]),
-    CatalogModel::new("grok-4.5", &[]),
-];
+const GROK_CATALOG: &[CatalogModel] = &[CatalogModel::new("grok-4.7", &["grok"])];
 
 /// OpenAI-compatible model entry exposed by the server's `/v1/models` route.
 #[derive(Debug, Clone, Serialize)]
@@ -2219,11 +2210,11 @@ mod tests {
             .into_iter()
             .map(|model| model.id)
             .collect();
-        assert!(ids.iter().any(|id| id == "grok-4.7"));
-        assert!(ids.iter().any(|id| id == "grok-4.7-build-fast"));
-        assert!(ids.iter().any(|id| id == "grok-4.6"));
-        assert!(ids.iter().any(|id| id == "grok-4.5"));
-        assert_eq!(ids.len(), 4, "catalog is only CLI-advertised ids: {ids:?}");
+        assert_eq!(
+            ids,
+            vec!["grok-4.7"],
+            "catalog follows the fresh proxy listing"
+        );
         assert!(
             !ids.iter().any(|id| id == "grok" || id == "composer"),
             "aliases must not be advertised as canonical models: {ids:?}"
@@ -5405,21 +5396,13 @@ mod tests {
     /// credential tests and keeps the offline suite green.
     #[test]
     fn model_catalog_is_cli_advertised_ids_only() {
-        // WHY: Grok exposes only the pinned proxy catalog (the 4 ids listed on
-        // 1.0.41, kept on 1.0.77 by operator decision because that Free-tier
-        // listing reflects account tier). A regression that leaked retired ids
-        // (e.g. grok-4.3 or composer) would misrepresent the surface users can
-        // actually hit on cli-chat-proxy.
+        // WHY: advertising ids absent from the fresh proxy listing would
+        // misrepresent the captured account's current model catalog.
         let p = GrokProvider::new(None).unwrap();
         let ids: Vec<String> = p.models_list().into_iter().map(|m| m.id).collect();
         assert_eq!(
             ids,
-            vec![
-                "grok-4.7".to_string(),
-                "grok-4.7-build-fast".to_string(),
-                "grok-4.6".to_string(),
-                "grok-4.5".to_string()
-            ],
+            vec!["grok-4.7".to_string()],
             "catalog must be exactly the advertised cli-chat-proxy ids"
         );
         assert!(!ids.iter().any(|id| id == "grok-4.3"));
@@ -5429,24 +5412,26 @@ mod tests {
 
     #[test]
     fn model_aliases_resolve_only_catalog_entries() {
-        // The wire body model id must come from the catalog. Unknown aliases stay
-        // verbatim; known aliases map to canonical ids.
+        // Catalog membership controls advertising and aliases, not passthrough.
         let p = GrokProvider::new(None).unwrap();
-        let mut req = CanonicalRequest {
-            model: "build".into(), // not in catalog
-            ..base_req()
-        };
-        let body = to_xai_chat_request(&req, &empty_repl(), p.active_catalog()).unwrap();
-        assert_eq!(body["model"], "build");
-
-        req.model = "grok".into();
-        let body = to_xai_chat_request(&req, &empty_repl(), p.active_catalog()).unwrap();
-        assert_eq!(body["model"], "grok-4.7");
-
-        // composer is no longer in the advertised catalog; pass through raw.
-        req.model = "composer".into();
-        let body = to_xai_chat_request(&req, &empty_repl(), p.active_catalog()).unwrap();
-        assert_eq!(body["model"], "composer");
+        for (model, expected) in [
+            ("grok", "grok-4.7"),
+            ("build", "build"),
+            ("composer", "composer"),
+            ("grok-4.7-build-fast", "grok-4.7-build-fast"),
+            ("grok-4.6", "grok-4.6"),
+            ("grok-4.5", "grok-4.5"),
+            ("future-grok", "future-grok"),
+        ] {
+            let req = CanonicalRequest {
+                model: model.into(),
+                ..base_req()
+            };
+            let chat = to_xai_chat_request(&req, &empty_repl(), p.active_catalog()).unwrap();
+            let responses = to_grok_responses_request(&req, p.active_catalog(), false).unwrap();
+            assert_eq!(chat["model"], expected, "chat model {model}");
+            assert_eq!(responses["model"], expected, "responses model {model}");
+        }
     }
 
     #[test]
@@ -5456,15 +5441,7 @@ mod tests {
         assert_eq!(GrokProvider::pinned_version(), "1.0.77");
         let p = GrokProvider::new(None).unwrap();
         let ids: Vec<_> = p.models_list().into_iter().map(|m| m.id).collect();
-        assert_eq!(
-            ids,
-            vec![
-                "grok-4.7".to_string(),
-                "grok-4.7-build-fast".to_string(),
-                "grok-4.6".to_string(),
-                "grok-4.5".to_string()
-            ]
-        );
+        assert_eq!(ids, vec!["grok-4.7".to_string()]);
         assert_eq!(p.version, "1.0.77");
     }
 
@@ -5799,7 +5776,7 @@ mod tests {
             .and(path("/v1/responses"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "resp_cons",
-                "model": "grok-build",
+                "model": "grok-4.7",
                 "status": "completed",
                 "output": [{"type":"message","content":[{"type":"output_text","text":"ok"}]}],
                 "usage": {"input_tokens": 1, "output_tokens": 1}
@@ -5814,7 +5791,7 @@ mod tests {
             server.uri(),
         );
         let req = CanonicalRequest {
-            model: "grok-build".into(),
+            model: "grok".into(),
             messages: vec![CanonicalMessage {
                 role: "user".into(),
                 content: CanonicalContent::Text("hi".into()),
@@ -5826,6 +5803,8 @@ mod tests {
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["model"], "grok-4.7");
         let h = &requests[0].headers;
         let val = |name: &str| h.get(name).map(|v| v.to_str().unwrap().to_string());
 
@@ -5845,7 +5824,7 @@ mod tests {
             Some("grok-shell/1.0.77 (linux; x86_64)"),
             "UA must be derived from the pinned catalog version"
         );
-        assert_eq!(val("x-grok-model-override").as_deref(), Some("grok-build"));
+        assert_eq!(val("x-grok-model-override").as_deref(), Some("grok-4.7"));
         assert_eq!(val("accept").as_deref(), Some("text/event-stream"));
         assert_eq!(val("content-type").as_deref(), Some("application/json"));
         assert_eq!(

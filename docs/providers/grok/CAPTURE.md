@@ -124,15 +124,16 @@ wrapper around `tools.capture extract jsonl` for sanitized JSONL exports.
 ## Current Wire + Model Findings
 
 The active version, header values, and catalog are defined in
-`crates/provider-grok/src/lib.rs`. The latest clean-HOME general capture and
-renewed catalog exception are described below.
+`crates/provider-grok/src/lib.rs`. The latest clean-HOME general capture
+retires the prior catalog retention exception; see the 2026-11-09 findings
+below.
 
 ### Previous capture (2026-10-15, grok-shell 1.0.67)
 
 The fresh `GET /v1/models` returned HTTP 200 with only `grok-4.7`, with
 low, medium, high, and xhigh effort. The Free-tier account has a temporary
-Grok 4.7 promo. The operator renewed the four-model catalog exception;
-see `docs/providers/grok/README.md`.
+Grok 4.7 promo. The operator renewed the four-model catalog exception at
+that time; the 2026-11-09 rebaseline below retires it.
 
 The no-model inference request selected `grok-4.7` and completed with
 HTTP 200 after one CLI-managed 429 retry. Background session-title
@@ -168,9 +169,55 @@ and removed after inspection. Refresh capture was not run.
 The operator explicitly renewed the four-model catalog exception for this
 pin. The active pin and exact header goldens now follow the inspected CLI
 capture while retaining the 1.0.41 catalog. This approval does not establish
-current acceptance for all four models. At the next rebaseline, obtain a
-paid-tier listing or renew the exception again; see
-`docs/providers/grok/README.md`.
+current acceptance for all four models. The 2026-11-09 rebaseline below
+supersedes that retention decision.
+
+### 2026-11-09 rebaseline
+
+The rebuilt isolated Omni server passed all three inbound APIs in streaming
+and non-streaming modes in a serial recheck (six completed replies). The
+initial concurrent run hit HTTP 429 on three paths and received a completed
+refusal to an exact-output prompt on another. The recheck used a normal
+question with three-second spacing. This confirms basic route acceptance;
+media, tool loops, and cache-miss behavior were not live-tested in this pass.
+
+The fresh clean-HOME general capture used the installed grok-shell 1.0.77
+(`50ca579fa996`, stable), unchanged from the previous pin. Official
+`GET /v1/models` on `cli-chat-proxy.grok.com` returned HTTP 200 with only
+`grok-4.7`. It advertises low, medium, high, and xhigh effort, with high as
+the default. Proxy `default_model` and the no-`--model` request both selected
+`grok-4.7`.
+
+The main inference request at 21:51:01 UTC returned HTTP 200 and a complete
+SSE `response.completed` event with status `completed`. Usage reported
+12,760 input tokens, 23 output tokens, and 8,576 cached input tokens. This
+establishes CLI completion and cache-read accounting, not cache-miss behavior
+or an Omni live smoke result.
+
+UA remains `grok-shell/1.0.77 (linux; x86_64)` and client-version remains
+`1.0.77`. The fixed token-auth, authenticate-response, client identifier,
+headless mode, model override, and SSE accept headers are unchanged. The
+OIDC user-id header was present. Existing omissions of CLI session, trace,
+compaction, and loop-guard headers remain unchanged. The main body keeps
+`include`, `input`, `model`, `prompt_cache_key`, `reasoning`, `store`,
+`stream`, and `tools`; CLI reasoning was high with concise summary.
+
+The catalog now follows the fresh listing. The three unlisted IDs are no
+longer advertised, and the prior issue #56 retention exception is retired.
+Unknown model passthrough and existing model-specific effort mappings are
+unchanged. This is evidence for the captured account, not a paid-tier or
+global inventory.
+
+Tokenization calls returned HTTP 429. A background `grok-4.6` request had
+HTTP 200 but no captured response body, so completion is unproven. One
+additional `grok-4.7` flow had no captured HTTP response; it is not counted
+as a successful inference. These do not change the completed main request.
+
+Shared extract redaction was checked against source credential values and
+captured sensitive request headers. Raw flows, extracts, CLI output, and
+staged credentials stayed on tmpfs and were removed after inspection. No
+refresh capture, credential-refresh UA change, installation, or shared
+service change was made.
 
 ### Custom endpoint override
 

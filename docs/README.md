@@ -38,8 +38,8 @@ Design narrative: [`DESIGN.md`](DESIGN.md). Decision record:
 ## Binary
 
 - `omni` - the only server binary. Routes by canonical upstream model id
-  (`claude-sonnet-5-5`, `grok-4.6`, or the configured Codex model),
-  documented shorthand alias (`sonnet`, `opus`, `haiku`, `fable`, `grok`,
+  (`claude-sonnet-5-5`, `grok-4.7`, or the configured Codex model),
+  documented shorthand alias (`sonnet`, `opus`, `haiku`, `fable`, `mythos`, `grok`,
   `gpt`), or optional provider prefix (`claude:...`,
   `grok:...`, `codex:...`) when a caller needs to force a provider.
 
@@ -150,7 +150,8 @@ Current shorthand aliases are resolved from provider-owned catalogs at startup:
 - `sonnet` -> `claude-sonnet-5-5`
 - `opus` -> `claude-opus-5-5`
 - `haiku` -> `claude-haiku-5-5`
-- `fable` -> `claude-fable-5-1`
+- `fable` -> `claude-fable-5-2`
+- `mythos` -> `claude-mythos-5-2`
 - `grok` -> `grok-4.7`
 - `gpt` -> the current Codex model from `$CODEX_HOME/config.toml` or
   `~/.codex/config.toml`, falling back to the provider default
@@ -237,7 +238,7 @@ Adapter mapping (summary):
 |---|---|---|---|
 | **Grok** | `low`/`medium`/`high`; `xhigh` on `grok-4.7`, `grok-4.7-build-fast`, and `grok-4.6`; `minimal`→`low`, `max`→`high` | omits field | `xhigh` on `grok-4.5`, `ultra`, other unknowns |
 | **Codex** | `none`/`minimal`/`low`/`medium`/`high`/`xhigh`; `max`→`high` | emits `none` | `ultra`, other unknowns |
-| **Claude** | client effort wins; pin default only when absent | suppresses pin | unmappable on a model without `output_config.effort` (none on the 2.1.293 pin) |
+| **Claude** | client effort wins; pin default only when absent | suppresses pin | unmappable on a model without `output_config.effort` (none on the active pin) |
 
 Claude precedence: **client effort > fingerprint pin default > absent**.
 Effort-capable models prefer `output_config.effort` over effort-derived thinking
@@ -256,7 +257,7 @@ suppresses pin fill and does not set `output_config.effort`. There is no closed
 local Claude effort allowlist. Unknown names may 400 from upstream by design.
 Fail loud only when the adapter cannot express the value: a model without
 `output_config.effort` falls back to the thinking-budget ladder, which has no
-`xhigh`. Every model on the 2.1.293 pin has `output_config.effort`.
+`xhigh`. Every model on the active pin has `output_config.effort`.
 
 Design notes: `docs/DESIGN.md`. Decision record: `docs/decisions.md`.
 
@@ -298,7 +299,7 @@ python3 -m unittest tools.live_http_suite.tests.test_hermetic -v
 ```
 
 Model pins (override via env): `OMNI_TEST_CLAUDE_MODEL` (default
-`claude-haiku-5-5`), `OMNI_TEST_DUAL_MODE_MODEL` (default `grok-4.5`),
+`claude-haiku-5-5`), `OMNI_TEST_DUAL_MODE_MODEL` (default `grok-4.7`),
 `OMNI_TEST_RESPONSES_MODEL` (default Claude haiku pin). The suite fails loud if
 a required pin is missing from `GET /v1/models`. Dual-mode skip is only via
 `OMNI_TEST_DUAL_MODE_OFF=1` or `--dual-mode-off`, checked before resolving the

@@ -15,23 +15,37 @@ pub struct ModelDef {
     pub max_tokens: u64,
 }
 
-/// Active Claude Code model catalog (pin 2.1.318).
+/// Active Claude Code model catalog (pin 2.1.321).
 /// Canonical ids and short aliases come from the current capture.
 /// Explicit
 /// `claude-fable-5` stays pass-through plus a wire/beta override, not a second
 /// advertised row.
 pub static MODEL_CATALOG: &[ModelDef] = &[
     ModelDef {
-        canonical: "claude-mythos-5-1",
+        canonical: "claude-mythos-5-2",
         cli_name: "mythos",
         aliases: &["mythos"],
+        context_window: 1_000_000,
+        max_tokens: 128_000,
+    },
+    ModelDef {
+        canonical: "claude-fable-5-2",
+        cli_name: "fable",
+        aliases: &["fable"],
+        context_window: 1_000_000,
+        max_tokens: 128_000,
+    },
+    ModelDef {
+        canonical: "claude-mythos-5-1",
+        cli_name: "claude-mythos-5-1",
+        aliases: &[],
         context_window: 1_000_000,
         max_tokens: 64_000,
     },
     ModelDef {
         canonical: "claude-fable-5-1",
-        cli_name: "fable",
-        aliases: &["fable"],
+        cli_name: "claude-fable-5-1",
+        aliases: &[],
         context_window: 1_000_000,
         max_tokens: 64_000,
     },
@@ -192,7 +206,7 @@ mod tests {
     fn resolve_short_aliases() {
         assert_eq!(
             profile().resolve_model("mythos").unwrap().canonical,
-            "claude-mythos-5-1"
+            "claude-mythos-5-2"
         );
         assert_eq!(
             profile().resolve_model("opus").unwrap().canonical,
@@ -208,7 +222,7 @@ mod tests {
         );
         assert_eq!(
             profile().resolve_model("fable").unwrap().canonical,
-            "claude-fable-5-1"
+            "claude-fable-5-2"
         );
     }
 
@@ -271,16 +285,23 @@ mod tests {
     #[test]
     fn models_list_returns_default_catalog() {
         let list = profile().models_list();
-        assert_eq!(list.len(), 5);
-        assert_eq!(list[0].id, "claude-mythos-5-1");
-        assert_eq!(list[1].id, "claude-fable-5-1");
-        assert_eq!(list[2].id, "claude-opus-5-5");
-        assert_eq!(list[3].id, "claude-sonnet-5-5");
-        assert_eq!(list[4].id, "claude-haiku-5-5");
-        assert_eq!(list[0].context_window, 1_000_000);
-        assert_eq!(list[0].max_tokens, 64_000);
-        assert_eq!(list[4].context_window, 1_000_000);
-        assert_eq!(list[4].max_tokens, 128_000);
+        assert_eq!(list.len(), 7);
+        assert_eq!(list[0].id, "claude-mythos-5-2");
+        assert_eq!(list[1].id, "claude-fable-5-2");
+        assert_eq!(list[2].id, "claude-mythos-5-1");
+        assert_eq!(list[3].id, "claude-fable-5-1");
+        assert_eq!(list[4].id, "claude-opus-5-5");
+        assert_eq!(list[5].id, "claude-sonnet-5-5");
+        assert_eq!(list[6].id, "claude-haiku-5-5");
+        for model in &list {
+            assert_eq!(model.context_window, 1_000_000);
+            let expected_output = if model.id.ends_with("5-1") {
+                64_000
+            } else {
+                128_000
+            };
+            assert_eq!(model.max_tokens, expected_output, "{}", model.id);
+        }
     }
 
     #[test]

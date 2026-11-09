@@ -167,29 +167,37 @@ source is `codex debug models --bundled` (`visibility=list` slugs). A custom
 Responses `base_url` is not a reason to skip. If that command fails or lists
 no models, stop. Do not keep the previous pin's catalog.
 
-The 2026-11-07 general capture used the installed Codex CLI and completed a
-Responses POST on the configured custom endpoint with HTTP 200 and a
-`response.completed` event. The fresh bundled catalog adds a visible model
-and updates the newest `terra` family alias. The default still follows the
-priority-1 slug. The active version, catalog ids, and aliases are defined by
-`CODEX_VERSION` and `CODEX_CATALOG` in `crates/provider-codex/src/lib.rs`.
-The `gpt` alias follows the configured model when the config names one.
-The captured user-agent now reports Ubuntu 26.4.0.
+The 2026-11-09 clean-HOME general capture used the installed Codex CLI and
+completed `POST /responses` on the configured custom endpoint with HTTP 200
+and a `response.completed` event whose response status was `completed`.
+The installed version and fresh bundled catalog are unchanged: nine visible
+slugs, sorted by priority for Omni's catalog and default. The bundled dump's
+array order is not priority order. The active version, catalog ids, and aliases
+remain defined by `CODEX_VERSION` and `CODEX_CATALOG` in
+`crates/provider-codex/src/lib.rs`. The `gpt` alias follows the configured model
+when the config names one. Hidden Daybreak and auto-review slugs stay excluded.
 
-A separate isolated local probe used fake ChatGPT auth, a loopback custom
-provider, and blocked external proxy traffic. It recorded WebSocket upgrade
-requests, but deliberately returned HTTP 503 and did not complete inference.
-Upgrade/prewarm metadata still has 19 keys. Actual-turn metadata adds
-`root_turn_id`, `turn_trigger`, and `turn_started_at_unix_ms`; these stay
-outside Omni's synthetic prewarm metadata.
+The REST capture reconfirmed the UA's Ubuntu 26.4.0 shape,
+`originator: codex_exec`, and `x-codex-beta-features: remote_compaction_v2`.
+Its `version`, `openai-beta`, and `x-codex-routing-hint` headers were absent.
+Those absences on a custom REST route do not prove a built-in WebSocket change.
 
-Both the local probe and live REST capture reported `sandbox: "seccomp"`
-and `node_repl_auto_review_required: true`. Omni updates the synthetic sandbox
-stand-in and keeps the other flags. The local probe used
-`sandbox_mode: "read-only"`; the configured live REST capture used `"workspace-write"`.
-Omni keeps its read-only stand-in. Request bodies keep the existing shape-only
-contract and omit CLI session data and preferences. The Responses-lite signal
-stays omitted by Omni.
+The separate 2026-11-07 isolated local probe used fake ChatGPT auth, a loopback
+custom provider, and blocked external proxy traffic. It recorded WebSocket
+upgrade requests, but deliberately returned HTTP 503 and did not complete
+inference. Upgrade/prewarm metadata had 19 keys. The fresh live REST capture
+has 22 actual-turn keys, including `root_turn_id`, `turn_trigger`, and
+`turn_started_at_unix_ms`; these stay outside Omni's synthetic prewarm metadata.
+No new WebSocket probe was run.
+
+Both the prior local probe and fresh live REST capture reported
+`sandbox: "seccomp"` and `node_repl_auto_review_required: true`; the other
+synthetic flags still match. The prior local probe used
+`sandbox_mode: "read-only"`; the configured live REST capture used
+`"workspace-write"`. Omni keeps its read-only stand-in. Request bodies keep
+the existing shape-only contract and omit CLI session data and preferences.
+The captured CLI sent the Responses-lite header and configured reasoning/text
+preferences; Omni still does not inject these CLI defaults.
 
 **Verification limit:** the machine has no ChatGPT OAuth login. The local
 custom-provider probe confirms emitted upgrade shape, not current built-in
@@ -200,7 +208,22 @@ a built-in change from that route. OAuth refresh traffic was not captured;
 its existing UA stays unchanged. The configured stored API key was staged
 in tmpfs; no ambient env key was forwarded and no host approval override was
 set. Custom/API-key REST continues to send configured headers and auth only,
-with no CLI headers or cookie.
+with no CLI headers or cookie. All raw flows, staged auth/config, and clean-HOME
+files were held on tmpfs and deleted after evidence extraction. The CLI also
+made plugin and telemetry requests; these are not inference or OAuth refresh
+proof.
+
+The rebuilt isolated Omni server completed Chat Completions, Responses, and
+translated Anthropic Messages requests, streaming and non-streaming, for eight
+of the nine bundled models (48 calls). The configured custom gateway rejected
+`gpt-5.5` on all six paths with an upstream 404 describing retirement from
+Codex with ChatGPT sign-in. This is route-specific availability evidence;
+`gpt-5.5` stays in Omni's catalog because the required bundled listing still
+marks it visible. No direct built-in ChatGPT acceptance was tested.
+
+**Separate behavior follow-up:** the fresh bundled catalog supports `max` on
+several models and `ultra` on some models. Omni still maps `max` to `high` and
+rejects `ultra`. This rebaseline does not change that reasoning-effort policy.
 
 ```sh
 python3 -m tools.capture catalog --provider codex

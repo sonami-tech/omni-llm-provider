@@ -63,7 +63,7 @@ const CONSERVATIVE_WINDOW_ID: &str = "00000000-0000-4000-8000-000000000000:0";
 const DEFAULT_CODEX_MODEL: &str = "gpt-6.1-sol";
 const DEFAULT_AUTH_COMMAND_TIMEOUT_MS: u64 = 5_000;
 
-// Codex catalog from `codex debug models --bundled` on CLI 0.166.0 (2026-11-07).
+// Codex catalog from `codex debug models --bundled` on CLI 0.166.0 (2026-11-09).
 // Visibility=list slugs only, in priority order. The priority-1 slug is the
 // default; family aliases name the newest model in each family. The dump has
 // no alias field. Hidden slugs stay out of the caller catalog. If this listing
@@ -2766,7 +2766,7 @@ model = "gpt-native"
         // sol/terra, gpt-6 astra/sol/luna, the 5.6 family, and still-listed 5.5) AND
         // the actually-configured model.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let _home = TempCodexHome::new("", None);
+        let _home = TempCodexHome::new(r#"model = "gpt-configured""#, None);
         // Clear any OMNI override from a prior test in the shared process.
         unsafe {
             std::env::remove_var("OMNI_CODEX_BASE_URL");
@@ -2774,6 +2774,8 @@ model = "gpt-native"
         }
         let provider = CodexProvider::new().unwrap();
         let ids: Vec<String> = provider.models_list().into_iter().map(|m| m.id).collect();
+        assert_eq!(ids.first().map(String::as_str), Some("gpt-configured"));
+        assert_eq!(ids.len(), 10, "configured model plus nine visible slugs");
         assert!(ids.iter().any(|id| id == "gpt-6.1-sol"), "ids: {ids:?}");
         assert!(ids.iter().any(|id| id == "gpt-6-astra"), "ids: {ids:?}");
         assert!(ids.iter().any(|id| id == "gpt-6-sol"), "ids: {ids:?}");
@@ -2785,8 +2787,13 @@ model = "gpt-native"
         assert!(ids.iter().any(|id| id == "gpt-5.5"), "ids: {ids:?}");
         assert!(!ids.iter().any(|id| id == "gpt-5.2"), "ids: {ids:?}");
         assert!(
-            !ids.iter()
-                .any(|id| id == "gpt-5.4-mini" || id == "codex-auto-review"),
+            !ids.iter().any(|id| matches!(
+                id.as_str(),
+                "gpt-5.4-mini"
+                    | "gpt-daybreak-blue-latest"
+                    | "gpt-daybreak-red-latest"
+                    | "codex-auto-review"
+            )),
             "hidden/internal slugs must stay out of the caller catalog: {ids:?}"
         );
     }
@@ -3400,7 +3407,7 @@ query_params = { api-version = "2026-01-01" }
         );
         assert_eq!(
             ws_headers.get("x-codex-beta-features").unwrap(),
-            CONSERVATIVE_BETA_FEATURES
+            "remote_compaction_v2"
         );
         assert_eq!(ws_headers.get("originator").unwrap(), "codex_exec");
         assert_eq!(ws_headers.get("version").unwrap(), "0.166.0");

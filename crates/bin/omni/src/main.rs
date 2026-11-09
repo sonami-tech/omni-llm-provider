@@ -3264,7 +3264,7 @@ mod tests {
         assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-sonnet-4-6"));
 
         let (k, m) = resolve_provider_and_model("fable", &catalogs).unwrap();
-        assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-fable-5-1"));
+        assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-fable-5-2"));
 
         let (k, m) = resolve_provider_and_model("sonnet", &catalogs).unwrap();
         assert_eq!((k.as_str(), m.as_str()), ("claude", "claude-sonnet-5-5"));
@@ -3336,9 +3336,10 @@ mod tests {
 
         let text = format_aliases_for_log(&providers).expect("aliases format");
         for expected in [
+            "mythos=claude-mythos-5-2",
             "sonnet=claude-sonnet-5-5",
             "opus=claude-opus-5-5",
-            "fable=claude-fable-5-1",
+            "fable=claude-fable-5-2",
             "haiku=claude-haiku-5-5",
             "grok=grok-4.7",
             "gpt=",
@@ -3354,7 +3355,7 @@ mod tests {
             "startup alias log must not advertise the pruned codex alias: {text}"
         );
         assert!(
-            text.contains("fable=claude-fable-5-1"),
+            text.contains("fable=claude-fable-5-2"),
             "startup alias log must advertise live fable alias: {text}"
         );
         // composer dropped from grok-shell 1.0.46 advertised catalog.
@@ -3377,9 +3378,9 @@ mod tests {
         assert!(text.contains("claude-sonnet-5-5"));
         assert!(text.contains("grok=["));
         assert!(text.contains("grok-4.7"));
-        assert!(text.contains("grok-4.7-build-fast"));
-        assert!(text.contains("grok-4.6"));
-        assert!(text.contains("grok-4.5"));
+        assert!(!text.contains("grok-4.7-build-fast"));
+        assert!(!text.contains("grok-4.6"));
+        assert!(!text.contains("grok-4.5"));
         assert!(
             !text.contains("grok-composer-2.5-fast"),
             "composer is no longer advertised: {text}"
@@ -6584,12 +6585,18 @@ data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"
             ids.iter().any(|id| id == "grok-4.7"),
             "grok default catalog entry missing: {ids:?}"
         );
-        assert!(ids.iter().any(|id| id == "grok-4.7-build-fast"));
-        assert!(ids.iter().any(|id| id == "grok-4.6"));
-        assert!(
-            ids.iter().any(|id| id == "grok-4.5"),
-            "grok real catalog entry missing: {ids:?}"
-        );
+        for absent in ["grok-4.7-build-fast", "grok-4.6", "grok-4.5"] {
+            assert!(
+                !ids.iter().any(|id| id == absent),
+                "unlisted Grok model advertised: {ids:?}"
+            );
+        }
+        for added in ["claude-mythos-5-2", "claude-fable-5-2"] {
+            assert!(
+                ids.iter().any(|id| id == added),
+                "new Claude model missing: {ids:?}"
+            );
+        }
         assert!(
             !ids.iter().any(|id| id == "grok-composer-2.5-fast"),
             "composer is no longer in the grok-shell 1.0.46 catalog: {ids:?}"
@@ -10178,7 +10185,7 @@ rule = [
             let out = post_json(
                 port,
                 "/v1/chat/completions",
-                r#"{"model":"grok:grok-4.3","messages":[{"role":"user","content":"Reply PONG"}]}"#,
+                r#"{"model":"grok:grok-4.7","messages":[{"role":"user","content":"Reply PONG"}]}"#,
             );
             let v = omni_common::test_support::parse_json(&out.body);
             if v.get("choices").is_some() {
@@ -10256,7 +10263,7 @@ rule = [
         let out = post_json(
             port,
             "/v1/chat/completions",
-            r#"{"model":"grok:grok-4.3","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"Reply PONG"}]}"#,
+            r#"{"model":"grok:grok-4.7","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"Reply PONG"}]}"#,
         );
         assert_eq!(out.status, 200);
         let body = out.body;
@@ -11434,7 +11441,7 @@ rule = [
         let out = post_json(
             port,
             "/v1/responses",
-            r#"{"model":"grok:grok-4.3","input":"Reply with the single word PONG","max_output_tokens":16}"#,
+            r#"{"model":"grok:grok-4.7","input":"Reply with the single word PONG","max_output_tokens":16}"#,
         );
         assert_eq!(out.status, 200, "live body: {}", out.body);
         let v = omni_common::test_support::parse_json(&out.body);
@@ -11454,7 +11461,7 @@ rule = [
         let out2 = post_json(
             port,
             "/v1/responses",
-            r#"{"model":"grok:grok-4.3","input":"Reply with the single word PONG","max_output_tokens":16,"stream":true}"#,
+            r#"{"model":"grok:grok-4.7","input":"Reply with the single word PONG","max_output_tokens":16,"stream":true}"#,
         );
         assert_eq!(out2.status, 200, "live stream body: {}", out2.body);
         let body = out2.body;
@@ -11492,7 +11499,7 @@ rule = [
         // Per-backend prefix model; only exercised when that backend has creds.
         let mut backends: Vec<&str> = Vec::new();
         if has_grok_creds() {
-            backends.push("grok:grok-4.3");
+            backends.push("grok:grok-4.7");
         }
         if has_claude_creds() {
             backends.push("claude:haiku");
@@ -11663,7 +11670,7 @@ rule = [
         let out = post_json(
             port,
             "/v1/responses",
-            r#"{"model":"grok:grok-4.3","input":[{"type":"message","role":"user","content":"Weather in SF?"},{"type":"function_call","call_id":"c1","name":"get_weather","arguments":"{\"city\":\"SF\"}"},{"type":"function_call_output","call_id":"c1","output":"72F and sunny"}],"tools":[{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}],"max_output_tokens":256}"#,
+            r#"{"model":"grok:grok-4.7","input":[{"type":"message","role":"user","content":"Weather in SF?"},{"type":"function_call","call_id":"c1","name":"get_weather","arguments":"{\"city\":\"SF\"}"},{"type":"function_call_output","call_id":"c1","output":"72F and sunny"}],"tools":[{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}],"max_output_tokens":256}"#,
         );
         assert_eq!(out.status, 200, "responses tool body: {}", out.body);
         let v = omni_common::test_support::parse_json(&out.body);

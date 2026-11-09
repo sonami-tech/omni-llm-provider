@@ -23,7 +23,7 @@ identity preambles. The maintained contract is:
 - model catalog kept current; the active version and catalog are defined in
   `crates/provider-grok/src/lib.rs`. Catalog source is clean-HOME
   `GET /v1/models` on `cli-chat-proxy.grok.com`. See
-  [Catalog exception](#catalog-exception).
+  [Current catalog](#current-catalog).
 
 `--grok-version` / `OMNI_GROK_VERSION` and match-system flags are removed
 (issue #12). Rebaseline overwrites this pin; older wire needs an older Omni
@@ -42,21 +42,20 @@ Default tests use wiremock. Live calls require `OMNI_LIVE_TESTS=1`.
 Capture and refresh-capture work uses `python3 -m tools.capture`; see
 `docs/providers/grok/CAPTURE.md`.
 
-## Catalog exception
+## Current catalog
 
-The 2026-11-07 grok-shell 1.0.77 clean-HOME general capture listed only
-`grok-4.7`, as did the previous Free-tier capture. The no-model request and
-proxy `default_model` agreed, and the main inference completed with HTTP 200
-and `response.completed`. A background `grok-4.6` request had HTTP 200 but no
-captured response body, so its completion remains unproven. Fixed header
-names and body shape match the previous pin apart from the CLI version.
+The 2026-11-09 clean-HOME general capture used the installed grok-shell
+1.0.77. Official `GET /v1/models` returned HTTP 200 with only `grok-4.7`,
+matching proxy `default_model` and the no-model inference request. Main
+inference completed with HTTP 200, `response.completed`, and usage. Fixed
+header values and body shape still match the active pin.
 
-The operator explicitly renewed the issue #56 exception for this pin:
-keep the four models from the 1.0.41 listing. This is catalog retention
-approval, not proof of current acceptance for all four models. Source of
-truth is `GROK_CATALOG` in `crates/provider-grok/src/lib.rs`. At the next
-rebaseline, take the listing from a paid-tier account, or obtain a new
-operator decision to keep the exception.
+The catalog now follows that fresh listing. The previous issue #56 retention
+exception is retired; unlisted IDs are no longer advertised. Source of truth
+is `GROK_CATALOG` in `crates/provider-grok/src/lib.rs`. This account-scoped
+listing does not prove model availability for other account tiers. Unknown
+model IDs still pass through unchanged, and the existing effort mappings
+remain unchanged. See [capture evidence](CAPTURE.md#2026-11-09-rebaseline).
 
 ## Reasoning effort
 

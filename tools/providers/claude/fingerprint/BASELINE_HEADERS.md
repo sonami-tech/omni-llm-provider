@@ -1,6 +1,6 @@
 # Claude CLI Baseline Wire Fingerprint
 
-Active baseline: Claude Code 2.1.318, captured 2026-11-07 (single pin; issue #12).
+Active baseline: Claude Code 2.1.321, captured 2026-11-09 (single pin; issue #12).
 
 Raw mitmproxy `.flow` files are not committed because they contain live bearer
 tokens and account identifiers. Keep raw captures on tmpfs and inspect them with
@@ -10,13 +10,13 @@ tokens and account identifiers. Keep raw captures on tmpfs and inspect them with
 
 | Profile | Claude Code | SDK package | Runtime | Entrypoint | Source |
 |---|---|---|---|---|---|
-| `cc-2.1.318-sdk-cli` | `2.1.318` | `0.128.0` | `v26.12.1` | `sdk-cli` | live shared-capture mitmproxy, Mythos/Opus/Sonnet/Haiku/Fable/default, 2026-11-07 |
+| `cc-2.1.321-sdk-cli` | `2.1.321` | `0.128.0` | `v26.12.1` | `sdk-cli` | live shared-capture mitmproxy, Mythos/Opus/Sonnet/Haiku/Fable/default, 2026-11-09 |
 
 Only one pin is compiled. Rebaseline overwrites this row; do not append a
 historical ladder. Older Omni releases retain older wire.
 
 
-Overwrite the single pin only after capture, vectors, and live smoke prove the
+Overwrite the single pin only after capture, wire goldens, and live smoke prove the
 new wire. Do not append historical profiles.
 
 ## Endpoint And Headers
@@ -44,7 +44,7 @@ Header names and dynamic values are pinned in
 - `anthropic-version: 2023-06-01`
 - `x-app: cli`
 
-## 2.1.318 Model Surface (active)
+## 2.1.321 Model Surface (active)
 
 | Input | Wire model | Beta list | max_tokens | temperature | output_config.effort |
 |---|---|---|---:|---:|---|
@@ -52,27 +52,27 @@ Header names and dynamic values are pinned in
 | `opus` | `claude-opus-5-5` | opus | 128000 | omitted | `medium` |
 | `sonnet` | `claude-sonnet-5-5` | sonnet (same bytes as opus) | 128000 | omitted | `medium` |
 | `haiku` | `claude-haiku-5-5` | haiku (opus members, reordered) | 128000 | omitted | `medium` |
-| `fable` | `claude-fable-5-1` | fable (same bytes as opus) | 64000 | omitted | `high` |
+| `fable` / `claude-fable-5-2` | `claude-fable-5-2` | fable (same bytes as opus) | 128000 | omitted | `medium` |
+| `claude-mythos-5-2` | `claude-mythos-5-2` | default (same bytes as opus) | 128000 | omitted | `medium` |
+| `claude-fable-5-1` | `claude-fable-5-1` | fable (same bytes as opus) | 64000 | omitted | `high` |
 | `claude-mythos-5-1` | `claude-mythos-5-1` | mythos (omits per-turn-control) | 64000 | omitted | `high` |
+| `claude-fable-5` | `claude-fable-5` | mythos (omits per-turn-control) | 64000 | omitted | `high` |
 
-All six captured requests returned HTTP 200 and completed with `OK`.
-Explicit `claude-fable-5` was not captured in this run and remains pass-through
-with its existing override. The beta lists move `thinking-token-count-2026-05-13`
-after `mid-conversation-tool-changes-2026-07-01`. Mythos omits
-`per-turn-control-2026-07-01`. Default, Sonnet, and Fable still equal Opus.
-Haiku puts `claude-code-20250219` after `context-management-2025-06-27`.
-Exact lists and model defaults are in
-`crates/provider-claude/src/fingerprint.rs`; the catalog is in
-`crates/provider-claude/src/models.rs`.
+All ten captured requests returned HTTP 200, replied `OK`, and ended with
+`message_delta.stop_reason: end_turn` followed by `message_stop`. The no-model
+and `opus` captures select the same model; `fable` and explicit Fable 5.2 do too.
+Explicit Fable 5 remains unadvertised with its freshly captured overrides.
+Exact beta lists and defaults are in `crates/provider-claude/src/fingerprint.rs`;
+the catalog is in `crates/provider-claude/src/models.rs`.
 
-Billing (no cch): `cc_version=2.1.318.352; cc_entrypoint=sdk-cli;` for
+Billing (no cch): `cc_version=2.1.321.ff0; cc_entrypoint=sdk-cli;` for
 prompt `Say OK`. Stainless package is `0.128.0`, runtime `v26.12.1`, and
 `x-client-request-id` is absent. The system identity remains
 `You are a Claude agent, built on Anthropic's Claude Agent SDK.`
-The CLI sends adaptive thinking on every captured model, Haiku included.
-Omni does not clone those CLI-only bodies. The installed CLI model metadata
-also reports a one-million-token context window for Mythos 5.1; the catalog
-uses its captured default output limit, consistent with the other models.
+The CLI sends adaptive thinking with `display: omitted` on every captured model.
+Omni keeps its existing shape-only body contract. Context windows are one million
+tokens; catalog output metadata follows captured defaults, including 64000 on
+Fable/Mythos 5.1. These defaults are distinct from public API maximum limits.
 
 ## 2.1.175 Model Surface
 

@@ -54,14 +54,16 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
    ```sh
    uv run --with mitmproxy python -m tools.capture capture run \
      --provider claude --mode general --live-capture \
-     --models claude-mythos-5-1 opus sonnet haiku fable
+     --models claude-mythos-5-2 claude-mythos-5-1 fable \
+       claude-fable-5-1 claude-fable-5 opus sonnet haiku
    ```
 
    The legacy wrapper remains for compatibility:
 
    ```sh
    tools/providers/claude/fingerprint/capture_baseline.sh \
-     claude-fable-5-1 claude-haiku-5-5 claude-sonnet-5-5 claude-opus-5-5
+     claude-mythos-5-2 claude-mythos-5-1 claude-fable-5-2 \
+     claude-fable-5-1 claude-fable-5 claude-haiku-5-5 claude-sonnet-5-5 claude-opus-5-5
    ```
 
    Both helpers start mitmdump as a reverse proxy to `https://api.anthropic.com`,
@@ -146,25 +148,28 @@ as `tools.capture` (for example `uv run --with mitmproxy python -m tools.capture
 
 ## Current Capture
 
-The 2026-11-07 clean-HOME capture used Claude Code 2.1.318. Default,
-Mythos 5.1, Opus, Sonnet, Haiku, and Fable each returned HTTP 200 with an
-`OK` reply. Mythos 5.1 is now included in the fresh five-model catalog.
-Catalog and defaults are defined in `crates/provider-claude/src/models.rs`
-and `crates/provider-claude/src/fingerprint.rs`.
+The 2026-11-09 clean-HOME capture used Claude Code 2.1.321. All ten
+requests (default, Mythos 5.2, Mythos 5.1, explicit Fable 5.2, `fable`,
+Fable 5.1, Fable 5, Opus, Sonnet, and Haiku) returned HTTP 200, completed
+with `message_stop` and `end_turn`, and replied `OK`.
 
-The runtime and beta ordering changed. Mythos has its own beta list, which
-omits `per-turn-control-2026-07-01`; its captured default is 64000 output
-tokens with high effort. The SDK, Anthropic version, identity, other model
-output defaults, and no-cch billing shape remain unchanged. The explicit
-`claude-fable-5` path was not recaptured; its pass-through and wire override
-remain unchanged.
+The `fable` alias resolves to Fable 5.2. Omni's `mythos` alias now selects
+Mythos 5.2. Both 5.2 models have captured defaults of 128000 output tokens
+and medium effort, with the same beta list as Opus. Mythos 5.1 and explicit
+Fable 5 omit `per-turn-control-2026-07-01`; Fable 5.1 retains it. The older
+Fable/Mythos defaults remain 64000/high. Explicit Fable 5 remains an
+unadvertised pass-through target with freshly confirmed overrides.
 
-The rebuilt Omni server also accepted Mythos through Chat Completions,
-Responses, and Anthropic Messages, with streaming and non-streaming requests.
-Every response completed with `OK`. Chat Completions also passed with
-`reasoning_effort: "minimal"`; the native counting endpoint returned a positive
-input token count. Both the canonical id and the `mythos` alias were exercised.
+The SDK, runtime, Anthropic version, system identity, other model defaults,
+and no-cch billing shape remain unchanged. Exact captured header bytes are
+recorded in `tools/providers/claude/fingerprint/BASELINE_HEADERS.md` and the
+fingerprint golden tests. Catalog and defaults are defined in
+`crates/provider-claude/src/models.rs` and
+`crates/provider-claude/src/fingerprint.rs`.
 
-Exact captured header bytes are recorded in
-`tools/providers/claude/fingerprint/BASELINE_HEADERS.md` and the existing
-fingerprint golden tests.
+The rebuilt isolated Omni server completed all three inbound APIs, with
+streaming and non-streaming requests, for every advertised Claude model
+and explicit Fable 5 (48 calls). The `fable` and `mythos` aliases also
+completed Chat Completions requests. Both 5.2 models returned positive
+native token counts. These checks prove basic request/response acceptance;
+tool, media, and cache behavior were not live-tested in this pass.
